@@ -28,11 +28,10 @@ pub fn get_value<C: Config + Serialize>(
     config: &C,
     key: &str,
 ) -> Result<ConfigResult, ClapfigError> {
-    let toml_value =
-        toml::Value::try_from(config).map_err(|e| ClapfigError::InvalidValue {
-            key: key.into(),
-            reason: e.to_string(),
-        })?;
+    let toml_value = toml::Value::try_from(config).map_err(|e| ClapfigError::InvalidValue {
+        key: key.into(),
+        reason: e.to_string(),
+    })?;
 
     let table = toml_value
         .as_table()
@@ -41,8 +40,7 @@ pub fn get_value<C: Config + Serialize>(
             reason: "config did not serialize to a table".into(),
         })?;
 
-    let value = table_get(table, key)
-        .ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
+    let value = table_get(table, key).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
 
     let value_str = format_value(value);
     let doc = lookup_doc(&C::META, key);
@@ -56,16 +54,23 @@ pub fn get_value<C: Config + Serialize>(
 
 /// Navigate a `toml::Table` by dotted key path (e.g. `"database.url"`).
 pub fn table_get<'a>(table: &'a toml::Table, dotted_key: &str) -> Option<&'a toml::Value> {
-    let segments: Vec<&str> = dotted_key.split('.').collect();
-    let mut tbl = table;
-    for (i, segment) in segments.iter().enumerate() {
-        let val = tbl.get(*segment)?;
-        if i == segments.len() - 1 {
-            return Some(val);
+    let (path, leaf) = match dotted_key.rsplit_once('.') {
+        Some((p, l)) => (Some(p), l),
+        None => (None, dotted_key),
+    };
+
+    let tbl = match path {
+        Some(path) => {
+            let mut current = table;
+            for segment in path.split('.') {
+                current = current.get(segment)?.as_table()?;
+            }
+            current
         }
-        tbl = val.as_table()?;
-    }
-    None
+        None => table,
+    };
+
+    tbl.get(leaf)
 }
 
 /// Format a TOML value for display.
@@ -198,8 +203,7 @@ mod tests {
 
     #[test]
     fn table_get_nested() {
-        let table: toml::Table =
-            toml::from_str("[database]\npool_size = 5").unwrap();
+        let table: toml::Table = toml::from_str("[database]\npool_size = 5").unwrap();
         let val = table_get(&table, "database.pool_size").unwrap();
         assert_eq!(val.as_integer().unwrap(), 5);
     }
