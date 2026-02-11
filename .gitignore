@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+Cargo.lock
+.DS_Store
+*.swp
+tmp/
+.history/
+.padz/
+tarpaulin-report.json
+Export_*.md
+Export_*.txt
+local
