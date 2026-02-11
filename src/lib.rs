@@ -5,7 +5,7 @@ mod builder;
 mod cli;
 mod env;
 mod file;
-pub mod merge;
+pub(crate) mod merge;
 mod ops;
 mod overrides;
 mod persist;
