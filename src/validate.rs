@@ -48,17 +48,42 @@ where
 
 /// Find the 1-indexed line number for a key in TOML content.
 ///
-/// For a dotted key like `"database.typo"`, searches for the leaf key `"typo"`
-/// as a TOML key assignment (starts a line and is followed by `=`).
+/// For a dotted key like `"database.typo"`, tracks the current `[section]` header
+/// while scanning and only matches the leaf key when inside the correct section.
+///
+/// This is a best-effort heuristic — it handles standard `[section]` headers and
+/// bare key assignments but does not handle quoted keys or inline tables.
+/// Returns 0 if the key cannot be located.
 fn find_key_line(content: &str, dotted_key: &str) -> usize {
-    let leaf = dotted_key.rsplit('.').next().unwrap_or(dotted_key);
+    let segments: Vec<&str> = dotted_key.split('.').collect();
+    let leaf = segments.last().unwrap_or(&dotted_key);
+    let expected_section = &segments[..segments.len() - 1]; // empty for top-level
+
+    let mut current_section: Vec<String> = Vec::new();
 
     for (i, line) in content.lines().enumerate() {
         let trimmed = line.trim();
-        if let Some(after_key) = trimmed.strip_prefix(leaf)
-            && after_key.trim_start().starts_with('=') {
-                return i + 1;
-            }
+
+        // Track [section] headers
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            let header = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
+            current_section = header.split('.').map(|s| s.trim().to_string()).collect();
+            continue;
+        }
+
+        // Check if we're in the right section
+        let in_right_section = expected_section.len() == current_section.len()
+            && expected_section
+                .iter()
+                .zip(&current_section)
+                .all(|(a, b)| *a == b);
+
+        if in_right_section
+            && let Some(after_key) = trimmed.strip_prefix(leaf)
+            && after_key.trim_start().starts_with('=')
+        {
+            return i + 1;
+        }
     }
     0
 }
