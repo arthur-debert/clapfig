@@ -66,10 +66,11 @@ impl<C: Config> ClapfigBuilder<C> {
         self
     }
 
-    /// Append a search path to the list.
+    /// Append a search path without replacing the defaults.
+    /// If no paths have been set yet, starts from the default `[Platform]`.
     pub fn add_search_path(mut self, path: SearchPath) -> Self {
         self.search_paths
-            .get_or_insert_with(Vec::new)
+            .get_or_insert_with(|| vec![SearchPath::Platform])
             .push(path);
         self
     }
@@ -249,11 +250,14 @@ mod tests {
     }
 
     #[test]
-    fn add_search_path_appends() {
+    fn add_search_path_appends_to_defaults() {
         let builder = Clapfig::builder::<TestConfig>()
             .app_name("myapp")
             .add_search_path(SearchPath::Cwd);
-        assert_eq!(builder.effective_search_paths(), vec![SearchPath::Cwd]);
+        assert_eq!(
+            builder.effective_search_paths(),
+            vec![SearchPath::Platform, SearchPath::Cwd]
+        );
     }
 
     #[test]
@@ -390,9 +394,7 @@ mod tests {
             .file_name("test.toml")
             .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
             .no_env()
-            .handle(&ConfigAction::Get {
-                key: "port".into(),
-            })
+            .handle(&ConfigAction::Get { key: "port".into() })
             .unwrap();
 
         match result {
