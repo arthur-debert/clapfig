@@ -4,22 +4,22 @@
 
 | Category | # | Title | Fixed in commit |
 |----------|---|-------|-----------------|
-| Correctness | 1 | `add_search_path` doesn't preserve default `Platform` path | |
-| Correctness | 2 | Silent data loss in `env.rs` when flat key conflicts with nested key | |
-| Correctness | 3 | `find_key_line` fragile with duplicate leaf names across sections | |
-| Correctness | 4 | Unreachable trailing `None` in `table_get` | |
-| Completeness | 5 | `config gen -o` flag parsed but never honored | |
-| Completeness | 6 | `Format` enum is dead code | |
-| Code Quality | 7 | `merge` module is `pub` with no reason to be | |
-| Code Quality | 8 | Wasteful serialize round-trip in `resolve.rs` | |
-| Test Quality | 9 | `types.rs` tests assert nothing meaningful | |
-| Test Quality | 10 | Missing test: `add_search_path` appending to already-set list | |
-| Test Quality | 11 | Missing test: `find_key_line` edge cases | |
-| Test Quality | 12 | Missing test: env var type conflict (flat vs nested) | |
-| Test Quality | 13 | Missing test: I/O permission errors | |
-| Documentation | 14 | No crate-level doc comment in `lib.rs` | |
-| Documentation | 15 | Internal modules lack `//!` doc comments | |
-| Documentation | 16 | `find_key_line` should document its heuristic nature | |
+| Correctness | 1 | `add_search_path` doesn't preserve default `Platform` path | db2e1ca |
+| Correctness | 2 | Silent data loss in `env.rs` when flat key conflicts with nested key | c124d9f |
+| Correctness | 3 | `find_key_line` fragile with duplicate leaf names across sections | a53620f |
+| Correctness | 4 | Unreachable trailing `None` in `table_get` | fdf170e |
+| Completeness | 5 | `config gen -o` flag parsed but never honored | 56b9a99 |
+| Completeness | 6 | `Format` enum is dead code | a626310 |
+| Code Quality | 7 | `merge` module is `pub` with no reason to be | 433aace |
+| Code Quality | 8 | Wasteful serialize round-trip in `resolve.rs` | 45bc5bf |
+| Test Quality | 9 | `types.rs` tests assert nothing meaningful | c61ef87 |
+| Test Quality | 10 | Missing test: `add_search_path` appending to already-set list | c61ef87 |
+| Test Quality | 11 | Missing test: `find_key_line` edge cases | c61ef87 |
+| Test Quality | 12 | Missing test: env var type conflict (flat vs nested) | c61ef87 |
+| Test Quality | 13 | Missing test: I/O permission errors | c61ef87 |
+| Documentation | 14 | No crate-level doc comment in `lib.rs` | 29b17f1 |
+| Documentation | 15 | Internal modules lack `//!` doc comments | 29b17f1 |
+| Documentation | 16 | `find_key_line` should document its heuristic nature | a53620f |
 
 ## Detailed Findings
 
