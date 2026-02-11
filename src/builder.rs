@@ -176,9 +176,24 @@ impl<C: Config> ClapfigBuilder<C> {
         C::Layer: for<'de> Deserialize<'de>,
     {
         match action {
-            ConfigAction::Gen { .. } => {
+            ConfigAction::Gen { output } => {
                 let template = ops::generate_template::<C>();
-                Ok(ConfigResult::Template(template))
+                match output {
+                    Some(path) => {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
+                                path: parent.to_path_buf(),
+                                source: e,
+                            })?;
+                        }
+                        std::fs::write(path, &template).map_err(|e| ClapfigError::IoError {
+                            path: path.clone(),
+                            source: e,
+                        })?;
+                        Ok(ConfigResult::TemplateWritten { path: path.clone() })
+                    }
+                    None => Ok(ConfigResult::Template(template)),
+                }
             }
             ConfigAction::Get { key } => {
                 let config = self.load()?;
@@ -382,6 +397,25 @@ mod tests {
             }
             other => panic!("Expected Template, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn handle_gen_with_output() {
+        let dir = TempDir::new().unwrap();
+        let out_path = dir.path().join("generated.toml");
+
+        let result: ConfigResult = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .no_env()
+            .handle(&ConfigAction::Gen {
+                output: Some(out_path.clone()),
+            })
+            .unwrap();
+
+        assert!(matches!(result, ConfigResult::TemplateWritten { .. }));
+        let content = fs::read_to_string(&out_path).unwrap();
+        assert!(content.contains("host"));
+        assert!(content.contains("port"));
     }
 
     #[test]

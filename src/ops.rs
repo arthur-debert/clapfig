@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use confique::Config;
 use serde::Serialize;
 
@@ -8,6 +10,8 @@ use crate::error::ClapfigError;
 pub enum ConfigResult {
     /// A generated TOML template string.
     Template(String),
+    /// Confirmation that a template was written to a file.
+    TemplateWritten { path: PathBuf },
     /// A key's resolved value and its doc comment.
     KeyValue {
         key: String,
