@@ -276,6 +276,18 @@ mod tests {
     }
 
     #[test]
+    fn add_search_path_appends_to_existing_list() {
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("myapp")
+            .search_paths(vec![SearchPath::Cwd])
+            .add_search_path(SearchPath::Platform);
+        assert_eq!(
+            builder.effective_search_paths(),
+            vec![SearchPath::Cwd, SearchPath::Platform]
+        );
+    }
+
+    #[test]
     fn cli_override_some_added() {
         let builder = Clapfig::builder::<TestConfig>()
             .app_name("myapp")

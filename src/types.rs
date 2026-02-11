@@ -21,26 +21,3 @@ pub enum ConfigAction {
     Get { key: String },
     Set { key: String, value: String },
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn search_path_variants_construct() {
-        let _ = SearchPath::Platform;
-        let _ = SearchPath::Home(".myapp");
-        let _ = SearchPath::Cwd;
-        let _ = SearchPath::Path(PathBuf::from("/etc/myapp"));
-    }
-
-    #[test]
-    fn config_action_variants() {
-        let _ = ConfigAction::Gen { output: None };
-        let _ = ConfigAction::Get { key: "host".into() };
-        let _ = ConfigAction::Set {
-            key: "port".into(),
-            value: "3000".into(),
-        };
-    }
-}

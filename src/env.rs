@@ -173,4 +173,32 @@ mod tests {
         assert_eq!(db["url"].as_str().unwrap(), "pg://");
         assert_eq!(db["pool_size"].as_integer().unwrap(), 20);
     }
+
+    #[test]
+    fn flat_key_replaced_by_nested() {
+        // If MYAPP__DATABASE (flat) and MYAPP__DATABASE__URL (nested) both exist,
+        // the nested key should win — the flat value is replaced by a table.
+        let table = env_to_table(
+            "MYAPP",
+            vars(&[
+                ("MYAPP__DATABASE", "flat_value"),
+                ("MYAPP__DATABASE__URL", "pg://"),
+            ]),
+        );
+        let db = table["database"].as_table().unwrap();
+        assert_eq!(db["url"].as_str().unwrap(), "pg://");
+    }
+
+    #[test]
+    fn nested_key_then_flat_overwrites() {
+        // Reverse order: nested first, then flat. Flat replaces the table.
+        let table = env_to_table(
+            "MYAPP",
+            vars(&[
+                ("MYAPP__DATABASE__URL", "pg://"),
+                ("MYAPP__DATABASE", "flat_value"),
+            ]),
+        );
+        assert_eq!(table["database"].as_str().unwrap(), "flat_value");
+    }
 }

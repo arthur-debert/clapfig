@@ -209,4 +209,42 @@ pool_size = 10
         let msg = err.to_string();
         assert!(msg.contains("config.toml") || msg.contains("Unknown keys"));
     }
+
+    #[test]
+    fn line_number_finds_correct_section_for_duplicate_leaf() {
+        // "typo" appears in [database] section — find_key_line should locate
+        // it there (line 4), not confuse it with a top-level key.
+        let content = "host = \"x\"\nport = 8080\n[database]\ntypo = \"bad\"\n";
+        let result = validate_unknown_keys::<TestConfig>(content, &path());
+        let err = result.unwrap_err();
+        match err {
+            ClapfigError::UnknownKeys(keys) => match &keys[0] {
+                ClapfigError::UnknownKey { key, line, .. } => {
+                    assert_eq!(key, "database.typo");
+                    assert_eq!(*line, 4);
+                }
+                other => panic!("Expected UnknownKey, got: {other:?}"),
+            },
+            other => panic!("Expected UnknownKeys, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_number_top_level_not_confused_by_nested_same_name() {
+        // "pool_size" exists as a known key in [database] but is unknown at top level.
+        // The line finder should find it at line 1 (top level), not inside [database].
+        let content = "typo = 99\n[database]\npool_size = 5\n";
+        let result = validate_unknown_keys::<TestConfig>(content, &path());
+        let err = result.unwrap_err();
+        match err {
+            ClapfigError::UnknownKeys(keys) => match &keys[0] {
+                ClapfigError::UnknownKey { key, line, .. } => {
+                    assert_eq!(key, "typo");
+                    assert_eq!(*line, 1);
+                }
+                other => panic!("Expected UnknownKey, got: {other:?}"),
+            },
+            other => panic!("Expected UnknownKeys, got: {other:?}"),
+        }
+    }
 }

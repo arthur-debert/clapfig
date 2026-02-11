@@ -47,7 +47,7 @@ pub fn load_config_files(
                 return Err(ClapfigError::IoError {
                     path: file_path,
                     source: e,
-                })
+                });
             }
         }
     }
@@ -138,5 +138,23 @@ mod tests {
         let paths = vec![SearchPath::Path(p1.clone()), SearchPath::Path(p2)];
         let primary = primary_config_path(&paths, "app.toml", "test");
         assert_eq!(primary, Some(p1.join("app.toml")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_returns_io_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("app.toml");
+        fs::write(&file_path, "port = 1\n").unwrap();
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let paths = vec![SearchPath::Path(dir.path().to_path_buf())];
+        let result = load_config_files(&paths, "app.toml", "test");
+        assert!(result.is_err());
+
+        // Restore permissions so TempDir cleanup succeeds
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o644)).unwrap();
     }
 }
