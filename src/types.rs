@@ -13,13 +13,6 @@ pub enum SearchPath {
     Path(PathBuf),
 }
 
-/// Config file format.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum Format {
-    #[default]
-    Toml,
-}
-
 /// A config operation, independent of any CLI framework.
 /// The CLI layer converts parsed clap args into this.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,16 +35,9 @@ mod tests {
     }
 
     #[test]
-    fn format_default_is_toml() {
-        assert_eq!(Format::default(), Format::Toml);
-    }
-
-    #[test]
     fn config_action_variants() {
         let _ = ConfigAction::Gen { output: None };
-        let _ = ConfigAction::Get {
-            key: "host".into(),
-        };
+        let _ = ConfigAction::Get { key: "host".into() };
         let _ = ConfigAction::Set {
             key: "port".into(),
             value: "3000".into(),
