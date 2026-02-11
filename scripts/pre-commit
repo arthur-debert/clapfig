@@ -1,0 +1,59 @@
+#!/bin/bash
+set -e
+
+echo "🔧 Running pre-commit checks..."
+
+# Get list of staged Rust files
+STAGED_RS_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
+
+if [ -z "$STAGED_RS_FILES" ]; then
+    echo "No Rust files staged, skipping Rust checks..."
+else
+    # Run cargo fmt and re-stage formatted files
+    echo "📝 Running cargo fmt..."
+    cargo fmt --all
+
+    # Re-stage any files that were formatted
+    for file in $STAGED_RS_FILES; do
+        if [ -f "$file" ]; then
+            git add "$file"
+        fi
+    done
+    echo "✓ Formatting complete and changes re-staged"
+fi
+
+# Run clippy with auto-fix on the whole project (allow warnings during fix phase)
+echo "📎 Running cargo clippy --fix..."
+cargo clippy --fix --allow-dirty --allow-staged --all-targets 2>&1 || true
+
+# Re-stage any files that clippy fixed
+if [ -n "$STAGED_RS_FILES" ]; then
+    for file in $STAGED_RS_FILES; do
+        if [ -f "$file" ]; then
+            git add "$file"
+        fi
+    done
+    echo "✓ Clippy fixes applied and re-staged"
+fi
+
+# Run clippy and fail on any warnings
+echo "📎 Running clippy check..."
+cargo clippy --all-targets -- -D warnings
+
+# Ensure the code compiles
+echo "🔍 Running cargo check..."
+cargo check --all-targets
+
+# Run tests
+echo "🧪 Running cargo test..."
+cargo test --all
+
+# Run live integration tests (bats)
+if command -v bats &>/dev/null; then
+    echo "🧪 Running bats live-tests..."
+    "$(git rev-parse --show-toplevel)/live-tests/run-tests"
+else
+    echo "⚠️  bats not found, skipping live-tests (install with: brew install bats-core)"
+fi
+
+echo "✅ All pre-commit checks passed!"
