@@ -39,6 +39,11 @@ fn insert_nested(table: &mut Table, segments: &[&str], value: Value) {
         let sub = table
             .entry(&key)
             .or_insert_with(|| Value::Table(Table::new()));
+        // If a flat var (e.g. MYAPP__DATABASE=x) already set this key to a
+        // non-table, replace it — the more specific nested key wins.
+        if !sub.is_table() {
+            *sub = Value::Table(Table::new());
+        }
         if let Value::Table(sub_table) = sub {
             insert_nested(sub_table, &segments[1..], value);
         }
