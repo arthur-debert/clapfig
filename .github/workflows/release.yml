@@ -55,7 +55,7 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          cargo publish --token ${{ secrets.CRATES_IO_KEY }} 2>&1 || {
+          cargo publish --allow-dirty --token ${{ secrets.CRATES_IO_KEY }} 2>&1 || {
             if cargo search clapfig --limit 1 2>/dev/null | grep -q "clapfig.*\"$VERSION\""; then
               echo "clapfig@$VERSION already published, skipping"
             else
