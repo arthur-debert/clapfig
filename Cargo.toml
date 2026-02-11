@@ -3,6 +3,11 @@ name = "clapfig"
 version = "0.1.0"
 edition = "2024"
 description = "Rich, layered configuration for Rust CLI apps"
+license = "MIT"
+repository = "https://github.com/arthur-debert/clapfig"
+homepage = "https://github.com/arthur-debert/clapfig"
+keywords = ["config", "configuration", "cli", "clap", "toml"]
+categories = ["config", "command-line-interface"]
 
 [dependencies]
 confique = { version = "0.4", features = ["toml"] }
