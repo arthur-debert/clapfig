@@ -169,6 +169,17 @@ impl<C: Config> ClapfigBuilder<C> {
         resolve::resolve(input)
     }
 
+    /// Handle a `ConfigAction` and print the result to stdout.
+    pub fn handle_and_print(self, action: &ConfigAction) -> Result<(), ClapfigError>
+    where
+        C: Serialize,
+        C::Layer: for<'de> Deserialize<'de>,
+    {
+        let result = self.handle(action)?;
+        print!("{result}");
+        Ok(())
+    }
+
     /// Handle a `ConfigAction` (gen / get / set).
     pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError>
     where

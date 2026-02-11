@@ -3,6 +3,7 @@
 //! Provides the logic behind `config gen`, `config get`, and the `ConfigResult`
 //! enum that callers use to display results.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use confique::Config;
@@ -25,6 +26,24 @@ pub enum ConfigResult {
     },
     /// Confirmation that a value was persisted.
     ValueSet { key: String, value: String },
+}
+
+impl fmt::Display for ConfigResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigResult::Template(t) => write!(f, "{t}"),
+            ConfigResult::TemplateWritten { path } => {
+                write!(f, "Config template written to {}", path.display())
+            }
+            ConfigResult::KeyValue { key, value, doc } => {
+                for line in doc {
+                    writeln!(f, "# {line}")?;
+                }
+                write!(f, "{key} = {value}")
+            }
+            ConfigResult::ValueSet { key, value } => write!(f, "Set {key} = {value}"),
+        }
+    }
 }
 
 /// Generate a commented TOML template from the config struct's doc comments.
