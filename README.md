@@ -11,6 +11,7 @@ Rich, layered configuration for Rust CLI apps. Define a struct, point at your fi
 - **Multi-path file search** — platform config dir, home, cwd, or any path, in precedence order
 - **Prefix-based env vars** — `MYAPP__DATABASE__URL` maps to `database.url` automatically
 - **Clap override** — map individual clap args to config keys in one call each
+- **Strict mode** — unknown keys in config files error with file path, key name, and line number (on by default)
 - **Template generation** — `config gen` emits a commented sample config derived from the struct's doc comments
 - **Config subcommand** — drop-in `config gen|get|set` commands for clap
 - **Persistence** — `config set` patches values in place, preserving file comments
@@ -83,7 +84,7 @@ That `app_name("myapp")` call sets sensible defaults:
 ### Builder methods
 
 ```rust
-use clapfig::{Clapfig, SearchPath, Format};
+use clapfig::{Clapfig, SearchPath};
 
 let config: AppConfig = Clapfig::builder()
     // Required — sets defaults for file_name, search_paths, env_prefix
@@ -91,11 +92,11 @@ let config: AppConfig = Clapfig::builder()
 
     // Optional overrides
     .file_name("settings.toml")                                   // override config file name
-    .search_paths(&[SearchPath::Platform, SearchPath::Cwd])       // replace default search paths
+    .search_paths(vec![SearchPath::Platform, SearchPath::Cwd])    // replace default search paths
     .add_search_path(SearchPath::Cwd)                             // append a path without replacing
     .env_prefix("MY_APP")                                         // override env var prefix
     .no_env()                                                     // disable env var loading entirely
-    .format(Format::Yaml)                                         // override format (default: from file extension)
+    .strict(false)                                                // disable strict mode (allow unknown keys)
     .cli_override("host", some_value)                             // override a key from a CLI arg
     .load()?;
 ```
@@ -103,11 +104,11 @@ let config: AppConfig = Clapfig::builder()
 ### Search Paths
 
 ```rust
-use clapfig::SearchPath;
+use clapfig::{Clapfig, SearchPath};
 
-Clapfig::<AppConfig>::builder()
+let config: AppConfig = Clapfig::builder()
     .app_name("myapp")
-    .search_paths(&[
+    .search_paths(vec![
         SearchPath::Platform,                  // ~/.config/myapp/ on Linux
                                                // ~/Library/Application Support/myapp/ on macOS
         SearchPath::Home(".myapp"),             // ~/.myapp/
@@ -120,6 +121,16 @@ Clapfig::<AppConfig>::builder()
 Files load in order. **Later paths override earlier ones.** A `myapp.toml` in `./` overrides one in `~/.config/myapp/`, which overrides compiled-in defaults.
 
 If a file doesn't exist at a given path, it's silently skipped.
+
+### Strict Mode
+
+Strict mode is **on by default**. If a config file contains a key that doesn't match any field in your struct, loading fails with a clear error including the file path, key name, and line number:
+
+```
+Unknown key 'typo_key' in /home/user/.config/myapp/myapp.toml (line 5)
+```
+
+Disable it with `.strict(false)` if you want to allow extra keys.
 
 ## Environment Variables
 
@@ -152,7 +163,7 @@ struct Cli {
     host: Option<String>,
 
     #[arg(long)]
-    port: Option<u16>,
+    port: Option<i64>,
 
     #[arg(long)]
     db_url: Option<String>,
@@ -172,7 +183,9 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-`cli_override(key, value)` takes `Option<V>` — `None` (flags the user didn't pass) is silently skipped. Dot notation addresses nested keys. Names don't need to match: `--db-url` maps to `database.url` through the explicit mapping.
+`cli_override(key, value)` takes `Option<V>` where `V: Into<toml::Value>` — `None` (flags the user didn't pass) is silently skipped. Dot notation addresses nested keys. Names don't need to match: `--db-url` maps to `database.url` through the explicit mapping.
+
+Supported value types: `String`, `&str`, `i64`, `i32`, `i8`, `u8`, `u32`, `f64`, `f32`, `bool`.
 
 ### Config Subcommand
 
@@ -180,31 +193,46 @@ Add config management to your CLI by nesting `clapfig::ConfigArgs`:
 
 ```rust
 use clap::Subcommand;
+use clapfig::{Clapfig, ConfigArgs, ConfigResult};
 
 #[derive(Subcommand)]
 enum Commands {
     /// Run the application
     Run,
     /// Manage configuration
-    Config(clapfig::ConfigArgs),
+    Config(ConfigArgs),
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let cf = Clapfig::<AppConfig>::builder().app_name("myapp");
 
-    // Handle config subcommand early
-    if let Commands::Config(args) = &cli.command {
-        return cf.handle(&args);
+    match cli.command {
+        Commands::Config(args) => {
+            let action = args.into_action();
+            let result = Clapfig::builder::<AppConfig>()
+                .app_name("myapp")
+                .handle(&action)?;
+            match result {
+                ConfigResult::Template(t) => print!("{t}"),
+                ConfigResult::KeyValue { key, value, doc } => {
+                    for line in &doc { println!("# {line}"); }
+                    println!("{key} = {value}");
+                }
+                ConfigResult::ValueSet { key, value } => {
+                    println!("Set {key} = {value}");
+                }
+            }
+        }
+        Commands::Run => {
+            let config: AppConfig = Clapfig::builder()
+                .app_name("myapp")
+                .cli_override("host", cli.host)
+                .cli_override("port", cli.port)
+                .load()?;
+            println!("Listening on {}:{}", config.host, config.port);
+        }
     }
 
-    // Normal path: load config with CLI overrides
-    let config = cf
-        .cli_override("host", cli.host)
-        .cli_override("port", cli.port)
-        .load()?;
-
-    println!("Listening on {}:{}", config.host, config.port);
     Ok(())
 }
 ```
@@ -258,7 +286,7 @@ Every layer is **sparse**. You only specify the keys you want to override. Unset
 
 ## Persistence
 
-`config set <key> <value>` writes to the primary config file (platform config dir by default).
+`config set <key> <value>` writes to the primary config file (first resolved search path by default).
 
 - If the file exists, the key is patched in place using [`toml_edit`](https://docs.rs/toml_edit), **preserving existing comments and formatting**.
 - If the file doesn't exist, a fresh config is created from the generated template with the target key set.
@@ -269,7 +297,7 @@ Every layer is **sparse**. You only specify the keys you want to override. Unset
 use clap::{Parser, Subcommand};
 use confique::Config;
 use serde::{Serialize, Deserialize};
-use clapfig::{Clapfig, SearchPath};
+use clapfig::{Clapfig, ConfigArgs, ConfigResult, SearchPath};
 
 // -- Config struct --
 
@@ -310,35 +338,51 @@ struct Cli {
     host: Option<String>,
 
     #[arg(long, global = true)]
-    port: Option<u16>,
+    port: Option<i64>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     Run,
-    Config(clapfig::ConfigArgs),
+    Config(ConfigArgs),
 }
 
 // -- Main --
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let cf = Clapfig::<AppConfig>::builder()
-        .app_name("myapp")
-        .add_search_path(SearchPath::Cwd);
 
-    if let Commands::Config(args) = &cli.command {
-        return cf.handle(&args);
-    }
+    match cli.command {
+        Commands::Config(args) => {
+            let action = args.into_action();
+            let result = Clapfig::builder::<AppConfig>()
+                .app_name("myapp")
+                .add_search_path(SearchPath::Cwd)
+                .handle(&action)?;
+            match result {
+                ConfigResult::Template(t) => print!("{t}"),
+                ConfigResult::KeyValue { key, value, doc } => {
+                    for line in &doc { println!("# {line}"); }
+                    println!("{key} = {value}");
+                }
+                ConfigResult::ValueSet { key, value } => {
+                    println!("Set {key} = {value}");
+                }
+            }
+        }
+        Commands::Run => {
+            let config: AppConfig = Clapfig::builder()
+                .app_name("myapp")
+                .add_search_path(SearchPath::Cwd)
+                .cli_override("host", cli.host)
+                .cli_override("port", cli.port)
+                .load()?;
 
-    let config = cf
-        .cli_override("host", cli.host)
-        .cli_override("port", cli.port)
-        .load()?;
-
-    println!("Listening on {}:{}", config.host, config.port);
-    if let Some(url) = &config.database.url {
-        println!("Database: {}", url);
+            println!("Listening on {}:{}", config.host, config.port);
+            if let Some(url) = &config.database.url {
+                println!("Database: {}", url);
+            }
+        }
     }
 
     Ok(())

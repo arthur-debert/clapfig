@@ -10,3 +10,10 @@ tarpaulin-report.json
 Export_*.md
 Export_*.txt
 local
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target
