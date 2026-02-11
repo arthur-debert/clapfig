@@ -1,3 +1,8 @@
+//! Recursive deep-merge for `toml::Table` values.
+//!
+//! Used to combine sparse config layers — each layer only specifies the keys it
+//! overrides, and nested tables are merged recursively rather than replaced wholesale.
+
 use toml::Table;
 
 /// Deep-merge `overlay` on top of `base`.

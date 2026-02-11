@@ -1,3 +1,9 @@
+//! Convert environment variables into a `toml::Table` for merging into config.
+//!
+//! Env vars matching `{PREFIX}__*` are collected, with `__` as the nesting separator
+//! and segments lowercased to match Rust field names. Values are parsed heuristically
+//! (bool > integer > float > string). Takes an iterator for testability.
+
 use toml::{Table, Value};
 
 /// Build a `toml::Table` from environment variables matching `{PREFIX}__*`.

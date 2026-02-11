@@ -1,3 +1,9 @@
+//! File discovery and loading for config files.
+//!
+//! Resolves `SearchPath` variants to concrete directories, reads config files from
+//! each resolved path, and determines the primary config path for persistence.
+//! Missing files are silently skipped; I/O errors (permissions, etc.) are propagated.
+
 use std::path::PathBuf;
 
 use crate::error::ClapfigError;

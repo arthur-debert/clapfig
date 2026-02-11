@@ -1,3 +1,15 @@
+//! Core resolution pipeline: merge all config layers and produce a typed config.
+//!
+//! Operates on pre-loaded data (`ResolveInput`) with no I/O, making the full
+//! pipeline testable with synthetic inputs. Steps:
+//!
+//! 1. Validate each file (if strict mode)
+//! 2. Parse and deep-merge config files (later overrides earlier)
+//! 3. Deep-merge env vars on top
+//! 4. Deep-merge CLI overrides on top (highest priority)
+//! 5. Deserialize merged table into `C::Layer`
+//! 6. Let confique fill defaults and validate required fields
+
 use std::path::PathBuf;
 
 use confique::Config;

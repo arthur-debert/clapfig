@@ -1,3 +1,9 @@
+//! Strict-mode validation: detect unknown keys in config files.
+//!
+//! Uses `serde_ignored` to deserialize into `C::Layer` (all-optional fields) and
+//! capture any keys that the layer doesn't consume. Reports each unknown key with
+//! its file path and best-effort line number.
+
 use std::path::Path;
 
 use confique::Config;

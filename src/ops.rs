@@ -1,3 +1,8 @@
+//! Config operations: template generation, key lookup, and result types.
+//!
+//! Provides the logic behind `config gen`, `config get`, and the `ConfigResult`
+//! enum that callers use to display results.
+
 use std::path::PathBuf;
 
 use confique::Config;

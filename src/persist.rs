@@ -1,3 +1,9 @@
+//! Config persistence: patch values into TOML files while preserving formatting.
+//!
+//! Uses `toml_edit` for comment-preserving edits. When no file exists yet,
+//! starts from the generated template so the new file includes doc comments.
+//! Creates parent directories as needed.
+
 use std::path::Path;
 
 use confique::Config;

@@ -1,3 +1,8 @@
+//! Convert dotted-key CLI overrides into a nested `toml::Table`.
+//!
+//! Each `("database.url", Value)` pair is expanded into the nested table structure
+//! needed for deep-merge with other config layers.
+
 use toml::{Table, Value};
 
 /// Convert dotted-key overrides into a nested `toml::Table`.
