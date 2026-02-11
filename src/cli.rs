@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn invalid_subcommand_errors() {
-        let result = TestCli::try_parse_from(&["test", "nope"]);
+        let result = TestCli::try_parse_from(["test", "nope"]);
         assert!(result.is_err());
     }
 }

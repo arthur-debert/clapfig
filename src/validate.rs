@@ -55,12 +55,10 @@ fn find_key_line(content: &str, dotted_key: &str) -> usize {
 
     for (i, line) in content.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with(leaf) {
-            let after_key = trimmed[leaf.len()..].trim_start();
-            if after_key.starts_with('=') {
+        if let Some(after_key) = trimmed.strip_prefix(leaf)
+            && after_key.trim_start().starts_with('=') {
                 return i + 1;
             }
-        }
     }
     0
 }

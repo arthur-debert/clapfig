@@ -9,10 +9,7 @@ use toml::{Table, Value};
 /// Values are parsed heuristically: bool > integer > float > string.
 ///
 /// Takes an iterator so tests can pass synthetic data instead of `std::env::vars()`.
-pub fn env_to_table(
-    prefix: &str,
-    vars: impl IntoIterator<Item = (String, String)>,
-) -> Table {
+pub fn env_to_table(prefix: &str, vars: impl IntoIterator<Item = (String, String)>) -> Table {
     let needle = format!("{prefix}__");
     let mut table = Table::new();
 
@@ -103,13 +100,13 @@ mod tests {
     #[test]
     fn parse_bool_true() {
         let table = env_to_table("MYAPP", vars(&[("MYAPP__DEBUG", "true")]));
-        assert_eq!(table["debug"].as_bool().unwrap(), true);
+        assert!(table["debug"].as_bool().unwrap());
     }
 
     #[test]
     fn parse_bool_false_case_insensitive() {
         let table = env_to_table("MYAPP", vars(&[("MYAPP__DEBUG", "FALSE")]));
-        assert_eq!(table["debug"].as_bool().unwrap(), false);
+        assert!(!table["debug"].as_bool().unwrap());
     }
 
     #[test]

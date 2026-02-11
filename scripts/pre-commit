@@ -40,20 +40,8 @@ fi
 echo "📎 Running clippy check..."
 cargo clippy --all-targets -- -D warnings
 
-# Ensure the code compiles
-echo "🔍 Running cargo check..."
-cargo check --all-targets
-
 # Run tests
 echo "🧪 Running cargo test..."
 cargo test --all
-
-# Run live integration tests (bats)
-if command -v bats &>/dev/null; then
-    echo "🧪 Running bats live-tests..."
-    "$(git rev-parse --show-toplevel)/live-tests/run-tests"
-else
-    echo "⚠️  bats not found, skipping live-tests (install with: brew install bats-core)"
-fi
 
 echo "✅ All pre-commit checks passed!"

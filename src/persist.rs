@@ -29,12 +29,12 @@ pub fn set_in_document<C: Config>(
         }
     };
 
-    let mut doc: toml_edit::DocumentMut = base.parse().map_err(|e: toml_edit::TomlError| {
-        ClapfigError::InvalidValue {
-            key: key.into(),
-            reason: e.to_string(),
-        }
-    })?;
+    let mut doc: toml_edit::DocumentMut =
+        base.parse()
+            .map_err(|e: toml_edit::TomlError| ClapfigError::InvalidValue {
+                key: key.into(),
+                reason: e.to_string(),
+            })?;
 
     let parsed_value = parse_toml_edit_value(raw_value);
 
@@ -69,7 +69,7 @@ pub fn persist_value<C: Config>(
             return Err(ClapfigError::IoError {
                 path: file_path.to_path_buf(),
                 source: e,
-            })
+            });
         }
     };
 
@@ -104,10 +104,10 @@ fn parse_toml_edit_value(s: &str) -> toml_edit::Value {
     if let Ok(i) = s.parse::<i64>() {
         return toml_edit::value(i).into_value().unwrap();
     }
-    if s.contains('.') {
-        if let Ok(f) = s.parse::<f64>() {
-            return toml_edit::value(f).into_value().unwrap();
-        }
+    if s.contains('.')
+        && let Ok(f) = s.parse::<f64>()
+    {
+        return toml_edit::value(f).into_value().unwrap();
     }
     toml_edit::value(s).into_value().unwrap()
 }
