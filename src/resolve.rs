@@ -43,11 +43,10 @@ where
         if input.strict {
             validate::validate_unknown_keys::<C>(content, path)?;
         }
-        let table: Table =
-            toml::from_str(content).map_err(|e| ClapfigError::ParseError {
-                path: path.clone(),
-                source: e,
-            })?;
+        let table: Table = toml::from_str(content).map_err(|e| ClapfigError::ParseError {
+            path: path.clone(),
+            source: e,
+        })?;
         merged = deep_merge(merged, table);
     }
 
@@ -63,13 +62,10 @@ where
         merged = deep_merge(merged, cli_table);
     }
 
-    // 6: Deserialize merged table into C::Layer
-    let toml_string = toml::to_string(&merged).map_err(|e| ClapfigError::InvalidValue {
-        key: "<merged>".into(),
-        reason: e.to_string(),
-    })?;
-    let layer: C::Layer =
-        toml::from_str(&toml_string).map_err(|e| ClapfigError::InvalidValue {
+    // 6: Deserialize merged table directly into C::Layer
+    let layer: C::Layer = Value::Table(merged)
+        .try_into()
+        .map_err(|e: toml::de::Error| ClapfigError::InvalidValue {
             key: "<merged>".into(),
             reason: e.to_string(),
         })?;
@@ -182,10 +178,7 @@ mod tests {
                     "base.toml".into(),
                     "[database]\nurl = \"pg://base\"\npool_size = 5\n".into(),
                 ),
-                (
-                    "local.toml".into(),
-                    "[database]\npool_size = 50\n".into(),
-                ),
+                ("local.toml".into(), "[database]\npool_size = 50\n".into()),
             ],
             ..empty_input()
         };
