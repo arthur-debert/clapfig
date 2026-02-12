@@ -1,22 +1,29 @@
 # clapfig
 
-Rich, layered configuration for Rust CLI apps. Define a struct, point at your files, and go.
+Rich, layered configuration for Rust applications. Define a struct, point at your files, and go.
 
-**clapfig** orchestrates configuration from multiple sources — config files, environment variables, and CLI flags — through a builder API that takes a few lines to set up. Built on [confique](https://github.com/LukasKalbertodt/confique) for struct-driven defaults and commented template generation.
+**clapfig** discovers, merges, and manages configuration from multiple sources — config files, environment variables, and programmatic overrides — through a pure Rust builder API. The core library has **no dependency on any CLI framework**: you can use it in GUI apps, servers, or with any argument parser. For [clap](https://docs.rs/clap) users, an optional adapter provides drop-in `config gen|list|get|set` subcommands with zero boilerplate.
+
+Built on [confique](https://github.com/LukasKalbertodt/confique) for struct-driven defaults and commented template generation.
 
 ## Features
 
+**Core** (always available, no CLI framework needed):
+
 - **Struct as source of truth** — define settings as a Rust struct with defaults and `///` doc comments
-- **Layered merge** — defaults < config files < env vars < CLI flags, every layer sparse
+- **Layered merge** — defaults < config files < env vars < overrides, every layer sparse
 - **Multi-path file search** — platform config dir, home, cwd, ancestor walk, or any path, in precedence order
 - **Search modes** — merge all found configs (layered overrides) or use the first match ("find my config")
 - **Ancestor walk** — `SearchPath::Ancestors` walks up from cwd to find project configs, with configurable boundary (`.git`, filesystem root)
 - **Prefix-based env vars** — `MYAPP__DATABASE__URL` maps to `database.url` automatically
-- **Clap override** — map individual clap args to config keys in one call each
 - **Strict mode** — unknown keys in config files error with file path, key name, and line number (on by default)
-- **Template generation** — `config gen` emits a commented sample config derived from the struct's doc comments
-- **Config subcommand** — drop-in `config gen|get|set` commands for clap
-- **Persistence** — `config set` patches values in place, preserving file comments
+- **Template generation** — emit a commented sample config derived from the struct's doc comments
+- **Persistence** — patch values in place, preserving file comments
+
+**Clap adapter** (`clap` feature, on by default):
+
+- **Config subcommand** — drop-in `config gen|get|set|list` commands for clap
+- **Auto-matching overrides** — map clap args to config keys by name in one call
 
 ## Quick Start
 
@@ -160,13 +167,13 @@ With env prefix `MYAPP`, variables map via double-underscore nesting:
 
 Disable env loading entirely with `.no_env()`.
 
-## Clap Integration
+## Programmatic Overrides
 
-### CLI Overrides
+The `cli_override` and `cli_overrides_from` methods on the builder work with **any** value source — they are not clap-specific despite the name. Use them to inject overrides from CLI args, GUI inputs, HTTP requests, or anything else.
 
-#### Auto-matching
+### Auto-matching
 
-If your clap struct derives `Serialize`, `cli_overrides_from` auto-matches fields by name against config keys:
+If your override source derives `Serialize`, `cli_overrides_from` auto-matches fields by name against config keys:
 
 ```rust
 use clap::Parser;
@@ -216,6 +223,13 @@ For fields where the CLI name differs from the config key, use `cli_override`:
 Both methods compose freely and push to the same override list. Later calls take precedence.
 
 Supported value types: `String`, `&str`, `i64`, `i32`, `i8`, `u8`, `u32`, `f64`, `f32`, `bool`.
+
+## Clap Adapter (optional)
+
+> Requires the `clap` Cargo feature (enabled by default). To use clapfig without clap:
+> ```toml
+> clapfig = { version = "...", default-features = false }
+> ```
 
 ### Config Subcommand
 
@@ -309,7 +323,7 @@ Config files          search paths in order, later paths win
        ↑ overridden by
 Environment vars      MYAPP__KEY
        ↑ overridden by
-CLI overrides         .cli_override()
+Overrides             .cli_override()
 ```
 
 Every layer is **sparse**. You only specify the keys you want to override. Unset keys fall through to the next layer down.
@@ -345,7 +359,7 @@ cargo run --example clapfig_demo -- config get server.port
 
 See [`examples/clapfig_demo/`](examples/clapfig_demo/) for the full source.
 
-## Full Example
+## Full Example (with clap)
 
 ```rust
 use clap::{Parser, Subcommand};

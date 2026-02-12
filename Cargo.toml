@@ -9,9 +9,13 @@ homepage = "https://github.com/arthur-debert/clapfig"
 keywords = ["config", "configuration", "cli", "clap", "toml"]
 categories = ["config", "command-line-interface"]
 
+[features]
+default = ["clap"]
+clap = ["dep:clap"]
+
 [dependencies]
 confique = { version = "0.4", features = ["toml"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 toml = "0.8"
@@ -21,3 +25,8 @@ thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "clapfig_demo"
+path = "examples/clapfig_demo/main.rs"
+required-features = ["clap"]
