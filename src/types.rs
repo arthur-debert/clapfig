@@ -17,7 +17,16 @@ pub enum SearchPath {
 /// The CLI layer converts parsed clap args into this.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigAction {
-    Gen { output: Option<PathBuf> },
-    Get { key: String },
-    Set { key: String, value: String },
+    /// Show all resolved configuration key-value pairs.
+    List,
+    Gen {
+        output: Option<PathBuf>,
+    },
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: String,
+    },
 }

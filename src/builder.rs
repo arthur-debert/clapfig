@@ -206,13 +206,17 @@ impl<C: Config> ClapfigBuilder<C> {
         Ok(())
     }
 
-    /// Handle a `ConfigAction` (gen / get / set).
+    /// Handle a `ConfigAction` (list / gen / get / set).
     pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError>
     where
         C: Serialize,
         C::Layer: for<'de> Deserialize<'de>,
     {
         match action {
+            ConfigAction::List => {
+                let config = self.load()?;
+                ops::list_values(&config)
+            }
             ConfigAction::Gen { output } => {
                 let template = ops::generate_template::<C>();
                 match output {
@@ -639,5 +643,50 @@ mod tests {
         assert_eq!(config.host, "1.2.3.4"); // from cli
         assert_eq!(config.port, 3000); // from file (cli was None)
         assert!(!config.debug); // default (verbose not in config)
+    }
+
+    #[test]
+    fn handle_list() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "port = 3000\n").unwrap();
+
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .handle(&ConfigAction::List)
+            .unwrap();
+
+        match result {
+            ConfigResult::Listing { entries } => {
+                let port = entries.iter().find(|(k, _)| k == "port").unwrap();
+                assert_eq!(port.1, "3000");
+                let host = entries.iter().find(|(k, _)| k == "host").unwrap();
+                assert_eq!(host.1, "localhost"); // default
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_list_defaults_only() {
+        let dir = TempDir::new().unwrap();
+
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .handle(&ConfigAction::List)
+            .unwrap();
+
+        match result {
+            ConfigResult::Listing { entries } => {
+                assert_eq!(entries.len(), 5);
+                let db_url = entries.iter().find(|(k, _)| k == "database.url").unwrap();
+                assert_eq!(db_url.1, "<not set>");
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
     }
 }

@@ -22,12 +22,14 @@ use crate::types::ConfigAction;
 #[derive(Debug, Args)]
 pub struct ConfigArgs {
     #[command(subcommand)]
-    pub action: ConfigSubcommand,
+    pub action: Option<ConfigSubcommand>,
 }
 
 /// Available config subcommands.
 #[derive(Debug, Subcommand)]
 pub enum ConfigSubcommand {
+    /// Show all resolved configuration key-value pairs.
+    List,
     /// Generate a commented sample configuration file.
     Gen {
         /// Write to a file instead of stdout.
@@ -50,11 +52,15 @@ pub enum ConfigSubcommand {
 
 impl ConfigArgs {
     /// Convert clap-parsed args into a framework-agnostic `ConfigAction`.
+    ///
+    /// Bare `config` (no subcommand) and explicit `config list` both map to
+    /// `ConfigAction::List`.
     pub fn into_action(self) -> ConfigAction {
         match self.action {
-            ConfigSubcommand::Gen { output } => ConfigAction::Gen { output },
-            ConfigSubcommand::Get { key } => ConfigAction::Get { key },
-            ConfigSubcommand::Set { key, value } => ConfigAction::Set { key, value },
+            None | Some(ConfigSubcommand::List) => ConfigAction::List,
+            Some(ConfigSubcommand::Gen { output }) => ConfigAction::Gen { output },
+            Some(ConfigSubcommand::Get { key }) => ConfigAction::Get { key },
+            Some(ConfigSubcommand::Set { key, value }) => ConfigAction::Set { key, value },
         }
     }
 }
@@ -148,5 +154,19 @@ mod tests {
     fn invalid_subcommand_errors() {
         let result = TestCli::try_parse_from(["test", "nope"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_bare_config_is_list() {
+        let args = parse(&["test"]);
+        let action = args.into_action();
+        assert_eq!(action, ConfigAction::List);
+    }
+
+    #[test]
+    fn parse_explicit_list() {
+        let args = parse(&["test", "list"]);
+        let action = args.into_action();
+        assert_eq!(action, ConfigAction::List);
     }
 }
