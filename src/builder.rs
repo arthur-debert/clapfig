@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ClapfigError;
 use crate::file;
+use crate::flatten;
 use crate::ops::{self, ConfigResult};
+use crate::overrides;
 use crate::persist;
 use crate::resolve::{self, ResolveInput};
 use crate::types::{ConfigAction, SearchPath};
@@ -98,6 +100,30 @@ impl<C: Config> ClapfigBuilder<C> {
     pub fn cli_override<V: Into<toml::Value>>(mut self, key: &str, value: Option<V>) -> Self {
         if let Some(v) = value {
             self.cli_overrides.push((key.to_string(), v.into()));
+        }
+        self
+    }
+
+    /// Add CLI overrides from any serializable source, auto-matching by field name.
+    ///
+    /// Serializes `source` into flat key-value pairs, skips `None` values, and keeps
+    /// only keys that match config fields in `C`. Non-matching keys are silently ignored,
+    /// so clap-only fields like `command` or `verbose` are automatically excluded.
+    ///
+    /// Works with clap-derived structs, `HashMap`s, or anything implementing `Serialize`.
+    ///
+    /// Composes with [`cli_override`](Self::cli_override) — both push to the same
+    /// override list. Later calls take precedence.
+    pub fn cli_overrides_from<S: Serialize>(mut self, source: &S) -> Self {
+        let pairs = flatten::flatten(source)
+            .expect("clapfig: failed to flatten CLI source for auto-matching");
+        let valid = overrides::valid_keys(&C::META);
+        for (key, value) in pairs {
+            if let Some(v) = value
+                && valid.contains(&key)
+            {
+                self.cli_overrides.push((key, v));
+            }
         }
         self
     }
@@ -478,5 +504,140 @@ mod tests {
         assert!(matches!(result, ConfigResult::ValueSet { .. }));
         let content = fs::read_to_string(dir.path().join("test.toml")).unwrap();
         assert!(content.contains("port = 3000"));
+    }
+
+    // --- cli_overrides_from tests ---
+
+    #[test]
+    fn overrides_from_matches_known_keys() {
+        #[derive(Serialize)]
+        struct Args {
+            host: Option<String>,
+            port: Option<u16>,
+        }
+        let args = Args {
+            host: Some("1.2.3.4".into()),
+            port: Some(9999),
+        };
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .cli_overrides_from(&args);
+        assert_eq!(builder.cli_overrides.len(), 2);
+    }
+
+    #[test]
+    fn overrides_from_skips_none() {
+        #[derive(Serialize)]
+        struct Args {
+            host: Option<String>,
+            port: Option<u16>,
+        }
+        let args = Args {
+            host: None,
+            port: Some(9999),
+        };
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .cli_overrides_from(&args);
+        assert_eq!(builder.cli_overrides.len(), 1);
+        assert_eq!(builder.cli_overrides[0].0, "port");
+    }
+
+    #[test]
+    fn overrides_from_ignores_unknown_keys() {
+        #[derive(Serialize)]
+        struct Args {
+            host: Option<String>,
+            verbose: bool,
+            output: Option<String>,
+        }
+        let args = Args {
+            host: Some("x".into()),
+            verbose: true,
+            output: Some("f".into()),
+        };
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .cli_overrides_from(&args);
+        assert_eq!(builder.cli_overrides.len(), 1);
+        assert_eq!(builder.cli_overrides[0].0, "host");
+    }
+
+    #[test]
+    fn overrides_from_composes_with_cli_override() {
+        #[derive(Serialize)]
+        struct Args {
+            host: Option<String>,
+        }
+        let args = Args {
+            host: Some("from_struct".into()),
+        };
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .cli_override("port", Some(1234i64))
+            .cli_overrides_from(&args);
+        assert_eq!(builder.cli_overrides.len(), 2);
+        assert_eq!(builder.cli_overrides[0].0, "port");
+        assert_eq!(builder.cli_overrides[1].0, "host");
+    }
+
+    #[test]
+    fn overrides_from_hashmap() {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert("port".to_string(), 3000i64);
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .cli_overrides_from(&map);
+        assert_eq!(builder.cli_overrides.len(), 1);
+        assert_eq!(builder.cli_overrides[0].0, "port");
+    }
+
+    #[test]
+    fn overrides_from_all_none() {
+        #[derive(Serialize)]
+        struct Args {
+            host: Option<String>,
+            port: Option<u16>,
+        }
+        let args = Args {
+            host: None,
+            port: None,
+        };
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .cli_overrides_from(&args);
+        assert!(builder.cli_overrides.is_empty());
+    }
+
+    #[test]
+    fn overrides_from_end_to_end() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "port = 3000\n").unwrap();
+
+        #[derive(Serialize)]
+        struct Args {
+            host: Option<String>,
+            port: Option<i64>,
+            verbose: bool,
+        }
+        let args = Args {
+            host: Some("1.2.3.4".into()),
+            port: None,
+            verbose: true,
+        };
+
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .cli_overrides_from(&args)
+            .load()
+            .unwrap();
+
+        assert_eq!(config.host, "1.2.3.4"); // from cli
+        assert_eq!(config.port, 3000); // from file (cli was None)
+        assert!(!config.debug); // default (verbose not in config)
     }
 }

@@ -29,6 +29,7 @@ mod builder;
 mod cli;
 mod env;
 mod file;
+mod flatten;
 pub(crate) mod merge;
 mod ops;
 mod overrides;

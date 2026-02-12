@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+- **Added**
+  - **Auto-match CLI overrides** - `.cli_overrides_from(&cli_struct)` auto-matches serializable struct fields to config keys by name, skipping `None` values and ignoring non-matching fields. Works with clap structs, `HashMap`s, or any `Serialize` type. Composes with manual `.cli_override()`.
+  - **`Display` for `ConfigResult`** - `ConfigResult` now implements `Display`, returning the formatted output as a string
+  - **`handle_and_print`** - Convenience method on `ClapfigBuilder` that calls `handle()` and prints the result
+
 ## [0.1.0] - 2026-02-11
 
 - **Added**
