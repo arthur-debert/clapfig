@@ -8,7 +8,9 @@ Rich, layered configuration for Rust CLI apps. Define a struct, point at your fi
 
 - **Struct as source of truth** — define settings as a Rust struct with defaults and `///` doc comments
 - **Layered merge** — defaults < config files < env vars < CLI flags, every layer sparse
-- **Multi-path file search** — platform config dir, home, cwd, or any path, in precedence order
+- **Multi-path file search** — platform config dir, home, cwd, ancestor walk, or any path, in precedence order
+- **Search modes** — merge all found configs (layered overrides) or use the first match ("find my config")
+- **Ancestor walk** — `SearchPath::Ancestors` walks up from cwd to find project configs, with configurable boundary (`.git`, filesystem root)
 - **Prefix-based env vars** — `MYAPP__DATABASE__URL` maps to `database.url` automatically
 - **Clap override** — map individual clap args to config keys in one call each
 - **Strict mode** — unknown keys in config files error with file path, key name, and line number (on by default)
@@ -101,26 +103,37 @@ let config: AppConfig = Clapfig::builder()
     .load()?;
 ```
 
-### Search Paths
+### Search Paths, Modes, and Persistence
+
+Config file handling has three orthogonal axes on the builder:
+
+- **Discovery** (`.search_paths()`) — where to look. Paths listed in priority-ascending order (last = highest).
+- **Resolution** (`.search_mode()`) — `Merge` (default: deep-merge all found files) or `FirstMatch` (use the single highest-priority file).
+- **Persistence** (`.persist_path()`) — where `config set` writes. Explicit, independent of search paths.
 
 ```rust
-use clapfig::{Clapfig, SearchPath};
+use clapfig::{Clapfig, SearchPath, SearchMode, Boundary};
 
+// Layered: global + local (default Merge mode)
 let config: AppConfig = Clapfig::builder()
     .app_name("myapp")
-    .search_paths(vec![
-        SearchPath::Platform,                  // ~/.config/myapp/ on Linux
-                                               // ~/Library/Application Support/myapp/ on macOS
-        SearchPath::Home(".myapp"),             // ~/.myapp/
-        SearchPath::Cwd,                       // ./
-        SearchPath::Path("/etc/myapp".into()), // explicit absolute path
-    ])
+    .search_paths(vec![SearchPath::Platform, SearchPath::Cwd])
+    .persist_path(SearchPath::Home(".myapp"))
+    .load()?;
+
+// Find nearest project config (walk up to .git, use first match)
+let config: AppConfig = Clapfig::builder()
+    .app_name("mytool")
+    .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
+    .search_mode(SearchMode::FirstMatch)
     .load()?;
 ```
 
-Files load in order. **Later paths override earlier ones.** A `myapp.toml` in `./` overrides one in `~/.config/myapp/`, which overrides compiled-in defaults.
+Available `SearchPath` variants: `Platform`, `Home(".myapp")`, `Cwd`, `Path(PathBuf)`, `Ancestors(Boundary)`.
 
-If a file doesn't exist at a given path, it's silently skipped.
+`Ancestors` walks up from cwd, expanding inline into multiple directories (shallowest first, cwd last = highest priority). `Boundary::Root` walks to the filesystem root; `Boundary::Marker(".git")` stops at the directory containing the marker (inclusive).
+
+Missing files are silently skipped. See the [`types` module docs](https://docs.rs/clapfig/latest/clapfig/types/) for the full conceptual guide and use-case examples.
 
 ### Strict Mode
 
@@ -303,10 +316,12 @@ Every layer is **sparse**. You only specify the keys you want to override. Unset
 
 ## Persistence
 
-`config set <key> <value>` writes to the primary config file (first resolved search path by default).
+`config set <key> <value>` writes to the path set via `.persist_path()` on the builder.
 
+- The persist path is independent of search paths — you choose where writes go explicitly.
 - If the file exists, the key is patched in place using [`toml_edit`](https://docs.rs/toml_edit), **preserving existing comments and formatting**.
 - If the file doesn't exist, a fresh config is created from the generated template with the target key set.
+- If `.persist_path()` is not set, `config set` returns `ClapfigError::NoPersistPath`.
 
 ## Demo Application
 
@@ -397,6 +412,7 @@ fn main() -> anyhow::Result<()> {
             Clapfig::builder::<AppConfig>()
                 .app_name("myapp")
                 .add_search_path(SearchPath::Cwd)
+                .persist_path(SearchPath::Cwd)
                 .handle_and_print(&args.into_action())?;
         }
         Commands::Run => {

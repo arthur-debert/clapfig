@@ -120,6 +120,7 @@ fn make_builder(cli: &Cli) -> ClapfigBuilder<DemoConfig> {
             SearchPath::Home(".clapfig-demo"),
             SearchPath::Cwd,
         ])
+        .persist_path(SearchPath::Home(".clapfig-demo"))
         // Auto-match top-level keys.
         .cli_overrides_from(&overrides)
         // Manually map nested keys.

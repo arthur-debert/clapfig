@@ -34,8 +34,11 @@ pub enum ClapfigError {
     #[error("Invalid value for '{key}': {reason}")]
     InvalidValue { key: String, reason: String },
 
-    #[error("No config path resolved for persistence")]
+    #[error("No persist path configured — call .persist_path() on the builder")]
     NoPersistPath,
+
+    #[error("Ancestors is not valid as a persist path (it resolves to multiple directories)")]
+    AncestorsNotAllowedAsPersistPath,
 
     #[error("App name is required — call .app_name() on the builder")]
     AppNameRequired,

@@ -10,7 +10,7 @@ use crate::ops::{self, ConfigResult};
 use crate::overrides;
 use crate::persist;
 use crate::resolve::{self, ResolveInput};
-use crate::types::{ConfigAction, SearchPath};
+use crate::types::{ConfigAction, SearchMode, SearchPath};
 
 /// Entry point for building a clapfig configuration.
 pub struct Clapfig;
@@ -22,10 +22,18 @@ impl Clapfig {
 }
 
 /// Builder for configuring and loading layered configuration.
+///
+/// Controls three orthogonal axes (see [`types`](crate::types) for the full picture):
+///
+/// - **Discovery**: [`search_paths()`](Self::search_paths) — where to look for config files.
+/// - **Resolution**: [`search_mode()`](Self::search_mode) — merge all or pick one.
+/// - **Persistence**: [`persist_path()`](Self::persist_path) — where `config set` writes.
 pub struct ClapfigBuilder<C: Config> {
     app_name: Option<String>,
     file_name: Option<String>,
     search_paths: Option<Vec<SearchPath>>,
+    search_mode: SearchMode,
+    persist_path: Option<SearchPath>,
     env_prefix: Option<String>,
     env_enabled: bool,
     strict: bool,
@@ -39,6 +47,8 @@ impl<C: Config> ClapfigBuilder<C> {
             app_name: None,
             file_name: None,
             search_paths: None,
+            search_mode: SearchMode::default(),
+            persist_path: None,
             env_prefix: None,
             env_enabled: true,
             strict: true,
@@ -63,6 +73,9 @@ impl<C: Config> ClapfigBuilder<C> {
     }
 
     /// Replace the default search paths entirely.
+    ///
+    /// Paths are listed in **priority-ascending** order: the last entry has the
+    /// highest priority. See [`SearchPath`] for the available variants.
     pub fn search_paths(mut self, paths: Vec<SearchPath>) -> Self {
         self.search_paths = Some(paths);
         self
@@ -74,6 +87,30 @@ impl<C: Config> ClapfigBuilder<C> {
         self.search_paths
             .get_or_insert_with(|| vec![SearchPath::Platform])
             .push(path);
+        self
+    }
+
+    /// Set the search mode (default: [`SearchMode::Merge`]).
+    ///
+    /// - [`Merge`](SearchMode::Merge): all found config files are deep-merged,
+    ///   later (higher-priority) files overriding earlier ones.
+    /// - [`FirstMatch`](SearchMode::FirstMatch): only the single highest-priority
+    ///   config file found is used.
+    pub fn search_mode(mut self, mode: SearchMode) -> Self {
+        self.search_mode = mode;
+        self
+    }
+
+    /// Set the persistence path for `config set`.
+    ///
+    /// This is where `config set` writes values. It is independent of the search
+    /// paths used for reading. Must be a single-directory variant (`Platform`,
+    /// `Home`, `Cwd`, or `Path`). Using [`Ancestors`](SearchPath::Ancestors)
+    /// produces an error at build time.
+    ///
+    /// If not set, `config set` returns [`ClapfigError::NoPersistPath`].
+    pub fn persist_path(mut self, path: SearchPath) -> Self {
+        self.persist_path = Some(path);
         self
     }
 
@@ -174,7 +211,7 @@ impl<C: Config> ClapfigBuilder<C> {
         let search_paths = self.effective_search_paths();
         let env_prefix = self.effective_env_prefix()?;
 
-        let files = file::load_config_files(&search_paths, &file_name, app_name)?;
+        let files = file::load_config_files(&search_paths, &file_name, app_name, self.search_mode)?;
         let env_vars: Vec<(String, String)> = std::env::vars().collect();
 
         Ok(ResolveInput {
@@ -243,10 +280,12 @@ impl<C: Config> ClapfigBuilder<C> {
             ConfigAction::Set { key, value } => {
                 let app_name = self.effective_app_name()?;
                 let file_name = self.effective_file_name()?;
-                let search_paths = self.effective_search_paths();
-
-                let path = file::primary_config_path(&search_paths, &file_name, app_name)
+                let persist = self
+                    .persist_path
+                    .as_ref()
                     .ok_or(ClapfigError::NoPersistPath)?;
+
+                let path = file::resolve_persist_path(persist, &file_name, app_name)?;
 
                 persist::persist_value::<C>(&path, key, value)
             }
@@ -258,6 +297,7 @@ impl<C: Config> ClapfigBuilder<C> {
 mod tests {
     use super::*;
     use crate::fixtures::test::TestConfig;
+    use crate::types::Boundary;
     use std::fs;
     use tempfile::TempDir;
 
@@ -329,6 +369,34 @@ mod tests {
     }
 
     #[test]
+    fn search_mode_defaults_to_merge() {
+        let builder = Clapfig::builder::<TestConfig>().app_name("myapp");
+        assert_eq!(builder.search_mode, SearchMode::Merge);
+    }
+
+    #[test]
+    fn search_mode_can_be_set() {
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("myapp")
+            .search_mode(SearchMode::FirstMatch);
+        assert_eq!(builder.search_mode, SearchMode::FirstMatch);
+    }
+
+    #[test]
+    fn persist_path_defaults_to_none() {
+        let builder = Clapfig::builder::<TestConfig>().app_name("myapp");
+        assert!(builder.persist_path.is_none());
+    }
+
+    #[test]
+    fn persist_path_can_be_set() {
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("myapp")
+            .persist_path(SearchPath::Platform);
+        assert_eq!(builder.persist_path, Some(SearchPath::Platform));
+    }
+
+    #[test]
     fn cli_override_some_added() {
         let builder = Clapfig::builder::<TestConfig>()
             .app_name("myapp")
@@ -351,6 +419,8 @@ mod tests {
         let result = builder.load();
         assert!(matches!(result, Err(ClapfigError::AppNameRequired)));
     }
+
+    // --- Load tests ---
 
     #[test]
     fn load_with_file() {
@@ -435,6 +505,88 @@ mod tests {
         assert_eq!(config.port, 3000);
     }
 
+    // --- SearchMode tests ---
+
+    #[test]
+    fn first_match_uses_highest_priority_file_only() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        fs::write(
+            dir1.path().join("test.toml"),
+            "port = 1000\nhost = \"low\"\n",
+        )
+        .unwrap();
+        fs::write(dir2.path().join("test.toml"), "port = 2000\n").unwrap();
+
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![
+                SearchPath::Path(dir1.path().to_path_buf()),
+                SearchPath::Path(dir2.path().to_path_buf()), // highest priority
+            ])
+            .search_mode(SearchMode::FirstMatch)
+            .no_env()
+            .load()
+            .unwrap();
+
+        // Should use dir2 only — port from dir2, host from defaults (not dir1!)
+        assert_eq!(config.port, 2000);
+        assert_eq!(config.host, "localhost"); // default, NOT "low" from dir1
+    }
+
+    #[test]
+    fn merge_mode_combines_both_files() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        fs::write(
+            dir1.path().join("test.toml"),
+            "port = 1000\nhost = \"base\"\n",
+        )
+        .unwrap();
+        fs::write(dir2.path().join("test.toml"), "port = 2000\n").unwrap();
+
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![
+                SearchPath::Path(dir1.path().to_path_buf()),
+                SearchPath::Path(dir2.path().to_path_buf()),
+            ])
+            .search_mode(SearchMode::Merge)
+            .no_env()
+            .load()
+            .unwrap();
+
+        // Merge: port from dir2 (higher priority), host from dir1 (lower priority)
+        assert_eq!(config.port, 2000);
+        assert_eq!(config.host, "base");
+    }
+
+    #[test]
+    fn first_match_falls_back_when_high_priority_missing() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        // Only dir1 (lower priority) has a config
+        fs::write(dir1.path().join("test.toml"), "port = 1000\n").unwrap();
+
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![
+                SearchPath::Path(dir1.path().to_path_buf()),
+                SearchPath::Path(dir2.path().to_path_buf()),
+            ])
+            .search_mode(SearchMode::FirstMatch)
+            .no_env()
+            .load()
+            .unwrap();
+
+        assert_eq!(config.port, 1000);
+    }
+
+    // --- handle tests ---
+
     #[test]
     fn handle_gen() {
         let result: ConfigResult = Clapfig::builder::<TestConfig>()
@@ -491,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_set() {
+    fn handle_set_requires_persist_path() {
         let dir = TempDir::new().unwrap();
 
         let result = Clapfig::builder::<TestConfig>()
@@ -502,12 +654,76 @@ mod tests {
             .handle(&ConfigAction::Set {
                 key: "port".into(),
                 value: "3000".into(),
+            });
+
+        assert!(matches!(result, Err(ClapfigError::NoPersistPath)));
+    }
+
+    #[test]
+    fn handle_set_with_persist_path() {
+        let dir = TempDir::new().unwrap();
+
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .persist_path(SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "3000".into(),
             })
             .unwrap();
 
         assert!(matches!(result, ConfigResult::ValueSet { .. }));
         let content = fs::read_to_string(dir.path().join("test.toml")).unwrap();
         assert!(content.contains("port = 3000"));
+    }
+
+    #[test]
+    fn handle_set_rejects_ancestors_persist_path() {
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .persist_path(SearchPath::Ancestors(Boundary::Root))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "3000".into(),
+            });
+
+        assert!(matches!(
+            result,
+            Err(ClapfigError::AncestorsNotAllowedAsPersistPath)
+        ));
+    }
+
+    #[test]
+    fn handle_set_persist_path_independent_of_search_paths() {
+        let search_dir = TempDir::new().unwrap();
+        let persist_dir = TempDir::new().unwrap();
+
+        fs::write(search_dir.path().join("test.toml"), "port = 1000\n").unwrap();
+
+        // persist_path points somewhere different from search_paths
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(search_dir.path().to_path_buf())])
+            .persist_path(SearchPath::Path(persist_dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "5000".into(),
+            })
+            .unwrap();
+
+        assert!(matches!(result, ConfigResult::ValueSet { .. }));
+        // Written to persist_dir, not search_dir
+        let content = fs::read_to_string(persist_dir.path().join("test.toml")).unwrap();
+        assert!(content.contains("port = 5000"));
+        // search_dir file unchanged
+        let original = fs::read_to_string(search_dir.path().join("test.toml")).unwrap();
+        assert!(original.contains("port = 1000"));
     }
 
     // --- cli_overrides_from tests ---
