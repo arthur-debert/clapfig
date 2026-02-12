@@ -308,6 +308,28 @@ Every layer is **sparse**. You only specify the keys you want to override. Unset
 - If the file exists, the key is patched in place using [`toml_edit`](https://docs.rs/toml_edit), **preserving existing comments and formatting**.
 - If the file doesn't exist, a fresh config is created from the generated template with the target key set.
 
+## Demo Application
+
+The repo includes a runnable example that exercises every clapfig feature — nested config structs, file search paths, env vars, CLI overrides, and the `config` subcommand. It's a good starting point for integration and for ad-hoc testing.
+
+```sh
+# Print all resolved values (default color: yellow)
+cargo run --example clapfig_demo -- echo
+
+# Override via env var
+CLAPFIG_DEMO__DISPLAY__COLOR=red cargo run --example clapfig_demo -- echo
+
+# Override via CLI flag
+cargo run --example clapfig_demo -- --color blue --port 8080 echo
+
+# Config subcommands
+cargo run --example clapfig_demo -- config gen
+cargo run --example clapfig_demo -- config list
+cargo run --example clapfig_demo -- config get server.port
+```
+
+See [`examples/clapfig_demo/`](examples/clapfig_demo/) for the full source.
+
 ## Full Example
 
 ```rust

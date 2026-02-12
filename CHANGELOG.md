@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Added**
   - **`config list`** - New `ConfigAction::List` and `ConfigSubcommand::List` to show all resolved key-value pairs. Bare `app config` (no subcommand) defaults to list. Uses the flatten module to display dotted keys, with `<not set>` for unset optional fields.
+  - **Demo application** - `examples/clapfig_demo/` is a runnable sample CLI that exercises all core features: multi-path file search, env var overrides (`CLAPFIG_DEMO__*`), CLI flag mapping (both `cli_overrides_from` and manual `cli_override`), nested config structs, `config gen|get|set|list` subcommands, and ANSI-colored terminal output. Run with `cargo run --example clapfig_demo -- echo`.
 
 ## [0.2.0] - 2026-02-12
 
