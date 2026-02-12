@@ -9,6 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Added**
   - **`config list`** - New `ConfigAction::List` and `ConfigSubcommand::List` to show all resolved key-value pairs. Bare `app config` (no subcommand) defaults to list. Uses the flatten module to display dotted keys, with `<not set>` for unset optional fields.
   - **Demo application** - `examples/clapfig_demo/` is a runnable sample CLI that exercises all core features: multi-path file search, env var overrides (`CLAPFIG_DEMO__*`), CLI flag mapping (both `cli_overrides_from` and manual `cli_override`), nested config structs, `config gen|get|set|list` subcommands, and ANSI-colored terminal output. Run with `cargo run --example clapfig_demo -- echo`.
+  - **Search modes** - New `SearchMode` enum on the builder via `.search_mode()`. `Merge` (default) deep-merges all found config files; `FirstMatch` uses only the highest-priority file found ("find my config" pattern).
+  - **Ancestor walk** - New `SearchPath::Ancestors(Boundary)` variant walks up from the current working directory to discover config files. `Boundary::Root` walks to the filesystem root; `Boundary::Marker(".git")` stops at a project boundary (inclusive). Expands inline in the search path list, composable with other variants.
+  - **Explicit persist path** - New `.persist_path()` builder method sets where `config set` writes, independent of the read search paths. Using `Ancestors` as a persist path produces a clear error.
+- **Changed**
+  - `config set` now requires an explicit `.persist_path()` instead of guessing from the search path list. Omitting it returns `ClapfigError::NoPersistPath`.
+  - `load_config_files` now takes a `SearchMode` parameter.
+  - New public exports: `Boundary`, `SearchMode`.
 
 ## [0.2.0] - 2026-02-12
 
