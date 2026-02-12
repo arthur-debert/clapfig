@@ -1,7 +1,7 @@
-//! Config operations: template generation, key lookup, and result types.
+//! Config operations: template generation, key lookup, listing, and result types.
 //!
-//! Provides the logic behind `config gen`, `config get`, and the `ConfigResult`
-//! enum that callers use to display results.
+//! Provides the logic behind `config list`, `config gen`, `config get`, and the
+//! `ConfigResult` enum that callers use to display results.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -26,6 +26,8 @@ pub enum ConfigResult {
     },
     /// Confirmation that a value was persisted.
     ValueSet { key: String, value: String },
+    /// All resolved configuration key-value pairs.
+    Listing { entries: Vec<(String, String)> },
 }
 
 impl fmt::Display for ConfigResult {
@@ -42,6 +44,15 @@ impl fmt::Display for ConfigResult {
                 write!(f, "{key} = {value}")
             }
             ConfigResult::ValueSet { key, value } => write!(f, "Set {key} = {value}"),
+            ConfigResult::Listing { entries } => {
+                for (i, (key, value)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        writeln!(f)?;
+                    }
+                    write!(f, "{key} = {value}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -78,6 +89,27 @@ pub fn get_value<C: Config + Serialize>(
         value: value_str,
         doc,
     })
+}
+
+/// List all resolved config values as flattened dotted key-value pairs.
+pub fn list_values<C: Config + Serialize>(config: &C) -> Result<ConfigResult, ClapfigError> {
+    let pairs = crate::flatten::flatten(config).map_err(|e| ClapfigError::InvalidValue {
+        key: "<list>".into(),
+        reason: e.to_string(),
+    })?;
+
+    let entries: Vec<(String, String)> = pairs
+        .into_iter()
+        .map(|(key, value)| {
+            let display = match value {
+                Some(v) => format_value(&v),
+                None => "<not set>".to_string(),
+            };
+            (key, display)
+        })
+        .collect();
+
+    Ok(ConfigResult::Listing { entries })
 }
 
 /// Navigate a `toml::Table` by dotted key path (e.g. `"database.url"`).
@@ -240,5 +272,63 @@ mod tests {
     fn table_get_missing() {
         let table: toml::Table = toml::from_str("port = 8080").unwrap();
         assert!(table_get(&table, "nope").is_none());
+    }
+
+    #[test]
+    fn list_values_includes_all_keys() {
+        let config = test_config();
+        let result = list_values::<TestConfig>(&config).unwrap();
+        match result {
+            ConfigResult::Listing { entries } => {
+                let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+                assert!(keys.contains(&"host"));
+                assert!(keys.contains(&"port"));
+                assert!(keys.contains(&"debug"));
+                assert!(keys.contains(&"database.url"));
+                assert!(keys.contains(&"database.pool_size"));
+                assert_eq!(entries.len(), 5);
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_values_shows_not_set_for_none() {
+        let config = test_config();
+        let result = list_values::<TestConfig>(&config).unwrap();
+        match result {
+            ConfigResult::Listing { entries } => {
+                let db_url = entries.iter().find(|(k, _)| k == "database.url").unwrap();
+                assert_eq!(db_url.1, "<not set>");
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_values_formats_correctly() {
+        let config = test_config();
+        let result = list_values::<TestConfig>(&config).unwrap();
+        match result {
+            ConfigResult::Listing { entries } => {
+                let port = entries.iter().find(|(k, _)| k == "port").unwrap();
+                assert_eq!(port.1, "8080");
+                let host = entries.iter().find(|(k, _)| k == "host").unwrap();
+                assert_eq!(host.1, "localhost");
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn listing_display_format() {
+        let result = ConfigResult::Listing {
+            entries: vec![
+                ("host".into(), "localhost".into()),
+                ("port".into(), "8080".into()),
+            ],
+        };
+        let display = format!("{result}");
+        assert_eq!(display, "host = localhost\nport = 8080");
     }
 }
