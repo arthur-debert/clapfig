@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Get the latest release tag
+latest_tag=$(git tag --list --sort=-version:refname  | head -n1)
+
+if [ -z "$latest_tag" ]; then
+  echo "No release tags found"
+  exit 1
+fi
+
+echo "Showing diff since latest release: $latest_tag"
+echo "─────────────────────────────────────────────"
+git --no-pager log --oneline "$latest_tag"..HEAD
