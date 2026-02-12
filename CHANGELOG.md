@@ -12,10 +12,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - **Search modes** - New `SearchMode` enum on the builder via `.search_mode()`. `Merge` (default) deep-merges all found config files; `FirstMatch` uses only the highest-priority file found ("find my config" pattern).
   - **Ancestor walk** - New `SearchPath::Ancestors(Boundary)` variant walks up from the current working directory to discover config files. `Boundary::Root` walks to the filesystem root; `Boundary::Marker(".git")` stops at a project boundary (inclusive). Expands inline in the search path list, composable with other variants.
   - **Explicit persist path** - New `.persist_path()` builder method sets where `config set` writes, independent of the read search paths. Using `Ancestors` as a persist path produces a clear error.
+  - **Feature-gated clap dependency** - `clap` is now an optional dependency behind the `clap` Cargo feature (enabled by default). The `cli` module, `ConfigArgs`, and `ConfigSubcommand` are only compiled when the feature is active. Use `default-features = false` to use clapfig without pulling in clap.
 - **Changed**
   - `config set` now requires an explicit `.persist_path()` instead of guessing from the search path list. Omitting it returns `ClapfigError::NoPersistPath`.
   - `load_config_files` now takes a `SearchMode` parameter.
   - New public exports: `Boundary`, `SearchMode`.
+  - Crate and README documentation restructured to clarify that the core API is framework-agnostic and clap is an optional adapter.
 
 ## [0.2.0] - 2026-02-12
 
