@@ -216,7 +216,7 @@ fn main() {
     match &cli.command {
         Commands::Echo { key } => {
             let config = make_builder(&cli).load().unwrap_or_else(|e| {
-                eprintln!("Failed to load config: {e}");
+                eprintln!("Failed to load config:\n{e}");
                 std::process::exit(1);
             });
             match key {
@@ -245,7 +245,7 @@ fn main() {
             make_builder(&cli)
                 .handle_and_print(&action)
                 .unwrap_or_else(|e| {
-                    eprintln!("Config error: {e}");
+                    eprintln!("Config error:\n{e}");
                     std::process::exit(1);
                 });
         }

@@ -10,7 +10,7 @@ pub enum ClapfigError {
         line: usize,
     },
 
-    #[error("Unknown keys in config file")]
+    #[error("Unknown keys in config file:\n{}", .0.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n"))]
     UnknownKeys(Vec<ClapfigError>),
 
     #[error("Failed to parse {path}: {source}")]
