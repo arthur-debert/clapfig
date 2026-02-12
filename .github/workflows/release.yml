@@ -32,6 +32,7 @@ jobs:
           TAG_VERSION=${{ steps.version.outputs.version }}
           if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
             echo "ERROR: Cargo.toml version ($CARGO_VERSION) does not match tag (v$TAG_VERSION)"
+            echo "Use 'cargo release' locally to bump version, tag, and push."
             exit 1
           fi
 

@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-12
+
 - **Added**
   - **Auto-match CLI overrides** - `.cli_overrides_from(&cli_struct)` auto-matches serializable struct fields to config keys by name, skipping `None` values and ignoring non-matching fields. Works with clap structs, `HashMap`s, or any `Serialize` type. Composes with manual `.cli_override()`.
   - **`Display` for `ConfigResult`** - `ConfigResult` now implements `Display`, returning the formatted output as a string
@@ -24,4 +26,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - **Config subcommand** - Drop-in `config gen|get|set` commands for clap
   - **Persistence** - `config set` patches values in place via `toml_edit`, preserving comments and formatting
 
+[0.2.0]: https://github.com/arthur-debert/clapfig/releases/tag/v0.2.0
 [0.1.0]: https://github.com/arthur-debert/clapfig/releases/tag/v0.1.0
