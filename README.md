@@ -151,12 +151,18 @@ Disable env loading entirely with `.no_env()`.
 
 ### CLI Overrides
 
+#### Auto-matching
+
+If your clap struct derives `Serialize`, `cli_overrides_from` auto-matches fields by name against config keys:
+
 ```rust
 use clap::Parser;
+use serde::Serialize;
 
-#[derive(Parser)]
+#[derive(Parser, Serialize)]
 struct Cli {
     #[command(subcommand)]
+    #[serde(skip)]
     command: Commands,
 
     #[arg(long)]
@@ -174,16 +180,27 @@ fn main() -> anyhow::Result<()> {
 
     let config: AppConfig = Clapfig::builder()
         .app_name("myapp")
-        .cli_override("host", cli.host)
-        .cli_override("port", cli.port)
-        .cli_override("database.url", cli.db_url)
+        .cli_overrides_from(&cli)                // auto-matches host, port
+        .cli_override("database.url", cli.db_url) // manual: name doesn't match
         .load()?;
 
     Ok(())
 }
 ```
 
-`cli_override(key, value)` takes `Option<V>` where `V: Into<toml::Value>` — `None` (flags the user didn't pass) is silently skipped. Dot notation addresses nested keys. Names don't need to match: `--db-url` maps to `database.url` through the explicit mapping.
+`cli_overrides_from(source)` serializes the source, skips `None` values, and keeps only keys that match a config field. Non-matching fields (`command`, `db_url`) are silently ignored. Works with any `Serialize` type — structs, `HashMap`s, etc.
+
+#### Manual overrides
+
+For fields where the CLI name differs from the config key, use `cli_override`:
+
+```rust
+.cli_override("database.url", cli.db_url)
+```
+
+`cli_override(key, value)` takes `Option<V>` where `V: Into<toml::Value>` — `None` is silently skipped. Dot notation addresses nested keys.
+
+Both methods compose freely and push to the same override list. Later calls take precedence.
 
 Supported value types: `String`, `&str`, `i64`, `i32`, `i8`, `u8`, `u32`, `f64`, `f32`, `bool`.
 
@@ -328,10 +345,11 @@ pub struct DbConfig {
 
 // -- CLI --
 
-#[derive(Parser)]
+#[derive(Parser, Serialize)]
 #[command(name = "myapp")]
 struct Cli {
     #[command(subcommand)]
+    #[serde(skip)]
     command: Commands,
 
     #[arg(long, global = true)]
@@ -354,28 +372,16 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Config(args) => {
-            let action = args.into_action();
-            let result = Clapfig::builder::<AppConfig>()
+            Clapfig::builder::<AppConfig>()
                 .app_name("myapp")
                 .add_search_path(SearchPath::Cwd)
-                .handle(&action)?;
-            match result {
-                ConfigResult::Template(t) => print!("{t}"),
-                ConfigResult::KeyValue { key, value, doc } => {
-                    for line in &doc { println!("# {line}"); }
-                    println!("{key} = {value}");
-                }
-                ConfigResult::ValueSet { key, value } => {
-                    println!("Set {key} = {value}");
-                }
-            }
+                .handle_and_print(&args.into_action())?;
         }
         Commands::Run => {
             let config: AppConfig = Clapfig::builder()
                 .app_name("myapp")
                 .add_search_path(SearchPath::Cwd)
-                .cli_override("host", cli.host)
-                .cli_override("port", cli.port)
+                .cli_overrides_from(&cli)
                 .load()?;
 
             println!("Listening on {}:{}", config.host, config.port);

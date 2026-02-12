@@ -3,6 +3,9 @@
 //! Each `("database.url", Value)` pair is expanded into the nested table structure
 //! needed for deep-merge with other config layers.
 
+use std::collections::HashSet;
+
+use confique::meta::{FieldKind, Meta};
 use toml::{Table, Value};
 
 /// Convert dotted-key overrides into a nested `toml::Table`.
@@ -32,6 +35,34 @@ fn set_nested(table: &mut Table, dotted_key: &str, value: Value) {
 
     let leaf = segments.last().unwrap();
     current.insert(leaf.to_string(), value);
+}
+
+/// Collect all valid leaf key paths from a confique `Meta` tree.
+///
+/// Returns dotted paths like `"host"`, `"database.url"`, `"database.pool_size"`.
+/// Section names (nested structs) are excluded — only leaf fields are returned.
+pub fn valid_keys(meta: &Meta) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    collect_keys(meta, "", &mut keys);
+    keys
+}
+
+fn collect_keys(meta: &Meta, prefix: &str, keys: &mut HashSet<String>) {
+    for field in meta.fields {
+        let dotted = if prefix.is_empty() {
+            field.name.to_string()
+        } else {
+            format!("{prefix}.{}", field.name)
+        };
+        match &field.kind {
+            FieldKind::Leaf { .. } => {
+                keys.insert(dotted);
+            }
+            FieldKind::Nested { meta, .. } => {
+                collect_keys(meta, &dotted, keys);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -91,5 +122,27 @@ mod tests {
             ("port", Value::Integer(5000)),
         ]));
         assert_eq!(table["port"].as_integer().unwrap(), 5000);
+    }
+
+    // --- valid_keys tests ---
+
+    use crate::fixtures::test::TestConfig;
+    use confique::Config;
+
+    #[test]
+    fn valid_keys_collects_all_leaf_paths() {
+        let keys = valid_keys(&TestConfig::META);
+        assert!(keys.contains("host"));
+        assert!(keys.contains("port"));
+        assert!(keys.contains("debug"));
+        assert!(keys.contains("database.url"));
+        assert!(keys.contains("database.pool_size"));
+        assert_eq!(keys.len(), 5);
+    }
+
+    #[test]
+    fn valid_keys_excludes_section_names() {
+        let keys = valid_keys(&TestConfig::META);
+        assert!(!keys.contains("database"));
     }
 }
