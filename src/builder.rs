@@ -243,7 +243,7 @@ impl<C: Config> ClapfigBuilder<C> {
         Ok(())
     }
 
-    /// Handle a `ConfigAction` (list / gen / get / set).
+    /// Handle a `ConfigAction` (list / gen / get / set / unset).
     pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError>
     where
         C: Serialize,
@@ -288,6 +288,18 @@ impl<C: Config> ClapfigBuilder<C> {
                 let path = file::resolve_persist_path(persist, &file_name, app_name)?;
 
                 persist::persist_value::<C>(&path, key, value)
+            }
+            ConfigAction::Unset { key } => {
+                let app_name = self.effective_app_name()?;
+                let file_name = self.effective_file_name()?;
+                let persist = self
+                    .persist_path
+                    .as_ref()
+                    .ok_or(ClapfigError::NoPersistPath)?;
+
+                let path = file::resolve_persist_path(persist, &file_name, app_name)?;
+
+                persist::unset_value(&path, key)
             }
         }
     }
@@ -678,6 +690,44 @@ mod tests {
         assert!(matches!(result, ConfigResult::ValueSet { .. }));
         let content = fs::read_to_string(dir.path().join("test.toml")).unwrap();
         assert!(content.contains("port = 3000"));
+    }
+
+    #[test]
+    fn handle_unset_requires_persist_path() {
+        let dir = TempDir::new().unwrap();
+
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .handle(&ConfigAction::Unset { key: "port".into() });
+
+        assert!(matches!(result, Err(ClapfigError::NoPersistPath)));
+    }
+
+    #[test]
+    fn handle_unset_removes_key() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("test.toml"),
+            "port = 3000\nhost = \"localhost\"\n",
+        )
+        .unwrap();
+
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .persist_path(SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Unset { key: "port".into() })
+            .unwrap();
+
+        assert!(matches!(result, ConfigResult::ValueUnset { .. }));
+        let content = fs::read_to_string(dir.path().join("test.toml")).unwrap();
+        assert!(!content.contains("port"));
+        assert!(content.contains("host = \"localhost\""));
     }
 
     #[test]

@@ -238,6 +238,9 @@ fn main() {
                     key: key.clone(),
                     value: value.clone(),
                 },
+                Some(ConfigSubcommand::Unset { key }) => {
+                    clapfig::ConfigAction::Unset { key: key.clone() }
+                }
             };
             make_builder(&cli)
                 .handle_and_print(&action)

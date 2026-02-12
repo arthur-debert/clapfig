@@ -7,7 +7,7 @@
 //!
 //! The module provides two clap derive types — [`ConfigArgs`] and
 //! [`ConfigSubcommand`] — that you can embed directly into your clap
-//! `#[derive(Parser)]` struct to get `config gen|list|get|set` subcommands
+//! `#[derive(Parser)]` struct to get `config gen|list|get|set|unset` subcommands
 //! with no boilerplate.
 //!
 //! The only bridge to the core is [`ConfigArgs::into_action()`], which
@@ -69,6 +69,11 @@ pub enum ConfigSubcommand {
         /// Value to set.
         value: String,
     },
+    /// Remove a configuration value from the config file.
+    Unset {
+        /// Dotted key path (e.g. "database.url").
+        key: String,
+    },
 }
 
 impl ConfigArgs {
@@ -82,6 +87,7 @@ impl ConfigArgs {
             Some(ConfigSubcommand::Gen { output }) => ConfigAction::Gen { output },
             Some(ConfigSubcommand::Get { key }) => ConfigAction::Get { key },
             Some(ConfigSubcommand::Set { key, value }) => ConfigAction::Set { key, value },
+            Some(ConfigSubcommand::Unset { key }) => ConfigAction::Unset { key },
         }
     }
 }
@@ -175,6 +181,18 @@ mod tests {
     fn invalid_subcommand_errors() {
         let result = TestCli::try_parse_from(["test", "nope"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_unset() {
+        let args = parse(&["test", "unset", "database.url"]);
+        let action = args.into_action();
+        assert_eq!(
+            action,
+            ConfigAction::Unset {
+                key: "database.url".into()
+            }
+        );
     }
 
     #[test]
