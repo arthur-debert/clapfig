@@ -26,6 +26,8 @@ pub enum ConfigResult {
     },
     /// Confirmation that a value was persisted.
     ValueSet { key: String, value: String },
+    /// Confirmation that a value was removed.
+    ValueUnset { key: String },
     /// All resolved configuration key-value pairs.
     Listing { entries: Vec<(String, String)> },
 }
@@ -44,6 +46,7 @@ impl fmt::Display for ConfigResult {
                 write!(f, "{key} = {value}")
             }
             ConfigResult::ValueSet { key, value } => write!(f, "Set {key} = {value}"),
+            ConfigResult::ValueUnset { key } => write!(f, "Unset {key}"),
             ConfigResult::Listing { entries } => {
                 for (i, (key, value)) in entries.iter().enumerate() {
                     if i > 0 {

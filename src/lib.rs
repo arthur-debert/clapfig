@@ -20,7 +20,7 @@
 //! adapter behind the **`clap`** Cargo feature (enabled by default). The [`cli`]
 //! module provides [`ConfigArgs`](cli::ConfigArgs) and
 //! [`ConfigSubcommand`](cli::ConfigSubcommand) — ready-made clap derive types
-//! that give your app `config gen|list|get|set` subcommands with zero
+//! that give your app `config gen|list|get|set|unset` subcommands with zero
 //! boilerplate. They convert to the framework-agnostic [`ConfigAction`] via
 //! [`ConfigArgs::into_action()`](cli::ConfigArgs::into_action).
 //!

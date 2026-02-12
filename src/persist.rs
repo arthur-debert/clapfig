@@ -99,6 +99,68 @@ pub fn persist_value<C: Config>(
     })
 }
 
+/// Pure function: remove a key from a TOML document string.
+///
+/// If the key doesn't exist, returns the document unchanged.
+/// Navigates dotted key paths (e.g. `"database.pool_size"`).
+/// Uses `toml_edit` to preserve existing comments and formatting.
+///
+/// Returns the modified document string.
+pub fn unset_in_document(content: &str, key: &str) -> Result<String, ClapfigError> {
+    let mut doc: toml_edit::DocumentMut =
+        content
+            .parse()
+            .map_err(|e: toml_edit::TomlError| ClapfigError::InvalidValue {
+                key: key.into(),
+                reason: e.to_string(),
+            })?;
+
+    let segments: Vec<&str> = key.split('.').collect();
+
+    // Navigate to the parent, then remove the leaf.
+    let mut current: &mut toml_edit::Item = doc.as_item_mut();
+
+    for segment in &segments[..segments.len() - 1] {
+        match current.get_mut(segment) {
+            Some(item) => current = item,
+            None => return Ok(doc.to_string()), // parent doesn't exist, nothing to unset
+        }
+    }
+
+    let leaf = segments.last().unwrap();
+    if let Some(table) = current.as_table_like_mut() {
+        table.remove(leaf);
+    }
+
+    Ok(doc.to_string())
+}
+
+/// I/O wrapper: reads file, removes the key, writes back.
+/// If the file doesn't exist, succeeds silently (nothing to unset).
+pub fn unset_value(file_path: &Path, key: &str) -> Result<ConfigResult, ClapfigError> {
+    let content = match std::fs::read_to_string(file_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConfigResult::ValueUnset { key: key.into() });
+        }
+        Err(e) => {
+            return Err(ClapfigError::IoError {
+                path: file_path.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+
+    let new_content = unset_in_document(&content, key)?;
+
+    std::fs::write(file_path, &new_content).map_err(|e| ClapfigError::IoError {
+        path: file_path.to_path_buf(),
+        source: e,
+    })?;
+
+    Ok(ConfigResult::ValueUnset { key: key.into() })
+}
+
 /// Parse a raw string value into a `toml_edit::Value` with type heuristics.
 fn parse_toml_edit_value(s: &str) -> toml_edit::Value {
     if s.eq_ignore_ascii_case("true") {
@@ -219,5 +281,69 @@ mod tests {
 
         persist_value::<TestConfig>(&path, "port", "3000").unwrap();
         assert!(path.exists());
+    }
+
+    // --- unset tests ---
+
+    #[test]
+    fn unset_removes_key() {
+        let content = "port = 8080\nhost = \"localhost\"\n";
+        let result = unset_in_document(content, "port").unwrap();
+        assert!(!result.contains("port"));
+        assert!(result.contains("host = \"localhost\""));
+    }
+
+    #[test]
+    fn unset_nested_key() {
+        let content = "[database]\npool_size = 5\nurl = \"pg://\"\n";
+        let result = unset_in_document(content, "database.pool_size").unwrap();
+        assert!(!result.contains("pool_size"));
+        assert!(result.contains("url = \"pg://\""));
+    }
+
+    #[test]
+    fn unset_nonexistent_key_is_noop() {
+        let content = "port = 8080\n";
+        let result = unset_in_document(content, "missing").unwrap();
+        assert!(result.contains("port = 8080"));
+    }
+
+    #[test]
+    fn unset_nonexistent_nested_key_is_noop() {
+        let content = "port = 8080\n";
+        let result = unset_in_document(content, "database.missing").unwrap();
+        assert!(result.contains("port = 8080"));
+    }
+
+    #[test]
+    fn unset_preserves_comments_on_other_keys() {
+        let content = "port = 8080\n# The host address\nhost = \"localhost\"\n";
+        let result = unset_in_document(content, "port").unwrap();
+        assert!(result.contains("# The host address"));
+        assert!(result.contains("host = \"localhost\""));
+        assert!(!result.contains("port"));
+    }
+
+    #[test]
+    fn unset_value_removes_from_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "port = 8080\nhost = \"localhost\"\n").unwrap();
+
+        let result = unset_value(&path, "port").unwrap();
+        assert!(matches!(result, ConfigResult::ValueUnset { .. }));
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("port"));
+        assert!(content.contains("host = \"localhost\""));
+    }
+
+    #[test]
+    fn unset_value_missing_file_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent.toml");
+
+        let result = unset_value(&path, "port").unwrap();
+        assert!(matches!(result, ConfigResult::ValueUnset { .. }));
     }
 }

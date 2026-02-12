@@ -156,4 +156,7 @@ pub enum ConfigAction {
         key: String,
         value: String,
     },
+    Unset {
+        key: String,
+    },
 }
