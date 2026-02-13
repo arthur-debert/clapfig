@@ -1,6 +1,6 @@
 [package]
 name = "clapfig"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 description = "Rich, layered configuration for Rust CLI apps"
 license = "MIT"
