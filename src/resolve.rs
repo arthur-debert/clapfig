@@ -222,4 +222,47 @@ mod tests {
         let config: TestConfig = resolve(input).unwrap();
         assert_eq!(config.port, 3000);
     }
+
+    // -- deserialize_with normalization tests ----------------------------------
+
+    use crate::fixtures::test::NormalizedConfig;
+
+    #[test]
+    fn deserialize_with_normalizes_from_file() {
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "color = \"BLUE\"\n".into())],
+            ..empty_input()
+        };
+        let config: NormalizedConfig = resolve(input).unwrap();
+        assert_eq!(config.color, "blue");
+    }
+
+    #[test]
+    fn deserialize_with_normalizes_from_env() {
+        let input = ResolveInput {
+            env_vars: vec![("APP__COLOR".into(), "GREEN".into())],
+            env_prefix: Some("APP".into()),
+            ..empty_input()
+        };
+        let config: NormalizedConfig = resolve(input).unwrap();
+        assert_eq!(config.color, "green");
+    }
+
+    #[test]
+    fn deserialize_with_normalizes_from_cli_override() {
+        let input = ResolveInput {
+            cli_overrides: vec![("color".into(), Value::String("MAGENTA".into()))],
+            ..empty_input()
+        };
+        let config: NormalizedConfig = resolve(input).unwrap();
+        assert_eq!(config.color, "magenta");
+    }
+
+    #[test]
+    fn deserialize_with_default_is_not_normalized() {
+        // confique defaults bypass deserialize_with — they are injected directly.
+        // This is confique's documented behavior: the default string is used as-is.
+        let config: NormalizedConfig = resolve(empty_input()).unwrap();
+        assert_eq!(config.color, "red");
+    }
 }

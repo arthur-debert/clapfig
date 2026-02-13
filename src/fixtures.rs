@@ -41,4 +41,26 @@ pub mod test {
         assert_eq!(config.database.url, None);
         assert_eq!(config.database.pool_size, 5);
     }
+
+    // -- Fixture for deserialize_with normalization tests ----------------------
+
+    /// Deserialize a string and normalize it to lowercase.
+    fn normalize_lowercase<'de, D>(deserializer: D) -> Result<String, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(s.to_lowercase())
+    }
+
+    #[derive(Config, Serialize, Deserialize, Debug, PartialEq)]
+    pub struct NormalizedConfig {
+        /// A color name, normalized to lowercase.
+        #[config(deserialize_with = normalize_lowercase, default = "red")]
+        pub color: String,
+
+        /// Plain field with no normalization.
+        #[config(default = 42)]
+        pub count: u32,
+    }
 }

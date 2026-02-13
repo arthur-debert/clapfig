@@ -152,6 +152,34 @@ Unknown key 'typo_key' in /home/user/.config/myapp/myapp.toml (line 5)
 
 Disable it with `.strict(false)` if you want to allow extra keys.
 
+## Normalizing Values
+
+You can normalize config values during deserialization using confique's `#[config(deserialize_with = ...)]` attribute. The function has the standard serde deserializer signature and runs automatically when a value is loaded from any source — config files, environment variables, or programmatic overrides.
+
+```rust
+use confique::Config;
+use serde::{Serialize, Deserialize, Deserializer};
+
+/// Normalize a string to lowercase during deserialization.
+fn normalize_lowercase<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let s = String::deserialize(d)?;
+    Ok(s.to_lowercase())
+}
+
+#[derive(Config, Serialize, Deserialize, Debug)]
+pub struct DisplayConfig {
+    /// Terminal color name, always stored as lowercase.
+    #[config(deserialize_with = normalize_lowercase, default = "yellow")]
+    pub color: String,
+
+    /// Output format (pretty or plain).
+    #[config(default = "pretty")]
+    pub format: String,
+}
+```
+
+With this, `color = "BLUE"` in a TOML file, `MYAPP__COLOR=Blue` as an env var, or `.cli_override("color", "RED")` all resolve to their lowercase form. Note that `#[config(default)]` values are injected directly by confique and do **not** pass through the deserializer — if your default needs normalization, write it in normalized form.
+
 ## Environment Variables
 
 With env prefix `MYAPP`, variables map via double-underscore nesting:
