@@ -42,6 +42,24 @@ pub mod test {
         assert_eq!(config.database.pool_size, 5);
     }
 
+    // -- Fixture for enum validation tests --------------------------------------
+
+    #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Mode {
+        Fast,
+        Slow,
+    }
+
+    #[derive(Config, Serialize, Deserialize, Debug, PartialEq)]
+    pub struct EnumConfig {
+        #[config(default = "fast")]
+        pub mode: Mode,
+
+        #[config(default = 8080)]
+        pub port: u16,
+    }
+
     // -- Fixture for deserialize_with normalization tests ----------------------
 
     /// Deserialize a string and normalize it to lowercase.
