@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- **Fixed**
+  - **`config set` now validates values before persisting** - Previously, `config set mode garbage` would silently write invalid values to the TOML file, only surfacing errors on the next `load()`. Now `set_in_document` validates both that the key exists in the config schema and that the value is type-compatible (e.g. valid enum variant) by round-trip deserializing into `C::Layer` before writing. Invalid values produce a clear `InvalidValue` error; unknown keys produce `KeyNotFound`. This closes the structural gap where `load()` and `cli_overrides_from()` validated but `config set` did not. ([#9](https://github.com/arthur-debert/clapfig/issues/9))
 - **Added**
   - **Named persist scopes** - New `.persist_scope(name, path)` builder method replaces `.persist_path()`. Scopes are named config file targets (e.g. "local", "global") for read/write operations. The first scope added is the default for writes. Scope paths are automatically added to search paths for discovery.
   - **`--scope` CLI flag** - New `--scope <name>` global flag on `ConfigArgs` targets a specific persist scope. Works with all config subcommands: `set`/`unset` write to the named scope; `list`/`get` read from that scope's file only (instead of the merged resolved view).
