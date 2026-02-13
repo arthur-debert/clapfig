@@ -352,7 +352,7 @@ impl<C: Config> ClapfigBuilder<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::test::TestConfig;
+    use crate::fixtures::test::{EnumConfig, TestConfig};
     use crate::types::Boundary;
     use std::fs;
     use tempfile::TempDir;
@@ -1149,6 +1149,64 @@ mod tests {
             }
             other => panic!("Expected Listing, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn handle_set_rejects_invalid_enum_value() {
+        let dir = TempDir::new().unwrap();
+
+        let result = Clapfig::builder::<EnumConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "mode".into(),
+                value: "garbage".into(),
+                scope: None,
+            });
+
+        assert!(matches!(result, Err(ClapfigError::InvalidValue { .. })));
+        // File should NOT have been written
+        assert!(!dir.path().join("test.toml").exists());
+    }
+
+    #[test]
+    fn handle_set_accepts_valid_enum_value() {
+        let dir = TempDir::new().unwrap();
+
+        let result = Clapfig::builder::<EnumConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "mode".into(),
+                value: "slow".into(),
+                scope: None,
+            });
+
+        assert!(matches!(result, Ok(ConfigResult::ValueSet { .. })));
+        let content = fs::read_to_string(dir.path().join("test.toml")).unwrap();
+        assert!(content.contains("mode = \"slow\""));
+    }
+
+    #[test]
+    fn handle_set_rejects_unknown_key() {
+        let dir = TempDir::new().unwrap();
+
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "nonexistent".into(),
+                value: "whatever".into(),
+                scope: None,
+            });
+
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
     }
 
     #[test]

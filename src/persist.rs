@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use confique::Config;
+use serde::Deserialize;
 
 use crate::error::ClapfigError;
 use crate::ops::ConfigResult;
@@ -21,7 +22,28 @@ pub fn set_in_document<C: Config>(
     content: Option<&str>,
     key: &str,
     raw_value: &str,
-) -> Result<String, ClapfigError> {
+) -> Result<String, ClapfigError>
+where
+    C::Layer: for<'de> Deserialize<'de>,
+{
+    // Validate key is known to the config schema
+    let valid_keys = crate::overrides::valid_keys(&C::META);
+    if !valid_keys.contains(key) {
+        return Err(ClapfigError::KeyNotFound(key.into()));
+    }
+
+    // Validate value is compatible with the field's type by round-trip
+    // deserializing a minimal table into C::Layer (all-optional fields).
+    let check_value = parse_toml_value(raw_value);
+    let check_table = crate::overrides::overrides_to_table(&[(key.to_string(), check_value)]);
+    let _: C::Layer =
+        toml::Value::Table(check_table)
+            .try_into()
+            .map_err(|e: toml::de::Error| ClapfigError::InvalidValue {
+                key: key.into(),
+                reason: e.to_string(),
+            })?;
+
     let base = match content {
         Some(c) => c.to_string(),
         None => {
@@ -67,7 +89,10 @@ pub fn persist_value<C: Config>(
     file_path: &Path,
     key: &str,
     value: &str,
-) -> Result<ConfigResult, ClapfigError> {
+) -> Result<ConfigResult, ClapfigError>
+where
+    C::Layer: for<'de> Deserialize<'de>,
+{
     let content = match std::fs::read_to_string(file_path) {
         Ok(c) => Some(c),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -161,6 +186,28 @@ pub fn unset_value(file_path: &Path, key: &str) -> Result<ConfigResult, ClapfigE
     Ok(ConfigResult::ValueUnset { key: key.into() })
 }
 
+/// Parse a raw string value into a `toml::Value` with type heuristics.
+///
+/// Used for round-trip validation: build a `toml::Table` and deserialize into
+/// `C::Layer` to catch type mismatches before persisting.
+fn parse_toml_value(s: &str) -> toml::Value {
+    if s.eq_ignore_ascii_case("true") {
+        return toml::Value::Boolean(true);
+    }
+    if s.eq_ignore_ascii_case("false") {
+        return toml::Value::Boolean(false);
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return toml::Value::Integer(i);
+    }
+    if s.contains('.')
+        && let Ok(f) = s.parse::<f64>()
+    {
+        return toml::Value::Float(f);
+    }
+    toml::Value::String(s.to_string())
+}
+
 /// Parse a raw string value into a `toml_edit::Value` with type heuristics.
 fn parse_toml_edit_value(s: &str) -> toml_edit::Value {
     if s.eq_ignore_ascii_case("true") {
@@ -183,9 +230,55 @@ fn parse_toml_edit_value(s: &str) -> toml_edit::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::test::TestConfig;
+    use crate::fixtures::test::{EnumConfig, TestConfig};
     use std::fs;
     use tempfile::TempDir;
+
+    // --- validation tests ---
+
+    #[test]
+    fn set_rejects_unknown_key() {
+        let result = set_in_document::<TestConfig>(Some(""), "nonexistent", "value");
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
+    }
+
+    #[test]
+    fn set_rejects_invalid_enum_value() {
+        let result = set_in_document::<EnumConfig>(Some(""), "mode", "garbage");
+        match result {
+            Err(ClapfigError::InvalidValue { key, reason }) => {
+                assert_eq!(key, "mode");
+                assert!(
+                    reason.contains("unknown variant"),
+                    "expected 'unknown variant' in: {reason}"
+                );
+            }
+            other => panic!("Expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_accepts_valid_enum_value() {
+        let result = set_in_document::<EnumConfig>(Some(""), "mode", "fast");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn set_rejects_wrong_type() {
+        let result = set_in_document::<TestConfig>(Some(""), "port", "not_a_number");
+        assert!(matches!(result, Err(ClapfigError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn persist_rejects_invalid_enum_value() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let result = persist_value::<EnumConfig>(&path, "mode", "garbage");
+        assert!(matches!(result, Err(ClapfigError::InvalidValue { .. })));
+        // File should NOT have been created
+        assert!(!path.exists());
+    }
 
     #[test]
     fn set_existing_key() {
