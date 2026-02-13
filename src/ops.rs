@@ -4,7 +4,7 @@
 //! `ConfigResult` enum that callers use to display results.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use confique::Config;
 use serde::Serialize;
@@ -113,6 +113,94 @@ pub fn list_values<C: Config + Serialize>(config: &C) -> Result<ConfigResult, Cl
         .collect();
 
     Ok(ConfigResult::Listing { entries })
+}
+
+/// List entries from a single scope's config file (raw file content, not merged).
+///
+/// If the file does not exist, returns an empty listing.
+pub fn list_scope_file(file_path: &Path) -> Result<ConfigResult, ClapfigError> {
+    let content = match std::fs::read_to_string(file_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConfigResult::Listing {
+                entries: Vec::new(),
+            });
+        }
+        Err(e) => {
+            return Err(ClapfigError::IoError {
+                path: file_path.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+
+    let table: toml::Table =
+        content
+            .parse()
+            .map_err(|e: toml::de::Error| ClapfigError::ParseError {
+                path: file_path.to_path_buf(),
+                source: e,
+            })?;
+
+    let mut entries = Vec::new();
+    flatten_toml_table(&table, "", &mut entries);
+
+    Ok(ConfigResult::Listing { entries })
+}
+
+/// Get a value from a single scope's config file by dotted key.
+///
+/// Returns the raw value from the file, plus doc comments from the config struct's
+/// metadata. Returns `KeyNotFound` if the key is not present in the file.
+pub fn get_scope_value<C: Config>(
+    file_path: &Path,
+    key: &str,
+) -> Result<ConfigResult, ClapfigError> {
+    let content = match std::fs::read_to_string(file_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ClapfigError::KeyNotFound(key.into()));
+        }
+        Err(e) => {
+            return Err(ClapfigError::IoError {
+                path: file_path.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+
+    let table: toml::Table =
+        content
+            .parse()
+            .map_err(|e: toml::de::Error| ClapfigError::ParseError {
+                path: file_path.to_path_buf(),
+                source: e,
+            })?;
+
+    let value = table_get(&table, key).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
+    let value_str = format_value(value);
+    let doc = lookup_doc(&C::META, key);
+
+    Ok(ConfigResult::KeyValue {
+        key: key.into(),
+        value: value_str,
+        doc,
+    })
+}
+
+/// Recursively flatten a TOML table into dotted key-value pairs.
+fn flatten_toml_table(table: &toml::Table, prefix: &str, entries: &mut Vec<(String, String)>) {
+    for (key, value) in table {
+        let full_key = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            toml::Value::Table(t) => flatten_toml_table(t, &full_key, entries),
+            _ => entries.push((full_key, format_value(value))),
+        }
+    }
 }
 
 /// Navigate a `toml::Table` by dotted key path (e.g. `"database.url"`).
@@ -333,5 +421,116 @@ mod tests {
         };
         let display = format!("{result}");
         assert_eq!(display, "host = localhost\nport = 8080");
+    }
+
+    // --- scope file operations ---
+
+    #[test]
+    fn list_scope_file_returns_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "port = 3000\nhost = \"localhost\"\n").unwrap();
+
+        let result = list_scope_file(&path).unwrap();
+        match result {
+            ConfigResult::Listing { entries } => {
+                assert_eq!(entries.len(), 2);
+                assert!(entries.contains(&("host".into(), "localhost".into())));
+                assert!(entries.contains(&("port".into(), "3000".into())));
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_scope_file_nested() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[database]\npool_size = 10\nurl = \"pg://\"\n").unwrap();
+
+        let result = list_scope_file(&path).unwrap();
+        match result {
+            ConfigResult::Listing { entries } => {
+                assert!(entries.contains(&("database.pool_size".into(), "10".into())));
+                assert!(entries.contains(&("database.url".into(), "pg://".into())));
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_scope_file_missing_returns_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent.toml");
+
+        let result = list_scope_file(&path).unwrap();
+        match result {
+            ConfigResult::Listing { entries } => assert!(entries.is_empty()),
+            other => panic!("Expected empty Listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_scope_value_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "port = 3000\n").unwrap();
+
+        let result = get_scope_value::<TestConfig>(&path, "port").unwrap();
+        match result {
+            ConfigResult::KeyValue { value, .. } => assert_eq!(value, "3000"),
+            other => panic!("Expected KeyValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_scope_value_nested() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[database]\npool_size = 20\n").unwrap();
+
+        let result = get_scope_value::<TestConfig>(&path, "database.pool_size").unwrap();
+        match result {
+            ConfigResult::KeyValue { value, .. } => assert_eq!(value, "20"),
+            other => panic!("Expected KeyValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_scope_value_not_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "port = 3000\n").unwrap();
+
+        let result = get_scope_value::<TestConfig>(&path, "missing");
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
+    }
+
+    #[test]
+    fn get_scope_value_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent.toml");
+
+        let result = get_scope_value::<TestConfig>(&path, "port");
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
+    }
+
+    #[test]
+    fn get_scope_value_includes_doc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "host = \"myhost\"\n").unwrap();
+
+        let result = get_scope_value::<TestConfig>(&path, "host").unwrap();
+        match result {
+            ConfigResult::KeyValue { doc, .. } => {
+                let doc_text = doc.join(" ");
+                assert!(
+                    doc_text.contains("host"),
+                    "doc should mention host: {doc_text}"
+                );
+            }
+            other => panic!("Expected KeyValue, got {other:?}"),
+        }
     }
 }

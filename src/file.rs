@@ -27,10 +27,9 @@
 //!
 //! # Persistence
 //!
-//! [`resolve_persist_path`] resolves the explicit [`SearchPath`] the user set via
-//! `.persist_path()` on the builder. It rejects [`Ancestors`](SearchPath::Ancestors)
-//! because that variant expands to multiple directories — a write target must be
-//! unambiguous.
+//! [`resolve_persist_path`] resolves the [`SearchPath`] for a named persist scope.
+//! It rejects [`Ancestors`](SearchPath::Ancestors) because that variant expands
+//! to multiple directories — a write target must be unambiguous.
 
 use std::path::PathBuf;
 
@@ -209,9 +208,9 @@ fn load_first_match(
     Ok(vec![])
 }
 
-/// Resolve the persist path for `config set`.
+/// Resolve the persist path for a named scope.
 ///
-/// Takes the explicit [`SearchPath`] the user configured via `.persist_path()`.
+/// Takes the [`SearchPath`] from a persist scope.
 /// Returns an error if [`Ancestors`](SearchPath::Ancestors) is used (it resolves
 /// to multiple directories and is not a valid write target).
 pub fn resolve_persist_path(

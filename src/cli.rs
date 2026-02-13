@@ -42,6 +42,16 @@ use crate::types::ConfigAction;
 /// ```
 #[derive(Debug, Args)]
 pub struct ConfigArgs {
+    /// Target a named persist scope (e.g. "local", "global").
+    ///
+    /// For `set`/`unset`: selects which config file to write to. Defaults to the
+    /// first scope configured on the builder.
+    ///
+    /// For `list`/`get`: reads from that scope's config file only (instead of
+    /// the merged resolved view).
+    #[arg(long, global = true)]
+    pub scope: Option<String>,
+
     #[command(subcommand)]
     pub action: Option<ConfigSubcommand>,
 }
@@ -80,14 +90,16 @@ impl ConfigArgs {
     /// Convert clap-parsed args into a framework-agnostic `ConfigAction`.
     ///
     /// Bare `config` (no subcommand) and explicit `config list` both map to
-    /// `ConfigAction::List`.
+    /// `ConfigAction::List`. The `--scope` flag is threaded through to all
+    /// variants except `Gen`.
     pub fn into_action(self) -> ConfigAction {
+        let scope = self.scope;
         match self.action {
-            None | Some(ConfigSubcommand::List) => ConfigAction::List,
+            None | Some(ConfigSubcommand::List) => ConfigAction::List { scope },
             Some(ConfigSubcommand::Gen { output }) => ConfigAction::Gen { output },
-            Some(ConfigSubcommand::Get { key }) => ConfigAction::Get { key },
-            Some(ConfigSubcommand::Set { key, value }) => ConfigAction::Set { key, value },
-            Some(ConfigSubcommand::Unset { key }) => ConfigAction::Unset { key },
+            Some(ConfigSubcommand::Get { key }) => ConfigAction::Get { key, scope },
+            Some(ConfigSubcommand::Set { key, value }) => ConfigAction::Set { key, value, scope },
+            Some(ConfigSubcommand::Unset { key }) => ConfigAction::Unset { key, scope },
         }
     }
 }
@@ -146,7 +158,8 @@ mod tests {
         assert_eq!(
             action,
             ConfigAction::Get {
-                key: "database.url".into()
+                key: "database.url".into(),
+                scope: None,
             }
         );
     }
@@ -159,7 +172,8 @@ mod tests {
             action,
             ConfigAction::Set {
                 key: "port".into(),
-                value: "3000".into()
+                value: "3000".into(),
+                scope: None,
             }
         );
     }
@@ -172,7 +186,8 @@ mod tests {
             action,
             ConfigAction::Set {
                 key: "host".into(),
-                value: "0.0.0.0".into()
+                value: "0.0.0.0".into(),
+                scope: None,
             }
         );
     }
@@ -190,7 +205,8 @@ mod tests {
         assert_eq!(
             action,
             ConfigAction::Unset {
-                key: "database.url".into()
+                key: "database.url".into(),
+                scope: None,
             }
         );
     }
@@ -199,13 +215,93 @@ mod tests {
     fn parse_bare_config_is_list() {
         let args = parse(&["test"]);
         let action = args.into_action();
-        assert_eq!(action, ConfigAction::List);
+        assert_eq!(action, ConfigAction::List { scope: None });
     }
 
     #[test]
     fn parse_explicit_list() {
         let args = parse(&["test", "list"]);
         let action = args.into_action();
-        assert_eq!(action, ConfigAction::List);
+        assert_eq!(action, ConfigAction::List { scope: None });
+    }
+
+    // --- scope flag tests ---
+
+    #[test]
+    fn parse_set_with_scope() {
+        let args = parse(&["test", "set", "port", "3000", "--scope", "global"]);
+        let action = args.into_action();
+        assert_eq!(
+            action,
+            ConfigAction::Set {
+                key: "port".into(),
+                value: "3000".into(),
+                scope: Some("global".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_scope_before_subcommand() {
+        let args = parse(&["test", "--scope", "global", "set", "port", "3000"]);
+        let action = args.into_action();
+        assert_eq!(
+            action,
+            ConfigAction::Set {
+                key: "port".into(),
+                value: "3000".into(),
+                scope: Some("global".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_list_with_scope() {
+        let args = parse(&["test", "list", "--scope", "global"]);
+        let action = args.into_action();
+        assert_eq!(
+            action,
+            ConfigAction::List {
+                scope: Some("global".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_get_with_scope() {
+        let args = parse(&["test", "get", "port", "--scope", "local"]);
+        let action = args.into_action();
+        assert_eq!(
+            action,
+            ConfigAction::Get {
+                key: "port".into(),
+                scope: Some("local".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_unset_with_scope() {
+        let args = parse(&["test", "unset", "port", "--scope", "global"]);
+        let action = args.into_action();
+        assert_eq!(
+            action,
+            ConfigAction::Unset {
+                key: "port".into(),
+                scope: Some("global".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bare_config_with_scope() {
+        let args = parse(&["test", "--scope", "global"]);
+        let action = args.into_action();
+        assert_eq!(
+            action,
+            ConfigAction::List {
+                scope: Some("global".into()),
+            }
+        );
     }
 }

@@ -35,7 +35,7 @@ mod config;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use clapfig::{Clapfig, ClapfigBuilder, ConfigArgs, ConfigSubcommand, SearchPath};
+use clapfig::{Clapfig, ClapfigBuilder, ConfigArgs, SearchPath};
 
 use config::DemoConfig;
 
@@ -120,7 +120,7 @@ fn make_builder(cli: &Cli) -> ClapfigBuilder<DemoConfig> {
             SearchPath::Home(".clapfig-demo"),
             SearchPath::Cwd,
         ])
-        .persist_path(SearchPath::Home(".clapfig-demo"))
+        .persist_scope("local", SearchPath::Home(".clapfig-demo"))
         // Auto-match top-level keys.
         .cli_overrides_from(&overrides)
         // Manually map nested keys.
@@ -212,42 +212,25 @@ fn echo_key(config: &DemoConfig, key: &str) {
 
 fn main() {
     let cli = Cli::parse();
+    let builder = make_builder(&cli);
 
-    match &cli.command {
+    match cli.command {
         Commands::Echo { key } => {
-            let config = make_builder(&cli).load().unwrap_or_else(|e| {
+            let config = builder.load().unwrap_or_else(|e| {
                 eprintln!("Failed to load config:\n{e}");
                 std::process::exit(1);
             });
             match key {
-                Some(k) => echo_key(&config, k),
+                Some(k) => echo_key(&config, &k),
                 None => echo_all(&config),
             }
         }
         Commands::Config(args) => {
-            // Reconstruct the action from the subcommand variant.
-            let action = match &args.action {
-                None | Some(ConfigSubcommand::List) => clapfig::ConfigAction::List,
-                Some(ConfigSubcommand::Gen { output }) => clapfig::ConfigAction::Gen {
-                    output: output.clone(),
-                },
-                Some(ConfigSubcommand::Get { key }) => {
-                    clapfig::ConfigAction::Get { key: key.clone() }
-                }
-                Some(ConfigSubcommand::Set { key, value }) => clapfig::ConfigAction::Set {
-                    key: key.clone(),
-                    value: value.clone(),
-                },
-                Some(ConfigSubcommand::Unset { key }) => {
-                    clapfig::ConfigAction::Unset { key: key.clone() }
-                }
-            };
-            make_builder(&cli)
-                .handle_and_print(&action)
-                .unwrap_or_else(|e| {
-                    eprintln!("Config error:\n{e}");
-                    std::process::exit(1);
-                });
+            let action = args.into_action();
+            builder.handle_and_print(&action).unwrap_or_else(|e| {
+                eprintln!("Config error:\n{e}");
+                std::process::exit(1);
+            });
         }
     }
 }

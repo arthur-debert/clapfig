@@ -7,11 +7,11 @@
 //! |------|---------------|----------|
 //! | **Discovery** | [`search_paths()`] | Where to look for config files |
 //! | **Resolution** | [`search_mode()`] | Whether to merge all found files or pick one |
-//! | **Persistence** | [`persist_path()`] | Where `config set` writes (explicit, no guessing) |
+//! | **Persistence** | [`persist_scope()`] | Named targets for `config set` writes |
 //!
 //! [`search_paths()`]: crate::ClapfigBuilder::search_paths
 //! [`search_mode()`]: crate::ClapfigBuilder::search_mode
-//! [`persist_path()`]: crate::ClapfigBuilder::persist_path
+//! [`persist_scope()`]: crate::ClapfigBuilder::persist_scope
 //!
 //! # Discovery: [`SearchPath`]
 //!
@@ -91,8 +91,8 @@ pub enum SearchPath {
     ///
     /// # Note
     ///
-    /// This variant is not valid as a [`persist_path`](crate::ClapfigBuilder::persist_path)
-    /// because it resolves to multiple directories. Using it there produces an error.
+    /// This variant is not valid as a [`persist_scope`](crate::ClapfigBuilder::persist_scope)
+    /// path because it resolves to multiple directories. Using it there produces an error.
     Ancestors(Boundary),
 }
 
@@ -142,21 +142,42 @@ pub enum SearchMode {
 
 /// A config operation, independent of any CLI framework.
 /// The CLI layer converts parsed clap args into this.
+///
+/// Operations that target a specific config file accept an optional `scope` name.
+/// When `scope` is `None`:
+/// - **`List` / `Get`**: return the merged resolved configuration (all layers).
+/// - **`Set` / `Unset`**: write to the default (first) persist scope.
+///
+/// When `scope` is `Some(name)`:
+/// - **`List` / `Get`**: return entries from that scope's config file only.
+/// - **`Set` / `Unset`**: write to that scope's config file.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigAction {
-    /// Show all resolved configuration key-value pairs.
-    List,
+    /// Show configuration key-value pairs.
+    List {
+        /// Target a specific persist scope's file, or `None` for merged view.
+        scope: Option<String>,
+    },
     Gen {
         output: Option<PathBuf>,
     },
+    /// Show a single config key's value.
     Get {
         key: String,
+        /// Target a specific persist scope's file, or `None` for merged view.
+        scope: Option<String>,
     },
+    /// Persist a value to a config file.
     Set {
         key: String,
         value: String,
+        /// Target scope, or `None` for the default (first) scope.
+        scope: Option<String>,
     },
+    /// Remove a value from a config file.
     Unset {
         key: String,
+        /// Target scope, or `None` for the default (first) scope.
+        scope: Option<String>,
     },
 }

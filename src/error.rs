@@ -34,11 +34,17 @@ pub enum ClapfigError {
     #[error("Invalid value for '{key}': {reason}")]
     InvalidValue { key: String, reason: String },
 
-    #[error("No persist path configured — call .persist_path() on the builder")]
+    #[error("No persist scopes configured — call .persist_scope() on the builder")]
     NoPersistPath,
 
-    #[error("Ancestors is not valid as a persist path (it resolves to multiple directories)")]
+    #[error("Ancestors is not valid as a persist scope path (it resolves to multiple directories)")]
     AncestorsNotAllowedAsPersistPath,
+
+    #[error("Unknown scope '{scope}' — available scopes: {}", available.join(", "))]
+    UnknownScope {
+        scope: String,
+        available: Vec<String>,
+    },
 
     #[error("App name is required — call .app_name() on the builder")]
     AppNameRequired,
