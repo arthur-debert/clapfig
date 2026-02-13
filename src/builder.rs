@@ -27,13 +27,13 @@ impl Clapfig {
 ///
 /// - **Discovery**: [`search_paths()`](Self::search_paths) — where to look for config files.
 /// - **Resolution**: [`search_mode()`](Self::search_mode) — merge all or pick one.
-/// - **Persistence**: [`persist_path()`](Self::persist_path) — where `config set` writes.
+/// - **Persistence**: [`persist_scope()`](Self::persist_scope) — named targets for writes.
 pub struct ClapfigBuilder<C: Config> {
     app_name: Option<String>,
     file_name: Option<String>,
     search_paths: Option<Vec<SearchPath>>,
     search_mode: SearchMode,
-    persist_path: Option<SearchPath>,
+    persist_scopes: Vec<(String, SearchPath)>,
     env_prefix: Option<String>,
     env_enabled: bool,
     strict: bool,
@@ -48,7 +48,7 @@ impl<C: Config> ClapfigBuilder<C> {
             file_name: None,
             search_paths: None,
             search_mode: SearchMode::default(),
-            persist_path: None,
+            persist_scopes: Vec::new(),
             env_prefix: None,
             env_enabled: true,
             strict: true,
@@ -101,16 +101,21 @@ impl<C: Config> ClapfigBuilder<C> {
         self
     }
 
-    /// Set the persistence path for `config set`.
+    /// Add a named persist scope.
     ///
-    /// This is where `config set` writes values. It is independent of the search
-    /// paths used for reading. Must be a single-directory variant (`Platform`,
-    /// `Home`, `Cwd`, or `Path`). Using [`Ancestors`](SearchPath::Ancestors)
-    /// produces an error at build time.
+    /// Scopes are named config file targets for `config set`/`unset` (and optionally
+    /// `config get`/`list` with `--scope`). The first scope added is the default
+    /// for write operations when no `--scope` is specified.
     ///
-    /// If not set, `config set` returns [`ClapfigError::NoPersistPath`].
-    pub fn persist_path(mut self, path: SearchPath) -> Self {
-        self.persist_path = Some(path);
+    /// Scope paths are automatically added to the search paths (if not already
+    /// present) so that persisted values are discoverable in the merged view.
+    ///
+    /// Must be a single-directory variant (`Platform`, `Home`, `Cwd`, or `Path`).
+    /// Using [`Ancestors`](SearchPath::Ancestors) produces an error at handle time.
+    ///
+    /// If no scopes are configured, `config set` returns [`ClapfigError::NoPersistPath`].
+    pub fn persist_scope(mut self, name: &str, path: SearchPath) -> Self {
+        self.persist_scopes.push((name.to_string(), path));
         self
     }
 
@@ -182,11 +187,23 @@ impl<C: Config> ClapfigBuilder<C> {
     }
 
     /// Resolve the effective search paths.
+    ///
+    /// Starts from the user-configured paths (or `[Platform]` default), then
+    /// appends any persist scope paths not already present.
     fn effective_search_paths(&self) -> Vec<SearchPath> {
-        if let Some(paths) = &self.search_paths {
-            return paths.clone();
+        let mut paths = if let Some(paths) = &self.search_paths {
+            paths.clone()
+        } else {
+            vec![SearchPath::Platform]
+        };
+
+        for (_, scope_path) in &self.persist_scopes {
+            if !paths.contains(scope_path) {
+                paths.push(scope_path.clone());
+            }
         }
-        vec![SearchPath::Platform]
+
+        paths
     }
 
     /// Resolve the effective env prefix (None if env disabled).
@@ -243,6 +260,37 @@ impl<C: Config> ClapfigBuilder<C> {
         Ok(())
     }
 
+    /// Resolve the file path for a persist scope.
+    ///
+    /// When `scope` is `None`, uses the default (first) scope.
+    /// Returns `NoPersistPath` if no scopes are configured, or `UnknownScope`
+    /// if the named scope doesn't exist.
+    fn resolve_scope_persist_path(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<std::path::PathBuf, ClapfigError> {
+        if self.persist_scopes.is_empty() {
+            return Err(ClapfigError::NoPersistPath);
+        }
+
+        let app_name = self.effective_app_name()?;
+        let file_name = self.effective_file_name()?;
+
+        let (_, search_path) = match scope {
+            None => &self.persist_scopes[0],
+            Some(name) => self
+                .persist_scopes
+                .iter()
+                .find(|(n, _)| n == name)
+                .ok_or_else(|| ClapfigError::UnknownScope {
+                    scope: name.to_string(),
+                    available: self.persist_scopes.iter().map(|(n, _)| n.clone()).collect(),
+                })?,
+        };
+
+        file::resolve_persist_path(search_path, &file_name, app_name)
+    }
+
     /// Handle a `ConfigAction` (list / gen / get / set / unset).
     pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError>
     where
@@ -250,10 +298,16 @@ impl<C: Config> ClapfigBuilder<C> {
         C::Layer: for<'de> Deserialize<'de>,
     {
         match action {
-            ConfigAction::List => {
-                let config = self.load()?;
-                ops::list_values(&config)
-            }
+            ConfigAction::List { scope } => match scope {
+                None => {
+                    let config = self.load()?;
+                    ops::list_values(&config)
+                }
+                Some(name) => {
+                    let path = self.resolve_scope_persist_path(Some(name))?;
+                    ops::list_scope_file(&path)
+                }
+            },
             ConfigAction::Gen { output } => {
                 let template = ops::generate_template::<C>();
                 match output {
@@ -273,32 +327,22 @@ impl<C: Config> ClapfigBuilder<C> {
                     None => Ok(ConfigResult::Template(template)),
                 }
             }
-            ConfigAction::Get { key } => {
-                let config = self.load()?;
-                ops::get_value(&config, key)
-            }
-            ConfigAction::Set { key, value } => {
-                let app_name = self.effective_app_name()?;
-                let file_name = self.effective_file_name()?;
-                let persist = self
-                    .persist_path
-                    .as_ref()
-                    .ok_or(ClapfigError::NoPersistPath)?;
-
-                let path = file::resolve_persist_path(persist, &file_name, app_name)?;
-
+            ConfigAction::Get { key, scope } => match scope {
+                None => {
+                    let config = self.load()?;
+                    ops::get_value(&config, key)
+                }
+                Some(name) => {
+                    let path = self.resolve_scope_persist_path(Some(name))?;
+                    ops::get_scope_value::<C>(&path, key)
+                }
+            },
+            ConfigAction::Set { key, value, scope } => {
+                let path = self.resolve_scope_persist_path(scope.as_deref())?;
                 persist::persist_value::<C>(&path, key, value)
             }
-            ConfigAction::Unset { key } => {
-                let app_name = self.effective_app_name()?;
-                let file_name = self.effective_file_name()?;
-                let persist = self
-                    .persist_path
-                    .as_ref()
-                    .ok_or(ClapfigError::NoPersistPath)?;
-
-                let path = file::resolve_persist_path(persist, &file_name, app_name)?;
-
+            ConfigAction::Unset { key, scope } => {
+                let path = self.resolve_scope_persist_path(scope.as_deref())?;
                 persist::unset_value(&path, key)
             }
         }
@@ -395,17 +439,40 @@ mod tests {
     }
 
     #[test]
-    fn persist_path_defaults_to_none() {
+    fn persist_scopes_default_empty() {
         let builder = Clapfig::builder::<TestConfig>().app_name("myapp");
-        assert!(builder.persist_path.is_none());
+        assert!(builder.persist_scopes.is_empty());
     }
 
     #[test]
-    fn persist_path_can_be_set() {
+    fn persist_scope_can_be_added() {
         let builder = Clapfig::builder::<TestConfig>()
             .app_name("myapp")
-            .persist_path(SearchPath::Platform);
-        assert_eq!(builder.persist_path, Some(SearchPath::Platform));
+            .persist_scope("local", SearchPath::Cwd);
+        assert_eq!(builder.persist_scopes.len(), 1);
+        assert_eq!(builder.persist_scopes[0].0, "local");
+        assert_eq!(builder.persist_scopes[0].1, SearchPath::Cwd);
+    }
+
+    #[test]
+    fn persist_scope_auto_adds_to_search_paths() {
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("myapp")
+            .persist_scope("local", SearchPath::Cwd);
+        let paths = builder.effective_search_paths();
+        // Platform (default) + Cwd (auto-added from scope)
+        assert_eq!(paths, vec![SearchPath::Platform, SearchPath::Cwd]);
+    }
+
+    #[test]
+    fn persist_scope_deduplicates_search_paths() {
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("myapp")
+            .search_paths(vec![SearchPath::Platform, SearchPath::Cwd])
+            .persist_scope("local", SearchPath::Cwd);
+        let paths = builder.effective_search_paths();
+        // Cwd already present, should not be duplicated
+        assert_eq!(paths, vec![SearchPath::Platform, SearchPath::Cwd]);
     }
 
     #[test]
@@ -636,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_get() {
+    fn handle_get_merged() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("test.toml"), "port = 3000\n").unwrap();
 
@@ -645,7 +712,10 @@ mod tests {
             .file_name("test.toml")
             .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
             .no_env()
-            .handle(&ConfigAction::Get { key: "port".into() })
+            .handle(&ConfigAction::Get {
+                key: "port".into(),
+                scope: None,
+            })
             .unwrap();
 
         match result {
@@ -655,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_set_requires_persist_path() {
+    fn handle_set_requires_persist_scope() {
         let dir = TempDir::new().unwrap();
 
         let result = Clapfig::builder::<TestConfig>()
@@ -666,24 +736,26 @@ mod tests {
             .handle(&ConfigAction::Set {
                 key: "port".into(),
                 value: "3000".into(),
+                scope: None,
             });
 
         assert!(matches!(result, Err(ClapfigError::NoPersistPath)));
     }
 
     #[test]
-    fn handle_set_with_persist_path() {
+    fn handle_set_default_scope() {
         let dir = TempDir::new().unwrap();
 
         let result = Clapfig::builder::<TestConfig>()
             .app_name("test")
             .file_name("test.toml")
             .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
-            .persist_path(SearchPath::Path(dir.path().to_path_buf()))
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
             .no_env()
             .handle(&ConfigAction::Set {
                 key: "port".into(),
                 value: "3000".into(),
+                scope: None,
             })
             .unwrap();
 
@@ -693,7 +765,32 @@ mod tests {
     }
 
     #[test]
-    fn handle_unset_requires_persist_path() {
+    fn handle_set_named_scope() {
+        let local_dir = TempDir::new().unwrap();
+        let global_dir = TempDir::new().unwrap();
+
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .persist_scope("local", SearchPath::Path(local_dir.path().to_path_buf()))
+            .persist_scope("global", SearchPath::Path(global_dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "9999".into(),
+                scope: Some("global".into()),
+            })
+            .unwrap();
+
+        assert!(matches!(result, ConfigResult::ValueSet { .. }));
+        // Written to global dir, not local
+        let content = fs::read_to_string(global_dir.path().join("test.toml")).unwrap();
+        assert!(content.contains("port = 9999"));
+        assert!(!local_dir.path().join("test.toml").exists());
+    }
+
+    #[test]
+    fn handle_unset_requires_persist_scope() {
         let dir = TempDir::new().unwrap();
 
         let result = Clapfig::builder::<TestConfig>()
@@ -701,7 +798,10 @@ mod tests {
             .file_name("test.toml")
             .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
             .no_env()
-            .handle(&ConfigAction::Unset { key: "port".into() });
+            .handle(&ConfigAction::Unset {
+                key: "port".into(),
+                scope: None,
+            });
 
         assert!(matches!(result, Err(ClapfigError::NoPersistPath)));
     }
@@ -719,9 +819,12 @@ mod tests {
             .app_name("test")
             .file_name("test.toml")
             .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
-            .persist_path(SearchPath::Path(dir.path().to_path_buf()))
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
             .no_env()
-            .handle(&ConfigAction::Unset { key: "port".into() })
+            .handle(&ConfigAction::Unset {
+                key: "port".into(),
+                scope: None,
+            })
             .unwrap();
 
         assert!(matches!(result, ConfigResult::ValueUnset { .. }));
@@ -731,14 +834,15 @@ mod tests {
     }
 
     #[test]
-    fn handle_set_rejects_ancestors_persist_path() {
+    fn handle_set_rejects_ancestors_scope() {
         let result = Clapfig::builder::<TestConfig>()
             .app_name("test")
-            .persist_path(SearchPath::Ancestors(Boundary::Root))
+            .persist_scope("bad", SearchPath::Ancestors(Boundary::Root))
             .no_env()
             .handle(&ConfigAction::Set {
                 key: "port".into(),
                 value: "3000".into(),
+                scope: None,
             });
 
         assert!(matches!(
@@ -748,32 +852,144 @@ mod tests {
     }
 
     #[test]
-    fn handle_set_persist_path_independent_of_search_paths() {
-        let search_dir = TempDir::new().unwrap();
-        let persist_dir = TempDir::new().unwrap();
+    fn handle_unknown_scope_errors() {
+        let dir = TempDir::new().unwrap();
 
-        fs::write(search_dir.path().join("test.toml"), "port = 1000\n").unwrap();
-
-        // persist_path points somewhere different from search_paths
         let result = Clapfig::builder::<TestConfig>()
             .app_name("test")
             .file_name("test.toml")
-            .search_paths(vec![SearchPath::Path(search_dir.path().to_path_buf())])
-            .persist_path(SearchPath::Path(persist_dir.path().to_path_buf()))
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
             .no_env()
             .handle(&ConfigAction::Set {
                 key: "port".into(),
-                value: "5000".into(),
+                value: "3000".into(),
+                scope: Some("nonexistent".into()),
+            });
+
+        match result {
+            Err(ClapfigError::UnknownScope { scope, available }) => {
+                assert_eq!(scope, "nonexistent");
+                assert_eq!(available, vec!["local"]);
+            }
+            other => panic!("Expected UnknownScope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_list_with_scope() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "port = 3000\n").unwrap();
+
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::List {
+                scope: Some("local".into()),
             })
             .unwrap();
 
-        assert!(matches!(result, ConfigResult::ValueSet { .. }));
-        // Written to persist_dir, not search_dir
-        let content = fs::read_to_string(persist_dir.path().join("test.toml")).unwrap();
-        assert!(content.contains("port = 5000"));
-        // search_dir file unchanged
-        let original = fs::read_to_string(search_dir.path().join("test.toml")).unwrap();
-        assert!(original.contains("port = 1000"));
+        match result {
+            ConfigResult::Listing { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0], ("port".into(), "3000".into()));
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_get_with_scope() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "port = 3000\n").unwrap();
+
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Get {
+                key: "port".into(),
+                scope: Some("local".into()),
+            })
+            .unwrap();
+
+        match result {
+            ConfigResult::KeyValue { value, .. } => assert_eq!(value, "3000"),
+            other => panic!("Expected KeyValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_scopes_separate_files() {
+        let local_dir = TempDir::new().unwrap();
+        let global_dir = TempDir::new().unwrap();
+
+        let make_builder = || {
+            Clapfig::builder::<TestConfig>()
+                .app_name("test")
+                .file_name("test.toml")
+                .persist_scope("local", SearchPath::Path(local_dir.path().to_path_buf()))
+                .persist_scope("global", SearchPath::Path(global_dir.path().to_path_buf()))
+                .no_env()
+        };
+
+        // Set in local
+        make_builder()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "3000".into(),
+                scope: None, // defaults to "local"
+            })
+            .unwrap();
+
+        // Set in global
+        make_builder()
+            .handle(&ConfigAction::Set {
+                key: "host".into(),
+                value: "0.0.0.0".into(),
+                scope: Some("global".into()),
+            })
+            .unwrap();
+
+        // Verify separate files
+        let local_content = fs::read_to_string(local_dir.path().join("test.toml")).unwrap();
+        assert!(local_content.contains("port = 3000"));
+        // host should NOT be set (template may have commented-out host)
+        assert!(!local_content.contains("host = \"0.0.0.0\""));
+
+        let global_content = fs::read_to_string(global_dir.path().join("test.toml")).unwrap();
+        assert!(global_content.contains("host = \"0.0.0.0\""));
+        // port should NOT be set in global
+        assert!(!global_content.contains("port = 3000"));
+
+        // List scoped: only that file's entries
+        let local_list = make_builder()
+            .handle(&ConfigAction::List {
+                scope: Some("local".into()),
+            })
+            .unwrap();
+        match local_list {
+            ConfigResult::Listing { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].0, "port");
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
+
+        // List merged (no scope): sees both files merged + defaults
+        let merged_list = make_builder()
+            .handle(&ConfigAction::List { scope: None })
+            .unwrap();
+        match merged_list {
+            ConfigResult::Listing { entries } => {
+                let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+                assert!(keys.contains(&"port"));
+                assert!(keys.contains(&"host"));
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
     }
 
     // --- cli_overrides_from tests ---
@@ -921,7 +1137,7 @@ mod tests {
             .file_name("test.toml")
             .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
             .no_env()
-            .handle(&ConfigAction::List)
+            .handle(&ConfigAction::List { scope: None })
             .unwrap();
 
         match result {
@@ -943,7 +1159,7 @@ mod tests {
             .app_name("test")
             .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
             .no_env()
-            .handle(&ConfigAction::List)
+            .handle(&ConfigAction::List { scope: None })
             .unwrap();
 
         match result {

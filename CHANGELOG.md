@@ -7,14 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 - **Added**
+  - **Named persist scopes** - New `.persist_scope(name, path)` builder method replaces `.persist_path()`. Scopes are named config file targets (e.g. "local", "global") for read/write operations. The first scope added is the default for writes. Scope paths are automatically added to search paths for discovery.
+  - **`--scope` CLI flag** - New `--scope <name>` global flag on `ConfigArgs` targets a specific persist scope. Works with all config subcommands: `set`/`unset` write to the named scope; `list`/`get` read from that scope's file only (instead of the merged resolved view).
+  - **Scope file operations** - `list_scope_file()` and `get_scope_value()` read entries from individual scope files without going through the full resolve pipeline.
+  - **`UnknownScope` error** - New `ClapfigError::UnknownScope` with the invalid scope name and list of available scopes.
   - **`config list`** - New `ConfigAction::List` and `ConfigSubcommand::List` to show all resolved key-value pairs. Bare `app config` (no subcommand) defaults to list. Uses the flatten module to display dotted keys, with `<not set>` for unset optional fields.
   - **Demo application** - `examples/clapfig_demo/` is a runnable sample CLI that exercises all core features: multi-path file search, env var overrides (`CLAPFIG_DEMO__*`), CLI flag mapping (both `cli_overrides_from` and manual `cli_override`), nested config structs, `config gen|get|set|list` subcommands, and ANSI-colored terminal output. Run with `cargo run --example clapfig_demo -- echo`.
   - **Search modes** - New `SearchMode` enum on the builder via `.search_mode()`. `Merge` (default) deep-merges all found config files; `FirstMatch` uses only the highest-priority file found ("find my config" pattern).
   - **Ancestor walk** - New `SearchPath::Ancestors(Boundary)` variant walks up from the current working directory to discover config files. `Boundary::Root` walks to the filesystem root; `Boundary::Marker(".git")` stops at a project boundary (inclusive). Expands inline in the search path list, composable with other variants.
-  - **Explicit persist path** - New `.persist_path()` builder method sets where `config set` writes, independent of the read search paths. Using `Ancestors` as a persist path produces a clear error.
   - **Feature-gated clap dependency** - `clap` is now an optional dependency behind the `clap` Cargo feature (enabled by default). The `cli` module, `ConfigArgs`, and `ConfigSubcommand` are only compiled when the feature is active. Use `default-features = false` to use clapfig without pulling in clap.
 - **Changed**
-  - `config set` now requires an explicit `.persist_path()` instead of guessing from the search path list. Omitting it returns `ClapfigError::NoPersistPath`.
+  - `.persist_path()` replaced by `.persist_scope(name, path)`. Scopes are named targets; the first added is the default.
+  - `ConfigAction` variants `List`, `Get`, `Set`, `Unset` now carry `scope: Option<String>`.
+  - `config set`/`unset` require at least one `.persist_scope()`. Omitting returns `ClapfigError::NoPersistPath`.
   - `load_config_files` now takes a `SearchMode` parameter.
   - New public exports: `Boundary`, `SearchMode`.
   - Crate and README documentation restructured to clarify that the core API is framework-agnostic and clap is an optional adapter.

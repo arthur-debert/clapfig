@@ -18,11 +18,12 @@ Built on [confique](https://github.com/LukasKalbertodt/confique) for struct-driv
 - **Prefix-based env vars** — `MYAPP__DATABASE__URL` maps to `database.url` automatically
 - **Strict mode** — unknown keys in config files error with file path, key name, and line number (on by default)
 - **Template generation** — emit a commented sample config derived from the struct's doc comments
-- **Persistence** — patch values in place, preserving file comments
+- **Persistence with named scopes** — `persist_scope("local", path)` / `persist_scope("global", path)` for global/local config patterns. Scope paths auto-added to search paths.
 
 **Clap adapter** (`clap` feature, on by default):
 
 - **Config subcommand** — drop-in `config gen|get|set|list` commands for clap
+- **`--scope` flag** — target a specific scope for any config subcommand (e.g. `config set key val --scope global`)
 - **Auto-matching overrides** — map clap args to config keys by name in one call
 
 ## Quick Start
@@ -116,16 +117,17 @@ Config file handling has three orthogonal axes on the builder:
 
 - **Discovery** (`.search_paths()`) — where to look. Paths listed in priority-ascending order (last = highest).
 - **Resolution** (`.search_mode()`) — `Merge` (default: deep-merge all found files) or `FirstMatch` (use the single highest-priority file).
-- **Persistence** (`.persist_path()`) — where `config set` writes. Explicit, independent of search paths.
+- **Persistence** (`.persist_scope(name, path)`) — named targets for `config set` writes. Scope paths are auto-added to search paths.
 
 ```rust
 use clapfig::{Clapfig, SearchPath, SearchMode, Boundary};
 
-// Layered: global + local (default Merge mode)
+// Layered global + local with named scopes
 let config: AppConfig = Clapfig::builder()
     .app_name("myapp")
     .search_paths(vec![SearchPath::Platform, SearchPath::Cwd])
-    .persist_path(SearchPath::Home(".myapp"))
+    .persist_scope("local", SearchPath::Cwd)        // default for writes
+    .persist_scope("global", SearchPath::Platform)
     .load()?;
 
 // Find nearest project config (walk up to .git, use first match)
@@ -134,6 +136,15 @@ let config: AppConfig = Clapfig::builder()
     .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
     .search_mode(SearchMode::FirstMatch)
     .load()?;
+```
+
+With scopes configured, the `--scope` flag targets specific config files:
+
+```sh
+myapp config set port 3000                    # writes to "local" (default)
+myapp config set port 3000 --scope global     # writes to "global"
+myapp config list                             # merged resolved config
+myapp config list --scope global              # only global scope's entries
 ```
 
 Available `SearchPath` variants: `Platform`, `Home(".myapp")`, `Cwd`, `Path(PathBuf)`, `Ancestors(Boundary)`.
@@ -358,12 +369,14 @@ Every layer is **sparse**. You only specify the keys you want to override. Unset
 
 ## Persistence
 
-`config set <key> <value>` writes to the path set via `.persist_path()` on the builder.
+`config set <key> <value>` writes to a named persist scope configured via `.persist_scope()` on the builder.
 
-- The persist path is independent of search paths — you choose where writes go explicitly.
+- **Named scopes** — each scope has a name (e.g. "local", "global") and a `SearchPath`. The first scope added is the default for writes.
+- **Auto-discovery** — scope paths are automatically added to search paths, so persisted values are always discoverable in the merged view.
+- **`--scope` flag** — target a specific scope: `config set key val --scope global`. Works with `list`, `get`, `set`, and `unset`.
 - If the file exists, the key is patched in place using [`toml_edit`](https://docs.rs/toml_edit), **preserving existing comments and formatting**.
 - If the file doesn't exist, a fresh config is created from the generated template with the target key set.
-- If `.persist_path()` is not set, `config set` returns `ClapfigError::NoPersistPath`.
+- If no scopes are configured, `config set` returns `ClapfigError::NoPersistPath`.
 
 ## Demo Application
 
@@ -454,7 +467,7 @@ fn main() -> anyhow::Result<()> {
             Clapfig::builder::<AppConfig>()
                 .app_name("myapp")
                 .add_search_path(SearchPath::Cwd)
-                .persist_path(SearchPath::Cwd)
+                .persist_scope("local", SearchPath::Cwd)
                 .handle_and_print(&args.into_action())?;
         }
         Commands::Run => {

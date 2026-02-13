@@ -43,9 +43,8 @@
 //!   configs (layered overrides); [`FirstMatch`](types::SearchMode::FirstMatch)
 //!   uses only the highest-priority file found ("find my config").
 //!
-//! - **Persistence** ([`persist_path()`](ClapfigBuilder::persist_path)): where
-//!   `config set` writes. Explicit and independent of the search paths — no
-//!   guessing.
+//! - **Persistence** ([`persist_scope()`](ClapfigBuilder::persist_scope)): named
+//!   targets for `config set` writes. Scope paths are auto-added to search paths.
 //!
 //! See the [`types`] module for the full conceptual documentation and use-case
 //! examples.
