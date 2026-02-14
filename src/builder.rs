@@ -1,3 +1,17 @@
+//! Builder API for configuring and loading layered configuration.
+//!
+//! [`Clapfig::builder()`] is the entry point. The builder follows a "set what
+//! you need, load" pattern: [`app_name()`](ClapfigBuilder::app_name) derives
+//! sensible defaults (file name, search paths, env prefix), and everything
+//! else is optional overrides. This means the minimal setup is two calls
+//! (`.app_name().load()`), while the full surface is available for apps that
+//! need fine-grained control.
+//!
+//! The builder also handles [`ConfigAction`](crate::ConfigAction) dispatch
+//! via [`handle()`](ClapfigBuilder::handle) — the same builder that loads
+//! config can also process `config get`, `config set`, and other operations.
+//! This keeps all configuration wiring in one place.
+
 use std::marker::PhantomData;
 
 use confique::Config;
