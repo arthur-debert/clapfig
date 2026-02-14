@@ -46,6 +46,9 @@ pub enum ClapfigError {
         available: Vec<String>,
     },
 
+    #[error("Unknown config subcommand: '{0}'")]
+    UnknownSubcommand(String),
+
     #[error("App name is required — call .app_name() on the builder")]
     AppNameRequired,
 }

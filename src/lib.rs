@@ -87,7 +87,7 @@ mod fixtures;
 
 pub use builder::{Clapfig, ClapfigBuilder};
 #[cfg(feature = "clap")]
-pub use cli::{ConfigArgs, ConfigSubcommand};
+pub use cli::{ConfigArgs, ConfigCommand, ConfigSubcommand};
 pub use error::ClapfigError;
 pub use ops::ConfigResult;
 pub use types::{Boundary, ConfigAction, SearchMode, SearchPath};
