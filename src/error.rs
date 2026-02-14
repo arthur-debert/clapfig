@@ -1,3 +1,14 @@
+//! Error types for clapfig operations.
+//!
+//! All errors are designed to be shown directly to end users. Each variant
+//! includes enough context to diagnose the problem without reaching for a
+//! debugger: file paths and line numbers for unknown keys, the list of
+//! available scopes when a scope name is wrong, and references to the
+//! builder method that needs to be called when a prerequisite is missing.
+//!
+//! Errors from the underlying TOML parser and from confique's validation are
+//! wrapped rather than re-invented, so you still get their full detail.
+
 use std::path::PathBuf;
 use thiserror::Error;
 
