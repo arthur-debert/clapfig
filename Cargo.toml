@@ -15,7 +15,7 @@ clap = ["dep:clap"]
 
 [dependencies]
 confique = { version = "0.4", features = ["toml"] }
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "string"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 toml = "0.8"

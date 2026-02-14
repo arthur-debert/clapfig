@@ -329,6 +329,54 @@ myapp config get database.url       # print the resolved value of a key
 myapp config set port 3000          # persist a value to the user's config file
 ```
 
+### Custom Command Names
+
+If the default subcommand or flag names conflict with your app (e.g. you already have a global `--scope` flag), use `ConfigCommand` to rename anything:
+
+```rust
+use clap::{Command, Parser, Subcommand};
+use clapfig::{Clapfig, ConfigCommand};
+
+#[derive(Parser)]
+struct Cli {
+    #[arg(long, global = true)]
+    scope: Option<String>,          // conflicts with ConfigArgs' --scope
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Run,
+}
+
+fn main() -> anyhow::Result<()> {
+    let config_cmd = ConfigCommand::new()
+        .scope_long("target")           // --scope → --target
+        .gen_name("template");          // gen → template
+
+    let app = Cli::command()
+        .subcommand(config_cmd.as_command("settings"));
+
+    let matches = app.get_matches();
+
+    if let Some(("settings", sub)) = matches.subcommand() {
+        let action = config_cmd.parse(sub)?;
+        Clapfig::builder::<AppConfig>()
+            .app_name("myapp")
+            .handle_and_print(&action)?;
+        return Ok(());
+    }
+
+    let cli = Cli::from_arg_matches(&matches)?;
+    // handle other commands...
+    Ok(())
+}
+```
+
+Available builder methods: `list_name()`, `gen_name()`, `get_name()`, `set_name()`, `unset_name()`, `scope_long()`, `output_long()`, `output_short()`. Default names match `ConfigArgs` exactly, so `ConfigCommand::new()` with no customization is equivalent to the derive path.
+
 ## Template Generation
 
 `config gen` produces a commented TOML file derived from your struct's `///` doc comments:
