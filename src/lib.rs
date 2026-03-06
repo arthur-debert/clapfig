@@ -79,6 +79,19 @@
 //! Overrides             .cli_override()
 //! ```
 //!
+//! This is the default order. You can customize it with
+//! [`layer_order()`](ClapfigBuilder::layer_order) — for example, to make
+//! files override env vars, or to exclude a layer entirely:
+//!
+//! ```ignore
+//! Clapfig::builder::<MyConfig>()
+//!     .app_name("myapp")
+//!     .layer_order(vec![Layer::Env, Layer::Files, Layer::Cli])
+//!     .load()?;
+//! ```
+//!
+//! See [`Layer`] for the available variants.
+//!
 //! Every layer is **sparse**. You only specify the keys you want to override
 //! in that layer; unset keys fall through to the layer below. This is a
 //! deliberate design choice: config files don't need to be complete, env vars
@@ -322,4 +335,4 @@ pub use builder::{Clapfig, ClapfigBuilder};
 pub use cli::{ConfigArgs, ConfigCommand, ConfigSubcommand};
 pub use error::ClapfigError;
 pub use ops::ConfigResult;
-pub use types::{Boundary, ConfigAction, SearchMode, SearchPath};
+pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};

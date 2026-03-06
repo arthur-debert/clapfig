@@ -3,12 +3,12 @@
 //! Operates on pre-loaded data (`ResolveInput`) with no I/O, making the full
 //! pipeline testable with synthetic inputs. Steps:
 //!
-//! 1. Validate each file (if strict mode)
-//! 2. Parse and deep-merge config files (later overrides earlier)
-//! 3. Deep-merge env vars on top
-//! 4. Deep-merge CLI overrides on top (highest priority)
-//! 5. Deserialize merged table into `C::Layer`
-//! 6. Let confique fill defaults and validate required fields
+//! 1. Build each layer independently (files, env, URL, CLI)
+//! 2. Merge layers in the configured order (default: files < env < URL < CLI)
+//! 3. Deserialize merged table into `C::Layer`
+//! 4. Let confique fill defaults and validate required fields
+//!
+//! The layer order is configurable via [`ResolveInput::layer_order`].
 
 use std::path::PathBuf;
 
@@ -20,6 +20,7 @@ use crate::env;
 use crate::error::ClapfigError;
 use crate::merge::deep_merge;
 use crate::overrides;
+use crate::types::Layer;
 use crate::validate;
 
 /// All pre-loaded data needed to resolve a config. No I/O happens here.
@@ -37,54 +38,89 @@ pub struct ResolveInput {
     pub cli_overrides: Vec<(String, Value)>,
     /// Whether to reject unknown keys in config files.
     pub strict: bool,
+    /// Layer merge order, from lowest to highest priority.
+    /// `None` uses the default: `[Files, Env, Url, Cli]`.
+    pub layer_order: Option<Vec<Layer>>,
+}
+
+/// Returns the default layer order: `[Files, Env, Url, Cli]`.
+pub fn default_layer_order() -> Vec<Layer> {
+    vec![
+        Layer::Files,
+        Layer::Env,
+        #[cfg(feature = "url")]
+        Layer::Url,
+        Layer::Cli,
+    ]
 }
 
 /// Resolve configuration from pre-loaded inputs.
 ///
-/// 1. Validate each file (if strict)
-/// 2. Parse each file to `toml::Table`
-/// 3. Deep-merge files (later overrides earlier)
-/// 4. Deep-merge env table on top
-/// 5. Deep-merge CLI overrides on top
-/// 6. Deserialize merged table into `C::Layer`
-/// 7. `C::builder().preloaded(layer).load()` — confique fills defaults and validates
+/// Builds each layer independently, merges them in the configured order
+/// (default: files < env < URL < CLI), then deserializes into `C`.
 pub fn resolve<C: Config>(input: ResolveInput) -> Result<C, ClapfigError>
 where
     C::Layer: for<'de> Deserialize<'de>,
 {
-    // 1-3: Validate and merge file layers
-    let mut merged = Table::new();
-    for (path, content) in &input.files {
-        if input.strict {
-            validate::validate_unknown_keys::<C>(content, path)?;
+    // Build each layer independently, then merge in the configured order.
+
+    // Files layer: validate + parse + merge all file contents
+    let files_table = {
+        let mut t = Table::new();
+        for (path, content) in &input.files {
+            if input.strict {
+                validate::validate_unknown_keys::<C>(content, path)?;
+            }
+            let table: Table = toml::from_str(content).map_err(|e| ClapfigError::ParseError {
+                path: path.clone(),
+                source: e,
+            })?;
+            t = deep_merge(t, table);
         }
-        let table: Table = toml::from_str(content).map_err(|e| ClapfigError::ParseError {
-            path: path.clone(),
-            source: e,
-        })?;
-        merged = deep_merge(merged, table);
-    }
+        t
+    };
 
-    // 4: Env vars on top
-    if let Some(prefix) = &input.env_prefix {
-        let env_table = env::env_to_table(prefix, input.env_vars);
-        merged = deep_merge(merged, env_table);
-    }
+    // Env layer
+    let env_table = input
+        .env_prefix
+        .as_ref()
+        .map(|prefix| env::env_to_table(prefix, input.env_vars));
 
-    // 5: URL query overrides on top of env
+    // URL layer
     #[cfg(feature = "url")]
-    if !input.url_overrides.is_empty() {
-        let url_table = overrides::overrides_to_table(&input.url_overrides);
-        merged = deep_merge(merged, url_table);
+    let url_table = if input.url_overrides.is_empty() {
+        None
+    } else {
+        Some(overrides::overrides_to_table(&input.url_overrides))
+    };
+
+    // CLI layer
+    let cli_table = if input.cli_overrides.is_empty() {
+        None
+    } else {
+        Some(overrides::overrides_to_table(&input.cli_overrides))
+    };
+
+    // Default order: Files < Env < Url < Cli
+    let default_order = default_layer_order();
+    let order = input.layer_order.as_deref().unwrap_or(&default_order);
+
+    // Merge layers in the specified order (first = lowest priority)
+    let mut merged = Table::new();
+    for layer in order {
+        let table = match layer {
+            Layer::Files => Some(files_table.clone()),
+            Layer::Env => env_table.clone(),
+            #[cfg(feature = "url")]
+            Layer::Url => url_table.clone(),
+            Layer::Cli => cli_table.clone(),
+        };
+        if let Some(t) = table {
+            merged = deep_merge(merged, t);
+        }
     }
 
-    // 6: CLI overrides on top (highest priority)
-    if !input.cli_overrides.is_empty() {
-        let cli_table = overrides::overrides_to_table(&input.cli_overrides);
-        merged = deep_merge(merged, cli_table);
-    }
-
-    // 6: Deserialize merged table directly into C::Layer
+    // Deserialize merged table directly into C::Layer
     let layer: C::Layer = Value::Table(merged)
         .try_into()
         .map_err(|e: toml::de::Error| ClapfigError::InvalidValue {
@@ -92,7 +128,7 @@ where
             reason: e.to_string(),
         })?;
 
-    // 7: confique fills defaults and validates required fields
+    // confique fills defaults and validates required fields
     C::builder()
         .preloaded(layer)
         .load()
@@ -113,6 +149,7 @@ mod tests {
             url_overrides: vec![],
             cli_overrides: vec![],
             strict: true,
+            layer_order: None,
         }
     }
 
@@ -172,6 +209,7 @@ mod tests {
             url_overrides: vec![],
             cli_overrides: vec![("port".into(), Value::Integer(9999))],
             strict: true,
+            layer_order: None,
         };
         let config: TestConfig = resolve(input).unwrap();
         assert_eq!(config.port, 9999);
@@ -190,6 +228,7 @@ mod tests {
             url_overrides: vec![],
             cli_overrides: vec![("debug".into(), Value::Boolean(true))],
             strict: true,
+            layer_order: None,
         };
         let config: TestConfig = resolve(input).unwrap();
         assert_eq!(config.host, "filehost"); // from file
@@ -318,5 +357,141 @@ mod tests {
         };
         let config: TestConfig = resolve(input).unwrap();
         assert_eq!(config.database.pool_size, 42);
+    }
+
+    // -- Custom layer order tests ---------------------------------------------
+
+    #[test]
+    fn custom_order_env_overrides_cli() {
+        // Reverse the usual CLI > Env precedence
+        let input = ResolveInput {
+            env_vars: vec![("MYAPP__PORT".into(), "5000".into())],
+            env_prefix: Some("MYAPP".into()),
+            cli_overrides: vec![("port".into(), Value::Integer(9999))],
+            layer_order: Some(vec![Layer::Cli, Layer::Env]),
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        // Env comes after Cli in the order, so Env wins
+        assert_eq!(config.port, 5000);
+    }
+
+    #[test]
+    fn custom_order_files_override_env() {
+        // Make files win over env
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\n".into())],
+            env_vars: vec![("MYAPP__PORT".into(), "5000".into())],
+            env_prefix: Some("MYAPP".into()),
+            layer_order: Some(vec![Layer::Env, Layer::Files]),
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        // Files come after Env, so Files win
+        assert_eq!(config.port, 3000);
+    }
+
+    #[test]
+    fn custom_order_omitted_layer_excluded() {
+        // Omit Env layer entirely — env vars should have no effect
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\n".into())],
+            env_vars: vec![("MYAPP__PORT".into(), "5000".into())],
+            env_prefix: Some("MYAPP".into()),
+            layer_order: Some(vec![Layer::Files, Layer::Cli]),
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        // Env is not in layer_order, so the file value stands
+        assert_eq!(config.port, 3000);
+    }
+
+    #[test]
+    fn custom_order_cli_only() {
+        // Only CLI layer
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\n".into())],
+            env_vars: vec![("MYAPP__PORT".into(), "5000".into())],
+            env_prefix: Some("MYAPP".into()),
+            cli_overrides: vec![("port".into(), Value::Integer(7777))],
+            layer_order: Some(vec![Layer::Cli]),
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        assert_eq!(config.port, 7777);
+    }
+
+    #[test]
+    fn custom_order_empty_uses_only_defaults() {
+        // Empty layer order — no layers merged, only confique defaults
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\n".into())],
+            env_vars: vec![("MYAPP__PORT".into(), "5000".into())],
+            env_prefix: Some("MYAPP".into()),
+            cli_overrides: vec![("port".into(), Value::Integer(9999))],
+            layer_order: Some(vec![]),
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        // No layers applied, so confique default (8080) stands
+        assert_eq!(config.port, 8080);
+    }
+
+    #[test]
+    fn default_order_preserved_when_none() {
+        // layer_order: None should behave exactly like the old hardcoded order
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\n".into())],
+            env_vars: vec![("MYAPP__PORT".into(), "5000".into())],
+            env_prefix: Some("MYAPP".into()),
+            cli_overrides: vec![("port".into(), Value::Integer(9999))],
+            layer_order: None,
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        assert_eq!(config.port, 9999); // CLI wins
+    }
+
+    #[test]
+    fn custom_order_all_three_sources_reordered() {
+        // Order: Cli < Files < Env (env has highest priority)
+        let input = ResolveInput {
+            files: vec![(
+                "test.toml".into(),
+                "host = \"filehost\"\nport = 3000\n".into(),
+            )],
+            env_vars: vec![("APP__PORT".into(), "5000".into())],
+            env_prefix: Some("APP".into()),
+            cli_overrides: vec![
+                ("port".into(), Value::Integer(9999)),
+                ("debug".into(), Value::Boolean(true)),
+            ],
+            layer_order: Some(vec![Layer::Cli, Layer::Files, Layer::Env]),
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        // Env is last → highest priority for port
+        assert_eq!(config.port, 5000);
+        // Files overrides Cli for host (file has it, cli doesn't set host)
+        assert_eq!(config.host, "filehost");
+        // debug only set in Cli (lowest here), but no other layer overrides it
+        assert!(config.debug);
+    }
+
+    #[cfg(feature = "url")]
+    #[test]
+    fn custom_order_url_highest_priority() {
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\n".into())],
+            env_vars: vec![("MYAPP__PORT".into(), "5000".into())],
+            env_prefix: Some("MYAPP".into()),
+            url_overrides: vec![("port".into(), Value::Integer(7777))],
+            cli_overrides: vec![("port".into(), Value::Integer(9999))],
+            layer_order: Some(vec![Layer::Files, Layer::Env, Layer::Cli, Layer::Url]),
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        // Url is last → highest priority
+        assert_eq!(config.port, 7777);
     }
 }

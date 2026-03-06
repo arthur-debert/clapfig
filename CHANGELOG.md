@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 - **Added**
+  - **Configurable layer precedence** — New `Layer` enum and `.layer_order()` builder method allow customizing the merge order of configuration sources. The default order (`Files < Env < Url < Cli`) is preserved when unset. Layers listed later override earlier ones; omitting a layer excludes it from merging entirely. New public export: `Layer`.
   - **URL query parameter layer** — New `.url_query()` builder method parses URL query strings (`port=9090&database.url=pg%3A%2F%2Fprod`) into config overrides. Keys use `.` for nesting, values are percent-decoded and parsed with the same heuristic as env vars. Sits between env vars and CLI overrides in precedence: defaults < files < env < **URL** < CLI. Requires the `url` Cargo feature (`dep:percent-encoding`).
 - **Documentation**
   - **Restructured documentation** — Moved the comprehensive user guide from README into crate-level doc comments (published to docs.rs), covering design rationale, trade-offs, and "when to use what" guidance. Added module-level docs to `builder` and `error` modules. Slimmed README from 537 to 126 lines as a landing page with feature list, quick start, and link to docs.rs. ([#13](https://github.com/arthur-debert/clapfig/pull/13))

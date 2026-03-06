@@ -62,6 +62,38 @@
 
 use std::path::PathBuf;
 
+/// A configuration layer in the merge pipeline.
+///
+/// Used with [`ClapfigBuilder::layer_order()`](crate::ClapfigBuilder::layer_order)
+/// to customize the precedence of configuration sources.
+///
+/// The default order is `[Files, Env, Url, Cli]` (lowest to highest priority).
+/// Layers listed later in the order override earlier ones.
+///
+/// # Example
+///
+/// ```ignore
+/// use clapfig::{Clapfig, Layer};
+///
+/// // Make files override env vars instead of the default
+/// let config: AppConfig = Clapfig::builder()
+///     .app_name("myapp")
+///     .layer_order(vec![Layer::Env, Layer::Files, Layer::Cli])
+///     .load()?;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Layer {
+    /// Config files discovered via search paths.
+    Files,
+    /// Environment variables with the configured prefix.
+    Env,
+    /// URL query parameter overrides (requires `url` feature).
+    #[cfg(feature = "url")]
+    Url,
+    /// Programmatic overrides (via `cli_override` / `cli_overrides_from`).
+    Cli,
+}
+
 /// Where to search for config files.
 ///
 /// Each variant represents a source of candidate directories. The builder

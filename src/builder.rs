@@ -24,7 +24,7 @@ use crate::ops::{self, ConfigResult};
 use crate::overrides;
 use crate::persist;
 use crate::resolve::{self, ResolveInput};
-use crate::types::{ConfigAction, SearchMode, SearchPath};
+use crate::types::{ConfigAction, Layer, SearchMode, SearchPath};
 
 /// Entry point for building a clapfig configuration.
 pub struct Clapfig;
@@ -54,6 +54,7 @@ pub struct ClapfigBuilder<C: Config> {
     #[cfg(feature = "url")]
     url_overrides: Vec<(String, toml::Value)>,
     cli_overrides: Vec<(String, toml::Value)>,
+    layer_order: Option<Vec<Layer>>,
     _phantom: PhantomData<C>,
 }
 
@@ -71,6 +72,7 @@ impl<C: Config> ClapfigBuilder<C> {
             #[cfg(feature = "url")]
             url_overrides: Vec::new(),
             cli_overrides: Vec::new(),
+            layer_order: None,
             _phantom: PhantomData,
         }
     }
@@ -153,6 +155,29 @@ impl<C: Config> ClapfigBuilder<C> {
     /// In strict mode, unknown keys in config files produce errors.
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Set a custom layer merge order.
+    ///
+    /// Layers listed later override earlier ones. The default order is
+    /// `[Files, Env, Url, Cli]` — the common-sense precedence where code
+    /// defaults are lowest and explicit overrides are highest.
+    ///
+    /// Omit a layer to exclude it from merging entirely. Duplicate layers
+    /// are applied in the order given (the second occurrence overrides the first).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Files override env vars; CLI still wins
+    /// Clapfig::builder::<MyConfig>()
+    ///     .app_name("myapp")
+    ///     .layer_order(vec![Layer::Env, Layer::Files, Layer::Cli])
+    ///     .load()?;
+    /// ```
+    pub fn layer_order(mut self, order: Vec<Layer>) -> Self {
+        self.layer_order = Some(order);
         self
     }
 
@@ -274,6 +299,7 @@ impl<C: Config> ClapfigBuilder<C> {
             url_overrides: self.url_overrides.clone(),
             cli_overrides: self.cli_overrides.clone(),
             strict: self.strict,
+            layer_order: self.layer_order.clone(),
         })
     }
 
@@ -1265,5 +1291,60 @@ mod tests {
             }
             other => panic!("Expected Listing, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn layer_order_defaults_to_none() {
+        let builder = Clapfig::builder::<TestConfig>().app_name("myapp");
+        assert_eq!(builder.layer_order, None);
+    }
+
+    #[test]
+    fn layer_order_can_be_set() {
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("myapp")
+            .layer_order(vec![Layer::Env, Layer::Files, Layer::Cli]);
+        assert_eq!(
+            builder.layer_order,
+            Some(vec![Layer::Env, Layer::Files, Layer::Cli])
+        );
+    }
+
+    #[test]
+    fn layer_order_cli_below_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "port = 3000\n").unwrap();
+
+        // Custom order: Cli < Files (files win over cli)
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .cli_override("port", Some(9999))
+            .layer_order(vec![Layer::Cli, Layer::Files])
+            .load()
+            .unwrap();
+
+        // Files comes after Cli in the order, so Files wins
+        assert_eq!(config.port, 3000);
+    }
+
+    #[test]
+    fn layer_order_default_cli_wins() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "port = 3000\n").unwrap();
+
+        // Default order: Files < Cli, so cli should win
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .cli_override("port", Some(9999))
+            .load()
+            .unwrap();
+
+        assert_eq!(config.port, 9999);
     }
 }
