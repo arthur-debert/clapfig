@@ -183,9 +183,11 @@
 //! *(Requires the `url` Cargo feature.)*
 //!
 //! For Rust-backed web applications, URL query parameters can serve as a
-//! per-request config layer — sitting between environment variables and CLI
-//! overrides in precedence. This is useful for WASM frontends (Leptos, Dioxus,
-//! Yew) or server-side apps that accept config overrides via the URL.
+//! per-request config layer — by default sitting between environment variables
+//! and CLI overrides in precedence (customizable via
+//! [`layer_order()`](ClapfigBuilder::layer_order)). This is useful for WASM
+//! frontends (Leptos, Dioxus, Yew) or server-side apps that accept config
+//! overrides via the URL.
 //!
 //! ```ignore
 //! let config: AppConfig = Clapfig::builder()
@@ -219,9 +221,11 @@
 //!
 //! The [`cli_override()`](ClapfigBuilder::cli_override) and
 //! [`cli_overrides_from()`](ClapfigBuilder::cli_overrides_from) methods
-//! inject values at the highest-priority layer. Despite the name, they are
-//! not clap-specific — use them with any value source (GUI inputs, HTTP
-//! headers, hardcoded test values).
+//! inject values at the `Cli` layer (highest priority by default). Despite
+//! the name, they are not clap-specific — use them with any value source
+//! (GUI inputs, HTTP headers, hardcoded test values). Their position in the
+//! merge order can be changed with
+//! [`layer_order()`](ClapfigBuilder::layer_order).
 //!
 //! `cli_overrides_from(source)` auto-matches: it serializes the source,
 //! skips `None` values, and keeps only keys that exist in the config struct.

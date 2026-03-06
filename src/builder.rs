@@ -189,8 +189,9 @@ impl<C: Config> ClapfigBuilder<C> {
     ///
     /// A leading `?` is stripped if present.
     ///
-    /// URL parameters sit between env vars and CLI overrides in precedence:
-    /// defaults < files < env < **URL** < CLI.
+    /// By default, URL parameters sit between env vars and CLI overrides in
+    /// precedence: defaults < files < env < **URL** < CLI. This position can
+    /// be changed with [`layer_order()`](Self::layer_order).
     #[cfg(feature = "url")]
     pub fn url_query(mut self, query: &str) -> Self {
         self.url_overrides
