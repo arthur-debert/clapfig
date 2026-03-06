@@ -56,9 +56,9 @@ fn insert_nested(table: &mut Table, segments: &[&str], value: Value) {
     }
 }
 
-/// Parse an env var value into a typed TOML value.
+/// Parse a string value into a typed TOML value.
 /// Tries: bool → integer → float → string.
-fn parse_env_value(s: &str) -> Value {
+pub(crate) fn parse_env_value(s: &str) -> Value {
     if s.eq_ignore_ascii_case("true") {
         return Value::Boolean(true);
     }

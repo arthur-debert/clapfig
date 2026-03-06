@@ -74,6 +74,8 @@
 //!        ↑ overridden by
 //! Environment vars      PREFIX__KEY
 //!        ↑ overridden by
+//! URL query params      .url_query()          (requires "url" feature)
+//!        ↑ overridden by
 //! Overrides             .cli_override()
 //! ```
 //!
@@ -162,6 +164,43 @@
 //! Disable env loading entirely with [`.no_env()`](ClapfigBuilder::no_env)
 //! when you don't want environment variables in the mix (e.g. in tests or
 //! embedded contexts).
+//!
+//! # URL query parameters
+//!
+//! *(Requires the `url` Cargo feature.)*
+//!
+//! For Rust-backed web applications, URL query parameters can serve as a
+//! per-request config layer — sitting between environment variables and CLI
+//! overrides in precedence. This is useful for WASM frontends (Leptos, Dioxus,
+//! Yew) or server-side apps that accept config overrides via the URL.
+//!
+//! ```ignore
+//! let config: AppConfig = Clapfig::builder()
+//!     .app_name("myapp")
+//!     .url_query("port=9090&database.url=pg%3A%2F%2Fprod&debug=true")
+//!     .load()?;
+//! ```
+//!
+//! Keys use `.` for nesting (same as CLI overrides). Values are
+//! percent-decoded and parsed with the same heuristic as env vars. A leading
+//! `?` is stripped if present.
+//!
+//! | Query param | Config key | Parsed value |
+//! |---|---|---|
+//! | `port=9090` | `port` | `9090` (integer) |
+//! | `database.url=pg%3A%2F%2Fprod` | `database.url` | `"pg://prod"` (string) |
+//! | `debug=true` | `debug` | `true` (bool) |
+//!
+//! Clapfig is framework-agnostic — it takes a raw query string, not a
+//! framework-specific request object. Your app extracts the query string
+//! however it likes (`window.location.search`, request headers, etc.) and
+//! passes it in.
+//!
+//! Enable the feature in your `Cargo.toml`:
+//!
+//! ```toml
+//! clapfig = { version = "...", features = ["url"] }
+//! ```
 //!
 //! # Programmatic overrides
 //!
@@ -271,6 +310,8 @@ mod ops;
 mod overrides;
 mod persist;
 mod resolve;
+#[cfg(feature = "url")]
+mod url;
 mod validate;
 
 #[cfg(test)]

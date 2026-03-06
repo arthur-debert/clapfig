@@ -51,6 +51,8 @@ pub struct ClapfigBuilder<C: Config> {
     env_prefix: Option<String>,
     env_enabled: bool,
     strict: bool,
+    #[cfg(feature = "url")]
+    url_overrides: Vec<(String, toml::Value)>,
     cli_overrides: Vec<(String, toml::Value)>,
     _phantom: PhantomData<C>,
 }
@@ -66,6 +68,8 @@ impl<C: Config> ClapfigBuilder<C> {
             env_prefix: None,
             env_enabled: true,
             strict: true,
+            #[cfg(feature = "url")]
+            url_overrides: Vec::new(),
             cli_overrides: Vec::new(),
             _phantom: PhantomData,
         }
@@ -149,6 +153,23 @@ impl<C: Config> ClapfigBuilder<C> {
     /// In strict mode, unknown keys in config files produce errors.
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Add URL query parameters as a config layer.
+    ///
+    /// Parses the query string (e.g. `"port=9090&database.url=pg://prod"`) into
+    /// config overrides. Keys use `.` for nesting, values are percent-decoded and
+    /// parsed with the same heuristic as env vars (bool > int > float > string).
+    ///
+    /// A leading `?` is stripped if present.
+    ///
+    /// URL parameters sit between env vars and CLI overrides in precedence:
+    /// defaults < files < env < **URL** < CLI.
+    #[cfg(feature = "url")]
+    pub fn url_query(mut self, query: &str) -> Self {
+        self.url_overrides
+            .extend(crate::url::query_to_overrides(query));
         self
     }
 
@@ -249,6 +270,8 @@ impl<C: Config> ClapfigBuilder<C> {
             files,
             env_vars,
             env_prefix,
+            #[cfg(feature = "url")]
+            url_overrides: self.url_overrides.clone(),
             cli_overrides: self.cli_overrides.clone(),
             strict: self.strict,
         })
