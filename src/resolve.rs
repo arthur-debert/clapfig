@@ -30,6 +30,9 @@ pub struct ResolveInput {
     pub env_vars: Vec<(String, String)>,
     /// Env var prefix (e.g. `"MYAPP"`). `None` means env disabled.
     pub env_prefix: Option<String>,
+    /// URL query parameter overrides as `(dotted_key, value)` pairs.
+    #[cfg(feature = "url")]
+    pub url_overrides: Vec<(String, Value)>,
     /// CLI overrides as `(dotted_key, value)` pairs.
     pub cli_overrides: Vec<(String, Value)>,
     /// Whether to reject unknown keys in config files.
@@ -68,7 +71,14 @@ where
         merged = deep_merge(merged, env_table);
     }
 
-    // 5: CLI overrides on top (highest priority)
+    // 5: URL query overrides on top of env
+    #[cfg(feature = "url")]
+    if !input.url_overrides.is_empty() {
+        let url_table = overrides::overrides_to_table(&input.url_overrides);
+        merged = deep_merge(merged, url_table);
+    }
+
+    // 6: CLI overrides on top (highest priority)
     if !input.cli_overrides.is_empty() {
         let cli_table = overrides::overrides_to_table(&input.cli_overrides);
         merged = deep_merge(merged, cli_table);
@@ -99,6 +109,8 @@ mod tests {
             files: vec![],
             env_vars: vec![],
             env_prefix: None,
+            #[cfg(feature = "url")]
+            url_overrides: vec![],
             cli_overrides: vec![],
             strict: true,
         }
@@ -156,6 +168,8 @@ mod tests {
             files: vec![("test.toml".into(), "port = 3000\n".into())],
             env_vars: vec![("MYAPP__PORT".into(), "5000".into())],
             env_prefix: Some("MYAPP".into()),
+            #[cfg(feature = "url")]
+            url_overrides: vec![],
             cli_overrides: vec![("port".into(), Value::Integer(9999))],
             strict: true,
         };
@@ -172,6 +186,8 @@ mod tests {
             )],
             env_vars: vec![("APP__PORT".into(), "4000".into())],
             env_prefix: Some("APP".into()),
+            #[cfg(feature = "url")]
+            url_overrides: vec![],
             cli_overrides: vec![("debug".into(), Value::Boolean(true))],
             strict: true,
         };
@@ -264,5 +280,43 @@ mod tests {
         // This is confique's documented behavior: the default string is used as-is.
         let config: NormalizedConfig = resolve(empty_input()).unwrap();
         assert_eq!(config.color, "red");
+    }
+
+    // -- URL layer precedence tests -------------------------------------------
+
+    #[cfg(feature = "url")]
+    #[test]
+    fn url_overrides_env() {
+        let input = ResolveInput {
+            env_vars: vec![("MYAPP__PORT".into(), "5000".into())],
+            env_prefix: Some("MYAPP".into()),
+            url_overrides: vec![("port".into(), Value::Integer(7777))],
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        assert_eq!(config.port, 7777);
+    }
+
+    #[cfg(feature = "url")]
+    #[test]
+    fn cli_overrides_url() {
+        let input = ResolveInput {
+            url_overrides: vec![("port".into(), Value::Integer(7777))],
+            cli_overrides: vec![("port".into(), Value::Integer(9999))],
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        assert_eq!(config.port, 9999);
+    }
+
+    #[cfg(feature = "url")]
+    #[test]
+    fn url_nested_key() {
+        let input = ResolveInput {
+            url_overrides: vec![("database.pool_size".into(), Value::Integer(42))],
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        assert_eq!(config.database.pool_size, 42);
     }
 }

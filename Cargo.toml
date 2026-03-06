@@ -12,6 +12,7 @@ categories = ["config", "command-line-interface"]
 [features]
 default = ["clap"]
 clap = ["dep:clap"]
+url = ["dep:percent-encoding"]
 
 [dependencies]
 confique = { version = "0.4", features = ["toml"] }
@@ -21,6 +22,7 @@ serde_ignored = "0.1"
 toml = "0.8"
 toml_edit = "0.22"
 directories = "6"
+percent-encoding = { version = "2", optional = true }
 thiserror = "2"
 
 [dev-dependencies]
