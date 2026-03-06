@@ -11,7 +11,7 @@ Built on [confique](https://github.com/LukasKalbertodt/confique) for struct-driv
 **Core** (always available, no CLI framework needed):
 
 - **Struct as source of truth** — define settings as a Rust struct with defaults and `///` doc comments
-- **Layered merge** — defaults < config files < env vars < overrides, every layer sparse
+- **Layered merge** — defaults < config files < env vars < overrides, every layer sparse, [customizable precedence order](#layer-precedence)
 - **Multi-path file search** — platform config dir, home, cwd, ancestor walk, or any path
 - **Search modes** — merge all found configs or use the first match
 - **Ancestor walk** — walk up from cwd to find project configs, with configurable boundary (`.git`, filesystem root)
@@ -101,10 +101,25 @@ Config files          search paths in order, later paths win
        ↑ overridden by
 Environment vars      MYAPP__KEY
        ↑ overridden by
+URL query params      .url_query()          (requires "url" feature)
+       ↑ overridden by
 Overrides             .cli_override()
 ```
 
 Every layer is **sparse**. You only specify the keys you want to override. Unset keys fall through to the next layer down.
+
+This is the default order. You can customize it with `.layer_order()`:
+
+```rust
+use clapfig::{Clapfig, Layer};
+
+let config: AppConfig = Clapfig::builder()
+    .app_name("myapp")
+    .layer_order(vec![Layer::Env, Layer::Files, Layer::Cli])
+    .load()?;
+```
+
+Layers listed later override earlier ones. Omitting a layer excludes it from merging entirely. See [`Layer`](https://docs.rs/clapfig/latest/clapfig/enum.Layer.html) for the available variants.
 
 ## Demo
 
