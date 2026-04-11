@@ -13,6 +13,7 @@
 //! This keeps all configuration wiring in one place.
 
 use std::marker::PhantomData;
+use std::path::PathBuf;
 
 use confique::Config;
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,7 @@ use crate::flatten;
 use crate::ops::{self, ConfigResult};
 use crate::overrides;
 use crate::persist;
-use crate::resolve::{self, ResolveInput};
+use crate::resolver::Resolver;
 use crate::types::{ConfigAction, Layer, SearchMode, SearchPath};
 
 /// Entry point for building a clapfig configuration.
@@ -38,7 +39,7 @@ impl Clapfig {
 /// Boxed post-merge validation hook.
 ///
 /// See [`ClapfigBuilder::post_validate`] for how it is invoked.
-type PostValidateHook<C> = Box<dyn Fn(&C) -> Result<(), String> + Send + Sync>;
+pub(crate) type PostValidateHook<C> = Box<dyn Fn(&C) -> Result<(), String> + Send + Sync>;
 
 /// Builder for configuring and loading layered configuration.
 ///
@@ -322,29 +323,57 @@ impl<C: Config> ClapfigBuilder<C> {
         Ok(Some(app.to_uppercase()))
     }
 
-    /// Build the `ResolveInput` from current builder state.
-    fn build_input(&self) -> Result<ResolveInput, ClapfigError>
-    where
-        C::Layer: for<'de> Deserialize<'de>,
-    {
-        let app_name = self.effective_app_name()?;
+    /// Build a reusable [`Resolver<C>`] that captures the current builder
+    /// state and can be called repeatedly with different starting directories.
+    ///
+    /// Use this when you need to resolve configuration at multiple points in a
+    /// directory tree — for example, a static site generator visiting every
+    /// content leaf, or a linter walking a repository. Each
+    /// [`resolve_at(dir)`](Resolver::resolve_at) call interprets
+    /// [`SearchPath::Cwd`] and [`SearchPath::Ancestors`] relative to `dir`, so
+    /// every leaf gets its own independently merged configuration. Files read
+    /// from disk are cached inside the resolver so repeated walks pay the
+    /// disk+parse cost once per unique file.
+    ///
+    /// Any [`post_validate`](Self::post_validate) hook registered on the
+    /// builder is captured into the resolver and fires on every `resolve_at`
+    /// call.
+    ///
+    /// Returns [`ClapfigError::AppNameRequired`] if `.app_name()` was not
+    /// called on the builder.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let resolver = Clapfig::builder::<MyConfig>()
+    ///     .app_name("myapp")
+    ///     .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
+    ///     .build_resolver()?;
+    ///
+    /// for leaf in walk_tree("./content") {
+    ///     let cfg = resolver.resolve_at(&leaf)?;
+    ///     render(&leaf, &cfg);
+    /// }
+    /// ```
+    pub fn build_resolver(self) -> Result<Resolver<C>, ClapfigError> {
+        let app_name = self.effective_app_name()?.to_string();
         let file_name = self.effective_file_name()?;
         let search_paths = self.effective_search_paths();
         let env_prefix = self.effective_env_prefix()?;
 
-        let files = file::load_config_files(&search_paths, &file_name, app_name, self.search_mode)?;
-        let env_vars: Vec<(String, String)> = std::env::vars().collect();
-
-        Ok(ResolveInput {
-            files,
-            env_vars,
+        Ok(Resolver::from_builder(
+            app_name,
+            file_name,
+            search_paths,
+            self.search_mode,
             env_prefix,
+            self.strict,
             #[cfg(feature = "url")]
-            url_overrides: self.url_overrides.clone(),
-            cli_overrides: self.cli_overrides.clone(),
-            strict: self.strict,
-            layer_order: self.layer_order.clone(),
-        })
+            self.url_overrides,
+            self.cli_overrides,
+            self.layer_order,
+            self.post_validate,
+        ))
     }
 
     /// Load and resolve the configuration through all layers.
@@ -352,16 +381,19 @@ impl<C: Config> ClapfigBuilder<C> {
     /// If a [`post_validate`](Self::post_validate) hook is registered, it
     /// runs after the merged configuration has been produced and any
     /// rejection is returned as [`ClapfigError::PostValidationFailed`].
+    ///
+    /// Internally this is equivalent to
+    /// `self.build_resolver()?.resolve_at(std::env::current_dir()?)`, so all
+    /// resolution logic lives in exactly one place (see [`Resolver`]).
     pub fn load(self) -> Result<C, ClapfigError>
     where
         C::Layer: for<'de> Deserialize<'de>,
     {
-        let input = self.build_input()?;
-        let config = resolve::resolve(input)?;
-        if let Some(hook) = self.post_validate.as_ref() {
-            hook(&config).map_err(ClapfigError::PostValidationFailed)?;
-        }
-        Ok(config)
+        let start_dir = std::env::current_dir().map_err(|e| ClapfigError::IoError {
+            path: PathBuf::from("."),
+            source: e,
+        })?;
+        self.build_resolver()?.resolve_at(start_dir)
     }
 
     /// Handle a `ConfigAction` and print the result to stdout.

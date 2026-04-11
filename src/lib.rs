@@ -251,6 +251,107 @@
 //! [`.strict(false)`](ClapfigBuilder::strict) if you intentionally share
 //! config files across tools or want forward-compatible configs.
 //!
+//! # Semantic validation — the `post_validate` hook
+//!
+//! Strict mode and confique together cover **structural** validation: every
+//! key is known, every required field is present, every value has the right
+//! type. They do not cover **semantic** constraints — the rules that depend
+//! on the merged value rather than a single field's type:
+//!
+//! - numeric ranges (`port >= 1024`, `quality <= 100`, `pool_size > 0`)
+//! - cross-field invariants (`if tls_enabled then tls_cert_path must be set`)
+//! - enum combinations (`mode == "fast" requires buffer_size < 64k`)
+//! - filesystem preconditions (`output_dir must exist and be writable`)
+//! - anything that needs the final, fully-merged `&C` to decide
+//!
+//! Write them once, in a closure, and register it on the builder:
+//!
+//! ```ignore
+//! let config: AppConfig = Clapfig::builder()
+//!     .app_name("myapp")
+//!     .post_validate(|c| {
+//!         if c.port < 1024 {
+//!             return Err(format!("port {} is below 1024", c.port));
+//!         }
+//!         if c.tls_enabled && c.tls_cert_path.is_none() {
+//!             return Err("tls_enabled requires tls_cert_path".into());
+//!         }
+//!         Ok(())
+//!     })
+//!     .load()?;
+//! ```
+//!
+//! The hook runs after all layers have been merged and confique has
+//! type-validated the result, but before [`load()`](ClapfigBuilder::load)
+//! returns. Rejections become
+//! [`ClapfigError::PostValidationFailed`],
+//! which renders with the same error pipeline as every other clapfig error.
+//!
+//! Design notes:
+//!
+//! - **Signature is `Fn(&C) -> Result<(), String>`.** String keeps the API
+//!   tiny. Callers with richer error types call `.map_err(|e| e.to_string())`.
+//! - **Upstream failures short-circuit.** Parse errors, strict-mode
+//!   violations, and type errors all fire before the hook, so the hook only
+//!   ever sees a fully-valid `&C`.
+//! - **One hook per builder.** Calling `.post_validate()` twice replaces the
+//!   previous hook — compose multiple checks inside one closure.
+//! - **The hook is captured by value and fires on every resolution.** If you
+//!   build a [`Resolver<C>`](Resolver) for tree-walk use cases (see the next
+//!   section), the same hook runs on every [`resolve_at()`](Resolver::resolve_at)
+//!   call.
+//!
+//! # Tree-walk resolution — the `Resolver<C>` handle
+//!
+//! [`load()`](ClapfigBuilder::load) assumes one resolution per process,
+//! anchored at `std::env::current_dir()`. For one-shot CLI tools that's
+//! exactly right. But for tools that walk a **dynamic file tree** where every
+//! directory can have an optional config — the `.htaccess` / `.gitignore` /
+//! `.editorconfig` / `.eslintrc` pattern — you need N resolutions from N
+//! different anchors, and you want to amortize the I/O cost across calls.
+//!
+//! [`ClapfigBuilder::build_resolver()`] gives you a reusable
+//! [`Resolver<C>`](Resolver) handle for that case:
+//!
+//! ```ignore
+//! let resolver = Clapfig::builder::<MyConfig>()
+//!     .app_name("myapp")
+//!     .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
+//!     .post_validate(|c| validate_ranges(c))
+//!     .build_resolver()?;
+//!
+//! for leaf in walk_content_tree("./site") {
+//!     let cfg = resolver.resolve_at(&leaf)?;
+//!     render_page(&leaf, &cfg);
+//! }
+//! ```
+//!
+//! Key properties:
+//!
+//! - **`SearchPath::Cwd` and `SearchPath::Ancestors` are anchored at the
+//!   directory passed to [`resolve_at()`](Resolver::resolve_at)**, not at the
+//!   process CWD. Each call is a fully independent resolution with the same
+//!   builder state but a different starting point. Walking a site tree with
+//!   `Ancestors(Boundary::Marker(".git"))` gives you nearest-project-config
+//!   semantics on every leaf for free.
+//! - **Files are cached by absolute path inside the resolver.** A tree walk
+//!   that visits 1000 leaves sharing 5 ancestor config files pays the disk +
+//!   parse cost once per unique file, not 1000×. The `Resolver` is the cache
+//!   scope — drop it to invalidate everything.
+//! - **No mtime checking.** The cache is not invalidated when files change on
+//!   disk. Long-lived processes that need freshness should build a new
+//!   `Resolver`. This is a deliberate "keep v1 simple" choice; the contract
+//!   is documented and a regression test locks it in.
+//! - **`load()` is the special case.** Internally `load()` is just
+//!   `self.build_resolver()?.resolve_at(std::env::current_dir()?)`, so
+//!   existing single-shot callers get zero behavior change and all resolution
+//!   flows through one code path.
+//! - **The `post_validate` hook composes naturally.** Registered once on the
+//!   builder, captured into the resolver, fired on every `resolve_at` call —
+//!   so per-leaf invariants get the same enforcement as top-level `load()`.
+//!
+//! See [`Resolver`] for the full API.
+//!
 //! # Normalizing values
 //!
 //! Use confique's `#[config(deserialize_with = ...)]` to normalize values
@@ -329,6 +430,7 @@ mod ops;
 mod overrides;
 mod persist;
 mod resolve;
+mod resolver;
 #[cfg(feature = "url")]
 mod url;
 mod validate;
@@ -341,4 +443,5 @@ pub use builder::{Clapfig, ClapfigBuilder};
 pub use cli::{ConfigArgs, ConfigCommand, ConfigSubcommand};
 pub use error::{ClapfigError, UnknownKeyInfo};
 pub use ops::ConfigResult;
+pub use resolver::Resolver;
 pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};
