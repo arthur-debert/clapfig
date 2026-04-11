@@ -17,6 +17,7 @@ Built on [confique](https://github.com/LukasKalbertodt/confique) for struct-driv
 - **Ancestor walk** — walk up from cwd to find project configs, with configurable boundary (`.git`, filesystem root)
 - **Prefix-based env vars** — `MYAPP__DATABASE__URL` maps to `database.url` automatically
 - **Strict mode** — unknown keys error with file path, key name, and line number (on by default)
+- **Structured errors + rendering** — [`ClapfigError`](https://docs.rs/clapfig/latest/clapfig/error/enum.ClapfigError.html) carries data (keys, paths, lines, source text); the [`render`](https://docs.rs/clapfig/latest/clapfig/render/index.html) module turns it into plain text or [`miette`](https://docs.rs/miette)-style output with snippets and carets (rich mode behind the `rich-errors` feature)
 - **Template generation** — emit a commented sample config from the struct's doc comments
 - **Persistence with named scopes** — global/local config file patterns with `--scope` targeting
 
@@ -131,6 +132,10 @@ cargo run --example clapfig_demo -- --color blue --port 8080 echo
 cargo run --example clapfig_demo -- config gen
 cargo run --example clapfig_demo -- config list
 cargo run --example clapfig_demo -- config get server.port
+
+# See the rich error renderer (miette) in action:
+cargo run --example clapfig_demo --features rich-errors -- echo
+# (drop a `clapfig-demo.toml` with an unknown key like `typo = 1` first)
 ```
 
 See [`examples/clapfig_demo/`](examples/clapfig_demo/) for the full source.

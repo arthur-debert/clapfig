@@ -314,6 +314,7 @@
 //! builder method to call. See the [`error`] module for the full set.
 
 pub mod error;
+pub mod render;
 pub mod types;
 
 mod builder;
@@ -337,6 +338,6 @@ mod fixtures;
 pub use builder::{Clapfig, ClapfigBuilder};
 #[cfg(feature = "clap")]
 pub use cli::{ConfigArgs, ConfigCommand, ConfigSubcommand};
-pub use error::ClapfigError;
+pub use error::{ClapfigError, UnknownKeyInfo};
 pub use ops::ConfigResult;
 pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};

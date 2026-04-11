@@ -13,6 +13,7 @@ categories = ["config", "command-line-interface"]
 default = ["clap"]
 clap = ["dep:clap"]
 url = ["dep:percent-encoding"]
+rich-errors = ["dep:miette"]
 
 [dependencies]
 confique = { version = "0.4", features = ["toml"] }
@@ -23,6 +24,7 @@ toml = "0.8"
 toml_edit = "0.22"
 directories = "6"
 percent-encoding = { version = "2", optional = true }
+miette = { version = "7", features = ["fancy"], optional = true }
 thiserror = "2"
 
 [dev-dependencies]

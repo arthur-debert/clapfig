@@ -29,15 +29,46 @@
 //! | `config list`            | `cargo run --example clapfig_demo -- config list`                   |
 //! | Single key echo          | `cargo run --example clapfig_demo -- echo --key display.color`      |
 //! | Colored output           | Default is yellow; override `display.color` to change it            |
+//! | Error rendering (plain)  | Put a typo in `clapfig-demo.toml`, then run `echo` — errors flow through [`clapfig::render::render_plain`] |
+//! | Error rendering (rich)   | Same, but run with `--features rich-errors` to get [`miette`]-style output |
+//!
+//! ## Error rendering
+//!
+//! This example wires both [`clapfig::render::render_plain`] and
+//! [`clapfig::render::render_rich`] into its error paths. `render_rich` is
+//! only compiled when the `rich-errors` feature is enabled:
+//!
+//! ```sh
+//! cargo run --example clapfig_demo --features rich-errors -- echo
+//! ```
+//!
+//! To see it in action, drop a `clapfig-demo.toml` in the current directory
+//! with an unknown key (e.g. `typo = 1`) and run any command.
 
 mod config;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use clapfig::{Clapfig, ClapfigBuilder, ConfigArgs, SearchPath};
+use clapfig::{Clapfig, ClapfigBuilder, ClapfigError, ConfigArgs, SearchPath, render};
 
 use config::DemoConfig;
+
+/// Render a [`ClapfigError`] for terminal display.
+///
+/// Uses [`render::render_rich`] (miette graphical report) when the
+/// `rich-errors` feature is enabled, otherwise falls back to
+/// [`render::render_plain`] (ANSI-free text with snippets and carets).
+fn render_error(err: &ClapfigError) -> String {
+    #[cfg(feature = "rich-errors")]
+    {
+        render::render_rich(err)
+    }
+    #[cfg(not(feature = "rich-errors"))]
+    {
+        render::render_plain(err)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CLI definitions
@@ -217,7 +248,7 @@ fn main() {
     match cli.command {
         Commands::Echo { key } => {
             let config = builder.load().unwrap_or_else(|e| {
-                eprintln!("Failed to load config:\n{e}");
+                eprintln!("{}", render_error(&e));
                 std::process::exit(1);
             });
             match key {
@@ -228,7 +259,7 @@ fn main() {
         Commands::Config(args) => {
             let action = args.into_action();
             builder.handle_and_print(&action).unwrap_or_else(|e| {
-                eprintln!("Config error:\n{e}");
+                eprintln!("{}", render_error(&e));
                 std::process::exit(1);
             });
         }

@@ -139,7 +139,8 @@ pub fn list_scope_file(file_path: &Path) -> Result<ConfigResult, ClapfigError> {
             .parse()
             .map_err(|e: toml::de::Error| ClapfigError::ParseError {
                 path: file_path.to_path_buf(),
-                source: e,
+                source: Box::new(e),
+                source_text: Some(std::sync::Arc::from(content.as_str())),
             })?;
 
     let mut entries = Vec::new();
@@ -174,7 +175,8 @@ pub fn get_scope_value<C: Config>(
             .parse()
             .map_err(|e: toml::de::Error| ClapfigError::ParseError {
                 path: file_path.to_path_buf(),
-                source: e,
+                source: Box::new(e),
+                source_text: Some(std::sync::Arc::from(content.as_str())),
             })?;
 
     let value = table_get(&table, key).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
