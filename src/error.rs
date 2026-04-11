@@ -115,7 +115,8 @@ pub enum ClapfigError {
     ///
     /// The inner string is the message returned by the hook — typically
     /// something like `"port 80 is below the allowed minimum 1024"`. Clapfig
-    /// does not interpret it; renderers surface it as-is.
+    /// does not interpret it; the displayed/rendered form includes the
+    /// `"Configuration validation failed: "` prefix plus the hook's message.
     #[error("Configuration validation failed: {0}")]
     PostValidationFailed(String),
 }
