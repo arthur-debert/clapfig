@@ -11,6 +11,7 @@
 //! The layer order is configurable via [`ResolveInput::layer_order`].
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use confique::Config;
 use serde::Deserialize;
@@ -73,7 +74,8 @@ where
             }
             let table: Table = toml::from_str(content).map_err(|e| ClapfigError::ParseError {
                 path: path.clone(),
-                source: e,
+                source: Box::new(e),
+                source_text: Some(Arc::from(content.as_str())),
             })?;
             t = deep_merge(t, table);
         }

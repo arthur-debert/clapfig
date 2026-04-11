@@ -5,11 +5,12 @@
 //! its file path and best-effort line number.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use confique::Config;
 use serde::Deserialize;
 
-use crate::error::ClapfigError;
+use crate::error::{ClapfigError, UnknownKeyInfo};
 
 /// Validate that a TOML config file contains no keys unknown to config type `C`.
 ///
@@ -30,26 +31,29 @@ where
     })
     .map_err(|e| ClapfigError::ParseError {
         path: path.to_path_buf(),
-        source: e,
+        source: Box::new(e),
+        source_text: Some(Arc::from(content)),
     })?;
 
     if unknown_keys.is_empty() {
         return Ok(());
     }
 
-    let errors: Vec<ClapfigError> = unknown_keys
+    let source: Arc<str> = Arc::from(content);
+    let infos: Vec<UnknownKeyInfo> = unknown_keys
         .into_iter()
         .map(|key| {
             let line = find_key_line(content, &key);
-            ClapfigError::UnknownKey {
+            UnknownKeyInfo {
                 key,
                 path: path.to_path_buf(),
                 line,
+                source: Some(Arc::clone(&source)),
             }
         })
         .collect();
 
-    Err(ClapfigError::UnknownKeys(errors))
+    Err(ClapfigError::UnknownKeys(infos))
 }
 
 /// Find the 1-indexed line number for a key in TOML content.
@@ -124,19 +128,11 @@ pool_size = 10
         let content = "host = \"localhost\"\ntypo_key = 42\n";
         let result = validate_unknown_keys::<TestConfig>(content, &path());
         let err = result.unwrap_err();
-        match err {
-            ClapfigError::UnknownKeys(keys) => {
-                assert_eq!(keys.len(), 1);
-                match &keys[0] {
-                    ClapfigError::UnknownKey { key, line, .. } => {
-                        assert_eq!(key, "typo_key");
-                        assert_eq!(*line, 2);
-                    }
-                    other => panic!("Expected UnknownKey, got: {other:?}"),
-                }
-            }
-            other => panic!("Expected UnknownKeys, got: {other:?}"),
-        }
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "typo_key");
+        assert_eq!(keys[0].line, 2);
+        assert!(keys[0].source.is_some());
     }
 
     #[test]
@@ -144,18 +140,10 @@ pool_size = 10
         let content = "[database]\nurl = \"pg://\"\ntypo = \"bad\"\n";
         let result = validate_unknown_keys::<TestConfig>(content, &path());
         let err = result.unwrap_err();
-        match err {
-            ClapfigError::UnknownKeys(keys) => {
-                assert_eq!(keys.len(), 1);
-                match &keys[0] {
-                    ClapfigError::UnknownKey { key, .. } => {
-                        assert_eq!(key, "database.typo");
-                    }
-                    other => panic!("Expected UnknownKey, got: {other:?}"),
-                }
-            }
-            other => panic!("Expected UnknownKeys, got: {other:?}"),
-        }
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "database.typo");
+        assert_eq!(keys[0].leaf(), "typo");
     }
 
     #[test]
@@ -163,12 +151,8 @@ pool_size = 10
         let content = "typo1 = 1\ntypo2 = 2\n";
         let result = validate_unknown_keys::<TestConfig>(content, &path());
         let err = result.unwrap_err();
-        match err {
-            ClapfigError::UnknownKeys(keys) => {
-                assert_eq!(keys.len(), 2);
-            }
-            other => panic!("Expected UnknownKeys, got: {other:?}"),
-        }
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 2);
     }
 
     #[test]
@@ -176,15 +160,8 @@ pool_size = 10
         let content = "host = \"x\"\nport = 8080\ndebug = false\n\n# comment\nbad_key = 1\n";
         let result = validate_unknown_keys::<TestConfig>(content, &path());
         let err = result.unwrap_err();
-        match err {
-            ClapfigError::UnknownKeys(keys) => match &keys[0] {
-                ClapfigError::UnknownKey { line, .. } => {
-                    assert_eq!(*line, 6);
-                }
-                other => panic!("Expected UnknownKey, got: {other:?}"),
-            },
-            other => panic!("Expected UnknownKeys, got: {other:?}"),
-        }
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].line, 6);
     }
 
     #[test]
@@ -218,39 +195,21 @@ pool_size = 10
 
     #[test]
     fn line_number_finds_correct_section_for_duplicate_leaf() {
-        // "typo" appears in [database] section — find_key_line should locate
-        // it there (line 4), not confuse it with a top-level key.
         let content = "host = \"x\"\nport = 8080\n[database]\ntypo = \"bad\"\n";
         let result = validate_unknown_keys::<TestConfig>(content, &path());
         let err = result.unwrap_err();
-        match err {
-            ClapfigError::UnknownKeys(keys) => match &keys[0] {
-                ClapfigError::UnknownKey { key, line, .. } => {
-                    assert_eq!(key, "database.typo");
-                    assert_eq!(*line, 4);
-                }
-                other => panic!("Expected UnknownKey, got: {other:?}"),
-            },
-            other => panic!("Expected UnknownKeys, got: {other:?}"),
-        }
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "database.typo");
+        assert_eq!(keys[0].line, 4);
     }
 
     #[test]
     fn line_number_top_level_not_confused_by_nested_same_name() {
-        // "pool_size" exists as a known key in [database] but is unknown at top level.
-        // The line finder should find it at line 1 (top level), not inside [database].
         let content = "typo = 99\n[database]\npool_size = 5\n";
         let result = validate_unknown_keys::<TestConfig>(content, &path());
         let err = result.unwrap_err();
-        match err {
-            ClapfigError::UnknownKeys(keys) => match &keys[0] {
-                ClapfigError::UnknownKey { key, line, .. } => {
-                    assert_eq!(key, "typo");
-                    assert_eq!(*line, 1);
-                }
-                other => panic!("Expected UnknownKey, got: {other:?}"),
-            },
-            other => panic!("Expected UnknownKeys, got: {other:?}"),
-        }
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "typo");
+        assert_eq!(keys[0].line, 1);
     }
 }
