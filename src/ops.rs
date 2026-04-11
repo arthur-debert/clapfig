@@ -76,9 +76,12 @@ pub fn generate_template<C: Config>() -> String {
 /// Generate a JSON Schema document (pretty-printed) describing the config struct.
 ///
 /// Delegates to [`crate::schema::generate_schema`] and serializes the result.
+/// Serialization of a `serde_json::Value` is infallible for the shapes this
+/// module produces, so we propagate any panic rather than masking it with a
+/// bogus "{}" payload.
 pub fn generate_schema_string<C: Config>() -> String {
     let value = crate::schema::generate_schema::<C>();
-    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
+    serde_json::to_string_pretty(&value).expect("serde_json::Value serialization is infallible")
 }
 
 /// Get a config value by dotted key, including its doc comment.

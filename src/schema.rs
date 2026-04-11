@@ -113,7 +113,9 @@ fn field_to_property(field: &Field) -> (String, Value, bool) {
                 if let Some(ty) = infer_type(expr) {
                     prop.insert("type".into(), Value::String(ty.into()));
                 }
-                prop.insert("default".into(), expr_to_json(expr));
+                if let Some(default_value) = expr_to_json(expr) {
+                    prop.insert("default".into(), default_value);
+                }
             }
 
             if let Some(env_name) = env {
@@ -140,31 +142,46 @@ fn infer_type(expr: &Expr) -> Option<&'static str> {
 }
 
 /// Convert a confique `Expr` (default value) into a JSON value.
-fn expr_to_json(expr: &Expr) -> Value {
+///
+/// Returns `None` for variants we can't faithfully represent (confique's
+/// `Expr` is `#[non_exhaustive]`), so the caller can omit the `default` key
+/// entirely rather than emitting a misleading `null`.
+fn expr_to_json(expr: &Expr) -> Option<Value> {
     match expr {
-        Expr::Str(s) => Value::String((*s).into()),
-        Expr::Integer(i) => json!(i),
-        Expr::Float(f) => json!(f),
-        Expr::Bool(b) => Value::Bool(*b),
-        Expr::Array(items) => Value::Array(items.iter().map(expr_to_json).collect()),
+        Expr::Str(s) => Some(Value::String((*s).into())),
+        Expr::Integer(i) => Some(json!(i)),
+        Expr::Float(f) => Some(json!(f)),
+        Expr::Bool(b) => Some(Value::Bool(*b)),
+        Expr::Array(items) => Some(Value::Array(
+            items.iter().filter_map(expr_to_json).collect(),
+        )),
         Expr::Map(entries) => {
             let mut obj = Map::new();
             for MapEntry { key, value } in *entries {
-                obj.insert(map_key_to_string(key), expr_to_json(value));
+                let Some(key_str) = map_key_to_string(key) else {
+                    continue;
+                };
+                let Some(val) = expr_to_json(value) else {
+                    continue;
+                };
+                obj.insert(key_str, val);
             }
-            Value::Object(obj)
+            Some(Value::Object(obj))
         }
-        _ => Value::Null,
+        _ => None,
     }
 }
 
-fn map_key_to_string(key: &MapKey) -> String {
+/// Render a `MapKey` as a JSON object key. Returns `None` for variants we
+/// can't faithfully represent, so the caller can skip the entry rather than
+/// collapsing distinct keys onto an empty string.
+fn map_key_to_string(key: &MapKey) -> Option<String> {
     match key {
-        MapKey::Str(s) => (*s).into(),
-        MapKey::Integer(i) => i.to_string(),
-        MapKey::Float(f) => f.to_string(),
-        MapKey::Bool(b) => b.to_string(),
-        _ => String::new(),
+        MapKey::Str(s) => Some((*s).into()),
+        MapKey::Integer(i) => Some(i.to_string()),
+        MapKey::Float(f) => Some(f.to_string()),
+        MapKey::Bool(b) => Some(b.to_string()),
+        _ => None,
     }
 }
 
@@ -296,6 +313,19 @@ mod tests {
         let s = schema();
         assert_eq!(s["additionalProperties"], false);
         assert_eq!(s["properties"]["database"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn optional_field_has_no_null_default_key() {
+        // Regression guard: expr_to_json must not fabricate a `default: null`
+        // for fields that have no default (Option<T> / unrepresentable Expr).
+        let s = schema();
+        let url = &s["properties"]["database"]["properties"]["url"];
+        let url_obj = url.as_object().unwrap();
+        assert!(
+            !url_obj.contains_key("default"),
+            "optional field must not have a default key: {url}"
+        );
     }
 
     #[test]
