@@ -329,6 +329,7 @@ mod ops;
 mod overrides;
 mod persist;
 mod resolve;
+mod resolver;
 #[cfg(feature = "url")]
 mod url;
 mod validate;
@@ -341,4 +342,5 @@ pub use builder::{Clapfig, ClapfigBuilder};
 pub use cli::{ConfigArgs, ConfigCommand, ConfigSubcommand};
 pub use error::{ClapfigError, UnknownKeyInfo};
 pub use ops::ConfigResult;
+pub use resolver::Resolver;
 pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};
