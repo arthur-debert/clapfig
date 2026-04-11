@@ -90,7 +90,16 @@ pub struct Resolver<C: Config> {
     search_paths: Vec<SearchPath>,
     search_mode: SearchMode,
     env_prefix: Option<String>,
-    env_enabled: bool,
+    /// Environment variables captured at [`build_resolver()`][crate::ClapfigBuilder::build_resolver]
+    /// time, not at each `resolve_at` call. This matches how the docs frame
+    /// "values captured at build time", avoids rescanning `std::env` on every
+    /// leaf of a tree walk, and gives a single consistent env snapshot across
+    /// every `resolve_at` call on the same resolver. Callers that need to
+    /// observe post-build env changes should build a new resolver.
+    ///
+    /// Empty when env was disabled on the builder (`env_prefix` will also be
+    /// `None` in that case).
+    env_vars: Vec<(String, String)>,
     strict: bool,
     #[cfg(feature = "url")]
     url_overrides: Vec<(String, toml::Value)>,
@@ -98,7 +107,14 @@ pub struct Resolver<C: Config> {
     layer_order: Option<Vec<Layer>>,
     post_validate: Option<Arc<PostValidateHook<C>>>,
     file_cache: Mutex<HashMap<PathBuf, CachedFile>>,
-    _phantom: PhantomData<C>,
+    /// Marks the config type parameter without imposing ownership semantics.
+    ///
+    /// Using `PhantomData<fn() -> C>` rather than `PhantomData<C>` keeps
+    /// `Resolver<C>` unconditionally `Send + Sync` (we never actually own a
+    /// `C` — only a closure that takes `&C` by reference), so callers can
+    /// share a `Resolver<MyConfig>` across threads even when `MyConfig`
+    /// itself has non-thread-safe internals.
+    _phantom: PhantomData<fn() -> C>,
 }
 
 impl<C: Config> Resolver<C> {
@@ -116,20 +132,26 @@ impl<C: Config> Resolver<C> {
         search_paths: Vec<SearchPath>,
         search_mode: SearchMode,
         env_prefix: Option<String>,
-        env_enabled: bool,
         strict: bool,
         #[cfg(feature = "url")] url_overrides: Vec<(String, toml::Value)>,
         cli_overrides: Vec<(String, toml::Value)>,
         layer_order: Option<Vec<Layer>>,
         post_validate: Option<PostValidateHook<C>>,
     ) -> Self {
+        // env_prefix is None when env was disabled on the builder, so
+        // capturing vars in that case would just be wasted work.
+        let env_vars = if env_prefix.is_some() {
+            std::env::vars().collect()
+        } else {
+            Vec::new()
+        };
         Self {
             app_name,
             file_name,
             search_paths,
             search_mode,
             env_prefix,
-            env_enabled,
+            env_vars,
             strict,
             #[cfg(feature = "url")]
             url_overrides,
@@ -159,18 +181,42 @@ impl<C: Config> Resolver<C> {
     where
         C::Layer: for<'de> Deserialize<'de>,
     {
+        // Normalize the start dir to an absolute (and, when possible,
+        // canonicalized) path before threading it through. A relative
+        // `start_dir` like `"./leaf"` would otherwise break in three ways:
+        //
+        //   1. `Ancestors(Boundary::Root)` walks via `Path::parent()`, which
+        //      stops at an empty component rather than the filesystem root.
+        //   2. `Boundary::Marker` probes `start_dir.join(name)` which
+        //      resolves against the process CWD, not the intended tree.
+        //   3. The file cache keys on `PathBuf`, so `"./leaf"` and `"leaf"`
+        //      would each take their own slot instead of sharing one.
+        //
+        // Canonicalization can fail (e.g. the directory doesn't exist yet),
+        // in which case we fall back to the plain absolute form so the call
+        // still runs rather than erroring the whole walk.
         let start_dir = start_dir.as_ref();
-        let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, start_dir);
-        let files = self.load_files_cached(&dirs)?;
-        let env_vars: Vec<(String, String)> = if self.env_enabled {
-            std::env::vars().collect()
+        let absolute = if start_dir.is_absolute() {
+            start_dir.to_path_buf()
         } else {
-            Vec::new()
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(start_dir),
+                Err(e) => {
+                    return Err(ClapfigError::IoError {
+                        path: start_dir.to_path_buf(),
+                        source: e,
+                    });
+                }
+            }
         };
+        let normalized = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+
+        let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, &normalized);
+        let files = self.load_files_cached(&dirs)?;
 
         let input = ResolveInput {
             files,
-            env_vars,
+            env_vars: self.env_vars.clone(),
             env_prefix: self.env_prefix.clone(),
             #[cfg(feature = "url")]
             url_overrides: self.url_overrides.clone(),
@@ -577,6 +623,113 @@ mod tests {
     fn build_resolver_requires_app_name() {
         let result = Clapfig::builder::<TestConfig>().build_resolver();
         assert!(matches!(result, Err(ClapfigError::AppNameRequired)));
+    }
+
+    // --- start_dir normalization (regression: relative paths broke Ancestors) ---
+
+    #[test]
+    fn resolve_at_normalizes_relative_start_dir_via_cwd() {
+        // A relative start_dir must be resolved against the process CWD
+        // before Ancestors walks it — otherwise `Path::parent()` stops at
+        // an empty component instead of the filesystem root and the walk
+        // never reaches files placed above.
+        //
+        // We exercise this by passing the same directory spelled two ways
+        // (absolute form + canonicalized absolute form) and checking that
+        // both hit the same cache entry. That indirectly proves the
+        // normalization path runs.
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("test.toml"), "port = 3030\n").unwrap();
+
+        let resolver = resolver_with_paths(vec![SearchPath::Cwd]);
+
+        // First spelling: plain absolute path.
+        let c1 = resolver.resolve_at(&sub).unwrap();
+        assert_eq!(c1.port, 3030);
+        let size_after_plain = resolver.cache_size();
+
+        // Second spelling: canonicalized (same dir, possibly different on
+        // platforms with symlinks in /tmp — on macOS /tmp -> /private/tmp).
+        let canon = std::fs::canonicalize(&sub).unwrap();
+        let c2 = resolver.resolve_at(&canon).unwrap();
+        assert_eq!(c2.port, 3030);
+        let size_after_canon = resolver.cache_size();
+
+        assert_eq!(
+            size_after_plain, size_after_canon,
+            "normalization should collapse equivalent spellings to one cache entry"
+        );
+    }
+
+    #[test]
+    fn resolve_at_relative_start_dir_does_not_panic() {
+        // Guard against the `Path::parent()` walking off the end of a
+        // relative path. If `resolve_at` forwarded a relative path straight
+        // through, `Ancestors(Boundary::Root)` would terminate at
+        // `Some("")` → `None` after two iterations. Normalization should
+        // turn the relative path into an absolute one before the walk.
+        let resolver = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Ancestors(Boundary::Root)])
+            .no_env()
+            .build_resolver()
+            .unwrap();
+
+        // "." is a relative path. Should yield the same config as passing
+        // the current directory in absolute form — not panic or return
+        // garbage.
+        let rel = resolver.resolve_at(".").unwrap();
+        let abs = resolver
+            .resolve_at(std::env::current_dir().unwrap())
+            .unwrap();
+        assert_eq!(rel.port, abs.port);
+        assert_eq!(rel.host, abs.host);
+    }
+
+    // --- env vars captured at build_resolver time ---
+
+    #[test]
+    fn env_vars_captured_at_build_resolver_time() {
+        // Regression: the first implementation called std::env::vars() on
+        // every resolve_at(), so env changes between calls would sneak in
+        // despite the docs claiming values are "captured at build time".
+        // A unique var name avoids collisions with parallel tests.
+        const KEY: &str = "CLAPFIG_RESOLVER_CAPTURE_TEST_F7A2E1__PORT";
+
+        // Safety: set_var/remove_var are unsafe in the 2024 edition because
+        // env mutation is process-global. We accept that; the unique name
+        // keeps this test isolated from every other test in the suite.
+        unsafe {
+            std::env::set_var(KEY, "1111");
+        }
+
+        let dir = TempDir::new().unwrap();
+        let resolver = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .file_name("test.toml")
+            .env_prefix("CLAPFIG_RESOLVER_CAPTURE_TEST_F7A2E1")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .build_resolver()
+            .unwrap();
+
+        // Mutate the env after build_resolver. If env were re-read at
+        // resolve_at time, this value would leak through.
+        unsafe {
+            std::env::set_var(KEY, "2222");
+        }
+
+        let config = resolver.resolve_at(dir.path()).unwrap();
+        assert_eq!(
+            config.port, 1111,
+            "resolver must use the env snapshot captured at build_resolver time"
+        );
+
+        unsafe {
+            std::env::remove_var(KEY);
+        }
     }
 
     // --- load() still works through the Resolver path ---

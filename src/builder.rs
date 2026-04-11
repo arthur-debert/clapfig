@@ -367,7 +367,6 @@ impl<C: Config> ClapfigBuilder<C> {
             search_paths,
             self.search_mode,
             env_prefix,
-            self.env_enabled,
             self.strict,
             #[cfg(feature = "url")]
             self.url_overrides,
