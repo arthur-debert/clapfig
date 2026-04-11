@@ -9,7 +9,7 @@
 //!
 //! # Why a separate handle?
 //!
-//! Clapfig's original [`load()`](ClapfigBuilder::load) consumes the builder
+//! Clapfig's original [`load()`](crate::ClapfigBuilder::load) consumes the builder
 //! and anchors resolution at `std::env::current_dir()`. For single-invocation
 //! CLI tools that's exactly right. But for tools that walk a content tree and
 //! need per-directory config — static site generators, linters, format-as-you-go
@@ -36,7 +36,7 @@
 //!
 //! # post_validate composition
 //!
-//! A [`post_validate`](ClapfigBuilder::post_validate) hook registered on the
+//! A [`post_validate`](crate::ClapfigBuilder::post_validate) hook registered on the
 //! builder is captured into the `Resolver` at construction time and fires on
 //! every `resolve_at` call — not just once. The same invariants the hook
 //! enforced for `load()` still apply per leaf.
@@ -77,8 +77,13 @@ struct CachedFile {
     contents: String,
 }
 
-/// Reusable configuration resolver. See the [module documentation](self) for
-/// the full picture.
+/// Reusable configuration resolver for tree-walk use cases.
+///
+/// Built once via [`ClapfigBuilder::build_resolver`](crate::ClapfigBuilder::build_resolver), then called repeatedly
+/// with [`resolve_at(dir)`](Resolver::resolve_at) to produce a typed
+/// configuration anchored at a specific directory. See the
+/// [crate-level "Tree-walk resolution" section](crate#tree-walk-resolution--the-resolverc-handle)
+/// for the full design rationale.
 pub struct Resolver<C: Config> {
     app_name: String,
     file_name: String,
@@ -99,7 +104,8 @@ pub struct Resolver<C: Config> {
 impl<C: Config> Resolver<C> {
     /// Construct a resolver from a builder's captured state.
     ///
-    /// Called by [`ClapfigBuilder::build_resolver`] — not meant for direct use.
+    /// Called by [`ClapfigBuilder::build_resolver`](crate::ClapfigBuilder::build_resolver)
+    /// — not meant for direct use.
     /// The argument list is long but every entry is a direct forwarding of
     /// one builder field, so splitting into an intermediate struct would just
     /// move the same fields around without hiding any complexity.
@@ -140,9 +146,10 @@ impl<C: Config> Resolver<C> {
     ///
     /// [`SearchPath::Cwd`](crate::SearchPath::Cwd) is interpreted as `start_dir`;
     /// [`SearchPath::Ancestors`](crate::SearchPath::Ancestors) walks up from
-    /// `start_dir`. All other layers (env, URL, CLI) are applied identically to
-    /// [`load()`](ClapfigBuilder::load), using the values captured at build
-    /// time. If a [`post_validate`](ClapfigBuilder::post_validate) hook was
+    /// `start_dir`. All other layers (env, URL, CLI) are applied identically
+    /// to [`ClapfigBuilder::load`](crate::ClapfigBuilder::load), using the
+    /// values captured at build time. If a
+    /// [`post_validate`](crate::ClapfigBuilder::post_validate) hook was
     /// registered on the builder, it runs after the merge on every call.
     ///
     /// Files discovered during this call are cached by absolute path; a second

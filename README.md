@@ -15,10 +15,13 @@ Built on [confique](https://github.com/LukasKalbertodt/confique) for struct-driv
 - **Multi-path file search** — platform config dir, home, cwd, ancestor walk, or any path
 - **Search modes** — merge all found configs or use the first match
 - **Ancestor walk** — walk up from cwd to find project configs, with configurable boundary (`.git`, filesystem root)
+- **Tree-walk resolution** — build a reusable [`Resolver<C>`](https://docs.rs/clapfig/latest/clapfig/struct.Resolver.html) once, call `.resolve_at(&dir)` for every leaf in a dynamic file tree (`.htaccess`/`.editorconfig` pattern). Per-call `Cwd`/`Ancestors` anchoring, instance-scoped file cache so repeated walks pay disk+parse once per unique file.
 - **Prefix-based env vars** — `MYAPP__DATABASE__URL` maps to `database.url` automatically
 - **Strict mode** — unknown keys error with file path, key name, and line number (on by default)
+- **Post-merge validation hook** — `.post_validate(|c| ...)` closes the gap between confique's structural validation and the semantic constraints every real app has: port ranges, cross-field invariants, enum combinations, filesystem preconditions
 - **Structured errors + rendering** — [`ClapfigError`](https://docs.rs/clapfig/latest/clapfig/error/enum.ClapfigError.html) carries data (keys, paths, lines, source text); the [`render`](https://docs.rs/clapfig/latest/clapfig/render/index.html) module turns it into plain text or [`miette`](https://docs.rs/miette)-style output with snippets and carets (rich mode behind the `rich-errors` feature)
 - **Template generation** — emit a commented sample config from the struct's doc comments
+- **JSON Schema generation** — [`clapfig::schema::generate_schema::<C>()`](https://docs.rs/clapfig/latest/clapfig/schema/fn.generate_schema.html) produces a Draft 2020-12 JSON Schema for UI editors, external validators, and IDE integrations; also exposed as `app config schema`
 - **Persistence with named scopes** — global/local config file patterns with `--scope` targeting
 
 **Clap adapter** (`clap` feature, on by default):
