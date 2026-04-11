@@ -35,6 +35,11 @@ impl Clapfig {
     }
 }
 
+/// Boxed post-merge validation hook.
+///
+/// See [`ClapfigBuilder::post_validate`] for how it is invoked.
+type PostValidateHook<C> = Box<dyn Fn(&C) -> Result<(), String> + Send + Sync>;
+
 /// Builder for configuring and loading layered configuration.
 ///
 /// Controls three orthogonal axes (see [`types`](crate::types) for the full picture):
@@ -55,6 +60,7 @@ pub struct ClapfigBuilder<C: Config> {
     url_overrides: Vec<(String, toml::Value)>,
     cli_overrides: Vec<(String, toml::Value)>,
     layer_order: Option<Vec<Layer>>,
+    post_validate: Option<PostValidateHook<C>>,
     _phantom: PhantomData<C>,
 }
 
@@ -73,6 +79,7 @@ impl<C: Config> ClapfigBuilder<C> {
             url_overrides: Vec::new(),
             cli_overrides: Vec::new(),
             layer_order: None,
+            post_validate: None,
             _phantom: PhantomData,
         }
     }
@@ -178,6 +185,42 @@ impl<C: Config> ClapfigBuilder<C> {
     /// ```
     pub fn layer_order(mut self, order: Vec<Layer>) -> Self {
         self.layer_order = Some(order);
+        self
+    }
+
+    /// Register a post-merge validation hook.
+    ///
+    /// The hook runs after all layers have been merged and confique has
+    /// type-validated the result, but before [`load()`](Self::load) returns
+    /// the configuration. It receives the final `&C` and returns
+    /// `Ok(())` to accept it or `Err(String)` to reject it with a message
+    /// that will be wrapped in [`ClapfigError::PostValidationFailed`].
+    ///
+    /// Use it for constraints confique can't express: numeric ranges,
+    /// cross-field invariants ("if A is set then B must be set"), enum
+    /// combinations, filesystem preconditions, anything that depends on
+    /// the merged value rather than on a single field's type.
+    ///
+    /// Calling this method more than once replaces the previous hook.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config: AppConfig = Clapfig::builder()
+    ///     .app_name("myapp")
+    ///     .post_validate(|c| {
+    ///         if c.port < 1024 {
+    ///             return Err(format!("port {} is below 1024", c.port));
+    ///         }
+    ///         Ok(())
+    ///     })
+    ///     .load()?;
+    /// ```
+    pub fn post_validate<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&C) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.post_validate = Some(Box::new(f));
         self
     }
 
@@ -305,12 +348,20 @@ impl<C: Config> ClapfigBuilder<C> {
     }
 
     /// Load and resolve the configuration through all layers.
+    ///
+    /// If a [`post_validate`](Self::post_validate) hook is registered, it
+    /// runs after the merged configuration has been produced and any
+    /// rejection is returned as [`ClapfigError::PostValidationFailed`].
     pub fn load(self) -> Result<C, ClapfigError>
     where
         C::Layer: for<'de> Deserialize<'de>,
     {
         let input = self.build_input()?;
-        resolve::resolve(input)
+        let config = resolve::resolve(input)?;
+        if let Some(hook) = self.post_validate.as_ref() {
+            hook(&config).map_err(ClapfigError::PostValidationFailed)?;
+        }
+        Ok(config)
     }
 
     /// Handle a `ConfigAction` and print the result to stdout.
@@ -632,6 +683,122 @@ mod tests {
         assert_eq!(config.host, "localhost");
         assert_eq!(config.port, 8080);
         assert!(!config.debug);
+    }
+
+    // --- post_validate hook ---
+
+    #[test]
+    fn post_validate_sees_merged_values() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "port = 3000\n").unwrap();
+
+        let seen_port = std::sync::Arc::new(std::sync::Mutex::new(0u16));
+        let seen_port_clone = seen_port.clone();
+
+        let _config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .post_validate(move |c: &TestConfig| {
+                *seen_port_clone.lock().unwrap() = c.port;
+                Ok(())
+            })
+            .load()
+            .unwrap();
+
+        assert_eq!(
+            *seen_port.lock().unwrap(),
+            3000,
+            "hook must see post-merge values"
+        );
+    }
+
+    #[test]
+    fn post_validate_ok_passes_config_through() {
+        let dir = TempDir::new().unwrap();
+
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .post_validate(|_: &TestConfig| Ok(()))
+            .load()
+            .unwrap();
+
+        assert_eq!(config.port, 8080);
+    }
+
+    #[test]
+    fn post_validate_err_returns_post_validation_failed() {
+        let dir = TempDir::new().unwrap();
+
+        let result: Result<TestConfig, _> = Clapfig::builder()
+            .app_name("test")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .post_validate(|c: &TestConfig| {
+                if c.port < 10_000 {
+                    Err(format!("port {} is below 10000", c.port))
+                } else {
+                    Ok(())
+                }
+            })
+            .load();
+
+        match result {
+            Err(ClapfigError::PostValidationFailed(msg)) => {
+                assert!(msg.contains("8080"), "expected port in message: {msg}");
+                assert!(msg.contains("below"), "expected reason in message: {msg}");
+            }
+            Err(other) => panic!("expected PostValidationFailed, got {other:?}"),
+            Ok(_) => panic!("expected PostValidationFailed, got Ok"),
+        }
+    }
+
+    #[test]
+    fn post_validate_not_called_when_upstream_fails() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "typo_key = 1\n").unwrap();
+
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        let result: Result<TestConfig, _> = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .post_validate(move |_: &TestConfig| {
+                called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .load();
+
+        assert!(result.is_err(), "strict validation should have failed");
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "hook must not run when upstream resolution fails"
+        );
+    }
+
+    #[test]
+    fn post_validate_second_call_replaces_first() {
+        let dir = TempDir::new().unwrap();
+
+        let result: Result<TestConfig, _> = Clapfig::builder()
+            .app_name("test")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .post_validate(|_: &TestConfig| Err("first".into()))
+            .post_validate(|_: &TestConfig| Err("second".into()))
+            .load();
+
+        match result {
+            Err(ClapfigError::PostValidationFailed(msg)) => assert_eq!(msg, "second"),
+            other => panic!("expected PostValidationFailed('second'), got {other:?}"),
+        }
     }
 
     #[test]

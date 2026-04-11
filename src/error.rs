@@ -110,6 +110,14 @@ pub enum ClapfigError {
 
     #[error("App name is required — call .app_name() on the builder")]
     AppNameRequired,
+
+    /// A user-supplied `post_validate` hook rejected the merged configuration.
+    ///
+    /// The inner string is the message returned by the hook — typically
+    /// something like `"port 80 is below the allowed minimum 1024"`. Clapfig
+    /// does not interpret it; renderers surface it as-is.
+    #[error("Configuration validation failed: {0}")]
+    PostValidationFailed(String),
 }
 
 impl ClapfigError {
