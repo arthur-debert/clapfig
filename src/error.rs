@@ -31,7 +31,7 @@ use thiserror::Error;
 /// A single unknown-key violation discovered during strict-mode validation.
 ///
 /// Flat, pattern-match-free data carrier: no nested enums to unwrap. Produced
-/// by [`validate`](crate::error) and surfaced through
+/// during strict-mode validation and surfaced through
 /// [`ClapfigError::unknown_keys`].
 ///
 /// `source` holds the full file contents at the time of validation, shared

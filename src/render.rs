@@ -150,7 +150,7 @@ fn byte_offset_to_line_col(src: &str, offset: usize) -> (usize, usize) {
 /// Requires the `rich-errors` Cargo feature.
 #[cfg(feature = "rich-errors")]
 pub fn render_rich(err: &ClapfigError) -> String {
-    use miette::{GraphicalReportHandler, LabeledSpan, MietteDiagnostic, NamedSource};
+    use miette::{GraphicalReportHandler, MietteDiagnostic, NamedSource};
 
     let diagnostic = build_diagnostic(err);
     let mut out = String::new();
@@ -183,8 +183,6 @@ pub fn render_rich(err: &ClapfigError) -> String {
         }
     }
 
-    // Silence unused import warnings in builder helpers when this path is taken
-    let _ = LabeledSpan::at(0..0, "");
     out
 }
 
@@ -218,12 +216,16 @@ fn build_diagnostic(err: &ClapfigError) -> RichDiagnostic {
                 .filter(|i| i.line > 0)
                 .filter_map(|info| {
                     let line_idx = info.line - 1;
+                    // Use split_inclusive so byte offsets stay correct on
+                    // CRLF files — str::lines() strips both \n and \r\n,
+                    // which would make line_start off-by-one per CR.
                     let line_start: usize = source_text
-                        .lines()
+                        .split_inclusive('\n')
                         .take(line_idx)
-                        .map(|l| l.len() + 1)
+                        .map(str::len)
                         .sum();
-                    let line_text = source_text.lines().nth(line_idx)?;
+                    let raw_line = source_text.split_inclusive('\n').nth(line_idx)?;
+                    let line_text = raw_line.trim_end_matches('\n').trim_end_matches('\r');
                     let leaf = info.leaf();
                     let col = line_text.find(leaf).unwrap_or(0);
                     let offset = line_start + col;
@@ -370,5 +372,28 @@ mod tests {
         let err = ClapfigError::KeyNotFound("x.y".into());
         let out = render_rich(&err);
         assert!(out.contains("x.y"));
+    }
+
+    #[cfg(feature = "rich-errors")]
+    #[test]
+    fn rich_handles_crlf_line_endings() {
+        // Regression test: str::lines() strips \r\n, so using
+        // lines().map(|l| l.len() + 1).sum() for byte offsets was
+        // off-by-one per CR on CRLF files — the miette span would
+        // point into the wrong bytes. split_inclusive('\n') preserves
+        // the \r\n so offsets match the original buffer.
+        let source: Arc<str> = Arc::from("host = \"x\"\r\ntypo_key = 42\r\n[database]\r\n");
+        let infos = vec![UnknownKeyInfo {
+            key: "typo_key".into(),
+            path: "/crlf.toml".into(),
+            line: 2,
+            source: Some(source),
+        }];
+        let out = render_rich(&ClapfigError::UnknownKeys(infos));
+        assert!(out.contains("typo_key"), "missing key: {out}");
+        assert!(
+            out.contains("typo_key = 42"),
+            "snippet should point at the correct line, got: {out}"
+        );
     }
 }
