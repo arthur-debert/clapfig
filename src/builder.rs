@@ -391,6 +391,25 @@ impl<C: Config> ClapfigBuilder<C> {
                     None => Ok(ConfigResult::Template(template)),
                 }
             }
+            ConfigAction::Schema { output } => {
+                let schema = ops::generate_schema_string::<C>();
+                match output {
+                    Some(path) => {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
+                                path: parent.to_path_buf(),
+                                source: e,
+                            })?;
+                        }
+                        std::fs::write(path, &schema).map_err(|e| ClapfigError::IoError {
+                            path: path.clone(),
+                            source: e,
+                        })?;
+                        Ok(ConfigResult::SchemaWritten { path: path.clone() })
+                    }
+                    None => Ok(ConfigResult::Schema(schema)),
+                }
+            }
             ConfigAction::Get { key, scope } => match scope {
                 None => {
                     let config = self.load()?;
@@ -764,6 +783,45 @@ mod tests {
         let content = fs::read_to_string(&out_path).unwrap();
         assert!(content.contains("host"));
         assert!(content.contains("port"));
+    }
+
+    #[test]
+    fn handle_schema() {
+        let result: ConfigResult = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .no_env()
+            .handle(&ConfigAction::Schema { output: None })
+            .unwrap();
+
+        match result {
+            ConfigResult::Schema(s) => {
+                let value: serde_json::Value = serde_json::from_str(&s).unwrap();
+                assert_eq!(value["type"], "object");
+                assert_eq!(value["title"], "TestConfig");
+                assert!(value["properties"].get("host").is_some());
+                assert!(value["properties"].get("database").is_some());
+            }
+            other => panic!("Expected Schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_schema_with_output() {
+        let dir = TempDir::new().unwrap();
+        let out_path = dir.path().join("schema.json");
+
+        let result: ConfigResult = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .no_env()
+            .handle(&ConfigAction::Schema {
+                output: Some(out_path.clone()),
+            })
+            .unwrap();
+
+        assert!(matches!(result, ConfigResult::SchemaWritten { .. }));
+        let content = fs::read_to_string(&out_path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["title"], "TestConfig");
     }
 
     #[test]

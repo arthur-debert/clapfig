@@ -315,6 +315,7 @@
 
 pub mod error;
 pub mod render;
+pub mod schema;
 pub mod types;
 
 mod builder;

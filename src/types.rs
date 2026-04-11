@@ -193,6 +193,10 @@ pub enum ConfigAction {
     Gen {
         output: Option<PathBuf>,
     },
+    /// Emit a JSON Schema document describing the config struct.
+    Schema {
+        output: Option<PathBuf>,
+    },
     /// Show a single config key's value.
     Get {
         key: String,

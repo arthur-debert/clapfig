@@ -68,6 +68,12 @@ pub enum ConfigSubcommand {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Emit a JSON Schema document describing the config struct.
+    Schema {
+        /// Write to a file instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Show the resolved value and documentation for a config key.
     Get {
         /// Dotted key path (e.g. "database.url").
@@ -98,6 +104,7 @@ impl ConfigArgs {
         match self.action {
             None | Some(ConfigSubcommand::List) => ConfigAction::List { scope },
             Some(ConfigSubcommand::Gen { output }) => ConfigAction::Gen { output },
+            Some(ConfigSubcommand::Schema { output }) => ConfigAction::Schema { output },
             Some(ConfigSubcommand::Get { key }) => ConfigAction::Get { key, scope },
             Some(ConfigSubcommand::Set { key, value }) => ConfigAction::Set { key, value, scope },
             Some(ConfigSubcommand::Unset { key }) => ConfigAction::Unset { key, scope },
@@ -132,6 +139,7 @@ impl ConfigArgs {
 pub struct ConfigCommand {
     list_name: String,
     gen_name: String,
+    schema_name: String,
     get_name: String,
     set_name: String,
     unset_name: String,
@@ -145,6 +153,7 @@ impl Default for ConfigCommand {
         Self {
             list_name: "list".into(),
             gen_name: "gen".into(),
+            schema_name: "schema".into(),
             get_name: "get".into(),
             set_name: "set".into(),
             unset_name: "unset".into(),
@@ -170,6 +179,12 @@ impl ConfigCommand {
     /// Rename the `gen` subcommand.
     pub fn gen_name(mut self, name: impl Into<String>) -> Self {
         self.gen_name = name.into();
+        self
+    }
+
+    /// Rename the `schema` subcommand.
+    pub fn schema_name(mut self, name: impl Into<String>) -> Self {
+        self.schema_name = name.into();
         self
     }
 
@@ -220,20 +235,27 @@ impl ConfigCommand {
             .help("Target a named persist scope (e.g. \"local\", \"global\").")
             .global(true);
 
-        let mut output_arg = Arg::new("output")
-            .long(self.output_long.clone())
-            .help("Write to a file instead of stdout.")
-            .value_parser(clap::value_parser!(PathBuf));
-        if let Some(short) = self.output_short {
-            output_arg = output_arg.short(short);
-        }
+        let build_output_arg = || {
+            let mut arg = Arg::new("output")
+                .long(self.output_long.clone())
+                .help("Write to a file instead of stdout.")
+                .value_parser(clap::value_parser!(PathBuf));
+            if let Some(short) = self.output_short {
+                arg = arg.short(short);
+            }
+            arg
+        };
 
         let list_cmd = Command::new(self.list_name.clone())
             .about("Show all resolved configuration key-value pairs.");
 
         let gen_cmd = Command::new(self.gen_name.clone())
             .about("Generate a commented sample configuration file.")
-            .arg(output_arg);
+            .arg(build_output_arg());
+
+        let schema_cmd = Command::new(self.schema_name.clone())
+            .about("Emit a JSON Schema document describing the config struct.")
+            .arg(build_output_arg());
 
         let get_cmd = Command::new(self.get_name.clone())
             .about("Show the resolved value and documentation for a config key.")
@@ -266,6 +288,7 @@ impl ConfigCommand {
             .arg(scope_arg)
             .subcommand(list_cmd)
             .subcommand(gen_cmd)
+            .subcommand(schema_cmd)
             .subcommand(get_cmd)
             .subcommand(set_cmd)
             .subcommand(unset_cmd)
@@ -284,6 +307,10 @@ impl ConfigCommand {
             Some((name, sub)) if name == self.gen_name => {
                 let output = sub.get_one::<PathBuf>("output").cloned();
                 Ok(ConfigAction::Gen { output })
+            }
+            Some((name, sub)) if name == self.schema_name => {
+                let output = sub.get_one::<PathBuf>("output").cloned();
+                Ok(ConfigAction::Schema { output })
             }
             Some((name, sub)) if name == self.get_name => {
                 let key = sub.get_one::<String>("key").unwrap().clone();
@@ -334,6 +361,25 @@ mod tests {
             action,
             ConfigAction::Gen {
                 output: Some(PathBuf::from("out.toml"))
+            }
+        );
+    }
+
+    #[test]
+    fn parse_schema_no_output() {
+        let args = parse(&["test", "schema"]);
+        let action = args.into_action();
+        assert_eq!(action, ConfigAction::Schema { output: None });
+    }
+
+    #[test]
+    fn parse_schema_with_output() {
+        let args = parse(&["test", "schema", "-o", "schema.json"]);
+        let action = args.into_action();
+        assert_eq!(
+            action,
+            ConfigAction::Schema {
+                output: Some(PathBuf::from("schema.json"))
             }
         );
     }
@@ -565,6 +611,35 @@ mod tests {
             ConfigAction::Gen {
                 output: Some(PathBuf::from("out.toml"))
             }
+        );
+    }
+
+    #[test]
+    fn cmd_default_schema() {
+        let cmd = ConfigCommand::new();
+        assert_eq!(
+            cmd_parse(&cmd, &["test", "config", "schema"]),
+            ConfigAction::Schema { output: None }
+        );
+    }
+
+    #[test]
+    fn cmd_default_schema_with_output() {
+        let cmd = ConfigCommand::new();
+        assert_eq!(
+            cmd_parse(&cmd, &["test", "config", "schema", "-o", "schema.json"]),
+            ConfigAction::Schema {
+                output: Some(PathBuf::from("schema.json"))
+            }
+        );
+    }
+
+    #[test]
+    fn cmd_renamed_schema() {
+        let cmd = ConfigCommand::new().schema_name("json-schema");
+        assert_eq!(
+            cmd_parse(&cmd, &["test", "config", "json-schema"]),
+            ConfigAction::Schema { output: None }
         );
     }
 

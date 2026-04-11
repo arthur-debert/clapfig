@@ -18,6 +18,10 @@ pub enum ConfigResult {
     Template(String),
     /// Confirmation that a template was written to a file.
     TemplateWritten { path: PathBuf },
+    /// A generated JSON Schema document (already serialized).
+    Schema(String),
+    /// Confirmation that a JSON Schema document was written to a file.
+    SchemaWritten { path: PathBuf },
     /// A key's resolved value and its doc comment.
     KeyValue {
         key: String,
@@ -38,6 +42,10 @@ impl fmt::Display for ConfigResult {
             ConfigResult::Template(t) => write!(f, "{t}"),
             ConfigResult::TemplateWritten { path } => {
                 write!(f, "Config template written to {}", path.display())
+            }
+            ConfigResult::Schema(s) => write!(f, "{s}"),
+            ConfigResult::SchemaWritten { path } => {
+                write!(f, "Config schema written to {}", path.display())
             }
             ConfigResult::KeyValue { key, value, doc } => {
                 for line in doc {
@@ -63,6 +71,17 @@ impl fmt::Display for ConfigResult {
 /// Generate a commented TOML template from the config struct's doc comments.
 pub fn generate_template<C: Config>() -> String {
     confique::toml::template::<C>(confique::toml::FormatOptions::default())
+}
+
+/// Generate a JSON Schema document (pretty-printed) describing the config struct.
+///
+/// Delegates to [`crate::schema::generate_schema`] and serializes the result.
+/// Serialization of a `serde_json::Value` is infallible for the shapes this
+/// module produces, so we propagate any panic rather than masking it with a
+/// bogus "{}" payload.
+pub fn generate_schema_string<C: Config>() -> String {
+    let value = crate::schema::generate_schema::<C>();
+    serde_json::to_string_pretty(&value).expect("serde_json::Value serialization is infallible")
 }
 
 /// Get a config value by dotted key, including its doc comment.
