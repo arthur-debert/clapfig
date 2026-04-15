@@ -37,10 +37,10 @@ Built on [confique](https://github.com/LukasKalbertodt/confique) for struct-driv
 clapfig = "0.10"
 ```
 
-Define your config with confique's `Config` derive:
+Define your config with the `Config` derive (re-exported from confique):
 
 ```rust
-use confique::Config;
+use clapfig::Config;
 use serde::{Serialize, Deserialize};
 
 #[derive(Config, Serialize, Deserialize, Debug)]
@@ -143,6 +143,42 @@ cargo run --example clapfig_demo --features rich-errors -- echo
 
 See [`examples/clapfig_demo/`](examples/clapfig_demo/) for the full source.
 
+## Tree-Walk Resolution with `Resolver`
+
+For tools that walk a file tree where every directory can have its own config — the `.editorconfig` / `.eslintrc` / `.htaccess` pattern — `Resolver` provides cached, per-directory resolution:
+
+```rust
+use clapfig::{Clapfig, Config, SearchPath, Boundary};
+
+let resolver = Clapfig::builder::<MyConfig>()
+    .app_name("mytool")
+    .file_name(".mytool.toml")
+    .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
+    .build_resolver()?;
+
+// Each call resolves config independently from that directory,
+// walking ancestors up to the .git boundary.
+for dir in directories_to_process {
+    let config = resolver.resolve_at(&dir)?;
+    process(&dir, &config);
+}
+```
+
+Key properties:
+
+- **Per-call anchoring** — `SearchPath::Cwd` and `SearchPath::Ancestors` are relative to the directory passed to `resolve_at()`, not the process CWD.
+- **File caching** — files are cached by absolute path inside the resolver. A tree walk over 1000 directories sharing 5 ancestor configs pays disk+parse once per unique file.
+- **`post_validate` composition** — a validation hook registered on the builder fires on every `resolve_at()` call.
+
+See the [Resolver docs](https://docs.rs/clapfig/latest/clapfig/struct.Resolver.html) for the full API.
+
 ## Documentation
 
-The full guide — design rationale, search paths and modes, environment variables, programmatic overrides, persistence, clap adapter, template generation, strict mode, and normalizing values — lives in the [crate-level docs on docs.rs](https://docs.rs/clapfig).
+**Guides** (in [`docs/`](docs/)):
+
+- [Getting Started](docs/getting-started.md) — installation, first config struct, basic usage
+- [Layered Configuration](docs/layered-config.md) — layers, search paths, merge modes, env vars, overrides
+- [Resolver Guide](docs/resolver.md) — per-directory resolution for tree-walk tools
+- [Config Command Guide](docs/config-command.md) — the `config gen|list|get|set|unset` integration
+
+**API reference**: the full API with design rationale lives in the [crate-level docs on docs.rs](https://docs.rs/clapfig).
