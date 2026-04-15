@@ -32,11 +32,13 @@
 //!
 //! # Design: struct as source of truth
 //!
-//! Your config struct (via confique's `Config` derive) is the schema for
-//! everything:
+//! Your config struct (via the `Config` derive, re-exported from confique) is
+//! the schema for everything:
 //!
 //! - **`#[config(default = ...)]`** provides compiled defaults — the lowest
-//!   layer, always present.
+//!   layer, always present. Works with scalars (`default = 8080`), strings
+//!   (`default = "localhost"`), and collections (`default = {}` for an empty
+//!   map, `default = []` for an empty vec).
 //! - **`///` doc comments** become the comments in generated templates and the
 //!   output of `config get`.
 //! - **`#[config(nested)]`** models hierarchical config. Nesting maps to TOML
@@ -441,6 +443,7 @@ mod fixtures;
 pub use builder::{Clapfig, ClapfigBuilder};
 #[cfg(feature = "clap")]
 pub use cli::{ConfigArgs, ConfigCommand, ConfigSubcommand};
+pub use confique::Config;
 pub use error::{ClapfigError, UnknownKeyInfo};
 pub use ops::ConfigResult;
 pub use resolver::Resolver;

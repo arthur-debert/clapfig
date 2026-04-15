@@ -397,6 +397,11 @@ impl<C: Config> ClapfigBuilder<C> {
     }
 
     /// Handle a `ConfigAction` and print the result to stdout.
+    ///
+    /// Convenience wrapper around [`handle()`](Self::handle) for CLI apps that
+    /// print directly. For programmatic use or integration with other output
+    /// frameworks, prefer [`handle()`](Self::handle) (returns a
+    /// [`ConfigResult`]) or [`handle_to_string()`](Self::handle_to_string).
     pub fn handle_and_print(self, action: &ConfigAction) -> Result<(), ClapfigError>
     where
         C: Serialize,
@@ -405,6 +410,24 @@ impl<C: Config> ClapfigBuilder<C> {
         let result = self.handle(action)?;
         print!("{result}");
         Ok(())
+    }
+
+    /// Handle a `ConfigAction` and return the result as a `String`.
+    ///
+    /// Like [`handle_and_print()`](Self::handle_and_print), but captures the
+    /// output instead of printing to stdout. Useful when integrating with
+    /// output frameworks or custom rendering pipelines.
+    ///
+    /// ```ignore
+    /// let output = builder.handle_to_string(&action)?;
+    /// my_output_framework.write(&output);
+    /// ```
+    pub fn handle_to_string(self, action: &ConfigAction) -> Result<String, ClapfigError>
+    where
+        C: Serialize,
+        C::Layer: for<'de> Deserialize<'de>,
+    {
+        self.handle(action).map(|r| r.to_string())
     }
 
     /// Resolve the file path for a persist scope.
@@ -438,7 +461,16 @@ impl<C: Config> ClapfigBuilder<C> {
         file::resolve_persist_path(search_path, &file_name, app_name)
     }
 
-    /// Handle a `ConfigAction` (list / gen / get / set / unset).
+    /// Handle a `ConfigAction` and return the structured result.
+    ///
+    /// This is the core dispatch method for config operations (list, gen,
+    /// schema, get, set, unset). Returns a [`ConfigResult`] enum that can be
+    /// inspected programmatically or converted to a string via its `Display`
+    /// implementation.
+    ///
+    /// For convenience wrappers see
+    /// [`handle_and_print()`](Self::handle_and_print) (prints to stdout) and
+    /// [`handle_to_string()`](Self::handle_to_string) (returns a `String`).
     pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError>
     where
         C: Serialize,
