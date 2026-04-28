@@ -52,18 +52,17 @@ jobs:
           echo "=== Release Notes ==="
           cat release-notes.md
 
+      # Use scripts/ci-publish-crate.sh for robust two-tier "already
+      # published" detection: pre-check via crates.io JSON API + grep
+      # cargo's publish output for "already exists on crates.io index"
+      # / "already uploaded". Same pattern as standout/dodot/padz/rustloc.
+      # Replaces the prior `cargo search VERSION grep` heuristic which
+      # broke when re-running an older release (cargo search returns
+      # only the LATEST version, so the grep wouldn't match older ones).
       - name: Publish to crates.io
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          cargo publish --allow-dirty --token ${{ secrets.CRATES_IO_KEY }} 2>&1 || {
-            if cargo search clapfig --limit 1 2>/dev/null | grep -q "clapfig.*\"$VERSION\""; then
-              echo "clapfig@$VERSION already published, skipping"
-            else
-              echo "Failed to publish clapfig"
-              exit 1
-            fi
-          }
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_KEY }}
+        run: scripts/ci-publish-crate.sh clapfig
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
