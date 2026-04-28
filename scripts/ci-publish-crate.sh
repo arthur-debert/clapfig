@@ -40,7 +40,14 @@ fi
 
 echo "→ publishing $crate $version"
 log=$(mktemp)
-if cargo publish -p "$crate" 2>&1 | tee "$log"; then
+# `--allow-dirty` is safe in CI because the runner clones from a tagged
+# ref — any "dirt" is from CI-generated intermediate files (release
+# notes, build artifacts) that aren't shipped in the published crate
+# (cargo packages only files matching Cargo.toml include/exclude).
+# Without this flag, projects whose release.yml writes intermediate
+# files into the workdir (e.g. clapfig's `release-notes.md` step) fail
+# the publish with "files in working directory contain changes".
+if cargo publish -p "$crate" --allow-dirty 2>&1 | tee "$log"; then
     echo "✓ $crate $version published"
 elif grep -qE "already uploaded|is already uploaded|already exists on crates\.io index" "$log"; then
     echo "✓ $crate $version already uploaded (race) — continuing"
