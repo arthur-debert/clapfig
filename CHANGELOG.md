@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-04-28
+
 - **Documentation**
   - **Crate-level guide covers `post_validate` and `Resolver<C>`** — Added two new sections to the `lib.rs` crate doc (which is the front page of docs.rs/clapfig): "Semantic validation — the `post_validate` hook" explains why structural validation isn't enough and documents the hook's signature, short-circuit semantics, composition rules, and design tradeoffs; "Tree-walk resolution — the `Resolver<C>` handle" documents the `.htaccess`/`.editorconfig` use case, the per-call `Cwd`/`Ancestors` anchoring model, the instance-scoped file cache's no-mtime-check contract, and the `load() = build_resolver()?.resolve_at(cwd)?` relationship. `Resolver`'s type-level rustdoc links out to the crate-level section rather than duplicating the design doc, and all intra-doc links now use fully-qualified paths so docs build warning-free. README features list gains bullets for tree-walk resolution, the post-merge validation hook, and JSON Schema generation.
 - **Added**
