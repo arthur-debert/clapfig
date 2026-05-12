@@ -1,16 +1,14 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Shared checks used by both pre-commit and CI.
-# Usage: scripts/check
+# Shared checks used by both pre-commit hook and CI.
+# Each step is its own script so they can be run individually.
 
-echo "📝 Checking formatting..."
-cargo fmt --all -- --check
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "📎 Running clippy..."
-cargo clippy --all-targets -- -D warnings
+"$SCRIPT_DIR/check-fmt"
+"$SCRIPT_DIR/check-lint"
+"$SCRIPT_DIR/check-tests"
 
-echo "🧪 Running tests..."
-cargo test --all
-
-echo "✅ All checks passed!"
+echo ""
+echo "All checks passed!"
