@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running tests..."
+if command -v cargo-nextest &>/dev/null; then
+    cargo nextest run --workspace
+else
+    cargo test --workspace
+fi
+echo "Tests OK"

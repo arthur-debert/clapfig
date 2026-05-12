@@ -1,0 +1,34 @@
+# Pre-commit hooks — ordered by priority (lower number runs first).
+# If a priority group fails, later groups are skipped.
+#
+#   1 — Auto-fix:  rustfmt (staged files only, re-staged)
+#   2 — Check:     clippy and tests (parallel, via scripts/check-*)
+#
+# CI runs the same checks via scripts/check. Keep them in sync when
+# adding checks.
+#
+# Setup: `brew install lefthook && lefthook install`
+
+pre-commit:
+  commands:
+    # --- Phase 1: Auto-fix ---
+    # Format ONLY the staged .rs files — not the whole workspace — so
+    # unrelated unstaged edits don't leak into the commit and rustfmt
+    # version drift in untouched files doesn't produce lingering
+    # unstaged diffs after the commit lands.
+    rustfmt:
+      glob: '**/*.rs'
+      run: rustfmt --edition 2021 {staged_files}
+      stage_fixed: true
+      priority: 1
+
+    # --- Phase 2: Checks (parallel) ---
+    clippy:
+      glob: '**/*.{rs,toml}'
+      run: scripts/check-lint
+      priority: 2
+
+    tests:
+      glob: '**/*.{rs,toml}'
+      run: scripts/check-tests
+      priority: 2
