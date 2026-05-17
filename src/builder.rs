@@ -57,6 +57,7 @@ pub struct ClapfigBuilder<C: Config> {
     env_prefix: Option<String>,
     env_enabled: bool,
     strict: bool,
+    normalize_keys: bool,
     #[cfg(feature = "url")]
     url_overrides: Vec<(String, toml::Value)>,
     cli_overrides: Vec<(String, toml::Value)>,
@@ -76,6 +77,7 @@ impl<C: Config> ClapfigBuilder<C> {
             env_prefix: None,
             env_enabled: true,
             strict: true,
+            normalize_keys: false,
             #[cfg(feature = "url")]
             url_overrides: Vec::new(),
             cli_overrides: Vec::new(),
@@ -163,6 +165,28 @@ impl<C: Config> ClapfigBuilder<C> {
     /// In strict mode, unknown keys in config files produce errors.
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Accept kebab-case keys in config files and CLI/URL overrides
+    /// (default: `false`).
+    ///
+    /// When enabled, every key crossing the boundary into clapfig — TOML
+    /// table keys, dotted CLI override keys, URL query parameter keys — has
+    /// its `-` characters rewritten to `_` before validation, merging, and
+    /// deserialization. The user can then write `pool-size = 5` in a config
+    /// file (or `--set database.pool-size=5` on the CLI) and have it map
+    /// to a Rust field named `pool_size`.
+    ///
+    /// snake_case keys continue to work unchanged; this is purely additive.
+    /// Strict-mode validation still flags genuine unknown keys, just in
+    /// their normalized form.
+    ///
+    /// Environment variables are unaffected — shells dislike `-` in variable
+    /// names, and clapfig's env layer already lower-cases segments and
+    /// treats `__` as the nesting separator.
+    pub fn normalize_keys(mut self, normalize: bool) -> Self {
+        self.normalize_keys = normalize;
         self
     }
 
@@ -368,6 +392,7 @@ impl<C: Config> ClapfigBuilder<C> {
             self.search_mode,
             env_prefix,
             self.strict,
+            self.normalize_keys,
             #[cfg(feature = "url")]
             self.url_overrides,
             self.cli_overrides,
@@ -1618,6 +1643,91 @@ mod tests {
 
         // Files comes after Cli in the order, so Files wins
         assert_eq!(config.port, 3000);
+    }
+
+    // --- normalize_keys ---
+
+    #[test]
+    fn normalize_keys_defaults_to_false() {
+        let builder = Clapfig::builder::<TestConfig>().app_name("myapp");
+        assert!(!builder.normalize_keys);
+    }
+
+    #[test]
+    fn normalize_keys_can_be_enabled() {
+        let builder = Clapfig::builder::<TestConfig>()
+            .app_name("myapp")
+            .normalize_keys(true);
+        assert!(builder.normalize_keys);
+    }
+
+    #[test]
+    fn normalize_keys_load_accepts_kebab_in_file() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "[database]\npool-size = 42\n").unwrap();
+
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .normalize_keys(true)
+            .load()
+            .unwrap();
+
+        assert_eq!(config.database.pool_size, 42);
+    }
+
+    #[test]
+    fn normalize_keys_load_accepts_kebab_in_cli_override() {
+        let dir = TempDir::new().unwrap();
+
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .normalize_keys(true)
+            .cli_override("database.pool-size", Some(99i64))
+            .load()
+            .unwrap();
+
+        assert_eq!(config.database.pool_size, 99);
+    }
+
+    #[test]
+    fn normalize_keys_off_rejects_kebab_in_file() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "[database]\npool-size = 42\n").unwrap();
+
+        let result: Result<TestConfig, _> = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load();
+
+        assert!(
+            result.is_err(),
+            "kebab key should fail without normalize_keys"
+        );
+    }
+
+    #[test]
+    fn normalize_keys_snake_still_works_when_enabled() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "[database]\npool_size = 55\n").unwrap();
+
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .normalize_keys(true)
+            .load()
+            .unwrap();
+
+        assert_eq!(config.database.pool_size, 55);
     }
 
     #[test]

@@ -101,6 +101,7 @@ pub struct Resolver<C: Config> {
     /// `None` in that case).
     env_vars: Vec<(String, String)>,
     strict: bool,
+    normalize_keys: bool,
     #[cfg(feature = "url")]
     url_overrides: Vec<(String, toml::Value)>,
     cli_overrides: Vec<(String, toml::Value)>,
@@ -133,6 +134,7 @@ impl<C: Config> Resolver<C> {
         search_mode: SearchMode,
         env_prefix: Option<String>,
         strict: bool,
+        normalize_keys: bool,
         #[cfg(feature = "url")] url_overrides: Vec<(String, toml::Value)>,
         cli_overrides: Vec<(String, toml::Value)>,
         layer_order: Option<Vec<Layer>>,
@@ -153,6 +155,7 @@ impl<C: Config> Resolver<C> {
             env_prefix,
             env_vars,
             strict,
+            normalize_keys,
             #[cfg(feature = "url")]
             url_overrides,
             cli_overrides,
@@ -222,6 +225,7 @@ impl<C: Config> Resolver<C> {
             url_overrides: self.url_overrides.clone(),
             cli_overrides: self.cli_overrides.clone(),
             strict: self.strict,
+            normalize_keys: self.normalize_keys,
             layer_order: self.layer_order.clone(),
         };
 
