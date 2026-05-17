@@ -277,6 +277,12 @@
 //! message reports the normalized form, but the line-number snippet still
 //! points at the user's original line.
 //!
+//! Generated templates ([`ConfigAction::Gen`]) also follow the normalized
+//! presentation: with `.normalize_keys(true)` on, `config gen` emits keys
+//! and section headers in kebab-case (`pool-size`, `[my-section]`) so the
+//! template matches what users will type. Doc comments and values are
+//! never touched.
+//!
 //! Environment variables are unaffected — shells dislike `-` in variable
 //! names, and the env layer already lower-cases segments and treats `__` as
 //! the nesting separator.

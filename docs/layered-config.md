@@ -169,6 +169,11 @@ Strict-mode validation still flags genuine unknown keys; the error message
 reports them in their normalized form, but the line-number snippet still
 points at the user's original line in the file.
 
+The generated template (`config gen`) follows the same presentation: with
+`.normalize_keys(true)`, keys and section headers are emitted in
+kebab-case so the template matches what your users will type. Doc
+comments and values are never rewritten.
+
 Environment variables are unaffected — shells dislike `-` in variable names,
 and the env layer already lower-cases segments and treats `__` as the nesting
 separator.

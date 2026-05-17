@@ -69,8 +69,117 @@ impl fmt::Display for ConfigResult {
 }
 
 /// Generate a commented TOML template from the config struct's doc comments.
-pub fn generate_template<C: Config>() -> String {
-    confique::toml::template::<C>(confique::toml::FormatOptions::default())
+///
+/// When `kebab` is `true`, snake_case field names in the template's keys and
+/// section headers are rewritten to kebab-case (`pool_size` → `pool-size`)
+/// so the template matches what users will actually type when
+/// [`.normalize_keys(true)`](crate::ClapfigBuilder::normalize_keys) is in
+/// effect. Doc comments and values are never touched.
+pub fn generate_template<C: Config>(kebab: bool) -> String {
+    let raw = confique::toml::template::<C>(confique::toml::FormatOptions::default());
+    if kebab {
+        rewrite_keys_to_kebab(&raw)
+    } else {
+        raw
+    }
+}
+
+/// Rewrite snake_case keys to kebab-case in a confique TOML template.
+///
+/// Walks the template line by line and rewrites:
+/// - `[section]` / `[parent.section]` / `[[array]]` headers
+/// - `key = value` lines
+/// - `#key = value` commented-default lines (single or multi-hash prefix)
+///
+/// Doc-comment lines (a `#` followed by a space or end-of-line) and the
+/// value portion of any line are left untouched. The disambiguation between
+/// a doc comment and a commented-default line is the same convention
+/// confique itself uses: `# <text>` is documentation, `#key = ...` (no
+/// space after the hashes) is a commented key.
+fn rewrite_keys_to_kebab(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let ends_with_newline = template.ends_with('\n');
+
+    for (i, line) in template.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&rewrite_template_line(line));
+    }
+    if ends_with_newline {
+        out.push('\n');
+    }
+    out
+}
+
+fn rewrite_template_line(line: &str) -> String {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let stripped = &line[indent_len..];
+
+    // [[array.of.tables]] — must be checked before [section] since the
+    // shorter prefix `[` is a substring of `[[`.
+    if let Some(rest) = stripped.strip_prefix("[[")
+        && let Some(end) = rest.find("]]")
+    {
+        let name = rest[..end].trim();
+        let tail = &rest[end + 2..];
+        return format!("{indent}[[{}]]{tail}", swap_underscores_to_dashes(name));
+    }
+
+    // [section] / [parent.section]
+    if let Some(rest) = stripped.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        let name = rest[..end].trim();
+        let tail = &rest[end + 1..];
+        return format!("{indent}[{}]{tail}", swap_underscores_to_dashes(name));
+    }
+
+    // Commented-out key (#key = ...) vs. doc comment (# <text>).
+    let (hashes, body) = if stripped.starts_with('#') {
+        let count = stripped.bytes().take_while(|&b| b == b'#').count();
+        let after = &stripped[count..];
+        // confique's convention: hashes + whitespace (or EOL) = doc comment;
+        // hashes + bareword = commented-out default. Only rewrite the latter.
+        if after.is_empty() || after.starts_with(|c: char| c.is_whitespace()) {
+            return line.to_string();
+        }
+        (&stripped[..count], after)
+    } else {
+        ("", stripped)
+    };
+
+    // Plain or commented "key = value" line.
+    if let Some(eq_idx) = body.find('=') {
+        let key_part = &body[..eq_idx];
+        let key_trimmed = key_part.trim();
+        if is_bareword_dotted_key(key_trimmed) {
+            // Preserve whitespace around the key exactly.
+            let leading_ws_in_key = &key_part[..key_part.len() - key_part.trim_start().len()];
+            let trailing_ws_in_key = &key_part[leading_ws_in_key.len() + key_trimmed.len()..];
+            let rest = &body[eq_idx..];
+            return format!(
+                "{indent}{hashes}{leading_ws_in_key}{}{trailing_ws_in_key}{rest}",
+                swap_underscores_to_dashes(key_trimmed),
+            );
+        }
+    }
+
+    line.to_string()
+}
+
+fn is_bareword_dotted_key(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+fn swap_underscores_to_dashes(dotted: &str) -> String {
+    if !dotted.contains('_') {
+        return dotted.to_string();
+    }
+    dotted.replace('_', "-")
 }
 
 /// Generate a JSON Schema document (pretty-printed) describing the config struct.
@@ -293,7 +402,7 @@ mod tests {
 
     #[test]
     fn generate_template_contains_keys() {
-        let template = generate_template::<TestConfig>();
+        let template = generate_template::<TestConfig>(false);
         assert!(template.contains("host"));
         assert!(template.contains("port"));
         assert!(template.contains("database"));
@@ -302,9 +411,108 @@ mod tests {
 
     #[test]
     fn generate_template_contains_doc_comments() {
-        let template = generate_template::<TestConfig>();
+        let template = generate_template::<TestConfig>(false);
         assert!(template.contains("application host"));
         assert!(template.contains("port number"));
+    }
+
+    #[test]
+    fn generate_template_kebab_rewrites_snake_keys() {
+        let template = generate_template::<TestConfig>(true);
+        // The nested `pool_size` field should be emitted as `pool-size`.
+        assert!(
+            template.contains("pool-size"),
+            "expected kebab key in template:\n{template}"
+        );
+        assert!(
+            !template.contains("pool_size"),
+            "expected no snake leak in template:\n{template}"
+        );
+    }
+
+    #[test]
+    fn generate_template_kebab_preserves_doc_comments() {
+        // Doc comments that happen to mention the snake form (in prose, not
+        // as keys) should not be rewritten. TestConfig's docs include
+        // "Connection pool size."—lowercase plain English—but we also want
+        // the structural guarantee that `# ` lines pass through verbatim.
+        let template = generate_template::<TestConfig>(true);
+        assert!(template.contains("Connection pool size."));
+    }
+
+    #[test]
+    fn generate_template_kebab_off_is_default_behavior() {
+        // Sanity: with the flag off, output is byte-identical to the bare
+        // confique template (kebab path is opt-in).
+        let raw = generate_template::<TestConfig>(false);
+        let bare = confique::toml::template::<TestConfig>(confique::toml::FormatOptions::default());
+        assert_eq!(raw, bare);
+    }
+
+    // -- rewrite_keys_to_kebab unit tests -----------------------------------
+
+    #[test]
+    fn rewriter_handles_section_headers() {
+        let input = "[my_section]\n[parent.my_child]\n";
+        let out = rewrite_keys_to_kebab(input);
+        assert!(out.contains("[my-section]"));
+        assert!(out.contains("[parent.my-child]"));
+    }
+
+    #[test]
+    fn rewriter_handles_array_of_tables_headers() {
+        let input = "[[my_list]]\n";
+        let out = rewrite_keys_to_kebab(input);
+        assert_eq!(out, "[[my-list]]\n");
+    }
+
+    #[test]
+    fn rewriter_handles_commented_default_keys() {
+        let input = "#pool_size = 10\n";
+        let out = rewrite_keys_to_kebab(input);
+        assert_eq!(out, "#pool-size = 10\n");
+    }
+
+    #[test]
+    fn rewriter_handles_uncommented_keys() {
+        let input = "pool_size = 10\n";
+        let out = rewrite_keys_to_kebab(input);
+        assert_eq!(out, "pool-size = 10\n");
+    }
+
+    #[test]
+    fn rewriter_skips_doc_comments() {
+        // `#` followed by a space is a doc comment in confique's convention —
+        // any `_` in prose must survive the rewriter untouched.
+        let input = "# Set pool_size to a positive integer.\n";
+        let out = rewrite_keys_to_kebab(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn rewriter_leaves_value_underscores_alone() {
+        // Underscores in the value portion (e.g. inside string defaults)
+        // must not be touched — only the key gets rewritten.
+        let input = r#"db_url = "postgres://my_user@host""#.to_string() + "\n";
+        let out = rewrite_keys_to_kebab(&input);
+        assert!(out.contains("db-url = "));
+        assert!(out.contains(r#""postgres://my_user@host""#));
+    }
+
+    #[test]
+    fn rewriter_preserves_blank_lines() {
+        let input = "key_one = 1\n\nkey_two = 2\n";
+        let out = rewrite_keys_to_kebab(input);
+        assert_eq!(out, "key-one = 1\n\nkey-two = 2\n");
+    }
+
+    #[test]
+    fn rewriter_preserves_trailing_newline_absence() {
+        // If the original lacks a trailing newline, the rewritten output
+        // shouldn't sprout one.
+        let input = "pool_size = 10";
+        let out = rewrite_keys_to_kebab(input);
+        assert_eq!(out, "pool-size = 10");
     }
 
     #[test]
