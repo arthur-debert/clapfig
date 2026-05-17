@@ -409,6 +409,22 @@
 //! it seeds it from this template so the user gets a documented starting
 //! point.
 //!
+//! # Metadata accessors
+//!
+//! Tools that build help text, tooltips, settings UIs, or `--describe`
+//! flags can read a field's doc-comment lines directly from the static
+//! `Config::META` tree — no need to spin up the full resolve pipeline. See
+//! [`meta::doc_for`](crate::meta::doc_for):
+//!
+//! ```ignore
+//! let lines = clapfig::meta::doc_for::<AppConfig>("database.pool-size")
+//!     .unwrap_or_default();
+//! ```
+//!
+//! Key spelling is lenient (kebab and snake are interchangeable), and the
+//! function returns `None` for keys that don't exist so callers can
+//! distinguish "no such field" from "field exists, undocumented."
+//!
 //! # Clap adapter
 //!
 //! The `cli` module (behind the `clap` feature) offers two integration
@@ -451,6 +467,7 @@
 //! builder method to call. See the [`error`] module for the full set.
 
 pub mod error;
+pub mod meta;
 pub mod render;
 pub mod schema;
 pub mod types;

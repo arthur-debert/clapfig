@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- **Added**
+  - **`clapfig::meta::doc_for::<C>(key)` for programmatic doc-comment lookup** — New thin accessor that returns the `///` doc-comment lines for a config struct's field by dotted key path, walking confique's static `META` tree directly. Returns `Option<Vec<String>>` so callers can distinguish "key doesn't exist" from "key exists, undocumented." Key spelling is lenient: `database.pool-size` and `database.pool_size` find the same field regardless of whether the builder has `.normalize_keys(true)` set. Previously, the only ways to get this data were `ConfigAction::Get` (which runs the full resolve pipeline just to attach the doc) or generating the JSON Schema and walking it — both heavyweight for tools that just want `--describe`, tooltips, or generated help text. Internal callers (`get_value`, `get_scope_value`) now delegate to the same helper, dropping the duplicate private `lookup_doc` walker.
 - **Fixed**
   - **Generated TOML template now respects `.normalize_keys(true)`** — Previously, a builder configured with `.normalize_keys(true)` would still emit snake_case keys in the template produced by `config gen` (and `ConfigAction::Gen`), telling users they could type `pool-size = 5` while showing them `pool_size = 5` in the very template they were meant to copy from. The template generator now rewrites section headers and key lines to kebab-case when the flag is on, while leaving doc comments and the value portion of every line untouched. `config set` and the file-seed path that backs it still emit snake_case keys for now — wiring kebab through the persist/set path is a sibling fix.
 - **Added**
