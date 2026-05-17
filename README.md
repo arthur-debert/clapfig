@@ -17,6 +17,7 @@ Built on [confique](https://github.com/LukasKalbertodt/confique) for struct-driv
 - **Ancestor walk** — walk up from cwd to find project configs, with configurable boundary (`.git`, filesystem root)
 - **Tree-walk resolution** — build a reusable [`Resolver<C>`](https://docs.rs/clapfig/latest/clapfig/struct.Resolver.html) once, call `.resolve_at(&dir)` for every leaf in a dynamic file tree (`.htaccess`/`.editorconfig` pattern). Per-call `Cwd`/`Ancestors` anchoring, instance-scoped file cache so repeated walks pay disk+parse once per unique file.
 - **Prefix-based env vars** — `MYAPP__DATABASE__URL` maps to `database.url` automatically
+- **Kebab-case keys** — opt-in `.normalize_keys(true)` lets users write `pool-size = 5` in config files (or `--set database.pool-size=5` on the CLI) and have it map to a `pool_size` Rust field
 - **Strict mode** — unknown keys error with file path, key name, and line number (on by default)
 - **Post-merge validation hook** — `.post_validate(|c| ...)` closes the gap between confique's structural validation and the semantic constraints every real app has: port ranges, cross-field invariants, enum combinations, filesystem preconditions
 - **Structured errors + rendering** — [`ClapfigError`](https://docs.rs/clapfig/latest/clapfig/error/enum.ClapfigError.html) carries data (keys, paths, lines, source text); the [`render`](https://docs.rs/clapfig/latest/clapfig/render/index.html) module turns it into plain text or [`miette`](https://docs.rs/miette)-style output with snippets and carets (rich mode behind the `rich-errors` feature)

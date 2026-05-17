@@ -20,6 +20,7 @@ use toml::{Table, Value};
 use crate::env;
 use crate::error::ClapfigError;
 use crate::merge::deep_merge;
+use crate::normalize::{normalize_key, normalize_table};
 use crate::overrides;
 use crate::types::Layer;
 use crate::validate;
@@ -39,9 +40,29 @@ pub struct ResolveInput {
     pub cli_overrides: Vec<(String, Value)>,
     /// Whether to reject unknown keys in config files.
     pub strict: bool,
+    /// Whether to rewrite `-` to `_` in every key supplied by the user
+    /// (config files, CLI overrides, URL overrides) before validation and
+    /// merging — letting kebab-case keys map to snake_case Rust fields.
+    pub normalize_keys: bool,
     /// Layer merge order, from lowest to highest priority.
     /// `None` uses the default: `[Files, Env, Url, Cli]`.
     pub layer_order: Option<Vec<Layer>>,
+}
+
+/// Rewrite the dotted-key half of each override pair, applying the same
+/// `-` → `_` rule as [`normalize_table`]. Used so CLI/URL-supplied keys land
+/// in the same shape as keys coming from normalized config files.
+fn normalize_override_keys(
+    entries: &[(String, toml::Value)],
+    normalize_keys: bool,
+) -> Vec<(String, toml::Value)> {
+    if !normalize_keys {
+        return entries.to_vec();
+    }
+    entries
+        .iter()
+        .map(|(k, v)| (normalize_key(k), v.clone()))
+        .collect()
 }
 
 /// Returns the default layer order: `[Files, Env, Url, Cli]`.
@@ -65,18 +86,29 @@ where
 {
     // Build each layer independently, then merge in the configured order.
 
-    // Files layer: validate + parse + merge all file contents
+    // Files layer: parse → (optionally) normalize → validate → merge.
+    // Validation runs against the parsed Table — never the raw text — so
+    // normalized keys are checked in the same form they will reach the merge.
     let files_table = {
         let mut t = Table::new();
         for (path, content) in &input.files {
-            if input.strict {
-                validate::validate_unknown_keys::<C>(content, path)?;
+            let mut table: Table =
+                toml::from_str(content).map_err(|e| ClapfigError::ParseError {
+                    path: path.clone(),
+                    source: Box::new(e),
+                    source_text: Some(Arc::from(content.as_str())),
+                })?;
+            if input.normalize_keys {
+                normalize_table(&mut table).map_err(|c| ClapfigError::NormalizedKeyCollision {
+                    path: path.clone(),
+                    section: c.section,
+                    normalized_key: c.normalized_key,
+                    originals: c.originals,
+                })?;
             }
-            let table: Table = toml::from_str(content).map_err(|e| ClapfigError::ParseError {
-                path: path.clone(),
-                source: Box::new(e),
-                source_text: Some(Arc::from(content.as_str())),
-            })?;
+            if input.strict {
+                validate::validate_unknown_keys::<C>(&table, content, path, input.normalize_keys)?;
+            }
             t = deep_merge(t, table);
         }
         t
@@ -93,14 +125,20 @@ where
     let url_table = if input.url_overrides.is_empty() {
         None
     } else {
-        Some(overrides::overrides_to_table(&input.url_overrides))
+        Some(overrides::overrides_to_table(&normalize_override_keys(
+            &input.url_overrides,
+            input.normalize_keys,
+        )))
     };
 
     // CLI layer
     let cli_table = if input.cli_overrides.is_empty() {
         None
     } else {
-        Some(overrides::overrides_to_table(&input.cli_overrides))
+        Some(overrides::overrides_to_table(&normalize_override_keys(
+            &input.cli_overrides,
+            input.normalize_keys,
+        )))
     };
 
     // Default order: Files < Env < Url < Cli
@@ -151,6 +189,7 @@ mod tests {
             url_overrides: vec![],
             cli_overrides: vec![],
             strict: true,
+            normalize_keys: false,
             layer_order: None,
         }
     }
@@ -211,6 +250,7 @@ mod tests {
             url_overrides: vec![],
             cli_overrides: vec![("port".into(), Value::Integer(9999))],
             strict: true,
+            normalize_keys: false,
             layer_order: None,
         };
         let config: TestConfig = resolve(input).unwrap();
@@ -230,6 +270,7 @@ mod tests {
             url_overrides: vec![],
             cli_overrides: vec![("debug".into(), Value::Boolean(true))],
             strict: true,
+            normalize_keys: false,
             layer_order: None,
         };
         let config: TestConfig = resolve(input).unwrap();
@@ -495,5 +536,127 @@ mod tests {
         let config: TestConfig = resolve(input).unwrap();
         // Url is last → highest priority
         assert_eq!(config.port, 7777);
+    }
+
+    // -- normalize_keys tests -------------------------------------------------
+
+    #[test]
+    fn normalize_off_kebab_file_key_rejected_by_strict() {
+        // Baseline: without normalization, a kebab key in a config file is a
+        // strict-mode violation. Locks the opt-in behavior.
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "[database]\npool-size = 25\n".into())],
+            ..empty_input()
+        };
+        let result: Result<TestConfig, _> = resolve(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_on_kebab_file_key_accepted() {
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "[database]\npool-size = 25\n".into())],
+            normalize_keys: true,
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        assert_eq!(config.database.pool_size, 25);
+    }
+
+    #[test]
+    fn normalize_on_snake_file_key_still_works() {
+        // Backwards-compatible: snake-cased keys keep working when
+        // normalization is on.
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "[database]\npool_size = 30\n".into())],
+            normalize_keys: true,
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        assert_eq!(config.database.pool_size, 30);
+    }
+
+    #[test]
+    fn normalize_on_kebab_cli_override_accepted() {
+        let input = ResolveInput {
+            cli_overrides: vec![("database.pool-size".into(), Value::Integer(77))],
+            normalize_keys: true,
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        assert_eq!(config.database.pool_size, 77);
+    }
+
+    #[cfg(feature = "url")]
+    #[test]
+    fn normalize_on_kebab_url_override_accepted() {
+        let input = ResolveInput {
+            url_overrides: vec![("database.pool-size".into(), Value::Integer(88))],
+            normalize_keys: true,
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        assert_eq!(config.database.pool_size, 88);
+    }
+
+    #[test]
+    fn normalize_on_kebab_typo_still_strict_errors() {
+        // Normalization isn't a free pass — a kebab-cased *typo* still gets
+        // flagged because the snake form is also unknown.
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "[database]\npool-zize = 25\n".into())],
+            normalize_keys: true,
+            ..empty_input()
+        };
+        let result: Result<TestConfig, _> = resolve(input);
+        let err = result.unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        // Reported in normalized form.
+        assert_eq!(keys[0].key, "database.pool_zize");
+    }
+
+    #[test]
+    fn normalize_on_collision_in_file_errors() {
+        // Two distinct keys in the same table that normalize to the same
+        // name must surface as an explicit error, not silently drop one.
+        let input = ResolveInput {
+            files: vec![(
+                "test.toml".into(),
+                "[database]\npool-size = 5\npool_size = 10\n".into(),
+            )],
+            normalize_keys: true,
+            ..empty_input()
+        };
+        let result: Result<TestConfig, _> = resolve(input);
+        match result {
+            Err(ClapfigError::NormalizedKeyCollision {
+                normalized_key,
+                section,
+                originals,
+                ..
+            }) => {
+                assert_eq!(normalized_key, "pool_size");
+                assert_eq!(section, "database");
+                assert_eq!(originals, vec!["pool-size", "pool_size"]);
+            }
+            other => panic!("expected NormalizedKeyCollision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_on_mixed_kebab_and_snake_in_same_file() {
+        let input = ResolveInput {
+            files: vec![(
+                "test.toml".into(),
+                "host = \"x\"\n[database]\npool-size = 10\nurl = \"pg://y\"\n".into(),
+            )],
+            normalize_keys: true,
+            ..empty_input()
+        };
+        let config: TestConfig = resolve(input).unwrap();
+        assert_eq!(config.host, "x");
+        assert_eq!(config.database.pool_size, 10);
+        assert_eq!(config.database.url.as_deref(), Some("pg://y"));
     }
 }

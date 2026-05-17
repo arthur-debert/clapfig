@@ -253,6 +253,34 @@
 //! [`.strict(false)`](ClapfigBuilder::strict) if you intentionally share
 //! config files across tools or want forward-compatible configs.
 //!
+//! # Kebab-case keys
+//!
+//! By default, keys in config files and overrides must match the Rust field
+//! name exactly (`pool_size`, not `pool-size`). Opt into kebab acceptance
+//! with [`.normalize_keys(true)`](ClapfigBuilder::normalize_keys):
+//!
+//! ```ignore
+//! Clapfig::builder::<MyConfig>()
+//!     .app_name("myapp")
+//!     .normalize_keys(true)
+//!     .load()?;
+//! ```
+//!
+//! Every key crossing the boundary into clapfig — TOML keys in files, dotted
+//! keys in [`.cli_override()`](ClapfigBuilder::cli_override) /
+//! [`.cli_overrides_from()`](ClapfigBuilder::cli_overrides_from), URL query
+//! parameter keys — has its `-` characters rewritten to `_` before
+//! validation, merging, and deserialization. So `pool-size`, `pool_size`,
+//! and mixed forms all resolve to the same `pool_size` field.
+//!
+//! Strict-mode validation still flags genuine unknown keys; the error
+//! message reports the normalized form, but the line-number snippet still
+//! points at the user's original line.
+//!
+//! Environment variables are unaffected — shells dislike `-` in variable
+//! names, and the env layer already lower-cases segments and treats `__` as
+//! the nesting separator.
+//!
 //! # Semantic validation — the `post_validate` hook
 //!
 //! Strict mode and confique together cover **structural** validation: every
@@ -428,6 +456,7 @@ mod env;
 mod file;
 mod flatten;
 pub(crate) mod merge;
+mod normalize;
 mod ops;
 mod overrides;
 mod persist;

@@ -134,6 +134,45 @@ builder.cli_overrides_from(&cli_struct)
 `cli_overrides_from` is useful with clap: pass your entire CLI args struct and
 non-config fields are silently ignored.
 
+## Key naming — kebab-case keys
+
+By default, keys in config files and overrides must match the Rust field name
+exactly (`pool_size`, not `pool-size`). Opt into kebab-case acceptance with
+`.normalize_keys(true)`:
+
+```rust
+let config: AppConfig = Clapfig::builder()
+    .app_name("myapp")
+    .normalize_keys(true)
+    .load()?;
+```
+
+With this enabled, every key clapfig sees — TOML keys in files, dotted keys in
+`cli_override()` / `cli_overrides_from()`, URL query parameter keys — has its
+`-` characters rewritten to `_` before validation, merging, and deserialization.
+So all of the following map to the same `database.pool_size` field:
+
+```toml
+# config file
+[database]
+pool-size = 10    # ← works with normalize_keys(true)
+pool_size = 10    # ← always works
+```
+
+```rust
+// CLI overrides
+builder.cli_override("database.pool-size", Some(10));
+builder.cli_override("database.pool_size", Some(10));
+```
+
+Strict-mode validation still flags genuine unknown keys; the error message
+reports them in their normalized form, but the line-number snippet still
+points at the user's original line in the file.
+
+Environment variables are unaffected — shells dislike `-` in variable names,
+and the env layer already lower-cases segments and treats `__` as the nesting
+separator.
+
 ## Persistence — where writes go
 
 `persist_scope()` names a target for `config set` and `config unset`:
