@@ -96,6 +96,41 @@ fn segment_matches(field_name: &str, caller_segment: &str) -> bool {
 mod tests {
     use super::*;
     use crate::fixtures::test::TestConfig;
+    use serde::{Deserialize, Serialize};
+
+    /// Local fixture: a config struct with at least one field that has no
+    /// `///` doc comment. Used to lock down the
+    /// `Some(empty Vec)` vs `None` distinction in the public API.
+    #[derive(confique::Config, Serialize, Deserialize, Debug)]
+    struct PartiallyDocumentedConfig {
+        /// This one has a doc comment.
+        #[config(default = "x")]
+        documented: String,
+
+        // Intentionally no `///` line — confique will emit an empty doc slice.
+        #[config(default = 0)]
+        undocumented: u32,
+    }
+
+    #[test]
+    fn undocumented_field_returns_some_empty_vec() {
+        // The contract: existing-but-undocumented fields return Some(vec![]),
+        // not None. Callers depend on this to tell "no such key" apart from
+        // "key exists, no doc to show."
+        let doc = doc_for::<PartiallyDocumentedConfig>("undocumented")
+            .expect("field exists, even without a doc comment");
+        assert!(doc.is_empty(), "expected empty doc vec, got {doc:?}");
+    }
+
+    #[test]
+    fn documented_sibling_in_same_fixture_still_returns_lines() {
+        // Sanity check that the partial fixture still attaches docs to the
+        // documented field — guards against a regression where both fields
+        // collapse to empty.
+        let doc =
+            doc_for::<PartiallyDocumentedConfig>("documented").expect("documented field exists");
+        assert!(doc.iter().any(|line| line.contains("doc comment")));
+    }
 
     #[test]
     fn flat_key_returns_doc() {

@@ -367,10 +367,6 @@ fn format_value(value: &toml::Value) -> String {
     }
 }
 
-// Doc lookup lives in `crate::meta::doc_for` — see ops.rs callers above
-// for the `unwrap_or_default()` adapter that produces the same `Vec<String>`
-// shape the old internal helper used.
-
 #[cfg(test)]
 mod tests {
     use super::*;
