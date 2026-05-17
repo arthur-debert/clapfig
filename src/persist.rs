@@ -48,7 +48,11 @@ where
         Some(c) => c.to_string(),
         None => {
             // Start from template or empty
-            let template = crate::ops::generate_template::<C>();
+            // `config set` doesn't currently know about normalize_keys, so
+            // the seeded template stays snake_case to match today's behavior.
+            // Wiring kebab into the set/unset path (key validation + seed)
+            // is a sibling fix tracked separately.
+            let template = crate::ops::generate_template::<C>(false);
             if template.trim().is_empty() {
                 String::new()
             } else {

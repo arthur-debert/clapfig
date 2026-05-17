@@ -513,7 +513,7 @@ impl<C: Config> ClapfigBuilder<C> {
                 }
             },
             ConfigAction::Gen { output } => {
-                let template = ops::generate_template::<C>();
+                let template = ops::generate_template::<C>(self.normalize_keys);
                 match output {
                     Some(path) => {
                         if let Some(parent) = path.parent() {
@@ -1017,6 +1017,52 @@ mod tests {
             ConfigResult::Template(t) => {
                 assert!(t.contains("host"));
                 assert!(t.contains("port"));
+            }
+            other => panic!("Expected Template, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_gen_kebab_emits_kebab_keys() {
+        // End-to-end: a builder with .normalize_keys(true) must produce a
+        // template whose keys match what users will type, not the Rust
+        // field names.
+        let result: ConfigResult = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .no_env()
+            .normalize_keys(true)
+            .handle(&ConfigAction::Gen { output: None })
+            .unwrap();
+
+        match result {
+            ConfigResult::Template(t) => {
+                assert!(
+                    t.contains("pool-size"),
+                    "expected kebab key in generated template:\n{t}"
+                );
+                assert!(
+                    !t.contains("pool_size"),
+                    "snake form leaked into normalize_keys template:\n{t}"
+                );
+            }
+            other => panic!("Expected Template, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_gen_default_still_snake() {
+        // Without normalize_keys, the template stays snake_case — defaults
+        // unchanged for callers that haven't opted in.
+        let result: ConfigResult = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .no_env()
+            .handle(&ConfigAction::Gen { output: None })
+            .unwrap();
+
+        match result {
+            ConfigResult::Template(t) => {
+                assert!(t.contains("pool_size"));
+                assert!(!t.contains("pool-size"));
             }
             other => panic!("Expected Template, got {other:?}"),
         }
