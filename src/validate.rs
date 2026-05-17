@@ -256,7 +256,7 @@ pool_size = 10
 
     fn parse_and_normalize(content: &str) -> Table {
         let mut t = parse(content);
-        normalize_table(&mut t);
+        normalize_table(&mut t).expect("test fixtures must not contain collisions");
         t
     }
 

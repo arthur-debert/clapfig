@@ -99,7 +99,12 @@ where
                     source_text: Some(Arc::from(content.as_str())),
                 })?;
             if input.normalize_keys {
-                normalize_table(&mut table);
+                normalize_table(&mut table).map_err(|c| ClapfigError::NormalizedKeyCollision {
+                    path: path.clone(),
+                    section: c.section,
+                    normalized_key: c.normalized_key,
+                    originals: c.originals,
+                })?;
             }
             if input.strict {
                 validate::validate_unknown_keys::<C>(&table, content, path, input.normalize_keys)?;
@@ -609,6 +614,34 @@ mod tests {
         assert_eq!(keys.len(), 1);
         // Reported in normalized form.
         assert_eq!(keys[0].key, "database.pool_zize");
+    }
+
+    #[test]
+    fn normalize_on_collision_in_file_errors() {
+        // Two distinct keys in the same table that normalize to the same
+        // name must surface as an explicit error, not silently drop one.
+        let input = ResolveInput {
+            files: vec![(
+                "test.toml".into(),
+                "[database]\npool-size = 5\npool_size = 10\n".into(),
+            )],
+            normalize_keys: true,
+            ..empty_input()
+        };
+        let result: Result<TestConfig, _> = resolve(input);
+        match result {
+            Err(ClapfigError::NormalizedKeyCollision {
+                normalized_key,
+                section,
+                originals,
+                ..
+            }) => {
+                assert_eq!(normalized_key, "pool_size");
+                assert_eq!(section, "database");
+                assert_eq!(originals, vec!["pool-size", "pool_size"]);
+            }
+            other => panic!("expected NormalizedKeyCollision, got {other:?}"),
+        }
     }
 
     #[test]

@@ -119,6 +119,24 @@ pub enum ClapfigError {
     /// `"Configuration validation failed: "` prefix plus the hook's message.
     #[error("Configuration validation failed: {0}")]
     PostValidationFailed(String),
+
+    /// With `.normalize_keys(true)` enabled, two distinct keys in the same
+    /// table collapse to the same normalized name (e.g. `pool-size` and
+    /// `pool_size` both become `pool_size`). Surfacing this as an error
+    /// avoids the silent-drop ambiguity where one entry would win based on
+    /// the table's key iteration order. Fix by keeping only one spelling.
+    #[error(
+        "Conflicting keys in {}: '{normalized_key}'{} is defined by [{}], which normalize to the same name",
+        path.display(),
+        if section.is_empty() { String::new() } else { format!(" (under [{section}])") },
+        originals.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", "),
+    )]
+    NormalizedKeyCollision {
+        path: PathBuf,
+        section: String,
+        normalized_key: String,
+        originals: Vec<String>,
+    },
 }
 
 impl ClapfigError {
