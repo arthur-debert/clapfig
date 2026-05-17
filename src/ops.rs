@@ -213,7 +213,7 @@ pub fn get_value<C: Config + Serialize>(
     let value = table_get(table, key).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
 
     let value_str = format_value(value);
-    let doc = lookup_doc(&C::META, key);
+    let doc = crate::meta::doc_for::<C>(key).unwrap_or_default();
 
     Ok(ConfigResult::KeyValue {
         key: key.into(),
@@ -309,7 +309,7 @@ pub fn get_scope_value<C: Config>(
 
     let value = table_get(&table, key).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
     let value_str = format_value(value);
-    let doc = lookup_doc(&C::META, key);
+    let doc = crate::meta::doc_for::<C>(key).unwrap_or_default();
 
     Ok(ConfigResult::KeyValue {
         key: key.into(),
@@ -367,29 +367,9 @@ fn format_value(value: &toml::Value) -> String {
     }
 }
 
-/// Walk confique's `Meta` tree to find the doc comment for a dotted key path.
-fn lookup_doc(meta: &confique::meta::Meta, dotted_key: &str) -> Vec<String> {
-    let segments: Vec<&str> = dotted_key.split('.').collect();
-    lookup_doc_recursive(meta, &segments)
-}
-
-fn lookup_doc_recursive(meta: &confique::meta::Meta, segments: &[&str]) -> Vec<String> {
-    if segments.is_empty() {
-        return vec![];
-    }
-
-    for field in meta.fields {
-        if field.name == segments[0] {
-            if segments.len() == 1 {
-                return field.doc.iter().map(|s| s.to_string()).collect();
-            }
-            if let confique::meta::FieldKind::Nested { meta: nested, .. } = &field.kind {
-                return lookup_doc_recursive(nested, &segments[1..]);
-            }
-        }
-    }
-    vec![]
-}
+// Doc lookup lives in `crate::meta::doc_for` — see ops.rs callers above
+// for the `unwrap_or_default()` adapter that produces the same `Vec<String>`
+// shape the old internal helper used.
 
 #[cfg(test)]
 mod tests {
