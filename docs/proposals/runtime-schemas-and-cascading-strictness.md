@@ -306,8 +306,23 @@ would be rejected:
 
 ```rust
 pub struct UnknownKeyContext<'a> {
-    pub path: &'a str,        // full dotted path, e.g. "diagnostics.rules.foo.bar"
-    pub leaf: &'a str,        // last segment only,    e.g. "foo.bar"
+    /// Full dotted path with every segment unquoted, e.g.
+    /// `diagnostics.rules.acme.task-due-date-missing`.
+    pub path: &'a str,
+
+    /// The single TOML key clapfig saw at the leaf position — i.e. the
+    /// final element of the path *as TOML parsed it*, not the trailing
+    /// piece of `path` split on `.`. A bare key like `missing_footote`
+    /// gives `leaf = "missing_footote"`; a quoted key like
+    /// `"acme.task-due-date-missing"` gives
+    /// `leaf = "acme.task-due-date-missing"` (the dots are part of the
+    /// key, not segment separators).
+    ///
+    /// This is the field the lex-fmt example below pattern-matches on:
+    /// `leaf.contains('.')` distinguishes extension-emitted dotted keys
+    /// from bare typo-like keys.
+    pub leaf: &'a str,
+
     pub value: &'a toml::Value,
     pub file: Option<&'a Path>,
     pub line: Option<usize>,
