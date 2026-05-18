@@ -16,7 +16,8 @@
 //! shape the user typed.
 
 use confique::Config;
-use confique::meta::{FieldKind, Meta};
+
+use crate::spec::{FieldKindRef, SchemaRef};
 
 /// Look up the doc-comment lines for a config key.
 ///
@@ -46,29 +47,29 @@ use confique::meta::{FieldKind, Meta};
 /// }
 /// ```
 pub fn doc_for<C: Config>(key: &str) -> Option<Vec<String>> {
-    walk(&C::META, key)
+    walk(SchemaRef::from_meta(&C::META), key)
 }
 
-fn walk(meta: &Meta, dotted_key: &str) -> Option<Vec<String>> {
+pub(crate) fn walk(schema: SchemaRef<'_>, dotted_key: &str) -> Option<Vec<String>> {
     let segments: Vec<&str> = dotted_key.split('.').collect();
-    walk_segments(meta, &segments)
+    walk_segments(schema, &segments)
 }
 
-fn walk_segments(meta: &Meta, segments: &[&str]) -> Option<Vec<String>> {
+fn walk_segments(schema: SchemaRef<'_>, segments: &[&str]) -> Option<Vec<String>> {
     if segments.is_empty() {
         return None;
     }
     let head = segments[0];
-    for field in meta.fields {
+    for field in schema.fields() {
         if segment_matches(field.name, head) {
             if segments.len() == 1 {
                 return Some(field.doc.iter().map(|s| s.to_string()).collect());
             }
-            return match &field.kind {
-                FieldKind::Nested { meta: nested, .. } => walk_segments(nested, &segments[1..]),
+            return match field.kind {
+                FieldKindRef::Nested { schema: nested } => walk_segments(nested, &segments[1..]),
                 // Hit a leaf with segments still pending — the rest of the
                 // path can't resolve.
-                FieldKind::Leaf { .. } => None,
+                FieldKindRef::Leaf(_) => None,
             };
         }
     }
