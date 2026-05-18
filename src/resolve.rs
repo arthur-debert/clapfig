@@ -30,7 +30,10 @@ use crate::types::Layer;
 ///
 /// Generic over [`ConfigSpec`]: the static path threads in `StaticSpec<C>`;
 /// the planned runtime path (issue #36) will thread in a `DynamicSpec`.
-pub struct ResolveInput<'a, S: ConfigSpec> {
+///
+/// `pub(crate)` because the type parameter `S: ConfigSpec` is itself crate-
+/// private — Phase 2 will widen both as `Clapfig::runtime(schema)` lands.
+pub(crate) struct ResolveInput<'a, S: ConfigSpec> {
     /// Schema-walking strategy: validate unknown keys, finalize the merged
     /// table into the spec's `Output`.
     pub spec: &'a S,
@@ -73,7 +76,7 @@ fn normalize_override_keys(
 }
 
 /// Returns the default layer order: `[Files, Env, Url, Cli]`.
-pub fn default_layer_order() -> Vec<Layer> {
+pub(crate) fn default_layer_order() -> Vec<Layer> {
     vec![
         Layer::Files,
         Layer::Env,
@@ -88,7 +91,9 @@ pub fn default_layer_order() -> Vec<Layer> {
 /// Builds each layer independently, merges them in the configured order
 /// (default: files < env < URL < CLI), then hands the merged table to the
 /// spec for finalization.
-pub fn resolve<S: ConfigSpec>(input: ResolveInput<'_, S>) -> Result<S::Output, ClapfigError> {
+pub(crate) fn resolve<S: ConfigSpec>(
+    input: ResolveInput<'_, S>,
+) -> Result<S::Output, ClapfigError> {
     // Build each layer independently, then merge in the configured order.
 
     // Files layer: parse → (optionally) normalize → validate → merge.

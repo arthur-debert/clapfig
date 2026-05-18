@@ -209,6 +209,12 @@ fn map_key_to_string(key: &MapKey) -> Option<String> {
 ///
 /// Currently only used by the (Phase-1-dormant) `allowed_values` path on
 /// `LeafRef`. The static spec never populates it; Phase 2 will.
+///
+/// Complex variants (`Array`, `Table`, `Datetime`) are dropped today. The
+/// runtime enum surface in Phase 2 is scalar-only (`Field::enum_of(...)`
+/// over TOML primitives — log levels, modes, format names), so this is the
+/// faithful set for v1. Revisit if Phase 2 widens `enum_of` to accept
+/// container values.
 fn toml_value_to_json(value: &toml::Value) -> Option<Value> {
     match value {
         toml::Value::String(s) => Some(Value::String(s.clone())),
