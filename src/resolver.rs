@@ -67,6 +67,7 @@ use crate::builder::PostValidateHook;
 use crate::error::ClapfigError;
 use crate::file;
 use crate::resolve::{self, ResolveInput};
+use crate::spec::StaticSpec;
 use crate::types::{Layer, SearchMode, SearchPath};
 
 /// A cached file's raw text. The parsed `toml::Table` is not cached separately
@@ -217,7 +218,9 @@ impl<C: Config> Resolver<C> {
         let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, &normalized);
         let files = self.load_files_cached(&dirs)?;
 
+        let spec = StaticSpec::<C>::new();
         let input = ResolveInput {
+            spec: &spec,
             files,
             env_vars: self.env_vars.clone(),
             env_prefix: self.env_prefix.clone(),
@@ -229,7 +232,7 @@ impl<C: Config> Resolver<C> {
             layer_order: self.layer_order.clone(),
         };
 
-        let config = resolve::resolve::<C>(input)?;
+        let config = resolve::resolve(input)?;
         if let Some(hook) = self.post_validate.as_ref() {
             hook(&config).map_err(ClapfigError::PostValidationFailed)?;
         }

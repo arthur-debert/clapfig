@@ -485,6 +485,7 @@ mod overrides;
 mod persist;
 mod resolve;
 mod resolver;
+mod spec;
 #[cfg(feature = "url")]
 mod url;
 mod validate;

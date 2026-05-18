@@ -1,8 +1,13 @@
-//! JSON Schema generation from a confique config struct.
+//! JSON Schema generation from a config schema.
 //!
-//! Walks `C::META` (confique's compile-time metadata tree) and produces a
-//! JSON Schema document describing the config. Useful for auto-generating
-//! UI editors, external validation tools, or IDE integrations.
+//! Entry point is [`generate_schema::<C>()`](generate_schema): it walks the
+//! compile-time `confique::meta::Meta` tree and produces a JSON Schema
+//! document. Useful for auto-generating UI editors, external validation
+//! tools, or IDE integrations.
+//!
+//! Internally the walker consumes a crate-private `SchemaRef` view so the
+//! same generator will serve runtime-supplied schemas (issue #36) without
+//! a separate code path.
 //!
 //! # What is in the schema
 //!
@@ -36,8 +41,10 @@
 //! ```
 
 use confique::Config;
-use confique::meta::{Expr, Field, FieldKind, LeafKind, MapEntry, MapKey, Meta};
+use confique::meta::{Expr, MapEntry, MapKey};
 use serde_json::{Map, Value, json};
+
+use crate::spec::{FieldKindRef, FieldRef, LeafDefault, LeafRef, SchemaRef};
 
 /// JSON Schema dialect emitted in the root `$schema` field.
 const SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -47,26 +54,34 @@ const SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 /// Returns a `serde_json::Value` — the caller serializes it to a string,
 /// writes it to a file, or embeds it wherever needed.
 pub fn generate_schema<C: Config>() -> Value {
-    let mut root = meta_to_object(&C::META);
+    generate_schema_from_ref(SchemaRef::from_meta(&C::META))
+}
+
+/// Internal entry point. Walks any `SchemaRef`-backed schema and emits the
+/// JSON Schema document. Phase 2's runtime adapter calls this directly with
+/// its own `SchemaRef` variant.
+pub(crate) fn generate_schema_from_ref(schema: SchemaRef<'_>) -> Value {
+    let mut root = schema_to_object(schema);
     if let Value::Object(map) = &mut root {
         map.insert("$schema".into(), Value::String(SCHEMA_DIALECT.into()));
     }
     root
 }
 
-/// Convert a `confique::meta::Meta` node into a JSON Schema object.
-fn meta_to_object(meta: &Meta) -> Value {
+/// Convert a schema node into a JSON Schema object.
+fn schema_to_object(schema: SchemaRef<'_>) -> Value {
     let mut obj = Map::new();
     obj.insert("type".into(), Value::String("object".into()));
-    obj.insert("title".into(), Value::String(meta.name.into()));
-    if !meta.doc.is_empty() {
-        obj.insert("description".into(), Value::String(join_doc(meta.doc)));
+    obj.insert("title".into(), Value::String(schema.name().into()));
+    let schema_doc = schema.doc();
+    if !schema_doc.is_empty() {
+        obj.insert("description".into(), Value::String(join_doc(schema_doc)));
     }
 
     let mut properties = Map::new();
     let mut required = Vec::new();
 
-    for field in meta.fields {
+    for field in schema.fields() {
         let (name, prop, is_required) = field_to_property(field);
         if is_required {
             required.push(Value::String(name.clone()));
@@ -83,14 +98,14 @@ fn meta_to_object(meta: &Meta) -> Value {
     Value::Object(obj)
 }
 
-/// Convert a `Field` into a `(name, schema, required)` triple.
+/// Convert a [`FieldRef`] into a `(name, schema, required)` triple.
 ///
-/// `required` is `true` for non-`Option<T>` leaves and for all nested
-/// structs (a nested struct has its own internal required list).
-fn field_to_property(field: &Field) -> (String, Value, bool) {
-    match &field.kind {
-        FieldKind::Nested { meta } => {
-            let mut schema = meta_to_object(meta);
+/// `required` is `true` for non-optional leaves and for all nested structs
+/// (a nested struct has its own internal required list).
+fn field_to_property(field: FieldRef<'_>) -> (String, Value, bool) {
+    match field.kind {
+        FieldKindRef::Nested { schema: nested } => {
+            let mut schema = schema_to_object(nested);
             if !field.doc.is_empty()
                 && let Value::Object(map) = &mut schema
             {
@@ -98,18 +113,23 @@ fn field_to_property(field: &Field) -> (String, Value, bool) {
             }
             (field.name.into(), schema, true)
         }
-        FieldKind::Leaf { env, kind } => {
+        FieldKindRef::Leaf(leaf) => {
             let mut prop = Map::new();
             if !field.doc.is_empty() {
                 prop.insert("description".into(), Value::String(join_doc(field.doc)));
             }
+            populate_leaf(&mut prop, leaf);
+            (field.name.into(), Value::Object(prop), !leaf.optional)
+        }
+    }
+}
 
-            let default = match kind {
-                LeafKind::Required { default } => default.as_ref(),
-                LeafKind::Optional => None,
-            };
-
-            if let Some(expr) = default {
+/// Apply a leaf's default, env hint, and allowed-value set onto its JSON
+/// Schema object.
+fn populate_leaf(prop: &mut Map<String, Value>, leaf: LeafRef<'_>) {
+    if let Some(default) = leaf.default {
+        match default {
+            LeafDefault::Expr(expr) => {
                 if let Some(ty) = infer_type(expr) {
                     prop.insert("type".into(), Value::String(ty.into()));
                 }
@@ -117,13 +137,19 @@ fn field_to_property(field: &Field) -> (String, Value, bool) {
                     prop.insert("default".into(), default_value);
                 }
             }
+        }
+    }
 
-            if let Some(env_name) = env {
-                prop.insert("x-env".into(), Value::String((*env_name).into()));
-            }
+    if let Some(env_name) = leaf.env {
+        prop.insert("x-env".into(), Value::String(env_name.into()));
+    }
 
-            let required = matches!(kind, LeafKind::Required { .. });
-            (field.name.into(), Value::Object(prop), required)
+    // `allowed_values` is reserved for Phase 2's runtime enum leaves; static
+    // specs always leave it `None`, so the emitter is a no-op here today.
+    if let Some(values) = leaf.allowed_values {
+        let enum_array: Vec<Value> = values.iter().filter_map(toml_value_to_json).collect();
+        if !enum_array.is_empty() {
+            prop.insert("enum".into(), Value::Array(enum_array));
         }
     }
 }
@@ -181,6 +207,26 @@ fn map_key_to_string(key: &MapKey) -> Option<String> {
         MapKey::Integer(i) => Some(i.to_string()),
         MapKey::Float(f) => Some(f.to_string()),
         MapKey::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Convert a `toml::Value` into a JSON value for the `enum` slot.
+///
+/// Currently only used by the (Phase-1-dormant) `allowed_values` path on
+/// `LeafRef`. The static spec never populates it; Phase 2 will.
+///
+/// Complex variants (`Array`, `Table`, `Datetime`) are dropped today. The
+/// runtime enum surface in Phase 2 is scalar-only (`Field::enum_of(...)`
+/// over TOML primitives — log levels, modes, format names), so this is the
+/// faithful set for v1. Revisit if Phase 2 widens `enum_of` to accept
+/// container values.
+fn toml_value_to_json(value: &toml::Value) -> Option<Value> {
+    match value {
+        toml::Value::String(s) => Some(Value::String(s.clone())),
+        toml::Value::Integer(i) => Some(json!(i)),
+        toml::Value::Float(f) => Some(json!(f)),
+        toml::Value::Boolean(b) => Some(Value::Bool(*b)),
         _ => None,
     }
 }

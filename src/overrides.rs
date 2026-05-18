@@ -5,8 +5,9 @@
 
 use std::collections::HashSet;
 
-use confique::meta::{FieldKind, Meta};
 use toml::{Table, Value};
+
+use crate::spec::{FieldKindRef, SchemaRef};
 
 /// Convert dotted-key overrides into a nested `toml::Table`.
 ///
@@ -37,29 +38,29 @@ fn set_nested(table: &mut Table, dotted_key: &str, value: Value) {
     current.insert(leaf.to_string(), value);
 }
 
-/// Collect all valid leaf key paths from a confique `Meta` tree.
+/// Collect all valid leaf key paths from a schema.
 ///
 /// Returns dotted paths like `"host"`, `"database.url"`, `"database.pool_size"`.
 /// Section names (nested structs) are excluded — only leaf fields are returned.
-pub fn valid_keys(meta: &Meta) -> HashSet<String> {
+pub fn valid_keys(schema: SchemaRef<'_>) -> HashSet<String> {
     let mut keys = HashSet::new();
-    collect_keys(meta, "", &mut keys);
+    collect_keys(schema, "", &mut keys);
     keys
 }
 
-fn collect_keys(meta: &Meta, prefix: &str, keys: &mut HashSet<String>) {
-    for field in meta.fields {
+fn collect_keys(schema: SchemaRef<'_>, prefix: &str, keys: &mut HashSet<String>) {
+    for field in schema.fields() {
         let dotted = if prefix.is_empty() {
             field.name.to_string()
         } else {
             format!("{prefix}.{}", field.name)
         };
-        match &field.kind {
-            FieldKind::Leaf { .. } => {
+        match field.kind {
+            FieldKindRef::Leaf(_) => {
                 keys.insert(dotted);
             }
-            FieldKind::Nested { meta, .. } => {
-                collect_keys(meta, &dotted, keys);
+            FieldKindRef::Nested { schema: nested } => {
+                collect_keys(nested, &dotted, keys);
             }
         }
     }
@@ -129,9 +130,13 @@ mod tests {
     use crate::fixtures::test::TestConfig;
     use confique::Config;
 
+    fn test_schema() -> SchemaRef<'static> {
+        SchemaRef::from_meta(&TestConfig::META)
+    }
+
     #[test]
     fn valid_keys_collects_all_leaf_paths() {
-        let keys = valid_keys(&TestConfig::META);
+        let keys = valid_keys(test_schema());
         assert!(keys.contains("host"));
         assert!(keys.contains("port"));
         assert!(keys.contains("debug"));
@@ -142,7 +147,7 @@ mod tests {
 
     #[test]
     fn valid_keys_excludes_section_names() {
-        let keys = valid_keys(&TestConfig::META);
+        let keys = valid_keys(test_schema());
         assert!(!keys.contains("database"));
     }
 }

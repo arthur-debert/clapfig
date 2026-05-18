@@ -18,7 +18,7 @@ pre-commit:
     # unstaged diffs after the commit lands.
     rustfmt:
       glob: '**/*.rs'
-      run: rustfmt --edition 2021 {staged_files}
+      run: rustfmt --edition 2024 {staged_files}
       stage_fixed: true
       priority: 1
 
