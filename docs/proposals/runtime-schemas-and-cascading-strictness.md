@@ -81,12 +81,24 @@ pub struct NamedField {
 pub enum Field {
     Leaf {
         doc: Vec<String>,
-        ty: LeafType,              // String | Integer | Float | Bool | Array | Map
+        ty: LeafType,
         default: Option<toml::Value>,
         optional: bool,            // true => may be absent after merge
         env: Option<String>,       // optional env-var name override
     },
     Nested(Schema),
+}
+
+pub enum LeafType {
+    String,
+    Integer,
+    Float,
+    Bool,
+    Array,
+    Map,
+    /// Constrained value: must equal one of the listed TOML values.
+    /// Use for log levels, output formats, mode flags, etc.
+    Enum { values: Vec<toml::Value> },
 }
 ```
 
@@ -98,13 +110,26 @@ let schema = Schema::object("AppConfig")
     .doc("Top-level application config")
     .field("host",     Field::string().doc("App host").default("localhost"))
     .field("port",     Field::integer().default(8080))
+    .field("level",    Field::enum_of(["debug", "info", "warn", "error"])
+                            .default("info")
+                            .doc("Log verbosity"))
     .nested(
         Schema::object("Db")
+            .doc("Database connection settings")
             .field("url",       Field::string().optional())
             .field("pool_size", Field::integer().default(5))
     )
     .build();
 ```
+
+`doc(...)` on a `Schema` or `Field` is the runtime equivalent of a `///`
+doc comment on a static struct field. Every consumer that reads doc
+comments today — `config gen` template generation, `config get` output,
+`schema` (JSON Schema) emission, `meta::doc_for` — reads from these
+strings instead. There is no second-class status for runtime schemas: a
+runtime-driven app can ship `myapp config gen` and produce a fully
+commented template, including any enum's allowed values, with no extra
+work.
 
 `Schema` can also be loaded from a JSON Schema document — clapfig already
 emits JSON Schema via `schema::generate_schema`; the inverse operation
@@ -156,14 +181,40 @@ output side):
 - **Required fields.** After merge + defaults, any leaf with `optional: false`
   and no value is a `ClapfigError::MissingRequired { key }`. Same error
   pipeline as today.
+- **Type and enum validation.** Each merged value is checked against the
+  leaf's `LeafType`. For `LeafType::Enum { values }`, the merged value
+  must equal one of `values` (TOML equality, with `normalize_keys`
+  applied to string values when the option is on); a mismatch produces
+  `ClapfigError::InvalidValue { key, reason }` — the same error variant
+  static-path enum violations use today. `config set` consults the same
+  check, so writing an out-of-set value fails fast before the file is
+  touched (matching the behavior of `handle_set_rejects_invalid_enum_value`
+  for static enums).
+
+#### Enum leaves and `config gen`
+
+`LeafType::Enum` is included in v1 because constrained value sets — log
+levels, output formats, mode flags — are routine in real configs and
+rolling them by hand in `post_validate` defeats the point of having a
+schema. Static structs already get this via confique's enum derive; the
+runtime path gets a parallel facility.
+
+The generated template lists the allowed values inline so users do not
+need to consult external docs:
+
+```toml
+# Log verbosity
+# Allowed: "debug" | "info" | "warn" | "error"
+level = "info"
+```
+
+The JSON Schema emitter renders the same set as a top-level `"enum": [...]`
+on the property.
 
 #### What is intentionally not in v1
 
 - **`deserialize_with`-style normalizers on runtime fields.** Confique's
   static path keeps working; the runtime path treats values as-is.
-- **Custom enum types on runtime leaves.** Leaves are TOML primitives + array
-  + map. A "constrained string" with an allowed-values list is a reasonable
-  v2 addition.
 - **Nested runtime schemas inside a static struct.** The two paths don't
   cross-pollinate in v1; the whole config is either static or runtime.
 
