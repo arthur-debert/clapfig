@@ -56,6 +56,18 @@ whole resolution. This proposal generalizes both.
 - An app where a sub-config is itself a runtime schema (point 1) contributed
   by a third party. The parent doesn't want to dictate its strictness — the
   sub-config decides for itself.
+- A struct that mixes typed fields and a `#[serde(flatten)] BTreeMap`
+  catch-all at the same level — typed-field typos should error, but keys
+  intended for the catch-all (e.g. extension-emitted diagnostic codes
+  containing a `.`) should land silently in the map. This is the
+  [lex-fmt/lex use case driving issue #39][issue-39]: per-struct cascade
+  alone is too coarse here (it can't tell `missing_footote` from
+  `acme.task-due-date-missing` — both sit at the same struct level), so the
+  proposal also includes a per-key callback that lets user code apply a
+  domain-specific decision (e.g. "leaf contains a `.` → accept, otherwise
+  reject").
+
+[issue-39]: https://github.com/arthur-debert/clapfig/issues/39
 
 ## Specification
 
@@ -283,6 +295,74 @@ dropped silently, paths whose effective strictness is `true` become
 `ClapfigError::UnknownKeys` entries. Line numbers and source snippets are
 unaffected.
 
+#### Surface — per-key callback
+
+The cascade rule is **per struct**, which is the right grain for cases like
+"the whole `[plugins]` table is free-form" but is too coarse when typed
+fields and a free-form catch-all share a struct level (`#[serde(flatten)]
+BTreeMap` as a sibling of typed fields). For that case, the builder accepts
+an optional callback that runs *after* cascade resolution decides a key
+would be rejected:
+
+```rust
+pub struct UnknownKeyContext<'a> {
+    pub path: &'a str,        // full dotted path, e.g. "diagnostics.rules.foo.bar"
+    pub leaf: &'a str,        // last segment only,    e.g. "foo.bar"
+    pub value: &'a toml::Value,
+    pub file: Option<&'a Path>,
+    pub line: Option<usize>,
+}
+
+pub enum UnknownKeyDecision {
+    Reject,   // unchanged — produces ClapfigError::UnknownKeys
+    Accept,   // silently dropped, same as a lenient subtree
+}
+
+ClapfigBuilder::on_unknown_key(
+    impl Fn(&UnknownKeyContext) -> UnknownKeyDecision + Send + Sync + 'static
+)
+```
+
+Same hook on the runtime builder (`Clapfig::runtime(schema).on_unknown_key(...)`).
+Default is `Reject` — without the hook, behavior is identical to today.
+
+**The decision chain:**
+
+1. The schema walk (or `serde_ignored`) flags a key as unknown.
+2. The strictness cascade resolves an effective strictness for that key.
+3. If the cascade says **lenient**, drop silently. Done.
+4. If the cascade says **strict** and a callback is registered, call it.
+   `Accept` drops the key silently; `Reject` produces an
+   `UnknownKeys` error.
+5. If no callback is registered, the cascade decision stands.
+
+So the callback never gates keys the cascade already accepts — it only
+gives the user a last word on keys the cascade would have rejected. That
+preserves the "no opt-in cost" property: code that doesn't register a
+callback behaves exactly as before.
+
+**Composition with cascade — the lex-fmt example:**
+
+```rust
+Clapfig::builder::<LexConfig>()
+    .app_name("lex")
+    .strict(true)                                  // typo protection everywhere
+    .on_unknown_key(|c| {
+        // Inside diagnostics.rules, dotted leaves are extension-emitted codes
+        // (e.g. "acme.task-due-date-missing") and land in the flatten BTreeMap.
+        // Bare leaves are typos of typed sibling fields — keep the error.
+        if c.path.starts_with("diagnostics.rules.") && c.leaf.contains('.') {
+            UnknownKeyDecision::Accept
+        } else {
+            UnknownKeyDecision::Reject
+        }
+    })
+    .load()?;
+```
+
+This is the shape issue #39 needs. The cascade rule alone cannot express
+it because typed and free-form keys are *siblings*, not parent and child.
+
 #### Edge cases
 
 - **`strict_at` on an `Option<Nested>` field.** Resolves normally; the
@@ -318,6 +398,18 @@ A user mixing both — runtime schema with strict-per-section semantics —
 sets `strict` on each `Schema::object` as they build it; the cascade
 handles the rest.
 
+A user with sibling-level catch-all needs (lex-fmt/#39) registers
+`.on_unknown_key(|c| ...)`. The cascade alone won't do it; the callback
+gives them a domain-specific last word.
+
+The three knobs compose without leaking into each other:
+
+| Knob | Grain | Default |
+|------|-------|---------|
+| `strict(bool)` | whole resolution | `true` |
+| `strict_at(path, bool)` / `Schema::strict(bool)` | per struct subtree | inherit |
+| `on_unknown_key(fn)` | per key | reject (no-op) |
+
 ## Compatibility
 
 No existing public API changes. `Clapfig::builder::<C>()` keeps its current
@@ -326,6 +418,8 @@ signature and behavior. New surface is purely additive:
 - `Schema`, `Field`, `Clapfig::runtime(schema)`
 - `ClapfigBuilder::strict_at(path, bool)`
 - `Schema::strict(bool)` (only meaningful on runtime schemas)
+- `ClapfigBuilder::on_unknown_key(fn)` (also on runtime builder)
+- `UnknownKeyContext`, `UnknownKeyDecision`
 
 The internal refactor that introduces `ConfigSpec` / `SchemaRef` is not
 visible to users.
