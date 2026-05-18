@@ -1,9 +1,13 @@
 //! JSON Schema generation from a config schema.
 //!
-//! Walks a [`SchemaRef`](crate::spec::SchemaRef) view — confique's compile-time
-//! metadata tree on the static path, a user-supplied runtime schema in the
-//! planned runtime path — and produces a JSON Schema document. Useful for
-//! auto-generating UI editors, external validation tools, or IDE integrations.
+//! Entry point is [`generate_schema::<C>()`](generate_schema): it walks the
+//! compile-time `confique::meta::Meta` tree and produces a JSON Schema
+//! document. Useful for auto-generating UI editors, external validation
+//! tools, or IDE integrations.
+//!
+//! Internally the walker consumes a crate-private `SchemaRef` view so the
+//! same generator will serve runtime-supplied schemas (issue #36) without
+//! a separate code path.
 //!
 //! # What is in the schema
 //!
@@ -53,7 +57,9 @@ pub fn generate_schema<C: Config>() -> Value {
     generate_schema_from_ref(SchemaRef::from_meta(&C::META))
 }
 
-/// Internal entry point used by [`ConfigSpec::generate_schema`](crate::spec::ConfigSpec::generate_schema).
+/// Internal entry point. Walks any `SchemaRef`-backed schema and emits the
+/// JSON Schema document. Phase 2's runtime adapter calls this directly with
+/// its own `SchemaRef` variant.
 pub(crate) fn generate_schema_from_ref(schema: SchemaRef<'_>) -> Value {
     let mut root = schema_to_object(schema);
     if let Value::Object(map) = &mut root {

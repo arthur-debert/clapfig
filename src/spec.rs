@@ -6,7 +6,7 @@
 //! will supply a parallel adapter that walks a user-supplied owned `Schema`,
 //! so the same consumers — strict-mode validation, doc lookup, valid-key
 //! enumeration, JSON Schema generation, template generation, persistence
-//! validation — work over either source without a recompile-time struct.
+//! validation — work over either source without a compile-time struct.
 //!
 //! Phase 1 only ships the static side. The fields reserved here for later
 //! phases (`SchemaRef::strict` for cascading strictness, `LeafRef::allowed_values`
@@ -169,10 +169,12 @@ pub(crate) enum LeafDefault<'a> {
 ///
 /// The static path (`StaticSpec<C>`) delegates to confique; the planned
 /// runtime path (issue #36) supplies a `DynamicSpec` that walks a user-
-/// supplied `Schema`. The pipeline calls four hooks in order: `schema`
-/// (for any consumer that needs the structure), `validate_unknown` (strict
-/// mode), `fill_defaults` (pre-finalize), `finalize` (produce the typed
-/// `Output`).
+/// supplied `Schema`. The resolve pipeline invokes three hooks in order:
+/// `validate_unknown` (strict-mode check on every parsed file),
+/// `fill_defaults` (called once on the merged table just before finalize),
+/// `finalize` (produce the typed `Output`). The fourth hook, `schema`,
+/// is reserved for consumers that need to walk the structure independently
+/// — none do in Phase 1.
 pub(crate) trait ConfigSpec {
     /// The final, typed output produced by [`finalize`](Self::finalize).
     /// `StaticSpec<C>` returns `C`; the runtime path will return
