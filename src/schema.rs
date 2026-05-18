@@ -44,7 +44,8 @@ use confique::Config;
 use confique::meta::{Expr, MapEntry, MapKey};
 use serde_json::{Map, Value, json};
 
-use crate::spec::{FieldKindRef, FieldRef, LeafDefault, LeafRef, SchemaRef};
+use crate::runtime::LeafType;
+use crate::spec::{DocSource, FieldKindRef, FieldRef, LeafDefault, LeafRef, SchemaRef};
 
 /// JSON Schema dialect emitted in the root `$schema` field.
 const SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -113,6 +114,19 @@ fn field_to_property(field: FieldRef<'_>) -> (String, Value, bool) {
             }
             (field.name.into(), schema, true)
         }
+        FieldKindRef::ArrayOf { schema: item } => {
+            // JSON Schema for a TOML `[[name]]` array of items: `type: array`
+            // with `items: <item schema>`. Each runtime array entry is itself
+            // typed against `item`, so the per-item schema is the natural
+            // place to declare structure.
+            let mut prop = Map::new();
+            if !field.doc.is_empty() {
+                prop.insert("description".into(), Value::String(join_doc(field.doc)));
+            }
+            prop.insert("type".into(), Value::String("array".into()));
+            prop.insert("items".into(), schema_to_object(item));
+            (field.name.into(), Value::Object(prop), true)
+        }
         FieldKindRef::Leaf(leaf) => {
             let mut prop = Map::new();
             if !field.doc.is_empty() {
@@ -124,16 +138,42 @@ fn field_to_property(field: FieldRef<'_>) -> (String, Value, bool) {
     }
 }
 
-/// Apply a leaf's default, env hint, and allowed-value set onto its JSON
-/// Schema object.
+/// Apply a leaf's declared type, default, env hint, and allowed-value set
+/// onto its JSON Schema object.
 fn populate_leaf(prop: &mut Map<String, Value>, leaf: LeafRef<'_>) {
+    // Phase 2 runtime path supplies an explicit `LeafType`; emit a faithful
+    // JSON Schema `type` from it without depending on whether a default
+    // happens to be present.
+    if let Some(ty) = leaf.ty
+        && let Some(name) = leaf_type_json_name(ty)
+    {
+        prop.insert("type".into(), Value::String(name.into()));
+        if let LeafType::Array(item) = ty
+            && let Some(item_name) = leaf_type_json_name(item)
+        {
+            let mut items = Map::new();
+            items.insert("type".into(), Value::String(item_name.into()));
+            prop.insert("items".into(), Value::Object(items));
+        }
+    }
+
     if let Some(default) = leaf.default {
         match default {
             LeafDefault::Expr(expr) => {
-                if let Some(ty) = infer_type(expr) {
+                // Confique's `Meta` doesn't carry an explicit type; infer
+                // from the default expression if a `LeafType` wasn't already
+                // emitted above.
+                if leaf.ty.is_none()
+                    && let Some(ty) = infer_type(expr)
+                {
                     prop.insert("type".into(), Value::String(ty.into()));
                 }
                 if let Some(default_value) = expr_to_json(expr) {
+                    prop.insert("default".into(), default_value);
+                }
+            }
+            LeafDefault::Toml(value) => {
+                if let Some(default_value) = toml_value_to_json(value) {
                     prop.insert("default".into(), default_value);
                 }
             }
@@ -144,13 +184,38 @@ fn populate_leaf(prop: &mut Map<String, Value>, leaf: LeafRef<'_>) {
         prop.insert("x-env".into(), Value::String(env_name.into()));
     }
 
-    // `allowed_values` is reserved for Phase 2's runtime enum leaves; static
-    // specs always leave it `None`, so the emitter is a no-op here today.
     if let Some(values) = leaf.allowed_values {
         let enum_array: Vec<Value> = values.iter().filter_map(toml_value_to_json).collect();
         if !enum_array.is_empty() {
             prop.insert("enum".into(), Value::Array(enum_array));
         }
+    }
+}
+
+/// JSON Schema `type` name for a runtime [`LeafType`]. `Enum` returns the
+/// underlying primitive type implied by the first allowed value (callers
+/// also emit `enum: [...]` separately).
+fn leaf_type_json_name(ty: &LeafType) -> Option<&'static str> {
+    match ty {
+        LeafType::String => Some("string"),
+        LeafType::Integer => Some("integer"),
+        LeafType::Float => Some("number"),
+        LeafType::Bool => Some("boolean"),
+        LeafType::DateTime => Some("string"),
+        LeafType::Array(_) => Some("array"),
+        LeafType::Map(_) => Some("object"),
+        LeafType::Enum { values } => values.first().and_then(toml_value_json_type),
+    }
+}
+
+/// Map a `toml::Value` to its JSON Schema `type` name.
+fn toml_value_json_type(value: &toml::Value) -> Option<&'static str> {
+    match value {
+        toml::Value::String(_) => Some("string"),
+        toml::Value::Integer(_) => Some("integer"),
+        toml::Value::Float(_) => Some("number"),
+        toml::Value::Boolean(_) => Some("boolean"),
+        _ => None,
     }
 }
 
@@ -231,8 +296,8 @@ fn toml_value_to_json(value: &toml::Value) -> Option<Value> {
     }
 }
 
-fn join_doc(lines: &[&str]) -> String {
-    lines
+fn join_doc(source: DocSource<'_>) -> String {
+    source
         .iter()
         .map(|l| l.trim())
         .collect::<Vec<_>>()

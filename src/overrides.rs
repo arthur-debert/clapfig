@@ -59,7 +59,7 @@ fn collect_keys(schema: SchemaRef<'_>, prefix: &str, keys: &mut HashSet<String>)
             FieldKindRef::Leaf(_) => {
                 keys.insert(dotted);
             }
-            FieldKindRef::Nested { schema: nested } => {
+            FieldKindRef::Nested { schema: nested } | FieldKindRef::ArrayOf { schema: nested } => {
                 collect_keys(nested, &dotted, keys);
             }
         }

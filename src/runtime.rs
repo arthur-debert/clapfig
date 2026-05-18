@@ -1,0 +1,473 @@
+//! Runtime-defined schemas: owned `Schema` / `Field` / `LeafType` types and a
+//! fluent builder, for callers without a compile-time `confique::Config`
+//! struct.
+//!
+//! Pairs with the [`crate::spec`] schema abstraction introduced in Phase 1.
+//! The runtime-side `Schema` is converted to a borrowed [`SchemaRef`] view
+//! by [`SchemaRef::from_dynamic`], and every consumer that already walks a
+//! `SchemaRef` — strict-mode validation, doc lookup, valid-key enumeration,
+//! JSON Schema generation, template generation, persistence validation —
+//! works over either source without a recompile-time struct.
+//!
+//! [`SchemaRef`]: crate::spec::SchemaRef
+//! [`SchemaRef::from_dynamic`]: crate::spec::SchemaRef::from_dynamic
+//!
+//! # Example
+//!
+//! ```ignore
+//! use clapfig::runtime::{Field, Schema};
+//!
+//! let schema = Schema::object("AppConfig")
+//!     .doc("Top-level application config.")
+//!     .field("host", Field::string().doc("App host").default("localhost"))
+//!     .field("port", Field::integer().default(8080i64))
+//!     .field(
+//!         "level",
+//!         Field::enum_of(["debug", "info", "warn", "error"])
+//!             .doc("Log verbosity")
+//!             .default("info"),
+//!     )
+//!     .nested(
+//!         "db",
+//!         Schema::object("Db")
+//!             .doc("Database settings")
+//!             .field("url", Field::string().optional())
+//!             .field("pool_size", Field::integer().default(5i64)),
+//!     )
+//!     .build();
+//! ```
+
+use toml::Value;
+
+/// Owned, runtime-defined schema for a config node.
+///
+/// Constructed via [`Schema::object`] and the fluent builder, or directly
+/// as a plain data struct. Convert to a borrowed view with
+/// [`crate::spec::SchemaRef::from_dynamic`] for use by the resolve pipeline.
+#[derive(Debug, Clone)]
+pub struct Schema {
+    pub name: String,
+    pub doc: Vec<String>,
+    /// Per-node strictness override. Phase 2 stores the value; Phase 3
+    /// (cascading strictness) consumes it during unknown-key resolution.
+    pub strict: Option<bool>,
+    pub fields: Vec<NamedField>,
+}
+
+impl Schema {
+    /// Start building a schema with the given object name (analogous to the
+    /// struct name in the static path).
+    pub fn object(name: impl Into<String>) -> SchemaBuilder {
+        SchemaBuilder {
+            schema: Schema {
+                name: name.into(),
+                doc: Vec::new(),
+                strict: None,
+                fields: Vec::new(),
+            },
+        }
+    }
+}
+
+/// Fluent builder for [`Schema`].
+#[derive(Debug, Clone)]
+pub struct SchemaBuilder {
+    schema: Schema,
+}
+
+impl SchemaBuilder {
+    /// Append a doc-comment line. Multiple calls accumulate; mirrors the
+    /// effect of multi-line `///` comments on a static struct.
+    pub fn doc(mut self, line: impl Into<String>) -> Self {
+        self.schema.doc.push(line.into());
+        self
+    }
+
+    /// Set the node-level `strict` override. Phase 3 (cascading strictness)
+    /// consumes this during unknown-key resolution.
+    pub fn strict(mut self, value: bool) -> Self {
+        self.schema.strict = Some(value);
+        self
+    }
+
+    /// Add a leaf field.
+    pub fn field(mut self, name: impl Into<String>, field: FieldBuilder) -> Self {
+        self.schema.fields.push(NamedField {
+            name: name.into(),
+            field: Field::Leaf(field.build()),
+        });
+        self
+    }
+
+    /// Add a nested object (TOML `[section]`).
+    pub fn nested(mut self, name: impl Into<String>, child: SchemaBuilder) -> Self {
+        self.schema.fields.push(NamedField {
+            name: name.into(),
+            field: Field::Nested(child.build()),
+        });
+        self
+    }
+
+    /// Add an array of nested objects (TOML `[[name]]`).
+    pub fn array_of(mut self, name: impl Into<String>, item: SchemaBuilder) -> Self {
+        self.schema.fields.push(NamedField {
+            name: name.into(),
+            field: Field::ArrayOf(item.build()),
+        });
+        self
+    }
+
+    /// Finalize the builder into a [`Schema`].
+    pub fn build(self) -> Schema {
+        self.schema
+    }
+}
+
+/// A named field on a [`Schema`].
+#[derive(Debug, Clone)]
+pub struct NamedField {
+    pub name: String,
+    pub field: Field,
+}
+
+/// A schema field — leaf scalar / array, nested object, or array-of-objects.
+#[derive(Debug, Clone)]
+pub enum Field {
+    Leaf(Leaf),
+    /// A single nested object — TOML `[section]`.
+    Nested(Schema),
+    /// An array of nested objects — TOML `[[plugins]]`.
+    ArrayOf(Schema),
+}
+
+impl Field {
+    /// Start a leaf builder for a string value.
+    pub fn string() -> FieldBuilder {
+        FieldBuilder::new(LeafType::String)
+    }
+
+    /// Start a leaf builder for an integer value.
+    pub fn integer() -> FieldBuilder {
+        FieldBuilder::new(LeafType::Integer)
+    }
+
+    /// Start a leaf builder for a floating-point value.
+    pub fn float() -> FieldBuilder {
+        FieldBuilder::new(LeafType::Float)
+    }
+
+    /// Start a leaf builder for a boolean value.
+    pub fn boolean() -> FieldBuilder {
+        FieldBuilder::new(LeafType::Bool)
+    }
+
+    /// Start a leaf builder for a TOML datetime value.
+    pub fn datetime() -> FieldBuilder {
+        FieldBuilder::new(LeafType::DateTime)
+    }
+
+    /// Start a leaf builder for a homogeneous array.
+    pub fn array_of_type(item: LeafType) -> FieldBuilder {
+        FieldBuilder::new(LeafType::Array(Box::new(item)))
+    }
+
+    /// Start a leaf builder for a string-keyed map with homogeneous values.
+    pub fn map_of(value: LeafType) -> FieldBuilder {
+        FieldBuilder::new(LeafType::Map(Box::new(value)))
+    }
+
+    /// Start a leaf builder constrained to one of `values`.
+    ///
+    /// Each `value` must be representable as a TOML primitive (string,
+    /// integer, float, or bool). At load time, a merged value not in this
+    /// set produces [`ClapfigError::InvalidValue`](crate::error::ClapfigError::InvalidValue).
+    pub fn enum_of<V: Into<Value>, I: IntoIterator<Item = V>>(values: I) -> FieldBuilder {
+        let values: Vec<Value> = values.into_iter().map(Into::into).collect();
+        FieldBuilder::new(LeafType::Enum { values })
+    }
+}
+
+/// Owned leaf data for a runtime field.
+#[derive(Debug, Clone)]
+pub struct Leaf {
+    pub doc: Vec<String>,
+    pub ty: LeafType,
+    pub default: Option<Value>,
+    /// `true` if the field may be absent after merge. `false` (the default)
+    /// makes it required — a `MissingRequired` error is produced if every
+    /// layer omits the field and no default is set.
+    pub optional: bool,
+    /// Optional explicit env-var name override. Without this, the env layer
+    /// derives names from the field path (`PREFIX__SECTION__FIELD`).
+    pub env: Option<String>,
+}
+
+/// Leaf type discriminant — the value-level shape clapfig validates.
+#[derive(Debug, Clone)]
+pub enum LeafType {
+    String,
+    Integer,
+    Float,
+    Bool,
+    /// TOML datetime (offset, local-datetime, local-date, local-time).
+    DateTime,
+    /// Homogeneous array. The boxed `LeafType` is the element type.
+    Array(Box<LeafType>),
+    /// String-keyed map with homogeneous values. The boxed `LeafType` is the
+    /// value type.
+    Map(Box<LeafType>),
+    /// Constrained value: must equal one of the listed TOML values.
+    Enum {
+        values: Vec<Value>,
+    },
+}
+
+impl LeafType {
+    /// Human-readable name for use in error messages.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            LeafType::String => "string",
+            LeafType::Integer => "integer",
+            LeafType::Float => "float",
+            LeafType::Bool => "bool",
+            LeafType::DateTime => "datetime",
+            LeafType::Array(_) => "array",
+            LeafType::Map(_) => "map",
+            LeafType::Enum { .. } => "enum",
+        }
+    }
+
+    /// Check whether a `toml::Value` is shape-compatible with this leaf type.
+    ///
+    /// Containers (`Array`, `Map`) recurse into their elements. `Enum` checks
+    /// literal equality against the allowed-value set. Returns `Ok(())` on
+    /// match; on mismatch, returns a human-readable reason suitable for
+    /// `ClapfigError::InvalidValue::reason`.
+    pub(crate) fn check(&self, value: &Value) -> Result<(), String> {
+        match (self, value) {
+            (LeafType::String, Value::String(_)) => Ok(()),
+            (LeafType::Integer, Value::Integer(_)) => Ok(()),
+            (LeafType::Float, Value::Float(_)) => Ok(()),
+            (LeafType::Bool, Value::Boolean(_)) => Ok(()),
+            (LeafType::DateTime, Value::Datetime(_)) => Ok(()),
+            (LeafType::Array(elem), Value::Array(items)) => {
+                for (i, item) in items.iter().enumerate() {
+                    elem.check(item).map_err(|e| format!("array[{i}]: {e}"))?;
+                }
+                Ok(())
+            }
+            (LeafType::Map(elem), Value::Table(table)) => {
+                for (k, v) in table {
+                    elem.check(v).map_err(|e| format!("map[{k}]: {e}"))?;
+                }
+                Ok(())
+            }
+            (LeafType::Enum { values }, v) => {
+                if values.iter().any(|allowed| allowed == v) {
+                    Ok(())
+                } else {
+                    let listed = values
+                        .iter()
+                        .map(format_toml_value)
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    Err(format!(
+                        "value {} is not in allowed set: {listed}",
+                        format_toml_value(v)
+                    ))
+                }
+            }
+            (expected, got) => Err(format!(
+                "expected {}, got {}",
+                expected.name(),
+                value_type_name(got)
+            )),
+        }
+    }
+}
+
+/// Fluent builder for a [`Leaf`] field.
+#[derive(Debug, Clone)]
+pub struct FieldBuilder {
+    leaf: Leaf,
+}
+
+impl FieldBuilder {
+    fn new(ty: LeafType) -> Self {
+        Self {
+            leaf: Leaf {
+                doc: Vec::new(),
+                ty,
+                default: None,
+                optional: false,
+                env: None,
+            },
+        }
+    }
+
+    /// Append a doc-comment line.
+    pub fn doc(mut self, line: impl Into<String>) -> Self {
+        self.leaf.doc.push(line.into());
+        self
+    }
+
+    /// Set the default value injected when no layer supplies one.
+    pub fn default<V: Into<Value>>(mut self, value: V) -> Self {
+        self.leaf.default = Some(value.into());
+        self
+    }
+
+    /// Mark this field optional — absence after merge is accepted.
+    pub fn optional(mut self) -> Self {
+        self.leaf.optional = true;
+        self
+    }
+
+    /// Override the env-var name for this field. Without this, the env layer
+    /// derives a name from the field path.
+    pub fn env(mut self, name: impl Into<String>) -> Self {
+        self.leaf.env = Some(name.into());
+        self
+    }
+
+    pub(crate) fn build(self) -> Leaf {
+        self.leaf
+    }
+}
+
+/// Pretty-print a `toml::Value` for error messages.
+fn format_toml_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => format!("\"{s}\""),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Datetime(d) => d.to_string(),
+        Value::Array(_) => "<array>".into(),
+        Value::Table(_) => "<table>".into(),
+    }
+}
+
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::String(_) => "string",
+        Value::Integer(_) => "integer",
+        Value::Float(_) => "float",
+        Value::Boolean(_) => "bool",
+        Value::Datetime(_) => "datetime",
+        Value::Array(_) => "array",
+        Value::Table(_) => "table",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_builds_a_simple_schema() {
+        let s = Schema::object("App")
+            .doc("Top-level config")
+            .field("host", Field::string().default("localhost"))
+            .field("port", Field::integer().default(8080i64))
+            .build();
+        assert_eq!(s.name, "App");
+        assert_eq!(s.doc, vec!["Top-level config".to_string()]);
+        assert_eq!(s.fields.len(), 2);
+        assert!(matches!(s.fields[0].field, Field::Leaf(_)));
+    }
+
+    #[test]
+    fn builder_handles_nested_schemas() {
+        let s = Schema::object("Root")
+            .nested(
+                "db",
+                Schema::object("Db").field("url", Field::string().optional()),
+            )
+            .build();
+        match &s.fields[0].field {
+            Field::Nested(inner) => {
+                assert_eq!(inner.name, "Db");
+                assert_eq!(inner.fields.len(), 1);
+            }
+            other => panic!("expected Nested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_handles_strict_override() {
+        let s = Schema::object("Top").strict(false).build();
+        assert_eq!(s.strict, Some(false));
+    }
+
+    #[test]
+    fn enum_of_collects_values() {
+        let f = Field::enum_of(["debug", "info"]).build();
+        match &f.ty {
+            LeafType::Enum { values } => {
+                assert_eq!(values.len(), 2);
+                assert_eq!(values[0], Value::String("debug".into()));
+            }
+            other => panic!("expected Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leaf_type_check_accepts_matching_primitives() {
+        assert!(LeafType::String.check(&Value::String("x".into())).is_ok());
+        assert!(LeafType::Integer.check(&Value::Integer(1)).is_ok());
+        assert!(LeafType::Bool.check(&Value::Boolean(true)).is_ok());
+    }
+
+    #[test]
+    fn leaf_type_check_rejects_mismatched_type() {
+        let err = LeafType::Integer
+            .check(&Value::String("nope".into()))
+            .unwrap_err();
+        assert!(err.contains("expected integer"));
+        assert!(err.contains("got string"));
+    }
+
+    #[test]
+    fn leaf_type_check_enum_accepts_known_value() {
+        let e = LeafType::Enum {
+            values: vec!["info".into(), "warn".into()],
+        };
+        assert!(e.check(&Value::String("info".into())).is_ok());
+    }
+
+    #[test]
+    fn leaf_type_check_enum_rejects_unknown_value() {
+        let e = LeafType::Enum {
+            values: vec!["info".into(), "warn".into()],
+        };
+        let err = e.check(&Value::String("garbage".into())).unwrap_err();
+        assert!(err.contains("not in allowed set"));
+        assert!(err.contains("\"info\""));
+        assert!(err.contains("\"warn\""));
+    }
+
+    #[test]
+    fn leaf_type_check_array_recurses() {
+        let arr = LeafType::Array(Box::new(LeafType::Integer));
+        let good = Value::Array(vec![Value::Integer(1), Value::Integer(2)]);
+        assert!(arr.check(&good).is_ok());
+
+        let bad = Value::Array(vec![Value::Integer(1), Value::String("oops".into())]);
+        let err = arr.check(&bad).unwrap_err();
+        assert!(err.contains("array[1]"));
+        assert!(err.contains("expected integer"));
+    }
+
+    #[test]
+    fn leaf_type_check_map_recurses() {
+        let map = LeafType::Map(Box::new(LeafType::Integer));
+        let mut t = toml::map::Map::new();
+        t.insert("a".into(), Value::Integer(1));
+        assert!(map.check(&Value::Table(t.clone())).is_ok());
+
+        t.insert("b".into(), Value::String("oops".into()));
+        let err = map.check(&Value::Table(t)).unwrap_err();
+        assert!(err.contains("map[b]"));
+    }
+}

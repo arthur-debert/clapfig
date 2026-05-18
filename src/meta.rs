@@ -50,6 +50,12 @@ pub fn doc_for<C: Config>(key: &str) -> Option<Vec<String>> {
     walk(SchemaRef::from_meta(&C::META), key)
 }
 
+/// Runtime-path analogue of [`doc_for`]: look up a key's doc lines in an
+/// owned [`Schema`](crate::runtime::Schema).
+pub fn doc_for_runtime(schema: &crate::runtime::Schema, key: &str) -> Option<Vec<String>> {
+    walk(SchemaRef::from_dynamic(schema), key)
+}
+
 pub(crate) fn walk(schema: SchemaRef<'_>, dotted_key: &str) -> Option<Vec<String>> {
     let segments: Vec<&str> = dotted_key.split('.').collect();
     walk_segments(schema, &segments)
@@ -67,6 +73,7 @@ fn walk_segments(schema: SchemaRef<'_>, segments: &[&str]) -> Option<Vec<String>
             }
             return match field.kind {
                 FieldKindRef::Nested { schema: nested } => walk_segments(nested, &segments[1..]),
+                FieldKindRef::ArrayOf { schema: nested } => walk_segments(nested, &segments[1..]),
                 // Hit a leaf with segments still pending — the rest of the
                 // path can't resolve.
                 FieldKindRef::Leaf(_) => None,
