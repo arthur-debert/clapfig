@@ -1,72 +1,36 @@
-name: Release
+# Release clapfig — thin caller into the canonical rust-lib reusable
+# workflow at `arthur-debert/release/.github/workflows/rust-lib.yml`.
+#
+# Trigger model: **workflow_dispatch** (matches the rust-cli pattern
+# used by lex + the cascade-handler contract). Previously triggered
+# on tag-push; the canonical workflow's `prepare-release` action now
+# drives the bump + commit + tag + push, so the caller only needs to
+# pass the version.
+#
+# To cut a release:
+#   gh workflow run release.yml --ref main -f version=0.18.3
+# or via the GH web UI's "Run workflow" button on the Actions tab.
+
+name: Release clapfig
 
 on:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (bare semver, e.g. 0.18.3 — no leading v)'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   release:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Extract version from tag
-        id: version
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Release version: $VERSION"
-
-      - name: Verify Cargo.toml version matches tag
-        run: |
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          TAG_VERSION=${{ steps.version.outputs.version }}
-          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
-            echo "ERROR: Cargo.toml version ($CARGO_VERSION) does not match tag (v$TAG_VERSION)"
-            echo "Use 'cargo release' locally to bump version, tag, and push."
-            exit 1
-          fi
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run tests
-        run: cargo test --all
-
-      - name: Extract release notes from CHANGELOG
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          awk '/^## \['"$VERSION"'\]/{found=1; next} /^## \[/{if(found) exit} found{print}' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then
-            echo "Release v$VERSION" > release-notes.md
-          fi
-          echo "=== Release Notes ==="
-          cat release-notes.md
-
-      # Use scripts/ci-publish-crate.sh for robust two-tier "already
-      # published" detection: pre-check via crates.io JSON API + grep
-      # cargo's publish output for "already exists on crates.io index"
-      # / "already uploaded". Same pattern as standout/dodot/padz/rustloc.
-      # Replaces the prior `cargo search VERSION grep` heuristic which
-      # broke when re-running an older release (cargo search returns
-      # only the LATEST version, so the grep wouldn't match older ones).
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_KEY }}
-        run: scripts/ci-publish-crate.sh clapfig
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: v${{ steps.version.outputs.version }}
-          body_path: release-notes.md
+    uses: arthur-debert/release/.github/workflows/rust-lib.yml@v1
+    with:
+      version: ${{ inputs.version }}
+      crates: clapfig
+      changelog-path: CHANGELOG.md
+    secrets:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      CRATES_IO_KEY: ${{ secrets.CRATES_IO_KEY }}
