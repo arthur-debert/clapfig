@@ -98,7 +98,13 @@ pub enum Field {
         optional: bool,            // true => may be absent after merge
         env: Option<String>,       // optional env-var name override
     },
+    /// A single nested object — TOML `[section]`.
     Nested(Schema),
+    /// An array of nested objects — TOML `[[plugins]]` / `[[steps]]` /
+    /// `[[matrix.targets]]`. Each item is independently validated against
+    /// `Schema`. Required for the common plugin-list and step-list shapes
+    /// where each entry has its own typed structure.
+    ArrayOf(Schema),
 }
 
 pub enum LeafType {
@@ -106,8 +112,18 @@ pub enum LeafType {
     Integer,
     Float,
     Bool,
-    Array,
-    Map,
+    /// TOML datetime (offset, local-datetime, local-date, local-time).
+    /// Parsed as `toml::value::Datetime`; surfaced unchanged in the
+    /// output table.
+    DateTime,
+    /// Homogeneous array. The boxed `LeafType` is the element type; every
+    /// item in the array must validate against it. Use `Array(Box::new(
+    /// LeafType::String))` for `Vec<String>`, etc.
+    Array(Box<LeafType>),
+    /// String-keyed map with homogeneous values. The boxed `LeafType` is
+    /// the value type; every value must validate against it. Use
+    /// `Map(Box::new(LeafType::Integer))` for `BTreeMap<String, i64>`.
+    Map(Box<LeafType>),
     /// Constrained value: must equal one of the listed TOML values.
     /// Use for log levels, output formats, mode flags, etc.
     Enum { values: Vec<toml::Value> },
@@ -160,9 +176,10 @@ let cfg: toml::Table = Clapfig::runtime(schema)
 
 The returned builder exposes the **same surface** as `ClapfigBuilder<C>` —
 `app_name`, `file_name`, `search_paths`, `search_mode`, `persist_scope`,
-`env_prefix`, `no_env`, `strict`, `normalize_keys`, `layer_order`,
-`url_query`, `cli_override`, `cli_overrides_from`, `post_validate`,
-`build_resolver`, `load`, `handle`. Behavior is identical except:
+`env_prefix`, `no_env`, `strict`, `strict_at`, `on_unknown_key`,
+`normalize_keys`, `layer_order`, `url_query`, `cli_override`,
+`cli_overrides_from`, `post_validate`, `build_resolver`, `load`, `handle`.
+Behavior is identical except:
 
 - The output type is `toml::Table`, not a typed `C`. (Callers who want JSON
   can `.to_json()` it; we surface a small helper for that.)
@@ -195,8 +212,12 @@ output side):
   pipeline as today.
 - **Type and enum validation.** Each merged value is checked against the
   leaf's `LeafType`. For `LeafType::Enum { values }`, the merged value
-  must equal one of `values` (TOML equality, with `normalize_keys`
-  applied to string values when the option is on); a mismatch produces
+  must equal one of `values` under literal TOML equality — case- and
+  character-sensitive, no transformation. `normalize_keys(true)` does
+  **not** affect enum value comparison; that option only rewrites the
+  spelling of *keys* (see "Kebab-case keys" in the crate docs), and
+  silently mutating a string like `"warn-level"` into `"warn_level"`
+  during enum matching would surprise users. A mismatch produces
   `ClapfigError::InvalidValue { key, reason }` — the same error variant
   static-path enum violations use today. `config set` consults the same
   check, so writing an out-of-set value fails fast before the file is
