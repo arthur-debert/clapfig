@@ -75,6 +75,10 @@ impl fmt::Display for ConfigResult {
 /// so the template matches what users will actually type when
 /// [`.normalize_keys(true)`](crate::ClapfigBuilder::normalize_keys) is in
 /// effect. Doc comments and values are never touched.
+///
+/// The static path delegates to confique's `toml::template`; Phase 2's
+/// runtime path will walk a [`SchemaRef`](crate::spec::SchemaRef) and emit
+/// its own template.
 pub fn generate_template<C: Config>(kebab: bool) -> String {
     let raw = confique::toml::template::<C>(confique::toml::FormatOptions::default());
     if kebab {
@@ -184,12 +188,13 @@ fn swap_underscores_to_dashes(dotted: &str) -> String {
 
 /// Generate a JSON Schema document (pretty-printed) describing the config struct.
 ///
-/// Delegates to [`crate::schema::generate_schema`] and serializes the result.
-/// Serialization of a `serde_json::Value` is infallible for the shapes this
-/// module produces, so we propagate any panic rather than masking it with a
-/// bogus "{}" payload.
+/// Walks the schema via [`crate::schema::generate_schema_from_ref`] and
+/// serializes the result. Serialization of a `serde_json::Value` is infallible
+/// for the shapes this module produces, so we propagate any panic rather than
+/// masking it with a bogus "{}" payload.
 pub fn generate_schema_string<C: Config>() -> String {
-    let value = crate::schema::generate_schema::<C>();
+    let schema = crate::spec::SchemaRef::from_meta(&C::META);
+    let value = crate::schema::generate_schema_from_ref(schema);
     serde_json::to_string_pretty(&value).expect("serde_json::Value serialization is infallible")
 }
 

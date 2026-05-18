@@ -288,7 +288,7 @@ impl<C: Config> ClapfigBuilder<C> {
     pub fn cli_overrides_from<S: Serialize>(mut self, source: &S) -> Self {
         let pairs = flatten::flatten(source)
             .expect("clapfig: failed to flatten CLI source for auto-matching");
-        let valid = overrides::valid_keys(&C::META);
+        let valid = overrides::valid_keys(crate::spec::SchemaRef::from_meta(&C::META));
         for (key, value) in pairs {
             if let Some(v) = value
                 && valid.contains(&key)

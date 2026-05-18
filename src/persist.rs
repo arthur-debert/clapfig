@@ -27,7 +27,7 @@ where
     C::Layer: for<'de> Deserialize<'de>,
 {
     // Validate key is known to the config schema
-    let valid_keys = crate::overrides::valid_keys(&C::META);
+    let valid_keys = crate::overrides::valid_keys(crate::spec::SchemaRef::from_meta(&C::META));
     if !valid_keys.contains(key) {
         return Err(ClapfigError::KeyNotFound(key.into()));
     }
