@@ -61,13 +61,30 @@ pub struct LeafStatic {
 #[derive(Debug)]
 pub enum LeafTypeStatic {
     String,
+    /// Signed 64-bit integer (TOML's only integer width).
+    ///
+    /// The derive macro maps every Rust integer type, including the
+    /// unsigned ones (`u8`/`u16`/`u32`/`u64`/`usize`) and `isize`, to
+    /// this variant. Values that exceed `i64::MAX` (e.g. a `u64`
+    /// holding 2^63) **cannot be represented in TOML at all** — the
+    /// failure mode is at serialize time, before the value ever
+    /// reaches a deserializer, and there is no faithful intermediate.
+    /// Field types like `u64` are accepted because they are convenient
+    /// and round-trip correctly for the overwhelming majority of
+    /// values; callers who need the full unsigned-64 range should
+    /// store them as `String` and parse explicitly.
+    ///
+    /// `i128` and `u128` are rejected at derive time with a compile
+    /// error rather than silently truncated.
     Integer,
     Float,
     Bool,
     DateTime,
     Array(&'static LeafTypeStatic),
     Map(&'static LeafTypeStatic),
-    Enum { values: &'static [ValueStatic] },
+    Enum {
+        values: &'static [ValueStatic],
+    },
     Value,
 }
 
