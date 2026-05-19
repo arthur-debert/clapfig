@@ -557,7 +557,7 @@
 //! Tools that build help text, tooltips, settings UIs, or `--describe`
 //! flags can read a field's doc-comment lines directly from the static
 //! `Config::META` tree — no need to spin up the full resolve pipeline. See
-//! [`meta::doc_for`](crate::meta::doc_for):
+//! [`meta::doc_for`]:
 //!
 //! ```ignore
 //! let lines = clapfig::meta::doc_for::<AppConfig>("database.pool-size")

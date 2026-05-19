@@ -2,15 +2,13 @@
 //! fluent builder, for callers without a compile-time `confique::Config`
 //! struct.
 //!
-//! Pairs with the [`crate::spec`] schema abstraction introduced in Phase 1.
-//! The runtime-side `Schema` is converted to a borrowed [`SchemaRef`] view
-//! by [`SchemaRef::from_dynamic`], and every consumer that already walks a
-//! `SchemaRef` — strict-mode validation, doc lookup, valid-key enumeration,
-//! JSON Schema generation, template generation, persistence validation —
-//! works over either source without a recompile-time struct.
-//!
-//! [`SchemaRef`]: crate::spec::SchemaRef
-//! [`SchemaRef::from_dynamic`]: crate::spec::SchemaRef::from_dynamic
+//! Pairs with a crate-private schema abstraction introduced in Phase 1
+//! (a borrowed `SchemaRef` view). The runtime-side `Schema` is converted
+//! to that view internally, and every consumer that already walks the
+//! borrowed view — strict-mode validation, doc lookup, valid-key
+//! enumeration, JSON Schema generation, template generation, persistence
+//! validation — works over either source without a recompile-time
+//! struct.
 //!
 //! # Example
 //!
@@ -42,8 +40,9 @@ use toml::Value;
 /// Owned, runtime-defined schema for a config node.
 ///
 /// Constructed via [`Schema::object`] and the fluent builder, or directly
-/// as a plain data struct. Convert to a borrowed view with
-/// [`crate::spec::SchemaRef::from_dynamic`] for use by the resolve pipeline.
+/// as a plain data struct. The clapfig resolve pipeline borrows from
+/// this internally — callers normally only need to build it and hand it
+/// to [`Clapfig::runtime`](crate::Clapfig::runtime).
 #[derive(Debug, Clone)]
 pub struct Schema {
     pub name: String,
