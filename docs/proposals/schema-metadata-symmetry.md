@@ -115,8 +115,11 @@ All three are documentable in one paragraph rather than buried as
 The macro — provisionally `#[derive(clapfig::Schema)]`, final name TBD
 — is invoked on a Rust struct and emits:
 
-1. A `Clapfig` trait impl carrying a `&'static runtime::Schema` (or a
-   `fn schema() -> &'static runtime::Schema`, behind a `OnceLock`).
+1. A `clapfig::Schema` trait impl carrying a `&'static runtime::Schema`
+   (or a `fn schema() -> &'static runtime::Schema`, behind a `OnceLock`).
+   The exact storage shape — owned `OnceLock`, `Cow<'static, Schema>`,
+   or a parallel `SchemaStatic` representation — is an open question,
+   not a settled detail; see "Storage of the emitted schema" below.
 2. A `serde::Deserialize` impl, either directly or via a generated
    layer struct mirroring confique's `<C as Config>::Layer` pattern.
 3. (TBD per the migration plan) a `confique::Config` shim, if we want
@@ -132,7 +135,7 @@ handle, with the `LeafType` / `Field` / `Schema` output it produces.
 |------------------------------------------|-----------------------------------------------|
 | `String`, `&'static str`                 | `LeafType::String`                            |
 | `i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`  | `LeafType::Integer`                           |
-| `u64`, `usize`, `isize`                  | `LeafType::Integer` (overflow at deserialize) |
+| `u64`, `usize`, `isize`                  | `LeafType::Integer` (see TOML range note below) |
 | `f32`, `f64`                             | `LeafType::Float`                             |
 | `bool`                                   | `LeafType::Bool`                              |
 | `toml::value::Datetime`                  | `LeafType::DateTime`                          |
@@ -153,6 +156,26 @@ handle, with the `LeafType` / `Field` / `Schema` output it produces.
 and clapfig's dotted-path machinery assumes it. Numeric or enum keys are
 rejected.
 
+**TOML integer range.** TOML integers are strictly signed 64-bit. A
+`u64` value above `i64::MAX` (2^63 - 1) cannot be represented in TOML
+at all — the failure mode is at serialize time, before the value ever
+reaches a deserializer, and there is no faithful intermediate
+representation. The macro emits `LeafType::Integer` for `u64` /
+`usize` for symmetry with confique's current behavior, but the
+emitted doc-comment must surface the limitation. Same for `isize` on
+32-bit targets if we ever care, which we don't today.
+
+**Nested-schema composition.** The `Field::Nested(S::schema())` and
+`Field::ArrayOf(S::schema())` rows above are written abstractly. The
+runtime `Field` enum today holds owned `Schema` values
+(`src/runtime.rs:152-154`), so composing static schemas this way would
+require cloning the sub-schema tree on every emit. Whether the macro
+emits owned `Schema` copies, switches to `Cow<'static, Schema>`, or
+relies on a parallel `SchemaStatic` type is the storage decision
+flagged under "Open questions". This row in the table is a
+representation-agnostic statement of intent, not a commitment to
+owned values.
+
 ### Field-level attributes
 
 The macro reads the following attributes on each field:
@@ -162,7 +185,7 @@ The macro reads the following attributes on each field:
 | `///` doc comments                       | Populate `Leaf.doc` / `Schema.doc`           |
 | `#[clapfig(default = expr)]`             | `Leaf.default = Some(expr.into())`           |
 | `#[clapfig(env = "NAME")]`               | `Leaf.env = Some("NAME".into())`             |
-| `#[clapfig(optional)]`                   | Force `optional = true` even on non-`Option<T>` fields (rare; usually `Option<T>` is the right spelling) |
+| `#[clapfig(optional)]`                   | Force `optional = true` on a non-`Option<T>` field. The macro **must** reject this attribute unless the field also carries `#[clapfig(default = ...)]`, since otherwise the typed `load()` would deserialize a missing field into a `T` that has no value — runtime panic territory. The intended spelling is `Option<T>`; this attribute is the rare opt-out for "I want `optional` semantics on a non-`Option<T>` field whose default makes the type recoverable." |
 | `#[clapfig(value)]`                      | Override type mapping with `LeafType::Value` |
 | `#[clapfig(rename = "name")]`            | Override field name in the schema and on deserialize |
 | `#[clapfig(skip)]`                       | Omit from schema and require a `Default` impl |
@@ -297,11 +320,29 @@ Things to settle during review of this proposal, before macro code lands:
 - **Derive name.** `clapfig::Schema`? `clapfig::Config`? The latter
   reuses the confique-familiar name but creates ambiguity during the
   transition window when both crates' `Config` derives exist.
-- **Storage of the emitted schema.** Const-eval (`const SCHEMA:
-  runtime::Schema = ...`) or `OnceLock<runtime::Schema>` initialized on
-  first use? `runtime::Schema` contains `Vec` and `String`, so const-
-  eval requires `&'static [&'static str]` plumbing — possibly worth a
-  parallel `SchemaStatic` representation, or possibly not.
+- **Storage of the emitted schema.** Three concrete obstacles to a
+  `const SCHEMA: runtime::Schema = ...` form, all rooted in
+  owned types inside the runtime representation:
+  1. `Schema::doc` and `Leaf::doc` are `Vec<String>`. Const requires
+     `&'static [&'static str]`.
+  2. `Field::Nested(Schema)` and `Field::ArrayOf(Schema)` carry an
+     owned `Schema` value, so composing nested schemas means cloning
+     a sub-tree at every parent emit (`src/runtime.rs:152-154`). A
+     `Cow<'static, Schema>` or a reference-based variant would let
+     the macro emit a `&'static` pointer to a sub-type's pre-emitted
+     schema instead.
+  3. `Leaf.default: Option<toml::Value>` — `toml::Value` is owned and
+     contains `String` / `Vec`, so it can't appear in a `const`. A
+     parallel `ValueStatic` enum (`&'static str` / `&'static [...]`)
+     convertible to `toml::Value` on demand would close this.
+
+  The three options that emerge: (a) accept the allocation cost and
+  use `OnceLock<runtime::Schema>`, (b) add a parallel `SchemaStatic`
+  / `ValueStatic` type and have `SchemaRef` view both, (c) refactor
+  the runtime types themselves to be reference-based via `Cow`. Each
+  is a separate engineering investment with different ergonomic
+  consequences for the runtime-path API. The decision belongs in the
+  macro PR; this proposal flags the constraint.
 - **Coexistence with confique during the migration.** Accept
   `C: confique::Config` *or* `C: clapfig::Schema` on the static
   builder, with a shim from the first to the second? Or hard-fork and
