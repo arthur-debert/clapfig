@@ -240,17 +240,16 @@ fn parent_path(path: &str) -> &str {
 /// Section path of `(path, leaf)`: `path` with the trailing leaf stripped
 /// (plus the `.` separator if any). Returns `""` for a top-level key.
 ///
-/// Mirrors the same trick `validate::lookup_value` and
-/// `validate::find_key_line` use so the cascade correctly handles quoted
-/// TOML leaves that contain dots.
+/// Uses `strip_suffix` to remove the leaf then the `.` separator. Robust
+/// to quoted-key leaves with dots, array-index segments, and any other
+/// path shape — the cascade walks the same way regardless of what the
+/// leaf looks like.
 fn section_path_of<'a>(path: &'a str, leaf: &str) -> &'a str {
-    if path.len() == leaf.len() {
-        ""
-    } else {
-        // The `- 1` skips the `.` separator between the section path and
-        // the leaf.
-        &path[..path.len() - leaf.len() - 1]
+    if path == leaf {
+        return "";
     }
+    let parent = path.strip_suffix(leaf).unwrap_or(path);
+    parent.strip_suffix('.').unwrap_or(parent)
 }
 
 /// Strip every `[N]` array-index segment from a dotted path, yielding the

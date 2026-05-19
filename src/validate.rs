@@ -181,13 +181,14 @@ pub(crate) fn filter_through_cascade(
 /// callback path treats `None` as "value unknown" and falls back to a
 /// stand-in null so the callback still runs.
 fn lookup_value<'a>(table: &'a Table, path: &str, leaf: &str) -> Option<&'a Value> {
-    let section = if path.len() == leaf.len() {
+    // `strip_suffix` form mirrors `strict::section_path_of`: drop the
+    // leaf off the end of the path, then drop the `.` separator. Handles
+    // quoted-key and array-indexed paths uniformly.
+    let section = if path == leaf {
         ""
     } else {
-        // The `- 1` skips the `.` separator between the section path and
-        // the leaf. Guaranteed valid by construction: `leaf` was taken
-        // from the leaf position when the path was built.
-        &path[..path.len() - leaf.len() - 1]
+        let s = path.strip_suffix(leaf).unwrap_or(path);
+        s.strip_suffix('.').unwrap_or(s)
     };
     if section.is_empty() {
         return table.get(leaf);
@@ -246,12 +247,14 @@ fn parse_segment(seg: &str) -> (&str, Option<usize>) {
 /// Returns 0 if the key cannot be located.
 fn find_key_line(content: &str, dotted_path: &str, leaf: &str, normalize_keys: bool) -> usize {
     // Section path = dotted path with the leaf stripped off the end (plus
-    // the `.` separator if any). Mirrors `lookup_value` so quoted keys
-    // containing dots still resolve to the correct enclosing section.
-    let section_path = if dotted_path.len() == leaf.len() {
+    // the `.` separator if any). Mirrors `lookup_value` and
+    // `strict::section_path_of` so quoted keys containing dots still
+    // resolve to the correct enclosing section.
+    let section_path = if dotted_path == leaf {
         ""
     } else {
-        &dotted_path[..dotted_path.len() - leaf.len() - 1]
+        let s = dotted_path.strip_suffix(leaf).unwrap_or(dotted_path);
+        s.strip_suffix('.').unwrap_or(s)
     };
     let expected_section: Vec<&str> = if section_path.is_empty() {
         Vec::new()
