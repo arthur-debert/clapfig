@@ -616,6 +616,7 @@ pub mod meta;
 pub mod render;
 pub mod runtime;
 pub mod schema;
+pub mod static_schema;
 pub mod types;
 
 mod builder;
@@ -633,6 +634,7 @@ mod resolve;
 mod resolver;
 mod runtime_builder;
 mod runtime_spec;
+mod schema_builder;
 mod spec;
 mod strict;
 #[cfg(feature = "url")]
@@ -643,6 +645,8 @@ mod validate;
 mod fixtures;
 
 pub use builder::{Clapfig, ClapfigBuilder};
+#[cfg(feature = "derive")]
+pub use clapfig_derive::Schema;
 #[cfg(feature = "clap")]
 pub use cli::{ConfigArgs, ConfigCommand, ConfigSubcommand};
 pub use confique::Config;
@@ -650,5 +654,7 @@ pub use error::{ClapfigError, UnknownKeyInfo};
 pub use ops::ConfigResult;
 pub use resolver::Resolver;
 pub use runtime_builder::{RuntimeBuilder, RuntimeResolver};
+pub use schema_builder::SchemaConfigBuilder;
+pub use static_schema::Schema;
 pub use strict::{UnknownKeyContext, UnknownKeyDecision};
 pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};

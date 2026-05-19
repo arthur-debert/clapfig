@@ -1,0 +1,5 @@
+error: `value` and `allowed` are mutually exclusive on the same field
+ --> tests/ui/derive/value_and_allowed_conflict.rs:5:5
+  |
+5 |     #[clapfig(value, allowed = ["a", "b"])]
+  |     ^

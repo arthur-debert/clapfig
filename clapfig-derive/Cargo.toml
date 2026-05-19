@@ -1,0 +1,16 @@
+[package]
+name = "clapfig-derive"
+version = "0.20.0"
+edition = "2024"
+description = "Procedural macro for deriving clapfig::Schema"
+license = "MIT"
+repository = "https://github.com/arthur-debert/clapfig"
+homepage = "https://github.com/arthur-debert/clapfig"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }
