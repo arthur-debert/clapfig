@@ -117,7 +117,9 @@ pub(crate) fn filter_through_cascade(
     let mut rejected: Vec<UnknownKeyInfo> = Vec::new();
     for entry in unknown_keys {
         let UnknownKey { path: key, leaf } = entry;
-        let strict = ctx.overrides.effective_strict(&key, ctx.default_strict);
+        let strict = ctx
+            .overrides
+            .effective_strict(&key, &leaf, ctx.default_strict);
         if !strict {
             // Lenient subtree — drop silently.
             continue;
@@ -129,11 +131,12 @@ pub(crate) fn filter_through_cascade(
             // Callback runs only on cascade-strict keys. Look the value up
             // by `(path, leaf)` so quoted keys containing dots (literal
             // TOML keys like `"acme.task-due-date-missing"`) resolve
-            // correctly — the leaf is the raw TOML key the parser saw,
-            // not whatever dot-split would produce. Indexed array paths
-            // (`[N]` segments) can't round-trip through `table_get`;
-            // treat those as "value unknown" and use a stand-in null.
-            // The callback can still inspect path+leaf.
+            // correctly. `lookup_value` also walks `[N]` array-index
+            // segments, so callbacks on array-internal keys see the real
+            // entry value. When the lookup genuinely can't resolve (e.g.
+            // out-of-bounds index or a path through a non-table value)
+            // we fall back to a stand-in `false` so the callback still
+            // runs and can decide based on path/leaf/file/line alone.
             let null = Value::Boolean(false);
             let value = lookup_value(table, &key, &leaf).unwrap_or(&null);
             let context = UnknownKeyContext {
@@ -170,11 +173,13 @@ pub(crate) fn filter_through_cascade(
 /// single key; my dotted-path encoding flattens it into segments that
 /// dot-split can't recover). The fix: strip the leaf — plus the
 /// preceding `.` if any — off the end of the path, walk what remains as
-/// nested-table segments, then fetch `leaf` directly.
+/// nested-table segments (descending into `Value::Array` entries when a
+/// segment carries a `[N]` index suffix), then fetch `leaf` directly.
 ///
-/// Returns `None` on paths the lookup can't resolve: array-indexed
-/// segments (`[N]`) can't round-trip through `Table::get`, and
-/// intermediate segments must be sub-tables.
+/// Returns `None` only when the lookup genuinely fails: a non-table
+/// intermediate, a missing key, or an out-of-bounds array index. The
+/// callback path treats `None` as "value unknown" and falls back to a
+/// stand-in null so the callback still runs.
 fn lookup_value<'a>(table: &'a Table, path: &str, leaf: &str) -> Option<&'a Value> {
     let section = if path.len() == leaf.len() {
         ""
@@ -184,18 +189,42 @@ fn lookup_value<'a>(table: &'a Table, path: &str, leaf: &str) -> Option<&'a Valu
         // from the leaf position when the path was built.
         &path[..path.len() - leaf.len() - 1]
     };
-    let mut current = table;
-    if !section.is_empty() {
-        for seg in section.split('.') {
-            if seg.contains('[') {
-                // Array-indexed segments are intentionally out of scope
-                // here — the callback gets a stand-in null in that case.
-                return None;
-            }
-            current = current.get(seg)?.as_table()?;
+    if section.is_empty() {
+        return table.get(leaf);
+    }
+    let mut segments = section.split('.');
+    let first = segments.next().unwrap();
+    let (first_name, first_idx) = parse_segment(first);
+    let mut cursor: &Value = table.get(first_name)?;
+    if let Some(i) = first_idx {
+        cursor = cursor.as_array()?.get(i)?;
+    }
+    for seg in segments {
+        let (name, idx) = parse_segment(seg);
+        cursor = cursor.as_table()?.get(name)?;
+        if let Some(i) = idx {
+            cursor = cursor.as_array()?.get(i)?;
         }
     }
-    current.get(leaf)
+    cursor.as_table()?.get(leaf)
+}
+
+/// Split a path segment into `(name, optional index)`.
+///
+/// `plugins[3]` → `("plugins", Some(3))`; `name` → `("name", None)`.
+/// Garbage indices (`plugins[foo]`, `plugins[]`) parse as `(name, None)`,
+/// which falls through to the next non-array lookup and naturally fails.
+fn parse_segment(seg: &str) -> (&str, Option<usize>) {
+    if let Some(open) = seg.find('[')
+        && let Some(close) = seg[open..].find(']')
+    {
+        let name = &seg[..open];
+        let idx_str = &seg[open + 1..open + close];
+        if let Ok(i) = idx_str.parse::<usize>() {
+            return (name, Some(i));
+        }
+    }
+    (seg, None)
 }
 
 /// Find the 1-indexed line number for a key in TOML content.
@@ -255,14 +284,42 @@ fn find_key_line(content: &str, dotted_path: &str, leaf: &str, normalize_keys: b
 
         // Manually pull "<key> = ..." so we can compare the key under the
         // normalization rule rather than relying on a literal prefix match.
+        // `leaf_matches_source_key` also accepts the quoted-key form so
+        // a TOML line like `"acme.task" = 1` matches a leaf
+        // `acme.task` (the parser strips the quotes; the source line
+        // still carries them).
         if let Some((candidate, rest)) = trimmed.split_once('=')
-            && keys_match(candidate.trim_end(), leaf, normalize_keys)
+            && leaf_matches_source_key(candidate.trim_end(), leaf, normalize_keys)
             && !rest.is_empty()
         {
             return i + 1;
         }
     }
     0
+}
+
+/// Match a parsed `leaf` against the candidate-key text from a source
+/// line. Accepts both the bare form (`name`) and the basic quoted form
+/// (`"name"`) — TOML's parser strips the surrounding `"`/`'`, but our
+/// source-text matcher must accept either.
+fn leaf_matches_source_key(candidate: &str, leaf: &str, normalize_keys: bool) -> bool {
+    let candidate = candidate.trim();
+    if keys_match(candidate, leaf, normalize_keys) {
+        return true;
+    }
+    // Strip a surrounding pair of `"` or `'` and retry — covers basic
+    // TOML quoted keys. Literal-string keys (`'`) and escape sequences
+    // inside basic strings are heuristic matches only; close enough for
+    // line-number rendering.
+    let bytes = candidate.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        let inner = &candidate[1..candidate.len() - 1];
+        return keys_match(inner, leaf, normalize_keys);
+    }
+    false
 }
 
 /// Compare two keys for equality, optionally treating `-` and `_` as the

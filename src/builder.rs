@@ -2041,25 +2041,39 @@ mod tests {
     }
 
     #[test]
-    fn strict_at_honors_normalize_keys_kebab_path() {
-        // Path uses kebab; database is a real section under TestConfig.
-        let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("test.toml"),
-            "[database]\nurl = \"pg://\"\nplugin = 1\n",
-        )
-        .unwrap();
-        // No kebab fields needed here; we just confirm that the kebab path
-        // `data-base` doesn't exist and DOES exist under normalize_keys.
+    fn strict_at_kebab_normalizes_then_rejects_unknown_path() {
+        // `data-base` normalizes to `data_base`, which is not a section
+        // in TestConfig — confirms normalization runs before lookup
+        // (otherwise the kebab path would never reach the schema walker
+        // and we'd hit a different error path).
         let err = Clapfig::builder::<TestConfig>()
             .app_name("test")
             .normalize_keys(true)
-            .strict_at("data-base", false) // wrong: no `data-base` field
+            .strict_at("data-base", false)
             .build_resolver()
             .err();
-        // Note: `data-base` normalizes to `data_base`, still not a real
-        // field — confirms normalization runs before lookup.
         assert!(matches!(err, Some(ClapfigError::InvalidStrictPath { .. })));
+    }
+
+    #[test]
+    fn strict_at_kebab_normalizes_to_real_snake_section() {
+        // Success-path complement to the previous test: when the kebab
+        // form actually corresponds to a real snake_case section in the
+        // schema, build_resolver must accept it. Uses
+        // KebabStrictAtConfig because its sole nested section is
+        // multi-word (`my_section`), so the kebab → snake rewrite is
+        // observable.
+        use crate::fixtures::test::KebabStrictAtConfig;
+        let result = Clapfig::builder::<KebabStrictAtConfig>()
+            .app_name("test")
+            .normalize_keys(true)
+            .strict_at("my-section", false)
+            .build_resolver();
+        assert!(
+            result.is_ok(),
+            "kebab strict_at path resolving to a real snake section must build (got error: {:?})",
+            result.err()
+        );
     }
 
     #[test]
