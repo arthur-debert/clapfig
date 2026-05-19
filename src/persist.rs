@@ -87,6 +87,123 @@ where
     Ok(doc.to_string())
 }
 
+/// Runtime-path analogue of [`set_in_document`]. Validates the key against
+/// an owned [`Schema`](crate::runtime::Schema) and the value against the
+/// leaf's declared [`LeafType`](crate::runtime::LeafType) — same fail-fast
+/// invariants as the static path, just driven from a runtime schema.
+pub fn set_in_document_runtime(
+    schema: &crate::runtime::Schema,
+    content: Option<&str>,
+    key: &str,
+    raw_value: &str,
+) -> Result<String, ClapfigError> {
+    let valid_keys = crate::overrides::valid_keys(crate::spec::SchemaRef::from_dynamic(schema));
+    if !valid_keys.contains(key) {
+        return Err(ClapfigError::KeyNotFound(key.into()));
+    }
+
+    let check_value = parse_toml_value(raw_value);
+    if let Some(leaf_ty) = lookup_leaf_type(schema, key) {
+        leaf_ty
+            .check(&check_value)
+            .map_err(|reason| ClapfigError::InvalidValue {
+                key: key.into(),
+                reason,
+            })?;
+    }
+
+    let base = match content {
+        Some(c) => c.to_string(),
+        None => crate::ops::generate_template_from_runtime(schema, false),
+    };
+    let base = if base.trim().is_empty() {
+        String::new()
+    } else {
+        base
+    };
+
+    let mut doc: toml_edit::DocumentMut =
+        base.parse()
+            .map_err(|e: toml_edit::TomlError| ClapfigError::InvalidValue {
+                key: key.into(),
+                reason: e.to_string(),
+            })?;
+
+    let parsed_value = parse_toml_edit_value(raw_value);
+    let segments: Vec<&str> = key.split('.').collect();
+    let mut current: &mut toml_edit::Item = doc.as_item_mut();
+    for segment in &segments[..segments.len() - 1] {
+        if current.get(segment).is_none() {
+            current[segment] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        current = &mut current[segment];
+    }
+    let leaf = segments.last().unwrap();
+    current[leaf] = toml_edit::value(parsed_value);
+
+    Ok(doc.to_string())
+}
+
+/// Runtime-path wrapper around `set_in_document_runtime` with file I/O.
+pub fn persist_value_runtime(
+    schema: &crate::runtime::Schema,
+    file_path: &Path,
+    key: &str,
+    value: &str,
+) -> Result<ConfigResult, ClapfigError> {
+    let content = match std::fs::read_to_string(file_path) {
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(ClapfigError::IoError {
+                path: file_path.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+
+    let new_content = set_in_document_runtime(schema, content.as_deref(), key, value)?;
+
+    if let Some(parent) = file_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    std::fs::write(file_path, &new_content).map_err(|e| ClapfigError::IoError {
+        path: file_path.to_path_buf(),
+        source: e,
+    })?;
+
+    Ok(ConfigResult::ValueSet {
+        key: key.into(),
+        value: value.into(),
+    })
+}
+
+/// Descend a runtime schema by dotted key path and return the target leaf's
+/// declared type. `None` when the path doesn't resolve to a leaf.
+fn lookup_leaf_type<'a>(
+    schema: &'a crate::runtime::Schema,
+    dotted: &str,
+) -> Option<&'a crate::runtime::LeafType> {
+    let mut current = schema;
+    let mut segments = dotted.split('.').peekable();
+    while let Some(seg) = segments.next() {
+        let nf = current.fields.iter().find(|f| f.name == seg)?;
+        match &nf.field {
+            crate::runtime::Field::Leaf(leaf) if segments.peek().is_none() => {
+                return Some(&leaf.ty);
+            }
+            crate::runtime::Field::Nested(inner) if segments.peek().is_some() => {
+                current = inner;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// I/O wrapper: reads file (if it exists), patches it, writes back.
 /// Creates parent directories if needed.
 pub fn persist_value<C: Config>(

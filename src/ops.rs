@@ -198,6 +198,179 @@ pub fn generate_schema_string<C: Config>() -> String {
     serde_json::to_string_pretty(&value).expect("serde_json::Value serialization is infallible")
 }
 
+/// Runtime-path template generator. Walks the runtime [`Schema`] and emits
+/// a commented TOML template parallel to confique's `toml::template` output:
+///
+/// - Top-level `///`-equivalent doc lines render as `# <line>` at file head.
+/// - Each leaf field renders its doc lines as `# <line>`, then either
+///   `key = <default>` when a default is set, or `#key = <type-hint>` when
+///   the field is required / has no default.
+/// - Enum leaves get an extra `# Allowed: "a" | "b" | "c"` line so users
+///   don't have to look the set up elsewhere.
+/// - Nested sections render as `[parent.child]` headers; array-of-objects
+///   render as `[[parent.child]]`.
+/// - `kebab=true` applies the same key rewriter the static path uses, so
+///   the rendered template matches what a `normalize_keys(true)` builder
+///   accepts.
+///
+/// [`Schema`]: crate::runtime::Schema
+pub(crate) fn generate_template_from_runtime(
+    schema: &crate::runtime::Schema,
+    kebab: bool,
+) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    for line in &schema.doc {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            out.push_str("#\n");
+        } else {
+            let _ = writeln!(out, "# {trimmed}");
+        }
+    }
+    if !schema.doc.is_empty() {
+        out.push('\n');
+    }
+    emit_schema(&mut out, schema, "");
+
+    if kebab {
+        rewrite_keys_to_kebab(&out)
+    } else {
+        out
+    }
+}
+
+fn emit_schema(out: &mut String, schema: &crate::runtime::Schema, prefix: &str) {
+    use crate::runtime::Field;
+    use std::fmt::Write;
+
+    // TOML rule: once a [section] header is emitted, every following key
+    // belongs to that section until the next header. Emit local leaves
+    // first, then sections — otherwise a sibling leaf declared after a
+    // nested field in the schema would land inside the wrong section.
+    for nf in &schema.fields {
+        let Field::Leaf(leaf) = &nf.field else {
+            continue;
+        };
+        for line in &leaf.doc {
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                out.push_str("#\n");
+            } else {
+                let _ = writeln!(out, "# {trimmed}");
+            }
+        }
+        if let crate::runtime::LeafType::Enum { values } = &leaf.ty {
+            let listed = values
+                .iter()
+                .map(format_inline_toml)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let _ = writeln!(out, "# Allowed: {listed}");
+        }
+        match &leaf.default {
+            Some(value) => {
+                let _ = writeln!(out, "{} = {}", nf.name, format_inline_toml(value));
+            }
+            None => {
+                let hint = leaf.ty.template_placeholder();
+                let _ = writeln!(out, "#{} = {hint}", nf.name);
+            }
+        }
+        out.push('\n');
+    }
+
+    for nf in &schema.fields {
+        match &nf.field {
+            Field::Leaf(_) => {} // already emitted above
+            Field::Nested(child) => {
+                let path = if prefix.is_empty() {
+                    nf.name.clone()
+                } else {
+                    format!("{prefix}.{}", nf.name)
+                };
+                for line in &child.doc {
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        out.push_str("#\n");
+                    } else {
+                        let _ = writeln!(out, "# {trimmed}");
+                    }
+                }
+                let _ = writeln!(out, "[{path}]");
+                emit_schema(out, child, &path);
+            }
+            Field::ArrayOf(child) => {
+                let path = if prefix.is_empty() {
+                    nf.name.clone()
+                } else {
+                    format!("{prefix}.{}", nf.name)
+                };
+                for line in &child.doc {
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        out.push_str("#\n");
+                    } else {
+                        let _ = writeln!(out, "# {trimmed}");
+                    }
+                }
+                // Array-of-objects is rendered commented — clapfig can't
+                // know how many entries the user wants; show one example.
+                let _ = writeln!(out, "#[[{path}]]");
+                let mut buf = String::new();
+                emit_schema(&mut buf, child, &path);
+                for line in buf.lines() {
+                    if line.is_empty() {
+                        out.push('\n');
+                    } else {
+                        let _ = writeln!(out, "#{line}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Format a `toml::Value` as it would appear inline in a TOML file (no
+/// surrounding whitespace, no trailing newline).
+fn format_inline_toml(value: &toml::Value) -> String {
+    // toml::to_string handles inline encoding for primitives correctly;
+    // for arrays/tables it produces a TOML fragment we trim.
+    toml::to_string(&toml::Value::Table({
+        let mut t = toml::Table::new();
+        t.insert("v".into(), value.clone());
+        t
+    }))
+    .map(|s| {
+        // Output looks like `v = <inline>\n`. Strip the `v = ` prefix.
+        let trimmed = s.trim_end();
+        trimmed
+            .strip_prefix("v = ")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| trimmed.to_string())
+    })
+    .unwrap_or_else(|_| format!("{value:?}"))
+}
+
+impl crate::runtime::LeafType {
+    /// Single-word placeholder rendered in a commented-out template line
+    /// for a leaf without a default. Mirrors what confique emits as a
+    /// type-hint comment.
+    pub(crate) fn template_placeholder(&self) -> &'static str {
+        match self {
+            crate::runtime::LeafType::String => "\"\"",
+            crate::runtime::LeafType::Integer => "0",
+            crate::runtime::LeafType::Float => "0.0",
+            crate::runtime::LeafType::Bool => "false",
+            crate::runtime::LeafType::DateTime => "1970-01-01T00:00:00Z",
+            crate::runtime::LeafType::Array(_) => "[]",
+            crate::runtime::LeafType::Map(_) => "{}",
+            crate::runtime::LeafType::Enum { .. } => "\"\"",
+        }
+    }
+}
+
 /// Get a config value by dotted key, including its doc comment.
 pub fn get_value<C: Config + Serialize>(
     config: &C,

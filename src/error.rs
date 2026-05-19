@@ -137,6 +137,13 @@ pub enum ClapfigError {
         normalized_key: String,
         originals: Vec<String>,
     },
+
+    /// A required field declared by a runtime [`Schema`](crate::runtime::Schema)
+    /// was not supplied by any layer and has no default. Mirrors confique's
+    /// equivalent required-field check on the static path (which raises
+    /// `ConfigError` instead).
+    #[error("Missing required key: {key}")]
+    MissingRequired { key: String },
 }
 
 impl ClapfigError {
