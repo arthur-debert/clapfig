@@ -301,12 +301,16 @@ pub(crate) trait ConfigSpec {
     fn schema(&self) -> SchemaRef<'_>;
 
     /// Detect unknown keys in a parsed config table.
+    ///
+    /// `ctx` carries the strictness cascade overrides, the builder-level
+    /// default, the optional `on_unknown_key` callback, and the
+    /// `normalize_keys` flag for the line-number heuristic.
     fn validate_unknown(
         &self,
         table: &Table,
         source: &str,
         path: &Path,
-        normalize_keys: bool,
+        ctx: &crate::validate::ValidateContext<'_>,
     ) -> Result<(), ClapfigError>;
 
     /// Inject default values into a merged table before finalization.
@@ -352,9 +356,9 @@ where
         table: &Table,
         source: &str,
         path: &Path,
-        normalize_keys: bool,
+        ctx: &crate::validate::ValidateContext<'_>,
     ) -> Result<(), ClapfigError> {
-        crate::validate::validate_unknown_keys::<C>(table, source, path, normalize_keys)
+        crate::validate::validate_unknown_keys::<C>(table, source, path, ctx)
     }
 
     fn finalize(&self, merged: Table) -> Result<C, ClapfigError> {

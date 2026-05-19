@@ -24,7 +24,9 @@ use crate::merge::deep_merge;
 use crate::normalize::{normalize_key, normalize_table};
 use crate::overrides;
 use crate::spec::ConfigSpec;
+use crate::strict::{StrictnessOverrides, UnknownKeyHook};
 use crate::types::Layer;
+use crate::validate::ValidateContext;
 
 /// All pre-loaded data needed to resolve a config. No I/O happens here.
 ///
@@ -48,8 +50,18 @@ pub(crate) struct ResolveInput<'a, S: ConfigSpec> {
     pub url_overrides: Vec<(String, Value)>,
     /// CLI overrides as `(dotted_key, value)` pairs.
     pub cli_overrides: Vec<(String, Value)>,
-    /// Whether to reject unknown keys in config files.
-    pub strict: bool,
+    /// Builder-level default strictness — applies to any unknown key with
+    /// no explicit override on an ancestor in `strict_overrides`. Existing
+    /// callers' `strict(bool)` setting flows through here unchanged.
+    pub strict_default: bool,
+    /// Cascading strictness overrides — Phase 3 (#37). Empty when no
+    /// runtime `Schema::strict` or builder `strict_at` has been registered,
+    /// at which point every unknown key is decided by `strict_default`.
+    pub strict_overrides: StrictnessOverrides,
+    /// Optional per-key callback registered by `on_unknown_key`. Runs only
+    /// on keys the cascade flags strict; `Accept` drops them silently,
+    /// `Reject` produces a `ClapfigError::UnknownKeys` entry.
+    pub unknown_key_hook: Option<UnknownKeyHook>,
     /// Whether to rewrite `-` to `_` in every key supplied by the user
     /// (config files, CLI overrides, URL overrides) before validation and
     /// merging — letting kebab-case keys map to snake_case Rust fields.
@@ -96,6 +108,24 @@ pub(crate) fn resolve<S: ConfigSpec>(
 ) -> Result<S::Output, ClapfigError> {
     // Build each layer independently, then merge in the configured order.
 
+    let validate_ctx = ValidateContext {
+        overrides: &input.strict_overrides,
+        default_strict: input.strict_default,
+        callback: input.unknown_key_hook.as_ref(),
+        normalize_keys: input.normalize_keys,
+    };
+
+    // If the cascade is uniformly lenient — builder default `strict(false)`
+    // and no `strict_at` / runtime `Schema::strict` overrides — every
+    // unknown key drops silently anyway, so skip the validate step
+    // entirely. This preserves the pre-Phase-3 behavior where
+    // `strict(false)` bypassed `serde_ignored::deserialize`; callers with
+    // type errors in known fields still surface those errors from
+    // `finalize` exactly as before.
+    let cascade_active = input.strict_default
+        || !input.strict_overrides.is_empty()
+        || input.unknown_key_hook.is_some();
+
     // Files layer: parse → (optionally) normalize → validate → merge.
     // Validation runs against the parsed Table — never the raw text — so
     // normalized keys are checked in the same form they will reach the merge.
@@ -116,10 +146,10 @@ pub(crate) fn resolve<S: ConfigSpec>(
                     originals: c.originals,
                 })?;
             }
-            if input.strict {
+            if cascade_active {
                 input
                     .spec
-                    .validate_unknown(&table, content, path, input.normalize_keys)?;
+                    .validate_unknown(&table, content, path, &validate_ctx)?;
             }
             t = deep_merge(t, table);
         }
@@ -201,7 +231,9 @@ mod tests {
             #[cfg(feature = "url")]
             url_overrides: vec![],
             cli_overrides: vec![],
-            strict: true,
+            strict_default: true,
+            strict_overrides: StrictnessOverrides::new(),
+            unknown_key_hook: None,
             normalize_keys: false,
             layer_order: None,
         }
@@ -263,7 +295,9 @@ mod tests {
             #[cfg(feature = "url")]
             url_overrides: vec![],
             cli_overrides: vec![("port".into(), Value::Integer(9999))],
-            strict: true,
+            strict_default: true,
+            strict_overrides: StrictnessOverrides::new(),
+            unknown_key_hook: None,
             normalize_keys: false,
             layer_order: None,
         };
@@ -284,7 +318,9 @@ mod tests {
             #[cfg(feature = "url")]
             url_overrides: vec![],
             cli_overrides: vec![("debug".into(), Value::Boolean(true))],
-            strict: true,
+            strict_default: true,
+            strict_overrides: StrictnessOverrides::new(),
+            unknown_key_hook: None,
             normalize_keys: false,
             layer_order: None,
         };
@@ -316,7 +352,9 @@ mod tests {
     fn strict_rejects_unknown_key() {
         let input = ResolveInput {
             files: vec![("bad.toml".into(), "typo = 1\n".into())],
-            strict: true,
+            strict_default: true,
+            strict_overrides: StrictnessOverrides::new(),
+            unknown_key_hook: None,
             ..empty_input(&TEST_SPEC)
         };
         let result: Result<TestConfig, _> = resolve(input);
@@ -329,7 +367,7 @@ mod tests {
     fn lenient_allows_unknown_key() {
         let input = ResolveInput {
             files: vec![("ok.toml".into(), "typo = 1\nport = 3000\n".into())],
-            strict: false,
+            strict_default: false,
             ..empty_input(&TEST_SPEC)
         };
         let config: TestConfig = resolve(input).unwrap();
