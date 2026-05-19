@@ -630,6 +630,98 @@ fn post_validate_sees_default_filled_value() {
     assert_eq!(*seen.lock().unwrap(), 8080);
 }
 
+// -- i64::MIN default preserved through derive ---------------------------
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct I64MinDefault {
+    /// `i64::MIN`'s token form is `-9223372036854775808`, where the inner
+    /// positive literal is one larger than `i64::MAX`. Naive parsing as
+    /// `i64` would reject this; the macro must parse the magnitude as
+    /// `u64` and negate through `i128`.
+    #[clapfig(default = -9223372036854775808i64)]
+    low: i64,
+}
+
+#[test]
+fn i64_min_default_preserved_through_derive() {
+    let leaf = match &<I64MinDefault as Schema>::STATIC.fields[0].field {
+        FieldStatic::Leaf(l) => l,
+        _ => unreachable!(),
+    };
+    match leaf.default.as_ref().expect("default") {
+        ValueStatic::Integer(v) => assert_eq!(*v, i64::MIN),
+        other => panic!("expected Integer(i64::MIN), got {other:?}"),
+    }
+}
+
+// -- `allowed` accepts negative integer / float literals -----------------
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct AllowedNegativeInts {
+    /// Negative integers must round-trip through `allowed = [...]` —
+    /// they parse as `Expr::Unary(Neg, Lit::Int)`, not as `Expr::Lit`.
+    #[clapfig(allowed = [-1, 0, 1], default = 0)]
+    n: i64,
+}
+
+#[test]
+fn allowed_accepts_negative_integer_literals() {
+    let result = Clapfig::schema_builder::<AllowedNegativeInts>()
+        .app_name("t")
+        .no_env()
+        .handle(&ConfigAction::Schema { output: None })
+        .unwrap();
+    let s = match result {
+        ConfigResult::Schema(s) => s,
+        other => panic!("expected Schema, got {other:?}"),
+    };
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    let nums: Vec<i64> = v["properties"]["n"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_i64().unwrap())
+        .collect();
+    assert_eq!(nums, vec![-1, 0, 1]);
+}
+
+#[test]
+fn allowed_accepts_negative_int_on_load() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("t.toml"), "n = -1\n").unwrap();
+    let cfg: AllowedNegativeInts = Clapfig::schema_builder::<AllowedNegativeInts>()
+        .app_name("t")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.n, -1);
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct AllowedNegativeFloats {
+    #[clapfig(allowed = [-1.5, 0.0, 1.5], default = 0.0)]
+    f: f64,
+}
+
+#[test]
+fn allowed_accepts_negative_float_literals() {
+    let leaf = match &<AllowedNegativeFloats as Schema>::STATIC.fields[0].field {
+        FieldStatic::Leaf(l) => l,
+        _ => unreachable!(),
+    };
+    match &leaf.ty {
+        LeafTypeStatic::Enum { values } => {
+            assert_eq!(values.len(), 3);
+            match values[0] {
+                ValueStatic::Float(v) => assert!((v - (-1.5)).abs() < 1e-9),
+                ref other => panic!("expected Float, got {other:?}"),
+            }
+        }
+        other => panic!("expected Enum, got {other:?}"),
+    }
+}
+
 // -- Datetime defaults route to ValueStatic::Datetime --------------------
 
 #[derive(Schema, Serialize, Deserialize, Debug)]

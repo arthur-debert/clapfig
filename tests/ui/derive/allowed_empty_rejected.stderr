@@ -1,0 +1,5 @@
+error: `#[clapfig(allowed = [...])]` requires at least one value; an empty set produces a leaf that can never validate.
+ --> tests/ui/derive/allowed_empty_rejected.rs:7:5
+  |
+7 |     #[clapfig(allowed = [])]
+  |     ^
