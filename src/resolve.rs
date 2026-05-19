@@ -115,16 +115,19 @@ pub(crate) fn resolve<S: ConfigSpec>(
         normalize_keys: input.normalize_keys,
     };
 
-    // If the cascade is uniformly lenient — builder default `strict(false)`
-    // and no `strict_at` / runtime `Schema::strict` overrides — every
-    // unknown key drops silently anyway, so skip the validate step
-    // entirely. This preserves the pre-Phase-3 behavior where
-    // `strict(false)` bypassed `serde_ignored::deserialize`; callers with
-    // type errors in known fields still surface those errors from
-    // `finalize` exactly as before.
-    let cascade_active = input.strict_default
-        || !input.strict_overrides.is_empty()
-        || input.unknown_key_hook.is_some();
+    // Skip validation entirely when no path through the cascade can ever
+    // resolve to strict: builder default `strict(false)` AND no override
+    // sets `strict = true`. Lenient subtrees alone (e.g.
+    // `strict(false).strict_at("section", false)`) still trigger no
+    // strict outcome anywhere, so the per-file walk would only ever
+    // drop keys silently — and on the static path it would also
+    // re-invoke `serde_ignored::deserialize`, which can surface type
+    // errors that pre-Phase-3 `strict(false)` would have masked.
+    //
+    // The `on_unknown_key` callback is irrelevant to this check: it
+    // only fires on cascade-strict keys, so a cascade that produces no
+    // strict outcomes never calls it.
+    let cascade_active = input.strict_default || input.strict_overrides.has_any_strict();
 
     // Files layer: parse → (optionally) normalize → validate → merge.
     // Validation runs against the parsed Table — never the raw text — so

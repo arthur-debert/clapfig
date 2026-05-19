@@ -48,13 +48,20 @@ pub struct UnknownKeyContext<'a> {
     /// `diagnostics.rules.acme.task-due-date-missing`.
     pub path: &'a str,
 
-    /// The single TOML key clapfig saw at the leaf position — i.e. the
-    /// final element of the path as TOML parsed it, not the trailing piece
-    /// of `path` split on `.`. A bare key like `missing_footote` gives
-    /// `leaf = "missing_footote"`; a quoted key like
-    /// `"acme.task-due-date-missing"` gives
+    /// The single TOML key at the leaf position, as it reached the merge
+    /// step — i.e. the final element of the path as TOML parsed it, not
+    /// the trailing piece of `path` split on `.`. A bare key like
+    /// `missing_footote` gives `leaf = "missing_footote"`; a quoted key
+    /// like `"acme.task-due-date-missing"` gives
     /// `leaf = "acme.task-due-date-missing"` (the dots are part of the
     /// key, not segment separators).
+    ///
+    /// With [`normalize_keys(true)`](crate::ClapfigBuilder::normalize_keys)
+    /// the key has been rewritten (kebab → snake) before reaching the
+    /// callback, matching the form every other downstream consumer sees.
+    /// Callbacks that pattern-match on raw user-supplied spellings
+    /// should run on the un-normalized config builder, or normalize the
+    /// match arms themselves.
     pub leaf: &'a str,
 
     /// The value clapfig parsed at this key, before merge into the typed
@@ -119,8 +126,20 @@ impl StrictnessOverrides {
         self.entries.insert(path.into(), strict);
     }
 
+    #[allow(dead_code)] // public via crate-private API; useful for future short-circuits
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// `true` when at least one override could promote some key to strict.
+    /// Used by the resolve pipeline to decide whether the validate step is
+    /// worth running at all — a uniformly-lenient cascade (no `true`
+    /// overrides anywhere) lets every unknown key drop silently anyway,
+    /// so the per-file walk + `serde_ignored::deserialize` is wasted work
+    /// and (worse) changes behavior on the static path by surfacing type
+    /// errors that pre-Phase-3 `strict(false)` would have masked.
+    pub fn has_any_strict(&self) -> bool {
+        self.entries.values().any(|v| *v)
     }
 
     /// Walk a schema and copy every node's explicit `strict` into the map.
@@ -132,23 +151,46 @@ impl StrictnessOverrides {
         out
     }
 
-    /// Resolve the effective strictness for an unknown key.
+    /// Resolve the effective strictness for an unknown key at `(path, leaf)`.
     ///
-    /// The cascade walks `dotted_path` from its leaf parent up to the root,
-    /// returning the first explicit override it finds. With no override on
-    /// any ancestor, `default` is returned.
-    pub fn effective_strict(&self, dotted_path: &str, default: bool) -> bool {
-        // Parent of "a.b.c" is "a.b"; parent of "a" is ""; parent of "" is "".
-        // Walk until we find a hit, or hit root and return default.
-        let mut cursor: &str = parent_path(dotted_path);
+    /// `path` is the dotted form (full key, including the leaf); `leaf` is
+    /// the raw TOML key the parser saw at the leaf position. Passing the
+    /// leaf separately is necessary for two cases:
+    ///
+    /// - **Quoted leaves with dots** (`diagnostics.rules."acme.task"`):
+    ///   the section path is `diagnostics.rules`, not
+    ///   `diagnostics.rules.acme`. Dot-splitting the path would treat the
+    ///   leaf's internal dots as ancestor separators and apply overrides
+    ///   meant for unrelated sections.
+    /// - **Array-indexed paths** (`plugins[0].rogue`): the cascade
+    ///   probes both the physical form (`plugins[0]`) and the
+    ///   bracket-stripped schema form (`plugins`) at each step, so an
+    ///   override set on the item schema applies to any entry.
+    ///
+    /// The cascade walks from the leaf's section path upward, returning
+    /// the first explicit override found. With no override on any
+    /// ancestor, `default` is returned.
+    pub fn effective_strict(&self, path: &str, leaf: &str, default: bool) -> bool {
+        let initial = section_path_of(path, leaf);
+        let mut cursor: String = initial.to_string();
         loop {
-            if let Some(v) = self.entries.get(cursor) {
+            if let Some(v) = self.entries.get(&cursor) {
+                return *v;
+            }
+            // Also probe the bracket-stripped form so an override set on a
+            // runtime ArrayOf schema (e.g. `plugins.audit`) is consulted
+            // when the unknown key sits inside an array entry
+            // (`plugins[0].audit.rogue`).
+            let schema_form = strip_brackets(&cursor);
+            if schema_form != cursor
+                && let Some(v) = self.entries.get(&schema_form)
+            {
                 return *v;
             }
             if cursor.is_empty() {
                 return default;
             }
-            cursor = parent_path(cursor);
+            cursor = parent_path(&cursor).to_string();
         }
     }
 }
@@ -193,6 +235,39 @@ fn parent_path(path: &str) -> &str {
         (None, Some(b)) => &path[..b],
         (None, None) => "",
     }
+}
+
+/// Section path of `(path, leaf)`: `path` with the trailing leaf stripped
+/// (plus the `.` separator if any). Returns `""` for a top-level key.
+///
+/// Mirrors the same trick `validate::lookup_value` and
+/// `validate::find_key_line` use so the cascade correctly handles quoted
+/// TOML leaves that contain dots.
+fn section_path_of<'a>(path: &'a str, leaf: &str) -> &'a str {
+    if path.len() == leaf.len() {
+        ""
+    } else {
+        // The `- 1` skips the `.` separator between the section path and
+        // the leaf.
+        &path[..path.len() - leaf.len() - 1]
+    }
+}
+
+/// Strip every `[N]` array-index segment from a dotted path, yielding the
+/// schema-style form. `plugins[0].audit` → `plugins.audit`; `a.b.c` is
+/// unchanged.
+fn strip_brackets(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut in_brackets = false;
+    for ch in path.chars() {
+        match ch {
+            '[' => in_brackets = true,
+            ']' => in_brackets = false,
+            _ if in_brackets => {}
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Resolve a dotted path against a schema and return the kind of the node
@@ -275,14 +350,14 @@ mod tests {
         overrides.insert("plugins", false);
         // Unknown key inside `plugins[0]` should pick up the `plugins`
         // override via the indexed-path cascade.
-        assert!(!overrides.effective_strict("plugins[0].rogue", true));
+        assert!(!overrides.effective_strict("plugins[0].rogue", "rogue", true));
     }
 
     #[test]
     fn cascade_returns_default_with_no_overrides() {
         let overrides = StrictnessOverrides::new();
-        assert!(overrides.effective_strict("any.path.here", true));
-        assert!(!overrides.effective_strict("any.path.here", false));
+        assert!(overrides.effective_strict("any.path.here", "here", true));
+        assert!(!overrides.effective_strict("any.path.here", "here", false));
     }
 
     #[test]
@@ -291,9 +366,9 @@ mod tests {
         overrides.insert("a", true);
         overrides.insert("a.b", false);
         // Unknown key at "a.b.c": parent is "a.b" — explicit false wins.
-        assert!(!overrides.effective_strict("a.b.c", true));
+        assert!(!overrides.effective_strict("a.b.c", "c", true));
         // Unknown key at "a.x": parent is "a" — explicit true wins.
-        assert!(overrides.effective_strict("a.x", false));
+        assert!(overrides.effective_strict("a.x", "x", false));
     }
 
     #[test]
@@ -304,15 +379,57 @@ mod tests {
         overrides.insert("plugins", false);
         overrides.insert("plugins.audit", true);
         // Lenient subtree under `plugins`:
-        assert!(!overrides.effective_strict("plugins.foo.bar", true));
+        assert!(!overrides.effective_strict("plugins.foo.bar", "bar", true));
         // Re-tightened under `plugins.audit`:
-        assert!(overrides.effective_strict("plugins.audit.x", false));
+        assert!(overrides.effective_strict("plugins.audit.x", "x", false));
     }
 
     #[test]
     fn root_override_applies_when_no_more_specific() {
         let mut overrides = StrictnessOverrides::new();
         overrides.insert("", false);
-        assert!(!overrides.effective_strict("anything", true));
+        assert!(!overrides.effective_strict("anything", "anything", true));
+    }
+
+    #[test]
+    fn cascade_uses_section_path_not_dot_split_for_quoted_leaves() {
+        // For `diagnostics.rules."acme.task"`, the path string is
+        // `diagnostics.rules.acme.task` but leaf is `acme.task`. The
+        // section path is `diagnostics.rules` — an override on
+        // `diagnostics.rules.acme` is for an unrelated sibling and must
+        // NOT apply to the quoted-leaf key.
+        let mut overrides = StrictnessOverrides::new();
+        overrides.insert("diagnostics.rules.acme", true);
+        assert!(!overrides.effective_strict("diagnostics.rules.acme.task", "acme.task", false,));
+    }
+
+    #[test]
+    fn cascade_probes_bracket_stripped_form_at_each_step() {
+        // For `plugins[0].audit.rogue`, an override stored at
+        // `plugins.audit` (from `strict_at("plugins.audit", false)` or a
+        // runtime ArrayOf item-schema's `audit.strict(...)`) should be
+        // consulted on the schema-form walk: `plugins[0].audit` →
+        // bracket-stripped `plugins.audit` hits.
+        let mut overrides = StrictnessOverrides::new();
+        overrides.insert("plugins.audit", false);
+        assert!(!overrides.effective_strict("plugins[0].audit.rogue", "rogue", true,));
+    }
+
+    #[test]
+    fn strip_brackets_removes_array_indices() {
+        assert_eq!(strip_brackets("plugins[0].audit"), "plugins.audit");
+        assert_eq!(strip_brackets("a[10].b[2].c"), "a.b.c");
+        assert_eq!(strip_brackets("a.b.c"), "a.b.c");
+        assert_eq!(strip_brackets(""), "");
+    }
+
+    #[test]
+    fn has_any_strict_reflects_override_values() {
+        let mut overrides = StrictnessOverrides::new();
+        assert!(!overrides.has_any_strict());
+        overrides.insert("a", false);
+        assert!(!overrides.has_any_strict());
+        overrides.insert("b", true);
+        assert!(overrides.has_any_strict());
     }
 }
