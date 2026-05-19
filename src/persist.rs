@@ -69,21 +69,7 @@ where
             })?;
 
     let parsed_value = parse_toml_edit_value(raw_value);
-
-    // Navigate to the key, creating intermediate tables as needed.
-    let segments: Vec<&str> = key.split('.').collect();
-    let (leaf, parents) = segments
-        .split_last()
-        .expect("split('.') always yields at least one segment");
-    let mut current: &mut toml_edit::Item = doc.as_item_mut();
-    for segment in parents {
-        if current.get(segment).is_none() {
-            current[*segment] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        current = &mut current[*segment];
-    }
-    current[*leaf] = toml_edit::value(parsed_value);
-
+    write_at_dotted_path(&mut doc, key, parsed_value)?;
     Ok(doc.to_string())
 }
 
@@ -130,6 +116,22 @@ pub fn set_in_document_runtime(
             })?;
 
     let parsed_value = parse_toml_edit_value(raw_value);
+    write_at_dotted_path(&mut doc, key, parsed_value)?;
+    Ok(doc.to_string())
+}
+
+/// Walk a dotted path through `doc`, creating intermediate tables when
+/// missing, and assign `value` at the leaf. Returns
+/// [`ClapfigError::InvalidValue`] when an existing intermediate is a
+/// non-table scalar — `toml_edit`'s `IndexMut` would panic on that case,
+/// and the schema-time pre-checks only validate the schema, not the
+/// shape of an existing on-disk file (`config set database.url x` with
+/// `database = "string"` already in the file).
+fn write_at_dotted_path(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    value: toml_edit::Value,
+) -> Result<(), ClapfigError> {
     let segments: Vec<&str> = key.split('.').collect();
     let (leaf, parents) = segments
         .split_last()
@@ -137,13 +139,43 @@ pub fn set_in_document_runtime(
     let mut current: &mut toml_edit::Item = doc.as_item_mut();
     for segment in parents {
         if current.get(segment).is_none() {
+            // current must be table-like to insert a new section here;
+            // otherwise the existing file has a scalar where we need a
+            // table.
+            if current.as_table_like_mut().is_none() {
+                return Err(ClapfigError::InvalidValue {
+                    key: key.into(),
+                    reason: format!(
+                        "path conflict: existing file has a non-table value at the path before '{segment}'"
+                    ),
+                });
+            }
             current[*segment] = toml_edit::Item::Table(toml_edit::Table::new());
         }
-        current = &mut current[*segment];
+        // After the (possibly-created) child, navigate into it. The child
+        // might be a scalar from a pre-existing file; guard before
+        // indexing.
+        let next = current
+            .get_mut(*segment)
+            .expect("just confirmed or inserted above");
+        if next.as_table_like().is_none() {
+            return Err(ClapfigError::InvalidValue {
+                key: key.into(),
+                reason: format!(
+                    "path conflict: existing file has a non-table value at '{segment}'"
+                ),
+            });
+        }
+        current = next;
     }
-    current[*leaf] = toml_edit::value(parsed_value);
-
-    Ok(doc.to_string())
+    if current.as_table_like_mut().is_none() {
+        return Err(ClapfigError::InvalidValue {
+            key: key.into(),
+            reason: "path conflict: leaf parent is not a table".into(),
+        });
+    }
+    current[*leaf] = toml_edit::value(value);
+    Ok(())
 }
 
 /// Runtime-path wrapper around `set_in_document_runtime` with file I/O.
@@ -391,6 +423,23 @@ mod tests {
     fn set_rejects_wrong_type() {
         let result = set_in_document::<TestConfig>(Some(""), "port", "not_a_number");
         assert!(matches!(result, Err(ClapfigError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn set_rejects_path_through_scalar() {
+        // Existing file has `database` as a scalar string; `config set
+        // database.url x` would dereference into a non-table item, which
+        // pre-fix would panic via `toml_edit::Item::IndexMut`. The guard
+        // turns it into a clean InvalidValue.
+        let content = "database = \"oops\"\n";
+        let result = set_in_document::<TestConfig>(Some(content), "database.url", "pg://x");
+        match result {
+            Err(ClapfigError::InvalidValue { key, reason }) => {
+                assert_eq!(key, "database.url");
+                assert!(reason.contains("path conflict"), "got: {reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
     }
 
     #[test]

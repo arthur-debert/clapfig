@@ -246,10 +246,12 @@ fn parent_path(path: &str) -> &str {
 /// Section path of `(path, leaf)`: `path` with the trailing leaf stripped
 /// (plus the `.` separator if any). Returns `""` for a top-level key.
 ///
-/// Mirrors the same trick `validate::lookup_value` and
-/// `validate::find_key_line` use so the cascade correctly handles quoted
-/// TOML leaves that contain dots.
-fn section_path_of<'a>(path: &'a str, leaf: &str) -> &'a str {
+/// Shared with `validate::lookup_value` and `validate::find_key_line` —
+/// dot-splitting `path` would miscount segments when the leaf is a
+/// quoted TOML key containing literal dots (e.g.
+/// `"acme.task-due-date-missing"`). Stripping the known leaf off the
+/// end is the only way to recover the correct section path.
+pub(crate) fn section_path_of<'a>(path: &'a str, leaf: &str) -> &'a str {
     path.strip_suffix(leaf)
         .map(|p| p.strip_suffix('.').unwrap_or(p))
         .unwrap_or("")
