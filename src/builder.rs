@@ -2127,7 +2127,7 @@ mod tests {
             .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
             .no_env()
             .on_unknown_key(move |ctx: &UnknownKeyContext<'_>| {
-                if let Some(i) = ctx.value.as_integer() {
+                if let Some(i) = ctx.value.and_then(|v| v.as_integer()) {
                     *seen_clone.lock().unwrap() =
                         Some((ctx.path.into(), ctx.leaf.into(), i, ctx.line));
                 }

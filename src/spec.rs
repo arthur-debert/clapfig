@@ -62,9 +62,9 @@ impl<'a> SchemaRef<'a> {
     /// Explicit `strict` setting on this node.
     ///
     /// Populated by [`runtime::Schema::strict`] for dynamic schemas; the
-    /// static path always returns `None`. Phase 3 (cascading strictness)
-    /// will consume this during unknown-key resolution.
-    #[allow(dead_code)] // consumed in Phase 3
+    /// static path always returns `None`. Consumed by
+    /// [`crate::strict::StrictnessOverrides::from_schema`] during the
+    /// cascade build.
     pub fn strict(&self) -> Option<bool> {
         match self {
             SchemaRef::Static { .. } => None,

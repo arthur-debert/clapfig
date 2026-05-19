@@ -66,7 +66,14 @@ pub struct UnknownKeyContext<'a> {
 
     /// The value clapfig parsed at this key, before merge into the typed
     /// output.
-    pub value: &'a Value,
+    ///
+    /// `None` only when the lookup genuinely cannot resolve the value —
+    /// e.g. an out-of-bounds array index, or a path that crosses a
+    /// non-table intermediate. In practice the callback nearly always
+    /// sees `Some(_)`; an `Option` here is more honest than a stand-in
+    /// `Value::Boolean(false)` that pattern-matching on `.as_bool()`
+    /// would silently consume.
+    pub value: Option<&'a Value>,
 
     /// The file the key came from. `None` when the key came from a non-file
     /// source (env, CLI override, URL query) — strict-mode unknown-key
@@ -126,11 +133,6 @@ impl StrictnessOverrides {
         self.entries.insert(path.into(), strict);
     }
 
-    #[allow(dead_code)] // public via crate-private API; useful for future short-circuits
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// `true` when at least one override could promote some key to strict.
     /// Used by the resolve pipeline to decide whether the validate step is
     /// worth running at all — a uniformly-lenient cascade (no `true`
@@ -171,26 +173,30 @@ impl StrictnessOverrides {
     /// the first explicit override found. With no override on any
     /// ancestor, `default` is returned.
     pub fn effective_strict(&self, path: &str, leaf: &str, default: bool) -> bool {
-        let initial = section_path_of(path, leaf);
-        let mut cursor: String = initial.to_string();
+        // Walk subslices of the original `path` to avoid an allocation per
+        // step — `HashMap<String, _>::get` accepts `&str` via the `Borrow`
+        // impl. The only allocation in the loop body is `strip_brackets`,
+        // which we now skip when the cursor has no brackets to strip.
+        let mut cursor: &str = section_path_of(path, leaf);
         loop {
-            if let Some(v) = self.entries.get(&cursor) {
+            if let Some(v) = self.entries.get(cursor) {
                 return *v;
             }
             // Also probe the bracket-stripped form so an override set on a
             // runtime ArrayOf schema (e.g. `plugins.audit`) is consulted
             // when the unknown key sits inside an array entry
-            // (`plugins[0].audit.rogue`).
-            let schema_form = strip_brackets(&cursor);
-            if schema_form != cursor
-                && let Some(v) = self.entries.get(&schema_form)
-            {
-                return *v;
+            // (`plugins[0].audit.rogue`). Allocation-free fast path when
+            // there are no brackets in the cursor.
+            if cursor.contains('[') {
+                let schema_form = strip_brackets(cursor);
+                if let Some(v) = self.entries.get(&schema_form) {
+                    return *v;
+                }
             }
             if cursor.is_empty() {
                 return default;
             }
-            cursor = parent_path(&cursor).to_string();
+            cursor = parent_path(cursor);
         }
     }
 }

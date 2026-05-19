@@ -24,7 +24,7 @@ use std::path::Path;
 use toml::{Table, Value};
 
 use crate::error::ClapfigError;
-use crate::runtime::{Field, LeafType, NamedField, Schema};
+use crate::runtime::{Field, NamedField, Schema};
 use crate::spec::{ConfigSpec, SchemaRef};
 use crate::validate::{UnknownKey, ValidateContext, filter_through_cascade};
 
@@ -263,13 +263,6 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Table(_) => "table",
     }
-}
-
-// Re-export the leaf-type check so callers (e.g. persist::set_in_document)
-// can reach it without depending on `LeafType` directly.
-#[allow(dead_code)]
-pub(crate) fn check_leaf_type(ty: &LeafType, value: &Value) -> Result<(), String> {
-    ty.check(value)
 }
 
 #[cfg(test)]

@@ -133,16 +133,14 @@ pub(crate) fn filter_through_cascade(
             // TOML keys like `"acme.task-due-date-missing"`) resolve
             // correctly. `lookup_value` also walks `[N]` array-index
             // segments, so callbacks on array-internal keys see the real
-            // entry value. When the lookup genuinely can't resolve (e.g.
-            // out-of-bounds index or a path through a non-table value)
-            // we fall back to a stand-in `false` so the callback still
-            // runs and can decide based on path/leaf/file/line alone.
-            let null = Value::Boolean(false);
-            let value = lookup_value(table, &key, &leaf).unwrap_or(&null);
+            // entry value. `value` is `None` when the lookup genuinely
+            // can't resolve (out-of-bounds index, path through a
+            // non-table) — the callback still runs and can decide based
+            // on path/leaf/file/line alone.
             let context = UnknownKeyContext {
                 path: &key,
                 leaf: &leaf,
-                value,
+                value: lookup_value(table, &key, &leaf),
                 file: Some(path),
                 line: if line > 0 { Some(line) } else { None },
             };
