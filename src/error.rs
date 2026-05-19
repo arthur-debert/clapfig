@@ -61,7 +61,13 @@ impl UnknownKeyInfo {
     }
 }
 
+/// All clapfig operation errors.
+///
+/// Marked `#[non_exhaustive]`: future variants may be added without a
+/// breaking-change major bump. Downstream `match` over `ClapfigError`
+/// must include a `_ => ...` arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ClapfigError {
     /// One or more unknown keys were found in config files during strict-mode
     /// validation. The vector is never empty.

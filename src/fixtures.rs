@@ -81,4 +81,22 @@ pub mod test {
         #[config(default = 42)]
         pub count: u32,
     }
+
+    // -- Fixture for kebab strict_at tests ------------------------------------
+    //
+    // Has a multi-word nested section so `normalize_keys(true)` +
+    // `strict_at("my-section", ...)` actually exercises the kebab → snake
+    // rewriter on the override path. `TestConfig::database` is a single
+    // word and so wouldn't catch a normalization regression on its own.
+
+    #[derive(Config, Serialize, Deserialize, Debug, PartialEq)]
+    pub struct KebabStrictAtConfig {
+        #[config(nested)]
+        pub my_section: KebabSection,
+    }
+
+    #[derive(Config, Serialize, Deserialize, Debug, PartialEq)]
+    pub struct KebabSection {
+        pub x: Option<u32>,
+    }
 }
