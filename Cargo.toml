@@ -13,7 +13,7 @@ keywords = ["config", "configuration", "cli", "clap", "toml"]
 categories = ["config", "command-line-interface"]
 
 [features]
-default = ["clap", "derive"]
+default = ["clap"]
 clap = ["dep:clap"]
 url = ["dep:percent-encoding"]
 rich-errors = ["dep:miette"]

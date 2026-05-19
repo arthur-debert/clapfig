@@ -11,7 +11,7 @@
 //!
 //! This file is the single source of truth for that mirror.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::runtime::{
     Field as RuntimeField, Leaf as RuntimeLeaf, LeafType as RuntimeLeafType,
@@ -221,18 +221,39 @@ pub trait Schema {
     /// per-impl `OnceLock`; the helper [`cached_runtime_schema`] keeps the
     /// generated body small.
     fn schema() -> &'static RuntimeSchema;
+
+    /// `Arc`-flavored access to the same cached runtime view. Used by the
+    /// macro-driven builder ([`crate::SchemaConfigBuilder`]) to avoid
+    /// cloning the schema tree per builder construction — the runtime
+    /// spec stores an `Arc<Schema>` and the cache hands out cheap
+    /// reference-counted handles to it. Cost: one `Arc::clone` per call
+    /// (atomic increment, no allocation).
+    fn schema_arc() -> Arc<RuntimeSchema>;
 }
 
 /// Shared helper invoked by macro-generated [`Schema::schema`] bodies.
 ///
-/// Takes a `&'static OnceLock<RuntimeSchema>` to hold the cached
-/// conversion and the type's `schema_static()` accessor. Keeps the
-/// per-impl generated code to one line.
+/// The cache holds `Arc<Schema>` (not `Schema`) so [`Schema::schema_arc`]
+/// can hand out cheap reference-counted clones without re-running
+/// `to_runtime()`. [`Schema::schema`] returns a `&'static Schema` by
+/// dereferencing through the `Arc` — the deref is sound because the
+/// `OnceLock` itself is `'static`.
 pub fn cached_runtime_schema(
-    cell: &'static OnceLock<RuntimeSchema>,
+    cell: &'static OnceLock<Arc<RuntimeSchema>>,
     static_schema: &'static SchemaStatic,
 ) -> &'static RuntimeSchema {
-    cell.get_or_init(|| static_schema.to_runtime())
+    let arc: &'static Arc<RuntimeSchema> =
+        cell.get_or_init(|| Arc::new(static_schema.to_runtime()));
+    arc.as_ref()
+}
+
+/// `Arc`-returning counterpart to [`cached_runtime_schema`].
+pub fn cached_runtime_schema_arc(
+    cell: &'static OnceLock<Arc<RuntimeSchema>>,
+    static_schema: &'static SchemaStatic,
+) -> Arc<RuntimeSchema> {
+    cell.get_or_init(|| Arc::new(static_schema.to_runtime()))
+        .clone()
 }
 
 #[cfg(test)]
@@ -365,9 +386,19 @@ mod tests {
 
     #[test]
     fn cached_runtime_schema_returns_same_pointer_across_calls() {
-        static CELL: OnceLock<RuntimeSchema> = OnceLock::new();
+        static CELL: OnceLock<Arc<RuntimeSchema>> = OnceLock::new();
         let a = cached_runtime_schema(&CELL, &MINIMAL_SCHEMA);
         let b = cached_runtime_schema(&CELL, &MINIMAL_SCHEMA);
         assert!(std::ptr::eq(a, b));
+    }
+
+    #[test]
+    fn cached_runtime_schema_arc_shares_underlying_schema_with_ref_accessor() {
+        static CELL: OnceLock<Arc<RuntimeSchema>> = OnceLock::new();
+        let r = cached_runtime_schema(&CELL, &MINIMAL_SCHEMA);
+        let a = cached_runtime_schema_arc(&CELL, &MINIMAL_SCHEMA);
+        // Both accessors must yield the same in-memory schema — pointer
+        // equality after deref through the Arc.
+        assert!(std::ptr::eq(r, a.as_ref()));
     }
 }

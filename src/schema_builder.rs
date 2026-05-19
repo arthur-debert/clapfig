@@ -44,8 +44,11 @@ pub struct SchemaConfigBuilder<C: Schema> {
 
 impl<C: Schema> SchemaConfigBuilder<C> {
     pub(crate) fn new() -> Self {
+        // Reuse the per-type `Arc<Schema>` cache the derive maintains —
+        // one `Arc::clone` (atomic increment, no allocation) per builder
+        // construction instead of a full schema-tree clone.
         Self {
-            inner: RuntimeBuilder::new(C::schema().clone()),
+            inner: RuntimeBuilder::from_arc(C::schema_arc()),
             _phantom: PhantomData,
         }
     }
@@ -166,10 +169,11 @@ impl<C: Schema + DeserializeOwned> SchemaConfigBuilder<C> {
         F: Fn(&C) -> Result<(), String> + Send + Sync + 'static,
     {
         self.inner = self.inner.post_validate(move |t: &Table| {
-            let value = Value::Table(t.clone());
-            let typed: C = value
-                .try_into()
-                .map_err(|e: toml::de::Error| e.to_string())?;
+            // Match `load()`'s datetime-safe round-trip — see
+            // `deserialize_table` for why try_into isn't enough.
+            let text = toml::to_string(&Value::Table(t.clone()))
+                .map_err(|e: toml::ser::Error| e.to_string())?;
+            let typed: C = toml::from_str(&text).map_err(|e: toml::de::Error| e.to_string())?;
             f(&typed)
         });
         self
@@ -203,10 +207,22 @@ impl<C: Schema + DeserializeOwned> SchemaConfigBuilder<C> {
 }
 
 fn deserialize_table<C: DeserializeOwned>(table: Table) -> Result<C, ClapfigError> {
-    Value::Table(table)
-        .try_into()
-        .map_err(|e: toml::de::Error| ClapfigError::InvalidValue {
+    // `toml::Value::try_into` goes through a value-tree deserializer that
+    // doesn't preserve `toml::value::Datetime`'s special-struct marker —
+    // a `Value::Datetime` in the table arrives at the field's
+    // `Deserialize` impl as a plain string and the deserialize fails with
+    // "expected a TOML datetime". Serializing back to text and re-parsing
+    // routes through the TOML lexer, which keeps datetimes typed all the
+    // way to the field. One extra alloc on load is fine; correctness
+    // wins.
+    let text = toml::to_string(&Value::Table(table)).map_err(|e: toml::ser::Error| {
+        ClapfigError::InvalidValue {
             key: "<merged>".into(),
             reason: e.to_string(),
-        })
+        }
+    })?;
+    toml::from_str(&text).map_err(|e: toml::de::Error| ClapfigError::InvalidValue {
+        key: "<merged>".into(),
+        reason: e.to_string(),
+    })
 }

@@ -61,8 +61,20 @@ pub struct RuntimeBuilder {
 
 impl RuntimeBuilder {
     pub(crate) fn new(schema: Schema) -> Self {
+        Self::from_spec(Arc::new(DynamicSpec::new(schema)))
+    }
+
+    /// Construct a builder reusing an already-`Arc<Schema>`-cached schema
+    /// (e.g. the per-type cache the `clapfig::Schema` derive maintains).
+    /// Skips the per-builder clone of the schema tree that
+    /// [`new`](Self::new) performs.
+    pub(crate) fn from_arc(schema: Arc<Schema>) -> Self {
+        Self::from_spec(Arc::new(DynamicSpec::from_arc(schema)))
+    }
+
+    fn from_spec(spec: Arc<DynamicSpec>) -> Self {
         Self {
-            spec: Arc::new(DynamicSpec::new(schema)),
+            spec,
             app_name: None,
             file_name: None,
             search_paths: None,
