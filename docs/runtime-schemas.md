@@ -55,6 +55,7 @@ let schema = Schema::object("App")
 - **`Field::array_of_type(LeafType)`** — homogeneous array of a primitive type.
 - **`Field::map_of(LeafType)`** — string-keyed map with homogeneous values.
 - **`Field::enum_of(values)`** — constrained value: must be one of the listed TOML primitives. Used for log levels, output formats, modes.
+- **`Field::value()`** — accepts any TOML value (scalar, array, table). Escape hatch for keys whose value can take multiple incompatible shapes on the same field (e.g. a bare string *or* an array of `[string, table]`, like serde's `#[serde(untagged)]` enums). Clapfig does no shape check at the schema layer; the caller is responsible for further validation, typically via `serde` in a `post_validate` hook.
 - **`Schema::object(...).nested(name, child)`** — TOML `[section]` sub-object.
 - **`Schema::object(...).array_of(name, item_schema)`** — TOML `[[name]]` array of sub-objects.
 

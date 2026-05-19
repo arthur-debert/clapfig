@@ -269,6 +269,9 @@ fn emit_schema(out: &mut String, schema: &crate::runtime::Schema, prefix: &str) 
                 .join(" | ");
             let _ = writeln!(out, "# Allowed: {listed}");
         }
+        if matches!(&leaf.ty, crate::runtime::LeafType::Value) {
+            let _ = writeln!(out, "# Accepts: any TOML value");
+        }
         match &leaf.default {
             Some(value) => {
                 let _ = writeln!(out, "{} = {}", nf.name, format_inline_toml(value));
@@ -367,6 +370,7 @@ impl crate::runtime::LeafType {
             crate::runtime::LeafType::Array(_) => "[]",
             crate::runtime::LeafType::Map(_) => "{}",
             crate::runtime::LeafType::Enum { .. } => "\"\"",
+            crate::runtime::LeafType::Value => "\"\"",
         }
     }
 }
