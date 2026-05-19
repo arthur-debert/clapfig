@@ -24,18 +24,18 @@ pub fn overrides_to_table(entries: &[(String, Value)]) -> Table {
 
 fn set_nested(table: &mut Table, dotted_key: &str, value: Value) {
     let segments: Vec<&str> = dotted_key.split('.').collect();
+    let (leaf, parents) = segments
+        .split_last()
+        .expect("split('.') always yields at least one segment");
     let mut current = table;
-
-    for segment in &segments[..segments.len() - 1] {
+    for segment in parents {
         current = current
             .entry(*segment)
             .or_insert_with(|| Value::Table(Table::new()))
             .as_table_mut()
             .expect("clapfig: override path conflict — intermediate key is not a table");
     }
-
-    let leaf = segments.last().unwrap();
-    current.insert(leaf.to_string(), value);
+    current.insert((*leaf).to_string(), value);
 }
 
 /// Collect all valid leaf key paths from a schema.

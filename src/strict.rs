@@ -244,13 +244,9 @@ fn parent_path(path: &str) -> &str {
 /// `validate::find_key_line` use so the cascade correctly handles quoted
 /// TOML leaves that contain dots.
 fn section_path_of<'a>(path: &'a str, leaf: &str) -> &'a str {
-    if path.len() == leaf.len() {
-        ""
-    } else {
-        // The `- 1` skips the `.` separator between the section path and
-        // the leaf.
-        &path[..path.len() - leaf.len() - 1]
-    }
+    path.strip_suffix(leaf)
+        .map(|p| p.strip_suffix('.').unwrap_or(p))
+        .unwrap_or("")
 }
 
 /// Strip every `[N]` array-index segment from a dotted path, yielding the

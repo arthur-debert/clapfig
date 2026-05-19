@@ -72,17 +72,17 @@ where
 
     // Navigate to the key, creating intermediate tables as needed.
     let segments: Vec<&str> = key.split('.').collect();
+    let (leaf, parents) = segments
+        .split_last()
+        .expect("split('.') always yields at least one segment");
     let mut current: &mut toml_edit::Item = doc.as_item_mut();
-
-    for segment in &segments[..segments.len() - 1] {
+    for segment in parents {
         if current.get(segment).is_none() {
-            current[segment] = toml_edit::Item::Table(toml_edit::Table::new());
+            current[*segment] = toml_edit::Item::Table(toml_edit::Table::new());
         }
-        current = &mut current[segment];
+        current = &mut current[*segment];
     }
-
-    let leaf = segments.last().unwrap();
-    current[leaf] = toml_edit::value(parsed_value);
+    current[*leaf] = toml_edit::value(parsed_value);
 
     Ok(doc.to_string())
 }
@@ -131,15 +131,17 @@ pub fn set_in_document_runtime(
 
     let parsed_value = parse_toml_edit_value(raw_value);
     let segments: Vec<&str> = key.split('.').collect();
+    let (leaf, parents) = segments
+        .split_last()
+        .expect("split('.') always yields at least one segment");
     let mut current: &mut toml_edit::Item = doc.as_item_mut();
-    for segment in &segments[..segments.len() - 1] {
+    for segment in parents {
         if current.get(segment).is_none() {
-            current[segment] = toml_edit::Item::Table(toml_edit::Table::new());
+            current[*segment] = toml_edit::Item::Table(toml_edit::Table::new());
         }
-        current = &mut current[segment];
+        current = &mut current[*segment];
     }
-    let leaf = segments.last().unwrap();
-    current[leaf] = toml_edit::value(parsed_value);
+    current[*leaf] = toml_edit::value(parsed_value);
 
     Ok(doc.to_string())
 }
@@ -262,18 +264,19 @@ pub fn unset_in_document(content: &str, key: &str) -> Result<String, ClapfigErro
             })?;
 
     let segments: Vec<&str> = key.split('.').collect();
+    let (leaf, parents) = segments
+        .split_last()
+        .expect("split('.') always yields at least one segment");
 
     // Navigate to the parent, then remove the leaf.
     let mut current: &mut toml_edit::Item = doc.as_item_mut();
-
-    for segment in &segments[..segments.len() - 1] {
+    for segment in parents {
         match current.get_mut(segment) {
             Some(item) => current = item,
             None => return Ok(doc.to_string()), // parent doesn't exist, nothing to unset
         }
     }
 
-    let leaf = segments.last().unwrap();
     if let Some(table) = current.as_table_like_mut() {
         table.remove(leaf);
     }

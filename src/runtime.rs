@@ -91,27 +91,42 @@ impl SchemaBuilder {
     }
 
     /// Add a leaf field.
+    ///
+    /// `name` is treated as a single TOML key and cannot contain `.` (the
+    /// dotted-path separator), `[`, or `]` (array-index syntax), and cannot
+    /// be empty. Violating this panics — the cost of constructing a schema
+    /// with an ambiguous segment now is strictly less than the cost of
+    /// debugging silent `KeyNotFound`s at every consumer (the resolve
+    /// pipeline, persist, cascade lookup) down the line.
     pub fn field(mut self, name: impl Into<String>, field: FieldBuilder) -> Self {
+        let name = name.into();
+        validate_field_name(&self.schema, &name);
         self.schema.fields.push(NamedField {
-            name: name.into(),
+            name,
             field: Field::Leaf(field.build()),
         });
         self
     }
 
-    /// Add a nested object (TOML `[section]`).
+    /// Add a nested object (TOML `[section]`). Same `name` constraints as
+    /// [`field`](Self::field).
     pub fn nested(mut self, name: impl Into<String>, child: SchemaBuilder) -> Self {
+        let name = name.into();
+        validate_field_name(&self.schema, &name);
         self.schema.fields.push(NamedField {
-            name: name.into(),
+            name,
             field: Field::Nested(child.build()),
         });
         self
     }
 
-    /// Add an array of nested objects (TOML `[[name]]`).
+    /// Add an array of nested objects (TOML `[[name]]`). Same `name`
+    /// constraints as [`field`](Self::field).
     pub fn array_of(mut self, name: impl Into<String>, item: SchemaBuilder) -> Self {
+        let name = name.into();
+        validate_field_name(&self.schema, &name);
         self.schema.fields.push(NamedField {
-            name: name.into(),
+            name,
             field: Field::ArrayOf(item.build()),
         });
         self
@@ -335,6 +350,38 @@ impl FieldBuilder {
     }
 }
 
+/// Reject field names that would confuse every downstream consumer
+/// (resolve, persist, cascade lookup) the moment they're constructed.
+///
+/// - `.` would be re-parsed as a dotted-path separator (`Schema::field("a.b", ...)`
+///   would never be findable via `find_field(schema, "a")`).
+/// - `[` / `]` collide with the array-index syntax the cascade walker
+///   strips out.
+/// - Empty names produce confusing `KeyNotFound` errors with a blank
+///   token.
+/// - Duplicate names within one schema make `find_field` order-dependent
+///   and `valid_keys` collide.
+fn validate_field_name(schema: &Schema, name: &str) {
+    assert!(!name.is_empty(), "clapfig: field name must not be empty");
+    assert!(
+        !name.contains('.'),
+        "clapfig: field name {name:?} contains '.', which conflicts with the dotted-path separator"
+    );
+    assert!(
+        !name.contains('['),
+        "clapfig: field name {name:?} contains '[', which conflicts with array-index syntax"
+    );
+    assert!(
+        !name.contains(']'),
+        "clapfig: field name {name:?} contains ']', which conflicts with array-index syntax"
+    );
+    assert!(
+        !schema.fields.iter().any(|f| f.name == name),
+        "clapfig: duplicate field name {name:?} on schema {:?}",
+        schema.name
+    );
+}
+
 /// Pretty-print a `toml::Value` for error messages.
 fn format_toml_value(v: &Value) -> String {
     match v {
@@ -457,6 +504,51 @@ mod tests {
         let err = arr.check(&bad).unwrap_err();
         assert!(err.contains("array[1]"));
         assert!(err.contains("expected integer"));
+    }
+
+    #[test]
+    #[should_panic(expected = "contains '.'")]
+    fn field_name_with_dot_panics() {
+        let _ = Schema::object("Top").field("a.b", Field::string()).build();
+    }
+
+    #[test]
+    #[should_panic(expected = "contains '['")]
+    fn field_name_with_open_bracket_panics() {
+        let _ = Schema::object("Top").field("a[0]", Field::string()).build();
+    }
+
+    #[test]
+    #[should_panic(expected = "must not be empty")]
+    fn empty_field_name_panics() {
+        let _ = Schema::object("Top").field("", Field::string()).build();
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate field name")]
+    fn duplicate_field_name_panics() {
+        let _ = Schema::object("Top")
+            .field("a", Field::string())
+            .field("a", Field::integer())
+            .build();
+    }
+
+    #[test]
+    fn nested_and_array_of_share_the_same_validation() {
+        // Sanity: validator fires for `nested` / `array_of` too, not just
+        // `field`. Builds one of each cleanly, then asserts a duplicate
+        // collision across categories also trips the same panic.
+        let _ = Schema::object("Top")
+            .nested("a", Schema::object("A"))
+            .array_of("b", Schema::object("B"))
+            .build();
+        let result = std::panic::catch_unwind(|| {
+            Schema::object("Top")
+                .field("a", Field::string())
+                .nested("a", Schema::object("Dup")) // dup across kinds
+                .build()
+        });
+        assert!(result.is_err(), "duplicate across leaf/nested must panic");
     }
 
     #[test]
