@@ -209,6 +209,10 @@ fn leaf_type_json_name(ty: &LeafType) -> Option<&'static str> {
         LeafType::Array(_) => Some("array"),
         LeafType::Map(_) => Some("object"),
         LeafType::Enum { values } => values.first().and_then(toml_value_json_type),
+        // Unconstrained: JSON Schema convention is to omit `type` entirely,
+        // signalling that any value is acceptable. Callers reading the
+        // schema are expected to validate the value themselves.
+        LeafType::Value => None,
     }
 }
 

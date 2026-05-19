@@ -199,6 +199,21 @@ impl Field {
         let values: Vec<Value> = values.into_iter().map(Into::into).collect();
         FieldBuilder::new(LeafType::Enum { values })
     }
+
+    /// Start a leaf builder that accepts any TOML value.
+    ///
+    /// Escape hatch for keys whose value can take multiple incompatible
+    /// shapes (e.g. a bare string *or* an array, like serde's
+    /// `#[serde(untagged)]` enums). Clapfig will not type-check the value
+    /// at this layer; the caller is responsible for any further validation
+    /// or deserialization, typically inside a `post_validate` hook or
+    /// after `RuntimeResolver::resolve`.
+    ///
+    /// Strict mode is unaffected — `Value` is about *value shape* on a
+    /// known key, not about whether unknown sibling keys are allowed.
+    pub fn value() -> FieldBuilder {
+        FieldBuilder::new(LeafType::Value)
+    }
 }
 
 /// Owned leaf data for a runtime field.
@@ -234,6 +249,12 @@ pub enum LeafType {
     Enum {
         values: Vec<Value>,
     },
+    /// Accept any TOML value (scalar, array, table). Clapfig performs no
+    /// shape check; the caller is responsible for further validation,
+    /// typically via `serde` in a `post_validate` hook. Used for keys
+    /// whose value can take multiple incompatible shapes on the same
+    /// field (e.g. a bare string *or* an array of `[string, table]`).
+    Value,
 }
 
 impl LeafType {
@@ -248,6 +269,7 @@ impl LeafType {
             LeafType::Array(_) => "array",
             LeafType::Map(_) => "map",
             LeafType::Enum { .. } => "enum",
+            LeafType::Value => "value",
         }
     }
 
@@ -291,6 +313,7 @@ impl LeafType {
                     ))
                 }
             }
+            (LeafType::Value, _) => Ok(()),
             (expected, got) => Err(format!(
                 "expected {}, got {}",
                 expected.name(),
@@ -491,6 +514,32 @@ mod tests {
         assert!(err.contains("not in allowed set"));
         assert!(err.contains("\"info\""));
         assert!(err.contains("\"warn\""));
+    }
+
+    #[test]
+    fn leaf_type_value_accepts_any_shape() {
+        let v = LeafType::Value;
+        assert!(v.check(&Value::String("warn".into())).is_ok());
+        assert!(v.check(&Value::Integer(42)).is_ok());
+        assert!(v.check(&Value::Boolean(true)).is_ok());
+        assert!(
+            v.check(&Value::Array(vec![
+                Value::String("warn".into()),
+                Value::Table({
+                    let mut t = toml::Table::new();
+                    t.insert("max_columns".into(), Value::Integer(80));
+                    t
+                }),
+            ]))
+            .is_ok()
+        );
+        assert!(v.check(&Value::Table(toml::Table::new())).is_ok());
+    }
+
+    #[test]
+    fn field_value_constructs_value_leaf() {
+        let f = Field::value().build();
+        assert!(matches!(f.ty, LeafType::Value));
     }
 
     #[test]

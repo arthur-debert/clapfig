@@ -952,6 +952,96 @@ mod tests {
     }
 
     #[test]
+    fn handle_gen_renders_value_leaf_with_accepts_hint() {
+        // LeafType::Value is the escape hatch for keys whose value can
+        // take multiple incompatible shapes (issue #47). The template
+        // must surface this in the doc-comment area so the user knows
+        // the leaf is intentionally unconstrained.
+        let schema = Schema::object("Top")
+            .field(
+                "rule",
+                RtField::value().doc("Either a severity string or [severity, options]."),
+            )
+            .build();
+        let result = Clapfig::runtime(schema)
+            .app_name("demo")
+            .no_env()
+            .handle(&ConfigAction::Gen { output: None })
+            .unwrap();
+        match result {
+            ConfigResult::Template(t) => {
+                assert!(t.contains("# Either a severity string"));
+                assert!(t.contains("# Accepts: any TOML value"));
+                assert!(t.contains("#rule = \"\""));
+            }
+            other => panic!("expected Template, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_schema_value_leaf_omits_type_constraint() {
+        // JSON Schema convention for unconstrained: omit `type` entirely.
+        // A LeafType::Value field should appear in the schema with its
+        // description but no type/enum/etc. constraint.
+        let schema = Schema::object("Top")
+            .field("rule", RtField::value().doc("Any TOML value."))
+            .build();
+        let result = Clapfig::runtime(schema)
+            .app_name("demo")
+            .no_env()
+            .handle(&ConfigAction::Schema { output: None })
+            .unwrap();
+        match result {
+            ConfigResult::Schema(s) => {
+                let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+                let rule = &v["properties"]["rule"];
+                assert!(rule.is_object(), "rule property missing");
+                assert!(
+                    rule.get("type").is_none(),
+                    "Value leaves must have no `type` key (JSON Schema convention for unconstrained); got {rule}"
+                );
+                assert_eq!(rule["description"], "Any TOML value.");
+            }
+            other => panic!("expected Schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_leaf_accepts_any_shape_at_load() {
+        // The whole point of LeafType::Value: don't reject either the
+        // bare-string or the array-with-options shape on the same key.
+        let dir = TempDir::new().unwrap();
+        let toml_path = dir.path().join("demo.toml");
+        std::fs::write(
+            &toml_path,
+            "[rules]\nmissing_footnote = \"warn\"\nbad_columns = [\"warn\", { max = 80 }]\n",
+        )
+        .unwrap();
+
+        let schema = Schema::object("Top")
+            .nested(
+                "rules",
+                Schema::object("Rules")
+                    .strict(false)
+                    .field("missing_footnote", RtField::value())
+                    .field("bad_columns", RtField::value()),
+            )
+            .build();
+
+        let table = Clapfig::runtime(schema)
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap();
+
+        let rules = table["rules"].as_table().unwrap();
+        assert_eq!(rules["missing_footnote"].as_str(), Some("warn"));
+        assert!(rules["bad_columns"].as_array().is_some());
+    }
+
+    #[test]
     fn handle_schema_does_not_mark_array_of_required() {
         // Regression: `DynamicSpec::finalize` accepts an absent ArrayOf as
         // the empty list. The JSON Schema must agree — marking the
