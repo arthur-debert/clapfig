@@ -34,6 +34,32 @@ impl Clapfig {
     pub fn builder<C: Config>() -> ClapfigBuilder<C> {
         ClapfigBuilder::new()
     }
+
+    /// Entry point for the runtime path: build a config pipeline from an
+    /// owned [`Schema`](crate::runtime::Schema) instead of a compile-time
+    /// `Config` derive.
+    ///
+    /// Returns a [`RuntimeBuilder`](crate::RuntimeBuilder) with the same
+    /// surface as [`Self::builder`] — `app_name`, `search_paths`, `env_prefix`,
+    /// `cli_override`, `post_validate`, `load`, `handle`, `build_resolver`,
+    /// etc. — but produces a `toml::Table` rather than a typed `C`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use clapfig::{Clapfig, runtime::{Field, Schema}};
+    ///
+    /// let schema = Schema::object("App")
+    ///     .field("port", Field::integer().default(8080i64))
+    ///     .build();
+    ///
+    /// let table: toml::Table = Clapfig::runtime(schema)
+    ///     .app_name("myapp")
+    ///     .load()?;
+    /// ```
+    pub fn runtime(schema: crate::runtime::Schema) -> crate::runtime_builder::RuntimeBuilder {
+        crate::runtime_builder::RuntimeBuilder::new(schema)
+    }
 }
 
 /// Boxed post-merge validation hook.

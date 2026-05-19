@@ -469,6 +469,7 @@
 pub mod error;
 pub mod meta;
 pub mod render;
+pub mod runtime;
 pub mod schema;
 pub mod types;
 
@@ -485,6 +486,8 @@ mod overrides;
 mod persist;
 mod resolve;
 mod resolver;
+mod runtime_builder;
+mod runtime_spec;
 mod spec;
 #[cfg(feature = "url")]
 mod url;
@@ -500,4 +503,5 @@ pub use confique::Config;
 pub use error::{ClapfigError, UnknownKeyInfo};
 pub use ops::ConfigResult;
 pub use resolver::Resolver;
+pub use runtime_builder::{RuntimeBuilder, RuntimeResolver};
 pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};

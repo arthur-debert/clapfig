@@ -64,6 +64,13 @@ where
     Err(ClapfigError::UnknownKeys(infos))
 }
 
+/// Crate-internal accessor for the runtime spec's `validate_unknown` path,
+/// which collects unknown keys by walking the schema (rather than via
+/// `serde_ignored`) and then needs the same line-number heuristic.
+pub(crate) fn find_key_line_public(content: &str, dotted_key: &str, normalize_keys: bool) -> usize {
+    find_key_line(content, dotted_key, normalize_keys)
+}
+
 /// Find the 1-indexed line number for a key in TOML content.
 ///
 /// For a dotted key like `"database.typo"`, tracks the current `[section]` header

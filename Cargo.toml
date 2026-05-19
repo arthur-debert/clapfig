@@ -35,3 +35,7 @@ tempfile = "3"
 name = "clapfig_demo"
 path = "examples/clapfig_demo/main.rs"
 required-features = ["clap"]
+
+[[example]]
+name = "runtime_schema"
+path = "examples/runtime_schema/main.rs"
