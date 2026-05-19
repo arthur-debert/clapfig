@@ -68,6 +68,7 @@ use crate::error::ClapfigError;
 use crate::file;
 use crate::resolve::{self, ResolveInput};
 use crate::spec::StaticSpec;
+use crate::strict::{StrictnessOverrides, UnknownKeyHook};
 use crate::types::{Layer, SearchMode, SearchPath};
 
 /// A cached file's raw text. The parsed `toml::Table` is not cached separately
@@ -101,7 +102,9 @@ pub struct Resolver<C: Config> {
     /// Empty when env was disabled on the builder (`env_prefix` will also be
     /// `None` in that case).
     env_vars: Vec<(String, String)>,
-    strict: bool,
+    strict_default: bool,
+    strict_overrides: StrictnessOverrides,
+    unknown_key_hook: Option<UnknownKeyHook>,
     normalize_keys: bool,
     #[cfg(feature = "url")]
     url_overrides: Vec<(String, toml::Value)>,
@@ -134,7 +137,9 @@ impl<C: Config> Resolver<C> {
         search_paths: Vec<SearchPath>,
         search_mode: SearchMode,
         env_prefix: Option<String>,
-        strict: bool,
+        strict_default: bool,
+        strict_overrides: StrictnessOverrides,
+        unknown_key_hook: Option<UnknownKeyHook>,
         normalize_keys: bool,
         #[cfg(feature = "url")] url_overrides: Vec<(String, toml::Value)>,
         cli_overrides: Vec<(String, toml::Value)>,
@@ -155,7 +160,9 @@ impl<C: Config> Resolver<C> {
             search_mode,
             env_prefix,
             env_vars,
-            strict,
+            strict_default,
+            strict_overrides,
+            unknown_key_hook,
             normalize_keys,
             #[cfg(feature = "url")]
             url_overrides,
@@ -227,7 +234,9 @@ impl<C: Config> Resolver<C> {
             #[cfg(feature = "url")]
             url_overrides: self.url_overrides.clone(),
             cli_overrides: self.cli_overrides.clone(),
-            strict: self.strict,
+            strict_default: self.strict_default,
+            strict_overrides: self.strict_overrides.clone(),
+            unknown_key_hook: self.unknown_key_hook.clone(),
             normalize_keys: self.normalize_keys,
             layer_order: self.layer_order.clone(),
         };
