@@ -176,12 +176,22 @@ fn walk_schema_strict(schema: SchemaRef<'_>, prefix: &str, out: &mut StrictnessO
     }
 }
 
-/// Trim the last `.segment` (if any) from a dotted path, yielding the parent.
-/// Returns `""` for a single-segment path or for an already-empty path.
+/// Trim the last path segment (whether a `.field` or an `[index]`) from a
+/// dotted path, yielding the parent. Returns `""` for a single-segment
+/// path or an already-empty path.
+///
+/// Handling both `.` and `[` lets the cascade walk through array-indexed
+/// paths like `plugins[0].name` → `plugins[0]` → `plugins` so a
+/// `strict_at("plugins", false)` override applies to keys nested inside
+/// array entries.
 fn parent_path(path: &str) -> &str {
-    match path.rfind('.') {
-        Some(idx) => &path[..idx],
-        None => "",
+    let dot = path.rfind('.');
+    let bracket = path.rfind('[');
+    match (dot, bracket) {
+        (Some(d), Some(b)) => &path[..d.max(b)],
+        (Some(d), None) => &path[..d],
+        (None, Some(b)) => &path[..b],
+        (None, None) => "",
     }
 }
 
@@ -246,6 +256,26 @@ mod tests {
         assert_eq!(parent_path("a.b"), "a");
         assert_eq!(parent_path("a"), "");
         assert_eq!(parent_path(""), "");
+    }
+
+    #[test]
+    fn parent_path_handles_array_indices() {
+        // Without bracket-awareness, `plugins[0].name` would walk to
+        // `plugins[0]` then to `""` (skipping `plugins`), so an
+        // `array_of("plugins", ...).strict(false)` override would never
+        // apply to keys nested inside array entries.
+        assert_eq!(parent_path("plugins[0].name"), "plugins[0]");
+        assert_eq!(parent_path("plugins[0]"), "plugins");
+        assert_eq!(parent_path("plugins[10].a.b"), "plugins[10].a");
+    }
+
+    #[test]
+    fn cascade_walks_through_array_indices() {
+        let mut overrides = StrictnessOverrides::new();
+        overrides.insert("plugins", false);
+        // Unknown key inside `plugins[0]` should pick up the `plugins`
+        // override via the indexed-path cascade.
+        assert!(!overrides.effective_strict("plugins[0].rogue", true));
     }
 
     #[test]
