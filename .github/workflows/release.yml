@@ -29,7 +29,11 @@ jobs:
     uses: arthur-debert/release/.github/workflows/rust-lib.yml@v1
     with:
       version: ${{ inputs.version }}
-      crates: clapfig
+      # Topological order: clapfig-derive must publish before clapfig.
+      # clapfig's optional `derive` feature declares clapfig-derive as
+      # a registry dep (path = ..., version = "X.Y.Z"), so cargo publish
+      # requires that version to already exist on crates.io.
+      crates: clapfig-derive,clapfig
       changelog-path: CHANGELOG.md
     secrets:
       RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
