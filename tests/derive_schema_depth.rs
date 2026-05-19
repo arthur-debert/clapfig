@@ -759,6 +759,88 @@ fn datetime_default_survives_runtime_conversion() {
     assert_eq!(cfg.stamp.to_string(), "1970-01-01T00:00:00Z");
 }
 
+// -- HashMap / BTreeMap field support ------------------------------------
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct HashMapStringConfig {
+    /// `HashMap<String, String>` should map to `LeafType::Map(String)`,
+    /// not fall through to the nested-struct branch and produce an
+    /// opaque trait-bound error.
+    headers: std::collections::HashMap<String, String>,
+}
+
+#[test]
+fn hashmap_string_string_emits_map_leaf_type() {
+    let leaf = match &<HashMapStringConfig as Schema>::STATIC.fields[0].field {
+        FieldStatic::Leaf(l) => l,
+        other => panic!("expected Leaf, got {other:?}"),
+    };
+    match &leaf.ty {
+        LeafTypeStatic::Map(inner) => {
+            assert!(matches!(inner, LeafTypeStatic::String));
+        }
+        other => panic!("expected Map(String), got {other:?}"),
+    }
+}
+
+#[test]
+fn hashmap_loads_via_runtime_pipeline() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("t.toml"),
+        "[headers]\nx_request_id = \"abc\"\nx_trace_id = \"def\"\n",
+    )
+    .unwrap();
+    let cfg: HashMapStringConfig = Clapfig::schema_builder::<HashMapStringConfig>()
+        .app_name("t")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(
+        cfg.headers.get("x_request_id").map(String::as_str),
+        Some("abc")
+    );
+    assert_eq!(
+        cfg.headers.get("x_trace_id").map(String::as_str),
+        Some("def")
+    );
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct BTreeMapIntConfig {
+    counts: std::collections::BTreeMap<String, i64>,
+}
+
+#[test]
+fn btreemap_string_int_emits_map_of_integer() {
+    let leaf = match &<BTreeMapIntConfig as Schema>::STATIC.fields[0].field {
+        FieldStatic::Leaf(l) => l,
+        _ => unreachable!(),
+    };
+    match &leaf.ty {
+        LeafTypeStatic::Map(inner) => {
+            assert!(matches!(inner, LeafTypeStatic::Integer));
+        }
+        other => panic!("expected Map(Integer), got {other:?}"),
+    }
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct OptionalMapConfig {
+    tags: Option<std::collections::HashMap<String, String>>,
+}
+
+#[test]
+fn option_of_map_emits_optional_map_leaf() {
+    let leaf = match &<OptionalMapConfig as Schema>::STATIC.fields[0].field {
+        FieldStatic::Leaf(l) => l,
+        _ => unreachable!(),
+    };
+    assert!(leaf.optional);
+    assert!(matches!(leaf.ty, LeafTypeStatic::Map(_)));
+}
+
 // -- handle_to_string surface forwards correctly --------------------------
 
 #[test]

@@ -44,7 +44,17 @@ use syn::{
 ///   (`-9223372036854775808i64` works for `i64::MIN`); on `Vec<T>` fields,
 ///   also accepts an array literal of literals. On
 ///   `toml::value::Datetime` fields, a string literal is emitted as
-///   `ValueStatic::Datetime` (parsed at first schema access).
+///   `ValueStatic::Datetime`.
+///
+///   **Datetime caveat:** datetime defaults are *not* parsed at derive
+///   time — the macro intentionally avoids pulling the `toml` parser
+///   into its dependency tree. A malformed datetime literal (e.g.
+///   `default = "not-a-date"` on a `Datetime` field) compiles
+///   successfully and panics with `"clapfig: invalid datetime literal
+///   in static schema default"` the first time `Schema::schema()` is
+///   called (typically at app startup). Verify your datetime defaults
+///   match TOML's grammar (RFC 3339 offset / local datetime / local
+///   date / local time) before shipping.
 /// - `#[clapfig(env = "NAME")]` — explicit env-var override
 /// - `#[clapfig(rename = "name")]` — override the field's schema/serde name
 /// - `#[clapfig(value)]` — force `LeafType::Value` (untyped escape hatch
@@ -320,6 +330,9 @@ enum TypeShape {
     Optional(Box<TypeShape>),
     /// `Vec<T>` where T is a scalar — emits `LeafType::Array(T)`.
     Array(TokenStream2),
+    /// `HashMap<String, V>` / `BTreeMap<String, V>` where V is a leaf shape —
+    /// emits `LeafType::Map(V)`. TOML map keys must be strings.
+    Map(TokenStream2),
     /// Nested type referencing another struct's `clapfig::Schema` impl.
     Nested(TokenStream2),
     /// `toml::Value` — emits `LeafType::Value`.
@@ -374,6 +387,18 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
     if name == "Option" {
         let inner = single_generic_argument(&last.arguments, "Option")?;
         let inner_shape = classify_type(inner)?;
+        // `Option<Option<T>>` is almost always a user error — the outer
+        // Option's `None` and the inner Option's `None` collapse to the
+        // same observable state at the schema layer. Catch it cleanly
+        // here instead of accepting a redundant optional flag.
+        if matches!(inner_shape, TypeShape::Optional(_)) {
+            return Err(syn::Error::new(
+                inner.span(),
+                "Option<Option<T>> is not supported — collapse to a single Option<T>. \
+                 If you need to distinguish 'absent from config' from 'explicitly set to \
+                 a null-like value', use a `#[clapfig(value)]` field with a typed enum.",
+            ));
+        }
         return Ok(TypeShape::Optional(Box::new(inner_shape)));
     }
     if name == "Vec" {
@@ -403,6 +428,59 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
                 inner.span(),
                 "Vec<toml::Value> is not supported; use a single `toml::Value` with \
                  #[clapfig(value)] instead",
+            )),
+            TypeShape::Map(_) => Err(syn::Error::new(
+                inner.span(),
+                "Vec<HashMap<...>> / Vec<BTreeMap<...>> is not supported by clapfig::Schema. \
+                 Use `#[clapfig(value)]` with `toml::Value` for free-form nested shapes.",
+            )),
+        };
+    }
+    if name == "HashMap" || name == "BTreeMap" {
+        let (key_ty, value_ty) = two_generic_arguments(&last.arguments, &name)?;
+        // TOML map keys are strings — `LeafType::Map(V)` has no key-type
+        // discriminant on the value level. Reject any non-String key at
+        // derive time with a clear message instead of letting the schema
+        // emit something the deserializer can't satisfy.
+        if !is_string_path(key_ty) {
+            return Err(syn::Error::new(
+                key_ty.span(),
+                format!(
+                    "{name}<K, V> requires `K = String` (TOML map keys are string-typed); \
+                     numeric or enum keys aren't representable. Store the key inside the value type."
+                ),
+            ));
+        }
+        let value_shape = classify_type(value_ty)?;
+        return match value_shape {
+            TypeShape::Scalar(_, tok) => Ok(TypeShape::Map(tok)),
+            TypeShape::Value => Ok(TypeShape::Map(
+                quote! { ::clapfig::static_schema::LeafTypeStatic::Value },
+            )),
+            TypeShape::Array(elem) => Ok(TypeShape::Map(
+                quote! { ::clapfig::static_schema::LeafTypeStatic::Array(&#elem) },
+            )),
+            TypeShape::Optional(_) => Err(syn::Error::new(
+                value_ty.span(),
+                format!(
+                    "{name}<String, Option<T>> is not supported — an absent map entry is \
+                     already 'optional'; omit the Option<T> wrapper."
+                ),
+            )),
+            TypeShape::Map(_) => Err(syn::Error::new(
+                value_ty.span(),
+                format!(
+                    "{name}<String, {name}<...>> (map-of-map) is not yet supported by clapfig::Schema. \
+                     Use `#[clapfig(value)]` with `toml::Value` for free-form nested shapes."
+                ),
+            )),
+            TypeShape::Nested(_) => Err(syn::Error::new(
+                value_ty.span(),
+                format!(
+                    "{name}<String, NestedStruct> is not supported by clapfig::Schema — \
+                     `LeafType::Map` carries leaf values only. For maps of nested objects use the \
+                     runtime path (`Schema::object(...).field(...)`) or `#[clapfig(value)]`."
+                ),
             )),
         };
     }
@@ -491,35 +569,88 @@ fn single_generic_argument<'a>(args: &'a PathArguments, parent: &str) -> syn::Re
     }
 }
 
-fn is_toml_value_path(path: &syn::Path) -> bool {
-    // Match `toml::Value`, `Value` (re-imported), `::toml::Value`.
-    // Last segment is "Value"; if there's a preceding segment it must be
-    // exactly "toml" — guards against unrelated `Value` types being
-    // accidentally picked up.
-    let segs: Vec<_> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-    match segs.as_slice() {
-        [last] => last == "Value",
-        [.., a, b] => b == "Value" && a == "toml",
-        _ => false,
+fn two_generic_arguments<'a>(
+    args: &'a PathArguments,
+    parent: &str,
+) -> syn::Result<(&'a Type, &'a Type)> {
+    let abga = match args {
+        PathArguments::AngleBracketed(a) => a,
+        _ => {
+            return Err(syn::Error::new(
+                args.span(),
+                format!("{parent} requires two type arguments (K, V)"),
+            ));
+        }
+    };
+    if abga.args.len() != 2 {
+        return Err(syn::Error::new(
+            abga.span(),
+            format!("{parent} requires exactly two type arguments (K, V)"),
+        ));
     }
+    let mut iter = abga.args.iter();
+    let k = match iter.next().unwrap() {
+        GenericArgument::Type(t) => t,
+        other => {
+            return Err(syn::Error::new(
+                other.span(),
+                format!("{parent}'s key argument must be a type"),
+            ));
+        }
+    };
+    let v = match iter.next().unwrap() {
+        GenericArgument::Type(t) => t,
+        other => {
+            return Err(syn::Error::new(
+                other.span(),
+                format!("{parent}'s value argument must be a type"),
+            ));
+        }
+    };
+    Ok((k, v))
+}
+
+/// Last-segment check for `String` (or qualified `std::string::String`).
+fn is_string_path(ty: &Type) -> bool {
+    if let Type::Path(TypePath { path, qself: None }) = ty
+        && let Some(last) = path.segments.last()
+    {
+        return last.ident == "String" && last.arguments.is_empty();
+    }
+    false
+}
+
+fn is_toml_value_path(path: &syn::Path) -> bool {
+    // Strict suffix match for the toml crate's `Value` type:
+    //   `Value`                     — assumed to be a use-imported toml::Value
+    //   `toml::Value`               — canonical form (incl. leading `::`)
+    // Anything else (e.g. `my_crate::Value`, `crate::toml::Value`, or a
+    // longer path ending in `toml::Value`) is rejected. The leading-colon
+    // form parses as the same segments — `syn::Path::leading_colon` is a
+    // separate field, not a segment.
+    let segs: Vec<_> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    matches!(segs.as_slice(),
+        [a] if a == "Value"
+    ) || matches!(segs.as_slice(),
+        [a, b] if a == "toml" && b == "Value"
+    )
 }
 
 fn is_toml_datetime_path(path: &syn::Path) -> bool {
-    // Match exactly: `Datetime` (single segment — assumed to be a use-imported
-    // `toml::value::Datetime`), `toml::value::Datetime` (the canonical form),
-    // or `value::Datetime` only when the immediately preceding segment is
-    // `toml`. An unrelated `my_crate::value::Datetime` would have a different
-    // root segment and is correctly rejected here.
+    // Strict suffix match for `toml::value::Datetime`:
+    //   `Datetime`                  — use-imported
+    //   `toml::Datetime`            — common re-export
+    //   `toml::value::Datetime`     — canonical
+    // Any other path is rejected — `my_crate::toml::internal::value::Datetime`
+    // and friends do NOT match.
     let segs: Vec<_> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-    let last_is_datetime = segs.last().map(|s| s == "Datetime").unwrap_or(false);
-    if !last_is_datetime {
-        return false;
-    }
-    match segs.as_slice() {
-        [_] => true,
-        [.., a, _b] => a == "value" && segs.iter().any(|s| s == "toml"),
-        _ => false,
-    }
+    matches!(segs.as_slice(),
+        [a] if a == "Datetime"
+    ) || matches!(segs.as_slice(),
+        [a, b] if a == "toml" && b == "Datetime"
+    ) || matches!(segs.as_slice(),
+        [a, b, c] if a == "toml" && b == "value" && c == "Datetime"
+    )
 }
 
 fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
@@ -666,7 +797,7 @@ fn shape_accepts_allowed(shape: &TypeShape) -> bool {
     match shape {
         TypeShape::Scalar(_, _) => true,
         TypeShape::Optional(inner) => shape_accepts_allowed(inner),
-        TypeShape::Array(_) | TypeShape::Value | TypeShape::Nested(_) => false,
+        TypeShape::Array(_) | TypeShape::Map(_) | TypeShape::Value | TypeShape::Nested(_) => false,
     }
 }
 
@@ -686,6 +817,10 @@ fn inner_leaf_type(shape: &TypeShape) -> syn::Result<(TokenStream2, bool)> {
         }
         TypeShape::Array(elem) => Ok((
             quote! { ::clapfig::static_schema::LeafTypeStatic::Array(&#elem) },
+            false,
+        )),
+        TypeShape::Map(val) => Ok((
+            quote! { ::clapfig::static_schema::LeafTypeStatic::Map(&#val) },
             false,
         )),
         TypeShape::Value => Ok((

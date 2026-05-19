@@ -1,0 +1,5 @@
+error: Option<Option<T>> is not supported — collapse to a single Option<T>. If you need to distinguish 'absent from config' from 'explicitly set to a null-like value', use a `#[clapfig(value)]` field with a typed enum.
+ --> tests/ui/derive/option_of_option_rejected.rs:8:19
+  |
+8 |     field: Option<Option<String>>,
+  |                   ^^^^^^
