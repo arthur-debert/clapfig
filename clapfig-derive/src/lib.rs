@@ -344,9 +344,27 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
         ));
     }
 
+    // 128-bit integers don't fit TOML's signed-64-bit integer width and there
+    // is no faithful intermediate representation. Reject at derive time with
+    // a clear diagnostic rather than letting the field fall through to the
+    // nested-struct branch and produce an opaque trait-bound error.
+    if matches!(name.as_str(), "i128" | "u128") {
+        return Err(syn::Error::new(
+            ty.span(),
+            format!(
+                "clapfig::Schema does not support `{name}` field types: TOML's integer \
+                 width is signed 64-bit and 128-bit values cannot be represented faithfully. \
+                 Store as `String` and parse explicitly, or use `#[clapfig(value)]` with \
+                 `toml::Value` for a free-form leaf."
+            ),
+        ));
+    }
     let scalar = match name.as_str() {
         "String" => Some(quote! { ::clapfig::static_schema::LeafTypeStatic::String }),
         "bool" => Some(quote! { ::clapfig::static_schema::LeafTypeStatic::Bool }),
+        // Every Rust integer maps to TOML's single Integer width.
+        // `u64` / `usize` / `isize` values that exceed `i64::MAX` cannot be
+        // represented in TOML; documented on `LeafTypeStatic::Integer`.
         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
             Some(quote! { ::clapfig::static_schema::LeafTypeStatic::Integer })
         }

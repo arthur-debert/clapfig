@@ -1,0 +1,5 @@
+error: clapfig::Schema does not support `i128` field types: TOML's integer width is signed 64-bit and 128-bit values cannot be represented faithfully. Store as `String` and parse explicitly, or use `#[clapfig(value)]` with `toml::Value` for a free-form leaf.
+ --> tests/ui/derive/i128_rejected.rs:8:10
+  |
+8 |     big: i128,
+  |          ^^^^
