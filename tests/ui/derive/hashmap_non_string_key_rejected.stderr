@@ -1,0 +1,5 @@
+error: HashMap<K, V> requires `K = String` (TOML map keys are string-typed); numeric or enum keys aren't representable. Store the key inside the value type.
+ --> tests/ui/derive/hashmap_non_string_key_rejected.rs:9:20
+  |
+9 |     by_id: HashMap<u64, String>,
+  |                    ^^^
