@@ -253,6 +253,149 @@
 //! [`.strict(false)`](ClapfigBuilder::strict) if you intentionally share
 //! config files across tools or want forward-compatible configs.
 //!
+//! ## Cascading strictness
+//!
+//! Real apps rarely want one uniform answer. Typed fields want strict
+//! ("catch my typos"); plugin-extension subtrees want lenient ("pass
+//! through unknown keys"); some leaves inside that lenient subtree may
+//! want to re-tighten. Three composable knobs cover all of that:
+//!
+//! 1. **`.strict(bool)`** — the whole-resolution default (see above).
+//! 2. **`.strict_at(path, bool)`** — per-section override at a dotted path.
+//!    Runtime schemas additionally set per-node strictness via
+//!    [`Schema::strict(bool)`](crate::runtime::Schema::strict).
+//! 3. **`.on_unknown_key(callback)`** — last-word per-key callback that
+//!    runs *only* on cascade-strict keys.
+//!
+//! ### The cascade rule
+//!
+//! For any unknown key at dotted path `a.b.c`, the effective strictness
+//! is the value of the **nearest ancestor schema node** (including the
+//! key's parent) whose `strict` is explicitly set. With no ancestor
+//! override, the builder-level default applies.
+//!
+//! That single rule produces both expected behaviors:
+//!
+//! - A parent's `strict` cascades to every descendant that doesn't itself
+//!   set `strict`.
+//! - The first descendant that sets its own `strict` becomes the new root
+//!   for its subtree, overriding the inherited value below it.
+//!
+//! ```ignore
+//! Clapfig::builder::<AppConfig>()
+//!     .strict(true)                       // typo protection by default
+//!     .strict_at("plugins", false)        // plugins.* subtree: lenient
+//!     .strict_at("plugins.audit", true)   // …but plugins.audit re-tightens
+//!     .load()?;
+//! ```
+//!
+//! Targeting a leaf or an unknown path errors at
+//! [`build_resolver()`](ClapfigBuilder::build_resolver) time with
+//! [`ClapfigError::InvalidStrictPath`] — typo protection on the override
+//! itself. With [`.normalize_keys(true)`](ClapfigBuilder::normalize_keys)
+//! set, `path` may be written in kebab-case.
+//!
+//! ### The `on_unknown_key` callback
+//!
+//! Some shapes the cascade alone can't express: a struct level where
+//! typed fields and a `#[serde(flatten)] BTreeMap` catch-all are
+//! siblings. The cascade sees them as the same node — accept everything
+//! or reject everything. The callback splits the difference: it runs
+//! only on cascade-strict keys and decides each one. Returning
+//! [`UnknownKeyDecision::Accept`] drops the key silently; `Reject`
+//! produces a `ClapfigError::UnknownKeys` entry (the default).
+//!
+//! ```ignore
+//! Clapfig::builder::<AppConfig>()
+//!     .strict(true)
+//!     .on_unknown_key(|c: &UnknownKeyContext<'_>| {
+//!         // Extension-emitted dotted keys (`"acme.task-due-date"`) are
+//!         // a single TOML literal; bare typos aren't. Accept the
+//!         // former, reject the latter.
+//!         if c.leaf.contains('.') {
+//!             UnknownKeyDecision::Accept
+//!         } else {
+//!             UnknownKeyDecision::Reject
+//!         }
+//!     })
+//!     .load()?;
+//! ```
+//!
+//! The [`UnknownKeyContext`] carries the dotted path, the raw TOML leaf
+//! key (preserves quoted-key semantics — `"acme.task-due-date-missing"`
+//! stays as a single literal even though it contains dots), the parsed
+//! value, the source file, and the 1-indexed line number.
+//!
+//! ### Behavior compatibility note
+//!
+//! Pre-Phase-3 `.strict(false)` skipped validation entirely. Combining a
+//! lenient default with at least one strict override
+//! (`.strict(false).strict_at("X", true)`) now activates the validation
+//! step, which can surface type errors that an unconditionally lenient
+//! resolution would have masked. Plain `.strict(false)` with no
+//! `strict_at(_, true)` is byte-identical to the old behavior.
+//!
+//! # Runtime-defined schemas
+//!
+//! Some apps don't have a single compile-time `Config` struct: plugin
+//! hosts assemble their schema from loaded plugins, scripting hosts read
+//! it from a config descriptor file, generated apps build it programmatically.
+//! [`Clapfig::runtime`] is the entry point for those cases.
+//!
+//! ```ignore
+//! use clapfig::{Clapfig, runtime::{Field, Schema}};
+//!
+//! let schema = Schema::object("App")
+//!     .doc("Demo runtime schema.")
+//!     .field("host", Field::string().doc("App host.").default("localhost"))
+//!     .field("port", Field::integer().default(8080i64))
+//!     .field(
+//!         "level",
+//!         Field::enum_of(["debug", "info", "warn", "error"])
+//!             .doc("Log verbosity.")
+//!             .default("info"),
+//!     )
+//!     .nested(
+//!         "db",
+//!         Schema::object("Db")
+//!             .field("url", Field::string().optional())
+//!             .field("pool_size", Field::integer().default(5i64)),
+//!     )
+//!     .build();
+//!
+//! let table: toml::Table = Clapfig::runtime(schema)
+//!     .app_name("myapp")
+//!     .load()?;
+//! ```
+//!
+//! Same surface as [`Clapfig::builder`] — `app_name`, `search_paths`,
+//! `env_prefix`, `cli_override`, `post_validate`, `build_resolver`,
+//! `handle` (drives `config gen|list|get|set|unset|schema` the same as
+//! the static path) — but the result is a [`toml::Table`] rather than a
+//! typed `C`. `post_validate` receives `&Table`. A
+//! [`RuntimeResolver`] parallels [`Resolver<C>`](Resolver) for tree-walk
+//! use cases.
+//!
+//! `LeafType` covers TOML primitives + array + map, plus
+//! `Enum { values }` for constrained value sets (log levels, output
+//! formats, modes). The schema is consumed by every existing surface
+//! with no extra wiring: `config gen` emits a commented template with
+//! allowed-value lines for enum leaves; the JSON Schema emitter emits
+//! `enum: [...]` on the property; `meta::doc_for_runtime` reads
+//! doc-comment lines from the runtime schema the same way
+//! [`meta::doc_for`] reads them from `C::META`.
+//!
+//! Cascading strictness composes naturally: runtime schemas can set
+//! per-node strictness inline via [`Schema::strict(bool)`](crate::runtime::Schema::strict),
+//! and [`RuntimeBuilder::strict_at`](RuntimeBuilder::strict_at) /
+//! [`RuntimeBuilder::on_unknown_key`](RuntimeBuilder::on_unknown_key)
+//! overlay on top.
+//!
+//! Schema field names are validated at construction: empty names, names
+//! containing `.` / `[` / `]`, and duplicate names within one schema
+//! panic at `SchemaBuilder` time rather than producing silent
+//! `KeyNotFound` errors at every consumer.
+//!
 //! # Kebab-case keys
 //!
 //! By default, keys in config files and overrides must match the Rust field
