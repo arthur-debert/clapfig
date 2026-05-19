@@ -796,6 +796,45 @@ mod tests {
     // --- handle: gen / schema / get / list / set / unset ---
 
     #[test]
+    fn handle_gen_emits_local_leaves_before_nested_sections() {
+        // Regression: TOML rule — once `[section]` opens, every following
+        // key belongs to that section. A sibling leaf declared after a
+        // nested field in the schema must still render under its parent,
+        // not inside the previous section. The fix reorders the emitter so
+        // local leaves render first, then sections.
+        let schema = Schema::object("Top")
+            .field("first", RtField::string().default("a"))
+            .nested(
+                "inner",
+                Schema::object("Inner").field("x", RtField::integer().default(1i64)),
+            )
+            .field("second", RtField::string().default("b"))
+            .build();
+        let result = Clapfig::runtime(schema)
+            .app_name("demo")
+            .no_env()
+            .handle(&ConfigAction::Gen { output: None })
+            .unwrap();
+        let t = match result {
+            ConfigResult::Template(t) => t,
+            other => panic!("expected Template, got {other:?}"),
+        };
+        // Re-parse the output as TOML and verify `second` is at the root,
+        // not inside `[inner]`.
+        let parsed: toml::Table = t.parse().unwrap();
+        assert!(parsed.get("first").is_some(), "first must be at root:\n{t}");
+        assert!(
+            parsed.get("second").is_some(),
+            "second leaked into [inner] (template ordering bug):\n{t}"
+        );
+        let inner = parsed.get("inner").and_then(|v| v.as_table()).unwrap();
+        assert!(
+            inner.get("second").is_none(),
+            "second must not be under inner"
+        );
+    }
+
+    #[test]
     fn handle_gen_renders_template_with_doc_comments_and_enum_set() {
         let result = Clapfig::runtime(demo_schema())
             .app_name("demo")
@@ -814,6 +853,76 @@ mod tests {
             }
             other => panic!("expected Template, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn handle_schema_does_not_mark_array_of_required() {
+        // Regression: `DynamicSpec::finalize` accepts an absent ArrayOf as
+        // the empty list. The JSON Schema must agree — marking the
+        // property required would reject configs clapfig itself accepts.
+        let schema = Schema::object("Top")
+            .field("name", RtField::string().default("x"))
+            .array_of(
+                "plugins",
+                Schema::object("Plugin").field("id", RtField::string()),
+            )
+            .build();
+        let result = Clapfig::runtime(schema)
+            .app_name("demo")
+            .no_env()
+            .handle(&ConfigAction::Schema { output: None })
+            .unwrap();
+        match result {
+            ConfigResult::Schema(s) => {
+                let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+                let required = v["required"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|x| x.as_str().unwrap().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                assert!(
+                    !required.contains(&"plugins".to_string()),
+                    "plugins must not be in required: {required:?}"
+                );
+            }
+            other => panic!("expected Schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_of_keys_not_addressable_via_persist_set() {
+        // Regression: `valid_keys` used to recurse into ArrayOf subtrees,
+        // making `plugins.id` look like a valid persist target. But the
+        // persist path builds nested tables (not arrays-of-tables), so
+        // writing `plugins.id` would produce `[plugins] id = "..."` and
+        // then runtime validation would reject the result with
+        // "expected array, got table". The fix excludes ArrayOf subtrees
+        // from `valid_keys`; the user-facing symptom is a clean
+        // `KeyNotFound` instead of a corrupted file.
+        let dir = TempDir::new().unwrap();
+        let schema = Schema::object("Top").array_of(
+            "plugins",
+            Schema::object("Plugin").field("id", RtField::string()),
+        );
+        let result = Clapfig::runtime(schema.build())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "plugins.id".into(),
+                value: "x".into(),
+                scope: None,
+            });
+        assert!(
+            matches!(result, Err(ClapfigError::KeyNotFound(_))),
+            "expected KeyNotFound for ArrayOf-internal key, got {result:?}"
+        );
+        // File must not have been written.
+        assert!(!dir.path().join("demo.toml").exists());
     }
 
     #[test]

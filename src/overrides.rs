@@ -59,8 +59,20 @@ fn collect_keys(schema: SchemaRef<'_>, prefix: &str, keys: &mut HashSet<String>)
             FieldKindRef::Leaf(_) => {
                 keys.insert(dotted);
             }
-            FieldKindRef::Nested { schema: nested } | FieldKindRef::ArrayOf { schema: nested } => {
+            FieldKindRef::Nested { schema: nested } => {
                 collect_keys(nested, &dotted, keys);
+            }
+            FieldKindRef::ArrayOf { .. } => {
+                // Skip ArrayOf subtrees. Dotted-key consumers (cli_overrides,
+                // url_query, persist set/unset) build nested tables, not
+                // arrays-of-tables, so listing `plugins.name` as valid would
+                // let `config set plugins.name foo` write `[plugins]
+                // name = "foo"` — which then fails runtime validation with
+                // "expected array, got table". The right surface for setting
+                // entries inside an array of tables would be an indexed
+                // dotted syntax (`plugins[0].name`) that none of the current
+                // consumers parses. Until then, ArrayOf keys are not
+                // addressable by dotted path.
             }
         }
     }

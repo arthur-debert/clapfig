@@ -119,13 +119,17 @@ fn field_to_property(field: FieldRef<'_>) -> (String, Value, bool) {
             // with `items: <item schema>`. Each runtime array entry is itself
             // typed against `item`, so the per-item schema is the natural
             // place to declare structure.
+            //
+            // Not marked required: `DynamicSpec::finalize` treats an absent
+            // array-of as the empty list (no entries), so a JSON Schema
+            // requiring the property would reject configs clapfig accepts.
             let mut prop = Map::new();
             if !field.doc.is_empty() {
                 prop.insert("description".into(), Value::String(join_doc(field.doc)));
             }
             prop.insert("type".into(), Value::String("array".into()));
             prop.insert("items".into(), schema_to_object(item));
-            (field.name.into(), Value::Object(prop), true)
+            (field.name.into(), Value::Object(prop), false)
         }
         FieldKindRef::Leaf(leaf) => {
             let mut prop = Map::new();

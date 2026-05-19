@@ -245,36 +245,45 @@ fn emit_schema(out: &mut String, schema: &crate::runtime::Schema, prefix: &str) 
     use crate::runtime::Field;
     use std::fmt::Write;
 
+    // TOML rule: once a [section] header is emitted, every following key
+    // belongs to that section until the next header. Emit local leaves
+    // first, then sections — otherwise a sibling leaf declared after a
+    // nested field in the schema would land inside the wrong section.
+    for nf in &schema.fields {
+        let Field::Leaf(leaf) = &nf.field else {
+            continue;
+        };
+        for line in &leaf.doc {
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                out.push_str("#\n");
+            } else {
+                let _ = writeln!(out, "# {trimmed}");
+            }
+        }
+        if let crate::runtime::LeafType::Enum { values } = &leaf.ty {
+            let listed = values
+                .iter()
+                .map(format_inline_toml)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let _ = writeln!(out, "# Allowed: {listed}");
+        }
+        match &leaf.default {
+            Some(value) => {
+                let _ = writeln!(out, "{} = {}", nf.name, format_inline_toml(value));
+            }
+            None => {
+                let hint = leaf.ty.template_placeholder();
+                let _ = writeln!(out, "#{} = {hint}", nf.name);
+            }
+        }
+        out.push('\n');
+    }
+
     for nf in &schema.fields {
         match &nf.field {
-            Field::Leaf(leaf) => {
-                for line in &leaf.doc {
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        out.push_str("#\n");
-                    } else {
-                        let _ = writeln!(out, "# {trimmed}");
-                    }
-                }
-                if let crate::runtime::LeafType::Enum { values } = &leaf.ty {
-                    let listed = values
-                        .iter()
-                        .map(format_inline_toml)
-                        .collect::<Vec<_>>()
-                        .join(" | ");
-                    let _ = writeln!(out, "# Allowed: {listed}");
-                }
-                match &leaf.default {
-                    Some(value) => {
-                        let _ = writeln!(out, "{} = {}", nf.name, format_inline_toml(value));
-                    }
-                    None => {
-                        let hint = leaf.ty.template_placeholder();
-                        let _ = writeln!(out, "#{} = {hint}", nf.name);
-                    }
-                }
-                out.push('\n');
-            }
+            Field::Leaf(_) => {} // already emitted above
             Field::Nested(child) => {
                 let path = if prefix.is_empty() {
                     nf.name.clone()
