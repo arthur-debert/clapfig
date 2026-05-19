@@ -244,7 +244,10 @@ fn parent_path(path: &str) -> &str {
 /// to quoted-key leaves with dots, array-index segments, and any other
 /// path shape — the cascade walks the same way regardless of what the
 /// leaf looks like.
-fn section_path_of<'a>(path: &'a str, leaf: &str) -> &'a str {
+///
+/// `pub(crate)` so `validate::lookup_value` and `validate::find_key_line`
+/// can reuse the same single source of truth.
+pub(crate) fn section_path_of<'a>(path: &'a str, leaf: &str) -> &'a str {
     if path == leaf {
         return "";
     }
