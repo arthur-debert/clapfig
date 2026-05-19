@@ -82,21 +82,29 @@ impl RuntimeBuilder {
         }
     }
 
+    /// Set the application name. See
+    /// [`ClapfigBuilder::app_name`](crate::ClapfigBuilder::app_name).
     pub fn app_name(mut self, name: &str) -> Self {
         self.app_name = Some(name.to_string());
         self
     }
 
+    /// Override the config file name. See
+    /// [`ClapfigBuilder::file_name`](crate::ClapfigBuilder::file_name).
     pub fn file_name(mut self, name: &str) -> Self {
         self.file_name = Some(name.to_string());
         self
     }
 
+    /// Replace the default search paths entirely. See
+    /// [`ClapfigBuilder::search_paths`](crate::ClapfigBuilder::search_paths).
     pub fn search_paths(mut self, paths: Vec<SearchPath>) -> Self {
         self.search_paths = Some(paths);
         self
     }
 
+    /// Append a single search path. See
+    /// [`ClapfigBuilder::add_search_path`](crate::ClapfigBuilder::add_search_path).
     pub fn add_search_path(mut self, path: SearchPath) -> Self {
         self.search_paths
             .get_or_insert_with(|| vec![SearchPath::Platform])
@@ -104,26 +112,39 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Set the search mode (`Merge` vs `FirstMatch`). See
+    /// [`ClapfigBuilder::search_mode`](crate::ClapfigBuilder::search_mode).
     pub fn search_mode(mut self, mode: SearchMode) -> Self {
         self.search_mode = mode;
         self
     }
 
+    /// Register a named persist scope for `config set`/`unset`. See
+    /// [`ClapfigBuilder::persist_scope`](crate::ClapfigBuilder::persist_scope).
     pub fn persist_scope(mut self, name: &str, path: SearchPath) -> Self {
         self.persist_scopes.push((name.to_string(), path));
         self
     }
 
+    /// Override the env var prefix. See
+    /// [`ClapfigBuilder::env_prefix`](crate::ClapfigBuilder::env_prefix).
     pub fn env_prefix(mut self, prefix: &str) -> Self {
         self.env_prefix = Some(prefix.to_string());
         self
     }
 
+    /// Disable env loading entirely. See
+    /// [`ClapfigBuilder::no_env`](crate::ClapfigBuilder::no_env).
     pub fn no_env(mut self) -> Self {
         self.env_enabled = false;
         self
     }
 
+    /// Set the whole-resolution strictness default. See
+    /// [`ClapfigBuilder::strict`](crate::ClapfigBuilder::strict) and the
+    /// [cascading strictness section](crate#cascading-strictness) of the
+    /// crate docs for how this composes with `strict_at` and
+    /// `on_unknown_key`.
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
         self
@@ -149,11 +170,15 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Accept kebab-case keys in config files and CLI/URL overrides. See
+    /// [`ClapfigBuilder::normalize_keys`](crate::ClapfigBuilder::normalize_keys).
     pub fn normalize_keys(mut self, normalize: bool) -> Self {
         self.normalize_keys = normalize;
         self
     }
 
+    /// Set a custom layer merge order. See
+    /// [`ClapfigBuilder::layer_order`](crate::ClapfigBuilder::layer_order).
     pub fn layer_order(mut self, order: Vec<Layer>) -> Self {
         self.layer_order = Some(order);
         self
@@ -169,6 +194,8 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Add a URL query string as a config layer. See
+    /// [`ClapfigBuilder::url_query`](crate::ClapfigBuilder::url_query).
     #[cfg(feature = "url")]
     pub fn url_query(mut self, query: &str) -> Self {
         self.url_overrides
@@ -176,6 +203,8 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Add a single CLI override. See
+    /// [`ClapfigBuilder::cli_override`](crate::ClapfigBuilder::cli_override).
     pub fn cli_override<V: Into<Value>>(mut self, key: &str, value: Option<V>) -> Self {
         if let Some(v) = value {
             self.cli_overrides.push((key.to_string(), v.into()));
@@ -239,6 +268,12 @@ impl RuntimeBuilder {
         Ok(Some(app.to_uppercase()))
     }
 
+    /// Build a reusable [`RuntimeResolver`] that captures the current
+    /// builder state and can be called repeatedly with
+    /// [`resolve_at(dir)`](RuntimeResolver::resolve_at). Runtime-path
+    /// analogue of
+    /// [`ClapfigBuilder::build_resolver`](crate::ClapfigBuilder::build_resolver);
+    /// see that method for the full design rationale.
     pub fn build_resolver(self) -> Result<RuntimeResolver, ClapfigError> {
         let app_name = self.effective_app_name()?.to_string();
         let file_name = self.effective_file_name()?;
@@ -281,6 +316,9 @@ impl RuntimeBuilder {
         })
     }
 
+    /// Load and resolve the configuration through all layers. Runtime-path
+    /// analogue of [`ClapfigBuilder::load`](crate::ClapfigBuilder::load),
+    /// returning a [`toml::Table`] instead of a typed `C`.
     pub fn load(self) -> Result<Table, ClapfigError> {
         let start_dir = std::env::current_dir().map_err(|e| ClapfigError::IoError {
             path: PathBuf::from("."),
@@ -289,12 +327,18 @@ impl RuntimeBuilder {
         self.build_resolver()?.resolve_at(start_dir)
     }
 
+    /// Dispatch a [`ConfigAction`] and print the result. Runtime-path
+    /// analogue of
+    /// [`ClapfigBuilder::handle_and_print`](crate::ClapfigBuilder::handle_and_print).
     pub fn handle_and_print(self, action: &ConfigAction) -> Result<(), ClapfigError> {
         let result = self.handle(action)?;
         print!("{result}");
         Ok(())
     }
 
+    /// Dispatch a [`ConfigAction`] and return the rendered output as a
+    /// `String`. Runtime-path analogue of
+    /// [`ClapfigBuilder::handle_to_string`](crate::ClapfigBuilder::handle_to_string).
     pub fn handle_to_string(self, action: &ConfigAction) -> Result<String, ClapfigError> {
         self.handle(action).map(|r| r.to_string())
     }
