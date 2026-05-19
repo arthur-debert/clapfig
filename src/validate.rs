@@ -123,16 +123,19 @@ pub(crate) fn filter_through_cascade(
             continue;
         }
 
-        let line = find_key_line(source, &key, ctx.normalize_keys);
+        let line = find_key_line(source, &key, &leaf, ctx.normalize_keys);
 
         if let Some(callback) = ctx.callback {
             // Callback runs only on cascade-strict keys. Look the value up
-            // by dotted path so the callback sees what the user wrote.
-            // Indexed array paths (`[N]` segments) can't round-trip
-            // through `table_get`; treat those as "value unknown" and use
-            // a stand-in null. The callback can still inspect path+leaf.
+            // by `(path, leaf)` so quoted keys containing dots (literal
+            // TOML keys like `"acme.task-due-date-missing"`) resolve
+            // correctly — the leaf is the raw TOML key the parser saw,
+            // not whatever dot-split would produce. Indexed array paths
+            // (`[N]` segments) can't round-trip through `table_get`;
+            // treat those as "value unknown" and use a stand-in null.
+            // The callback can still inspect path+leaf.
             let null = Value::Boolean(false);
-            let value = lookup_value(table, &key).unwrap_or(&null);
+            let value = lookup_value(table, &key, &leaf).unwrap_or(&null);
             let context = UnknownKeyContext {
                 path: &key,
                 leaf: &leaf,
@@ -159,22 +162,40 @@ pub(crate) fn filter_through_cascade(
     }
 }
 
-/// Best-effort lookup of a dotted-path value in a parsed table. Returns
-/// `None` for paths the lookup can't resolve (e.g. paths containing array
-/// indexing or quoted-key segments).
-fn lookup_value<'a>(table: &'a Table, dotted: &str) -> Option<&'a Value> {
+/// Look up a value in a parsed table by its full dotted `path` plus the
+/// raw `leaf` key the parser saw at the end.
+///
+/// Splitting `path` on `.` doesn't work when the leaf is a quoted TOML
+/// key containing dots (e.g. `"acme.task-due-date-missing"` parses as a
+/// single key; my dotted-path encoding flattens it into segments that
+/// dot-split can't recover). The fix: strip the leaf — plus the
+/// preceding `.` if any — off the end of the path, walk what remains as
+/// nested-table segments, then fetch `leaf` directly.
+///
+/// Returns `None` on paths the lookup can't resolve: array-indexed
+/// segments (`[N]`) can't round-trip through `Table::get`, and
+/// intermediate segments must be sub-tables.
+fn lookup_value<'a>(table: &'a Table, path: &str, leaf: &str) -> Option<&'a Value> {
+    let section = if path.len() == leaf.len() {
+        ""
+    } else {
+        // The `- 1` skips the `.` separator between the section path and
+        // the leaf. Guaranteed valid by construction: `leaf` was taken
+        // from the leaf position when the path was built.
+        &path[..path.len() - leaf.len() - 1]
+    };
     let mut current = table;
-    let mut segments = dotted.split('.').peekable();
-    while let Some(seg) = segments.next() {
-        if seg.contains('[') {
-            return None;
+    if !section.is_empty() {
+        for seg in section.split('.') {
+            if seg.contains('[') {
+                // Array-indexed segments are intentionally out of scope
+                // here — the callback gets a stand-in null in that case.
+                return None;
+            }
+            current = current.get(seg)?.as_table()?;
         }
-        if segments.peek().is_none() {
-            return current.get(seg);
-        }
-        current = current.get(seg)?.as_table()?;
     }
-    None
+    current.get(leaf)
 }
 
 /// Find the 1-indexed line number for a key in TOML content.
@@ -182,17 +203,32 @@ fn lookup_value<'a>(table: &'a Table, dotted: &str) -> Option<&'a Value> {
 /// For a dotted key like `"database.typo"`, tracks the current `[section]` header
 /// while scanning and only matches the leaf key when inside the correct section.
 ///
+/// `leaf` is the raw TOML key as the parser saw it — distinct from the
+/// trailing dot-split segment when the key is a literal quoted key that
+/// contains dots (e.g. `"acme.task-due-date-missing"`). Passing the leaf
+/// separately preserves the line-number lookup for that case.
+///
 /// When `normalize_keys` is true, the comparison treats `-` and `_` as the same
 /// character — so a normalized lookup key like `"pool_size"` still locates a
 /// source line that reads `pool-size = 5`.
 ///
 /// This is a best-effort heuristic — it handles standard `[section]` headers and
-/// bare key assignments but does not handle quoted keys or inline tables.
+/// bare key assignments but does not handle inline tables.
 /// Returns 0 if the key cannot be located.
-fn find_key_line(content: &str, dotted_key: &str, normalize_keys: bool) -> usize {
-    let segments: Vec<&str> = dotted_key.split('.').collect();
-    let leaf = segments.last().unwrap_or(&dotted_key);
-    let expected_section = &segments[..segments.len() - 1]; // empty for top-level
+fn find_key_line(content: &str, dotted_path: &str, leaf: &str, normalize_keys: bool) -> usize {
+    // Section path = dotted path with the leaf stripped off the end (plus
+    // the `.` separator if any). Mirrors `lookup_value` so quoted keys
+    // containing dots still resolve to the correct enclosing section.
+    let section_path = if dotted_path.len() == leaf.len() {
+        ""
+    } else {
+        &dotted_path[..dotted_path.len() - leaf.len() - 1]
+    };
+    let expected_section: Vec<&str> = if section_path.is_empty() {
+        Vec::new()
+    } else {
+        section_path.split('.').collect()
+    };
 
     let mut current_section: Vec<String> = Vec::new();
 
