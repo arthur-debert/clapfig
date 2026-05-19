@@ -179,10 +179,7 @@ pub(crate) fn filter_through_cascade(
 /// callback path treats `None` as "value unknown" and falls back to a
 /// stand-in null so the callback still runs.
 fn lookup_value<'a>(table: &'a Table, path: &str, leaf: &str) -> Option<&'a Value> {
-    let section = path
-        .strip_suffix(leaf)
-        .map(|p| p.strip_suffix('.').unwrap_or(p))
-        .unwrap_or("");
+    let section = crate::strict::section_path_of(path, leaf);
     if section.is_empty() {
         return table.get(leaf);
     }
@@ -240,12 +237,9 @@ fn parse_segment(seg: &str) -> (&str, Option<usize>) {
 /// Returns 0 if the key cannot be located.
 fn find_key_line(content: &str, dotted_path: &str, leaf: &str, normalize_keys: bool) -> usize {
     // Section path = dotted path with the leaf stripped off the end (plus
-    // the `.` separator if any). Mirrors `lookup_value` so quoted keys
-    // containing dots still resolve to the correct enclosing section.
-    let section_path = dotted_path
-        .strip_suffix(leaf)
-        .map(|p| p.strip_suffix('.').unwrap_or(p))
-        .unwrap_or("");
+    // the `.` separator if any). Shared helper so quoted keys containing
+    // dots still resolve to the correct enclosing section.
+    let section_path = crate::strict::section_path_of(dotted_path, leaf);
     let expected_section: Vec<&str> = if section_path.is_empty() {
         Vec::new()
     } else {
