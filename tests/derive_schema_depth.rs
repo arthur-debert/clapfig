@@ -630,6 +630,43 @@ fn post_validate_sees_default_filled_value() {
     assert_eq!(*seen.lock().unwrap(), 8080);
 }
 
+// -- Datetime defaults route to ValueStatic::Datetime --------------------
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct DateTimeDefault {
+    /// String-literal default on a datetime field must emit
+    /// `ValueStatic::Datetime`, not `ValueStatic::String`. Otherwise the
+    /// runtime `LeafType::DateTime` check rejects the default at finalize.
+    #[clapfig(default = "1970-01-01T00:00:00Z")]
+    stamp: toml::value::Datetime,
+}
+
+#[test]
+fn datetime_default_emits_value_static_datetime() {
+    let leaf = match &<DateTimeDefault as Schema>::STATIC.fields[0].field {
+        FieldStatic::Leaf(l) => l,
+        _ => unreachable!(),
+    };
+    match leaf.default.as_ref().expect("default should be set") {
+        ValueStatic::Datetime(s) => assert_eq!(*s, "1970-01-01T00:00:00Z"),
+        other => panic!("expected ValueStatic::Datetime, got {other:?}"),
+    }
+}
+
+#[test]
+fn datetime_default_survives_runtime_conversion() {
+    // End-to-end: the static default must convert into a `toml::Value::Datetime`
+    // and pass the `LeafType::DateTime` check at finalize.
+    let dir = TempDir::new().unwrap();
+    let cfg: DateTimeDefault = Clapfig::schema_builder::<DateTimeDefault>()
+        .app_name("t")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.stamp.to_string(), "1970-01-01T00:00:00Z");
+}
+
 // -- handle_to_string surface forwards correctly --------------------------
 
 #[test]

@@ -1,0 +1,5 @@
+error: `#[clapfig(allowed = [...])]` is only valid on scalar leaf fields (String, integer, float, bool). It cannot be applied to Vec<T>, nested structs, or `#[clapfig(value)]` fields.
+ --> tests/ui/derive/allowed_on_vec_rejected.rs:7:5
+  |
+7 |     #[clapfig(allowed = ["a", "b"])]
+  |     ^

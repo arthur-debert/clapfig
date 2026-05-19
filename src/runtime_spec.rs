@@ -20,6 +20,7 @@
 //! [`Schema`]: crate::runtime::Schema
 
 use std::path::Path;
+use std::sync::Arc;
 
 use toml::{Table, Value};
 
@@ -28,14 +29,23 @@ use crate::runtime::{Field, NamedField, Schema};
 use crate::spec::{ConfigSpec, SchemaRef};
 use crate::validate::{UnknownKey, ValidateContext, filter_through_cascade};
 
-/// Runtime-path adapter: drives the resolve pipeline from an owned
-/// user-supplied schema.
+/// Runtime-path adapter: drives the resolve pipeline from a user-supplied
+/// schema. The schema is held behind an `Arc` so the macro-driven static
+/// path can share the same `&'static Schema` view that
+/// `clapfig::Schema::schema()` caches without cloning the schema tree per
+/// builder construction.
 pub(crate) struct DynamicSpec {
-    pub(crate) schema: Schema,
+    pub(crate) schema: Arc<Schema>,
 }
 
 impl DynamicSpec {
     pub fn new(schema: Schema) -> Self {
+        Self {
+            schema: Arc::new(schema),
+        }
+    }
+
+    pub fn from_arc(schema: Arc<Schema>) -> Self {
         Self { schema }
     }
 }

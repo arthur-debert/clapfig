@@ -57,6 +57,26 @@ pub fn derive_schema(input: TokenStream) -> TokenStream {
 }
 
 fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
+    // Generic structs would produce a module-level `static __CLAPFIG_SCHEMA_*`
+    // referencing type parameters that are not in scope for a `static`, so
+    // any usage would surface as a confusing post-expansion error. Reject
+    // here with a clear diagnostic.
+    if !input.generics.params.is_empty() {
+        return Err(syn::Error::new(
+            input.generics.span(),
+            "clapfig::Schema does not support generic structs — the emitted \
+             `static SchemaStatic = ...` cannot reference type parameters. \
+             Concretize the type, or build the schema dynamically via \
+             `Clapfig::runtime(Schema::object(...))`.",
+        ));
+    }
+    if input.generics.where_clause.is_some() {
+        return Err(syn::Error::new(
+            input.generics.where_clause.span(),
+            "clapfig::Schema does not support structs with a `where` clause; see \
+             the generic-struct diagnostic for context.",
+        ));
+    }
     let struct_name = &input.ident;
     let struct_attrs = parse_struct_attrs(&input.attrs)?;
     let schema_name = struct_attrs
@@ -112,14 +132,22 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
             };
 
         #[allow(non_upper_case_globals)]
-        static #cache_ident: ::std::sync::OnceLock<::clapfig::runtime::Schema> =
-            ::std::sync::OnceLock::new();
+        static #cache_ident: ::std::sync::OnceLock<
+            ::std::sync::Arc<::clapfig::runtime::Schema>,
+        > = ::std::sync::OnceLock::new();
 
         impl ::clapfig::Schema for #struct_name {
             const STATIC: &'static ::clapfig::static_schema::SchemaStatic = &#static_ident;
 
             fn schema() -> &'static ::clapfig::runtime::Schema {
                 ::clapfig::static_schema::cached_runtime_schema(
+                    &#cache_ident,
+                    <Self as ::clapfig::Schema>::STATIC,
+                )
+            }
+
+            fn schema_arc() -> ::std::sync::Arc<::clapfig::runtime::Schema> {
+                ::clapfig::static_schema::cached_runtime_schema_arc(
                     &#cache_ident,
                     <Self as ::clapfig::Schema>::STATIC,
                 )
@@ -422,12 +450,21 @@ fn is_toml_value_path(path: &syn::Path) -> bool {
 }
 
 fn is_toml_datetime_path(path: &syn::Path) -> bool {
+    // Match exactly: `Datetime` (single segment — assumed to be a use-imported
+    // `toml::value::Datetime`), `toml::value::Datetime` (the canonical form),
+    // or `value::Datetime` only when the immediately preceding segment is
+    // `toml`. An unrelated `my_crate::value::Datetime` would have a different
+    // root segment and is correctly rejected here.
     let segs: Vec<_> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-    matches!(segs.as_slice(),
-        [last] if last == "Datetime"
-    ) || segs
-        .windows(2)
-        .any(|w| w[0] == "value" && w[1] == "Datetime")
+    let last_is_datetime = segs.last().map(|s| s == "Datetime").unwrap_or(false);
+    if !last_is_datetime {
+        return false;
+    }
+    match segs.as_slice() {
+        [_] => true,
+        [.., a, _b] => a == "value" && segs.iter().any(|s| s == "toml"),
+        _ => false,
+    }
 }
 
 fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
@@ -523,6 +560,18 @@ fn leaf_type_for_shape(
         ));
     }
     if let Some(allowed) = &attrs.allowed {
+        // `allowed` constrains the field to a scalar-enum set. Permitting
+        // it on Vec/Map/Value leaves would emit a schema that can never
+        // validate or deserialize correctly (the value shape and the enum
+        // constraint disagree). Reject early with a clear diagnostic.
+        if !shape_accepts_allowed(shape) {
+            return Err(syn::Error::new(
+                span,
+                "`#[clapfig(allowed = [...])]` is only valid on scalar leaf fields \
+                 (String, integer, float, bool). It cannot be applied to Vec<T>, \
+                 nested structs, or `#[clapfig(value)]` fields.",
+            ));
+        }
         let value_statics = allowed
             .iter()
             .map(value_static_from_expr)
@@ -538,6 +587,28 @@ fn leaf_type_for_shape(
         ));
     }
     inner_leaf_type(shape)
+}
+
+/// `allowed = [...]` is only meaningful on scalar leaves; otherwise the
+/// emitted schema would be self-contradictory (enum-of-string constraint
+/// on a Vec field, etc.).
+fn shape_accepts_allowed(shape: &TypeShape) -> bool {
+    match shape {
+        TypeShape::Scalar(_) => true,
+        TypeShape::Optional(inner) => shape_accepts_allowed(inner),
+        TypeShape::Array(_) | TypeShape::Value | TypeShape::Nested(_) => false,
+    }
+}
+
+/// Detect whether the field's classified shape is `LeafTypeStatic::DateTime`
+/// (or `Option<DateTime>`). Used to route string-literal defaults to
+/// `ValueStatic::Datetime` instead of `ValueStatic::String`.
+fn is_datetime_shape(shape: &TypeShape) -> bool {
+    match shape {
+        TypeShape::Scalar(tok) => tok.to_string().contains("DateTime"),
+        TypeShape::Optional(inner) => is_datetime_shape(inner),
+        _ => false,
+    }
 }
 
 fn inner_leaf_type(shape: &TypeShape) -> syn::Result<(TokenStream2, bool)> {
@@ -574,6 +645,25 @@ fn value_static_from_expr(expr: &Expr) -> syn::Result<TokenStream2> {
 /// `shape` is the field's classified type; used to validate scalar/array
 /// compatibility and to drive nesting on array defaults.
 fn expr_to_value_static(expr: &Expr, shape: &TypeShape) -> syn::Result<TokenStream2> {
+    // Datetime fields with a string-literal default need a typed
+    // `ValueStatic::Datetime` so the runtime's `LeafType::DateTime` check
+    // accepts the default at finalize. Without this branch the literal
+    // would emit `ValueStatic::String` and the leaf type-check would
+    // reject the default at startup. We route the literal verbatim into
+    // `ValueStatic::Datetime`; the parse happens inside
+    // `ValueStatic::to_toml()` on first schema access and a malformed
+    // literal panics with `"clapfig: invalid datetime literal in static
+    // schema default"`. (Compile-time parsing would require pulling
+    // `toml` / `toml_datetime` into `clapfig-derive`, which we deliberately
+    // avoid to keep the proc-macro crate light.)
+    if is_datetime_shape(shape)
+        && let Expr::Lit(ExprLit {
+            lit: Lit::Str(s), ..
+        }) = expr
+    {
+        let value = s.value();
+        return Ok(quote! { ::clapfig::static_schema::ValueStatic::Datetime(#value) });
+    }
     match expr {
         Expr::Lit(ExprLit { lit, .. }) => lit_to_value_static(lit, expr.span()),
         Expr::Array(a) => {
