@@ -1,0 +1,5 @@
+error: unsupported #[clapfig(...)] struct attribute: `notreal`. Supported: name = "...", strict = true/false
+ --> tests/ui/derive/unknown_struct_attr.rs:4:11
+  |
+4 | #[clapfig(notreal = "x")]
+  |           ^^^^^^^

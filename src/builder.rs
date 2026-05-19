@@ -60,6 +60,43 @@ impl Clapfig {
     pub fn runtime(schema: crate::runtime::Schema) -> crate::runtime_builder::RuntimeBuilder {
         crate::runtime_builder::RuntimeBuilder::new(schema)
     }
+
+    /// Entry point for the `#[derive(clapfig::Schema)]` static path: build a
+    /// typed config pipeline from a struct whose schema was emitted by the
+    /// derive macro (rather than confique).
+    ///
+    /// Same builder surface as [`Self::builder`] and [`Self::runtime`]; the
+    /// load result is the typed `C`, like [`Self::builder`], but the
+    /// schema metadata available to JSON Schema, template, and persistence
+    /// emission is the full runtime view — closing the symmetry gap between
+    /// static and runtime paths described in
+    /// `docs/proposals/schema-metadata-symmetry.md`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use clapfig::{Clapfig, Schema};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Schema, Serialize, Deserialize, Debug)]
+    /// struct AppConfig {
+    ///     /// App host.
+    ///     #[clapfig(default = "localhost")]
+    ///     host: String,
+    ///
+    ///     /// App port.
+    ///     #[clapfig(default = 8080)]
+    ///     port: u16,
+    /// }
+    ///
+    /// let cfg: AppConfig = Clapfig::schema_builder::<AppConfig>()
+    ///     .app_name("myapp")
+    ///     .load()?;
+    /// ```
+    pub fn schema_builder<C: crate::static_schema::Schema>()
+    -> crate::schema_builder::SchemaConfigBuilder<C> {
+        crate::schema_builder::SchemaConfigBuilder::new()
+    }
 }
 
 /// Boxed post-merge validation hook.

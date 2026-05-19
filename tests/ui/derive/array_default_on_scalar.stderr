@@ -1,0 +1,5 @@
+error: array-literal defaults are only valid on Vec<T> (or Option<Vec<T>>) fields
+ --> tests/ui/derive/array_default_on_scalar.rs:6:25
+  |
+6 |     #[clapfig(default = ["a", "b"])]
+  |                         ^^^^^^^^^^
