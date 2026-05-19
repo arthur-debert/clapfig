@@ -1,0 +1,5 @@
+error: `allowed = [...]` entry has type `String` but the field is `Integer`; enum-constraint literals must match the field's TOML type.
+ --> tests/ui/derive/allowed_type_mismatch.rs:8:26
+  |
+8 |     #[clapfig(allowed = ["a", "b"])]
+  |                          ^^^

@@ -26,8 +26,12 @@ use syn::{
 ///
 /// # Supported field types
 ///
-/// - Scalars: `String`, `i8..i64`, `u8..u32`, `f32`, `f64`, `bool`,
-///   `toml::value::Datetime`, `toml::Value`
+/// - Scalars: `String`, `bool`, every Rust integer type
+///   (`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`usize`/`isize` — all
+///   mapped to TOML's signed 64-bit integer; see the
+///   `LeafTypeStatic::Integer` doc comment for the `i64::MAX` caveat on
+///   the unsigned variants), `f32`, `f64`, `toml::value::Datetime`,
+///   `toml::Value`. `i128` and `u128` are rejected at derive time.
 /// - `Option<T>`: marks the leaf optional
 /// - `Vec<T>` where `T` is a scalar: maps to `LeafType::Array(T)`
 /// - Nested struct: assumed to also derive `clapfig::Schema`; produces a
@@ -35,12 +39,25 @@ use syn::{
 ///
 /// # Field attributes
 ///
-/// - `#[clapfig(default = <literal>)]` — scalar default
+/// - `#[clapfig(default = <literal>)]` — scalar default. Accepts string,
+///   integer, float, bool, and unary-negated numeric literals
+///   (`-9223372036854775808i64` works for `i64::MIN`); on `Vec<T>` fields,
+///   also accepts an array literal of literals. On
+///   `toml::value::Datetime` fields, a string literal is emitted as
+///   `ValueStatic::Datetime` (parsed at first schema access).
 /// - `#[clapfig(env = "NAME")]` — explicit env-var override
 /// - `#[clapfig(rename = "name")]` — override the field's schema/serde name
-/// - `#[clapfig(value)]` — force `LeafType::Value` (untyped escape hatch)
-/// - `#[clapfig(allowed = ["a", "b", "c"])]` — set `LeafType::Enum` for
-///   `String` leaves with a fixed value set
+/// - `#[clapfig(value)]` — force `LeafType::Value` (untyped escape hatch
+///   — meant for fields whose value can take multiple incompatible
+///   shapes, e.g. a `#[serde(untagged)] enum`. The macro does not
+///   constrain which field type this is applied to: the caller takes
+///   responsibility for the deserialize side)
+/// - `#[clapfig(allowed = [...])]` — set `LeafType::Enum` on a scalar
+///   leaf. Works on `String`, integer, float, and `bool` fields; each
+///   listed literal must match the field's TOML type, and at least one
+///   value is required. Negative integer/float literals are accepted.
+/// - `#[clapfig(optional)]` — force `optional = true` on a non-`Option<T>`
+///   field (rarely needed; `Option<T>` is the usual spelling)
 ///
 /// # Struct attributes
 ///
@@ -293,8 +310,11 @@ fn doc_slice(lines: &[String]) -> TokenStream2 {
 
 /// Classification of a Rust field type into the schema shape it produces.
 enum TypeShape {
-    /// Plain scalar leaf with the given leaf-type token expression.
-    Scalar(TokenStream2),
+    /// Plain scalar leaf — carries both the emit-time token expression and
+    /// the compile-time `ScalarKind` discriminant. The kind lets attribute
+    /// validators (e.g. `#[clapfig(allowed = [...])]`) check that each
+    /// allowed literal's TOML type matches the field's scalar kind.
+    Scalar(ScalarKind, TokenStream2),
     /// `Option<T>` where T is itself a TypeShape; the inner shape is folded
     /// and `optional` is set.
     Optional(Box<TypeShape>),
@@ -304,6 +324,30 @@ enum TypeShape {
     Nested(TokenStream2),
     /// `toml::Value` — emits `LeafType::Value`.
     Value,
+}
+
+/// Compile-time-discriminant mirror of the scalar `LeafTypeStatic` variants.
+/// Used to validate that `#[clapfig(allowed = [...])]` literals match the
+/// field's inferred type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScalarKind {
+    String,
+    Integer,
+    Float,
+    Bool,
+    DateTime,
+}
+
+impl ScalarKind {
+    fn human(self) -> &'static str {
+        match self {
+            ScalarKind::String => "String",
+            ScalarKind::Integer => "Integer",
+            ScalarKind::Float => "Float",
+            ScalarKind::Bool => "Bool",
+            ScalarKind::DateTime => "DateTime",
+        }
+    }
 }
 
 fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
@@ -341,7 +385,7 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
         // resolution).
         let inner_shape = classify_type(inner)?;
         return match inner_shape {
-            TypeShape::Scalar(tok) => Ok(TypeShape::Array(tok)),
+            TypeShape::Scalar(_, tok) => Ok(TypeShape::Array(tok)),
             TypeShape::Optional(_) => Err(syn::Error::new(
                 inner.span(),
                 "Vec<Option<T>> is not supported; use Option<Vec<T>> instead",
@@ -368,6 +412,7 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
     }
     if name == "Datetime" && is_toml_datetime_path(path) {
         return Ok(TypeShape::Scalar(
+            ScalarKind::DateTime,
             quote! { ::clapfig::static_schema::LeafTypeStatic::DateTime },
         ));
     }
@@ -388,19 +433,29 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
         ));
     }
     let scalar = match name.as_str() {
-        "String" => Some(quote! { ::clapfig::static_schema::LeafTypeStatic::String }),
-        "bool" => Some(quote! { ::clapfig::static_schema::LeafTypeStatic::Bool }),
+        "String" => Some((
+            ScalarKind::String,
+            quote! { ::clapfig::static_schema::LeafTypeStatic::String },
+        )),
+        "bool" => Some((
+            ScalarKind::Bool,
+            quote! { ::clapfig::static_schema::LeafTypeStatic::Bool },
+        )),
         // Every Rust integer maps to TOML's single Integer width.
         // `u64` / `usize` / `isize` values that exceed `i64::MAX` cannot be
         // represented in TOML; documented on `LeafTypeStatic::Integer`.
-        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
-            Some(quote! { ::clapfig::static_schema::LeafTypeStatic::Integer })
-        }
-        "f32" | "f64" => Some(quote! { ::clapfig::static_schema::LeafTypeStatic::Float }),
+        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => Some((
+            ScalarKind::Integer,
+            quote! { ::clapfig::static_schema::LeafTypeStatic::Integer },
+        )),
+        "f32" | "f64" => Some((
+            ScalarKind::Float,
+            quote! { ::clapfig::static_schema::LeafTypeStatic::Float },
+        )),
         _ => None,
     };
-    if let Some(tok) = scalar {
-        return Ok(TypeShape::Scalar(tok));
+    if let Some((kind, tok)) = scalar {
+        return Ok(TypeShape::Scalar(kind, tok));
     }
 
     // Default: treat as a nested struct that also implements clapfig::Schema.
@@ -572,9 +627,24 @@ fn leaf_type_for_shape(
                  nested structs, or `#[clapfig(value)]` fields.",
             ));
         }
+        // An empty allowed set produces a leaf that can never be satisfied
+        // (no value passes the enum check) and a JSON Schema with no
+        // `type` (since `leaf_type_json_name` for Enum reads the first
+        // allowed value). Refuse to emit it.
+        if allowed.is_empty() {
+            return Err(syn::Error::new(
+                span,
+                "`#[clapfig(allowed = [...])]` requires at least one value; \
+                 an empty set produces a leaf that can never validate.",
+            ));
+        }
+        // The field's scalar kind drives literal-type validation: an
+        // integer field with `allowed = [\"a\"]` would emit a schema and
+        // deserialize that can never agree.
+        let kind = scalar_kind_of(shape).expect("scalar shape after shape_accepts_allowed");
         let value_statics = allowed
             .iter()
-            .map(value_static_from_expr)
+            .map(|e| value_static_from_expr_with_kind(e, kind))
             .collect::<syn::Result<Vec<_>>>()?;
         let (_, optional_from_type) = inner_leaf_type(shape)?;
         return Ok((
@@ -594,7 +664,7 @@ fn leaf_type_for_shape(
 /// on a Vec field, etc.).
 fn shape_accepts_allowed(shape: &TypeShape) -> bool {
     match shape {
-        TypeShape::Scalar(_) => true,
+        TypeShape::Scalar(_, _) => true,
         TypeShape::Optional(inner) => shape_accepts_allowed(inner),
         TypeShape::Array(_) | TypeShape::Value | TypeShape::Nested(_) => false,
     }
@@ -604,16 +674,12 @@ fn shape_accepts_allowed(shape: &TypeShape) -> bool {
 /// (or `Option<DateTime>`). Used to route string-literal defaults to
 /// `ValueStatic::Datetime` instead of `ValueStatic::String`.
 fn is_datetime_shape(shape: &TypeShape) -> bool {
-    match shape {
-        TypeShape::Scalar(tok) => tok.to_string().contains("DateTime"),
-        TypeShape::Optional(inner) => is_datetime_shape(inner),
-        _ => false,
-    }
+    matches!(scalar_kind_of(shape), Some(ScalarKind::DateTime))
 }
 
 fn inner_leaf_type(shape: &TypeShape) -> syn::Result<(TokenStream2, bool)> {
     match shape {
-        TypeShape::Scalar(tok) => Ok((tok.clone(), false)),
+        TypeShape::Scalar(_, tok) => Ok((tok.clone(), false)),
         TypeShape::Optional(inner) => {
             let (inner_tok, _) = inner_leaf_type(inner)?;
             Ok((inner_tok, true))
@@ -630,14 +696,110 @@ fn inner_leaf_type(shape: &TypeShape) -> syn::Result<(TokenStream2, bool)> {
     }
 }
 
-fn value_static_from_expr(expr: &Expr) -> syn::Result<TokenStream2> {
-    if let Expr::Lit(ExprLit { lit, .. }) = expr {
-        return lit_to_value_static(lit, expr.span());
+/// Extract the scalar kind from a (possibly `Option`-wrapped) scalar shape.
+/// Returns `None` for non-scalar shapes — used by `allowed`-attribute
+/// validation to check that literal types match the field's TOML kind.
+fn scalar_kind_of(shape: &TypeShape) -> Option<ScalarKind> {
+    match shape {
+        TypeShape::Scalar(k, _) => Some(*k),
+        TypeShape::Optional(inner) => scalar_kind_of(inner),
+        _ => None,
     }
-    Err(syn::Error::new(
-        expr.span(),
-        "`allowed = [...]` entries must be literal TOML primitives (string, integer, float, bool)",
-    ))
+}
+
+/// Parse a literal-or-negated-literal expression into a `ValueStatic`
+/// token, without kind validation. Used inside array-literal defaults
+/// where the element type is already constrained by the field's `Vec<T>`
+/// declaration (the per-element kind check is done by the toml
+/// deserializer at load time, not here).
+fn value_static_from_expr(expr: &Expr) -> syn::Result<TokenStream2> {
+    match expr {
+        Expr::Lit(ExprLit { lit, .. }) => lit_to_value_static(lit, expr.span()),
+        Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr: inner,
+            ..
+        }) => {
+            if let Expr::Lit(ExprLit { lit, .. }) = inner.as_ref() {
+                negated_lit_to_value_static(lit, expr.span())
+            } else {
+                Err(syn::Error::new(
+                    expr.span(),
+                    "literal-array entries must be literal TOML primitives",
+                ))
+            }
+        }
+        _ => Err(syn::Error::new(
+            expr.span(),
+            "literal-array entries must be literal TOML primitives \
+             (string, integer, float, bool)",
+        )),
+    }
+}
+
+/// Parse an `allowed = [...]` entry against the field's scalar kind.
+///
+/// Accepts positive literals (`"x"`, `1`, `1.5`, `true`) and unary-negated
+/// numeric literals (`-1`, `-1.5`). Rejects literals whose TOML primitive
+/// type doesn't match the field — e.g. `allowed = ["a"]` on an `i64` field
+/// — so the emitted schema is consistent with what the deserializer can
+/// accept.
+fn value_static_from_expr_with_kind(expr: &Expr, kind: ScalarKind) -> syn::Result<TokenStream2> {
+    let (tok, literal_kind) = match expr {
+        Expr::Lit(ExprLit { lit, .. }) => (
+            lit_to_value_static(lit, expr.span())?,
+            lit_to_scalar_kind(lit, expr.span())?,
+        ),
+        Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr: inner,
+            ..
+        }) => {
+            if let Expr::Lit(ExprLit { lit, .. }) = inner.as_ref() {
+                (
+                    negated_lit_to_value_static(lit, expr.span())?,
+                    lit_to_scalar_kind(lit, expr.span())?,
+                )
+            } else {
+                return Err(syn::Error::new(
+                    expr.span(),
+                    "`allowed = [...]` entries must be literal TOML primitives",
+                ));
+            }
+        }
+        _ => {
+            return Err(syn::Error::new(
+                expr.span(),
+                "`allowed = [...]` entries must be literal TOML primitives \
+                 (string, integer, float, bool)",
+            ));
+        }
+    };
+    if literal_kind != kind {
+        return Err(syn::Error::new(
+            expr.span(),
+            format!(
+                "`allowed = [...]` entry has type `{}` but the field is `{}`; \
+                 enum-constraint literals must match the field's TOML type.",
+                literal_kind.human(),
+                kind.human()
+            ),
+        ));
+    }
+    Ok(tok)
+}
+
+fn lit_to_scalar_kind(lit: &Lit, span: proc_macro2::Span) -> syn::Result<ScalarKind> {
+    match lit {
+        Lit::Str(_) => Ok(ScalarKind::String),
+        Lit::Bool(_) => Ok(ScalarKind::Bool),
+        Lit::Int(_) => Ok(ScalarKind::Integer),
+        Lit::Float(_) => Ok(ScalarKind::Float),
+        _ => Err(syn::Error::new(
+            span,
+            "literal must be a string, integer, float, or bool",
+        )),
+    }
 }
 
 /// Materialize a `ValueStatic` for a `#[clapfig(default = ...)]` expression.
@@ -740,8 +902,23 @@ fn lit_to_value_static(lit: &Lit, span: proc_macro2::Span) -> syn::Result<TokenS
 fn negated_lit_to_value_static(lit: &Lit, span: proc_macro2::Span) -> syn::Result<TokenStream2> {
     match lit {
         Lit::Int(i) => {
-            let v: i64 = i.base10_parse().map_err(|e| syn::Error::new(span, e))?;
-            let neg = -v;
+            // Parse the magnitude as `u64`, then negate through `i128`
+            // before fitting back into `i64`. Required for `i64::MIN`:
+            // the user writes `-9223372036854775808` and the inner token
+            // is the positive `9223372036854775808`, which overflows
+            // `i64::MAX` (the lexer doesn't know the unary `-` is part
+            // of the value). `u64` holds it, and `-(value as i128)`
+            // exactly equals `i64::MIN` for that input.
+            let raw: u64 = i
+                .base10_parse()
+                .map_err(|e| syn::Error::new(span, format!("integer literal: {e}")))?;
+            let neg_i128 = -(raw as i128);
+            let neg: i64 = i64::try_from(neg_i128).map_err(|_| {
+                syn::Error::new(
+                    span,
+                    "negated integer literal exceeds the i64 range (TOML's integer width)",
+                )
+            })?;
             Ok(quote! { ::clapfig::static_schema::ValueStatic::Integer(#neg) })
         }
         Lit::Float(f) => {
