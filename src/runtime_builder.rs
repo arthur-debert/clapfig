@@ -536,6 +536,17 @@ impl RuntimeResolver {
         }
     }
 
+    /// Number of files currently held in the resolver's cache. Intended for
+    /// tests and diagnostics; production code should not branch on this.
+    /// Parallel to [`Resolver::cache_size`](crate::Resolver::cache_size).
+    #[doc(hidden)]
+    pub fn cache_size(&self) -> usize {
+        self.file_cache
+            .lock()
+            .expect("file_cache mutex poisoned")
+            .len()
+    }
+
     fn read_cached(&self, path: &std::path::Path) -> Result<Option<String>, ClapfigError> {
         {
             let cache = self.file_cache.lock().expect("file_cache mutex poisoned");
@@ -1291,6 +1302,84 @@ mod tests {
                 .iter()
                 .any(|k| k.contains("acme.task-due-date-missing")),
             "dotted extension key must be accepted: {names:?}"
+        );
+    }
+
+    // --- RuntimeResolver cache behavior (parity with Resolver<C> tests) ---
+
+    fn resolver_with_path(dir: &std::path::Path) -> RuntimeResolver {
+        Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.to_path_buf())])
+            .no_env()
+            .build_resolver()
+            .unwrap()
+    }
+
+    #[test]
+    fn cache_populates_on_first_read() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "port = 3000\n").unwrap();
+        let resolver = resolver_with_path(dir.path());
+        assert_eq!(resolver.cache_size(), 0);
+        resolver.resolve_at(dir.path()).unwrap();
+        assert_eq!(resolver.cache_size(), 1);
+    }
+
+    #[test]
+    fn cache_hit_on_second_read_of_same_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("demo.toml");
+        fs::write(&path, "port = 3000\n").unwrap();
+        let resolver = resolver_with_path(dir.path());
+
+        let table1 = resolver.resolve_at(dir.path()).unwrap();
+        assert_eq!(table1.get("port"), Some(&Value::Integer(3000)));
+        assert_eq!(resolver.cache_size(), 1);
+
+        // Rewrite the file on disk. If the cache is honored, the second
+        // resolve returns the ORIGINAL value, not the new one — the
+        // contract is "no mtime check; build a new resolver for
+        // freshness," same as the static Resolver<C>.
+        fs::write(&path, "port = 9999\n").unwrap();
+        let table2 = resolver.resolve_at(dir.path()).unwrap();
+        assert_eq!(
+            table2.get("port"),
+            Some(&Value::Integer(3000)),
+            "cache should mask on-disk changes"
+        );
+        assert_eq!(resolver.cache_size(), 1, "no new cache entry");
+    }
+
+    #[test]
+    fn cache_shared_ancestor_across_resolves_dedups() {
+        use crate::types::Boundary;
+        let root = TempDir::new().unwrap();
+        let a_leaf = root.path().join("a");
+        let b_leaf = root.path().join("b");
+        fs::create_dir_all(&a_leaf).unwrap();
+        fs::create_dir_all(&b_leaf).unwrap();
+        // Only the shared root file exists.
+        fs::write(root.path().join("demo.toml"), "port = 7777\n").unwrap();
+
+        let resolver = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Ancestors(Boundary::Root)])
+            .no_env()
+            .build_resolver()
+            .unwrap();
+
+        resolver.resolve_at(&a_leaf).unwrap();
+        let cache_after_a = resolver.cache_size();
+        resolver.resolve_at(&b_leaf).unwrap();
+        let cache_after_b = resolver.cache_size();
+
+        assert!(cache_after_a >= 1);
+        assert_eq!(
+            cache_after_b, cache_after_a,
+            "shared ancestor file should be deduplicated in cache"
         );
     }
 }
