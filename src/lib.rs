@@ -489,6 +489,7 @@ mod resolver;
 mod runtime_builder;
 mod runtime_spec;
 mod spec;
+mod strict;
 #[cfg(feature = "url")]
 mod url;
 mod validate;
@@ -504,4 +505,5 @@ pub use error::{ClapfigError, UnknownKeyInfo};
 pub use ops::ConfigResult;
 pub use resolver::Resolver;
 pub use runtime_builder::{RuntimeBuilder, RuntimeResolver};
+pub use strict::{UnknownKeyContext, UnknownKeyDecision};
 pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};

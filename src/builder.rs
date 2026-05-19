@@ -67,6 +67,53 @@ impl Clapfig {
 /// See [`ClapfigBuilder::post_validate`] for how it is invoked.
 pub(crate) type PostValidateHook<C> = Box<dyn Fn(&C) -> Result<(), String> + Send + Sync>;
 
+/// Validate a list of `(path, strict)` overrides against a schema and
+/// collect them into a [`StrictnessOverrides`]. Shared between the static
+/// and runtime builders so both paths apply identical typo-protection
+/// rules to `strict_at` arguments.
+///
+/// Errors as [`ClapfigError::InvalidStrictPath`] when:
+///
+/// - the path does not resolve to any field in the schema, or
+/// - the path resolves to a leaf field (strict is a container property).
+///
+/// When `normalize_keys` is `true`, each path is rewritten through
+/// `normalize::normalize_key` before lookup so the override accepts the
+/// same kebab/snake spellings the rest of the pipeline does.
+pub(crate) fn build_strict_overrides(
+    entries: &[(String, bool)],
+    normalize_keys: bool,
+    schema: crate::spec::SchemaRef<'_>,
+) -> Result<crate::strict::StrictnessOverrides, ClapfigError> {
+    use crate::strict::{PathKind, StrictnessOverrides, resolve_path_kind};
+
+    let mut out = StrictnessOverrides::from_schema(schema);
+    for (raw_path, strict) in entries {
+        let path = if normalize_keys {
+            crate::normalize::normalize_key(raw_path)
+        } else {
+            raw_path.clone()
+        };
+        match resolve_path_kind(schema, &path) {
+            PathKind::Section => out.insert(path, *strict),
+            PathKind::Leaf => {
+                return Err(ClapfigError::InvalidStrictPath {
+                    path: raw_path.clone(),
+                    reason: "path resolves to a leaf field, but strict is a section property"
+                        .into(),
+                });
+            }
+            PathKind::Unknown => {
+                return Err(ClapfigError::InvalidStrictPath {
+                    path: raw_path.clone(),
+                    reason: "path does not resolve to any field in the config schema".into(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Builder for configuring and loading layered configuration.
 ///
 /// Controls three orthogonal axes (see [`types`](crate::types) for the full picture):
@@ -89,6 +136,19 @@ pub struct ClapfigBuilder<C: Config> {
     cli_overrides: Vec<(String, toml::Value)>,
     layer_order: Option<Vec<Layer>>,
     post_validate: Option<PostValidateHook<C>>,
+    /// Per-path strictness overrides registered via
+    /// [`strict_at`](Self::strict_at). Stored as `(path, strict)` tuples
+    /// rather than a `StrictnessOverrides` so `build_resolver` can
+    /// validate every path against the schema (and, when
+    /// `normalize_keys(true)` is set, run them through key normalization)
+    /// in one place.
+    strict_at_overrides: Vec<(String, bool)>,
+    /// Optional per-key callback registered via
+    /// [`on_unknown_key`](Self::on_unknown_key). The cascade rule decides
+    /// strict/lenient first; this hook only runs on cascade-strict keys
+    /// to let user code accept or reject them with a domain-specific
+    /// last word.
+    unknown_key_hook: Option<crate::strict::UnknownKeyHook>,
     _phantom: PhantomData<C>,
 }
 
@@ -109,6 +169,8 @@ impl<C: Config> ClapfigBuilder<C> {
             cli_overrides: Vec::new(),
             layer_order: None,
             post_validate: None,
+            strict_at_overrides: Vec::new(),
+            unknown_key_hook: None,
             _phantom: PhantomData,
         }
     }
@@ -188,9 +250,74 @@ impl<C: Config> ClapfigBuilder<C> {
     }
 
     /// Enable or disable strict mode (default: `true`).
-    /// In strict mode, unknown keys in config files produce errors.
+    ///
+    /// This is the **whole-resolution default** in the strictness cascade
+    /// — it applies to any unknown key whose ancestors don't carry an
+    /// explicit [`strict_at`](Self::strict_at) override. Strict-mode
+    /// behavior in the absence of overrides is identical to pre-Phase-3:
+    /// any unknown key produces a `ClapfigError::UnknownKeys` error.
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Set per-section strictness for the dotted path `path`.
+    ///
+    /// Path-aware variant of [`strict`](Self::strict). The override applies
+    /// to every descendant of `path` that doesn't itself set strictness —
+    /// the same cascade rule used for runtime
+    /// [`Schema::strict`](crate::runtime::Schema::strict).
+    ///
+    /// Common use case: typo protection on the typed part of a config plus
+    /// a lenient subtree where third-party plugin keys land.
+    ///
+    /// ```ignore
+    /// Clapfig::builder::<AppConfig>()
+    ///     .strict(true)                            // global default
+    ///     .strict_at("plugins", false)             // entire plugins.* subtree lenient
+    ///     .strict_at("plugins.audit", true)        // re-tighten one branch
+    ///     .load()?;
+    /// ```
+    ///
+    /// `path` must resolve to a nested-section in `C`'s schema; targeting
+    /// a leaf or an unknown field produces
+    /// [`ClapfigError::InvalidStrictPath`] from `build_resolver`. When
+    /// [`normalize_keys(true)`](Self::normalize_keys) is set, `path` may
+    /// be written in kebab-case — it is normalized before lookup.
+    ///
+    /// An empty `path` ( `""` ) targets the root, equivalent to
+    /// [`strict(bool)`](Self::strict) but lets you still register
+    /// per-subtree overrides.
+    pub fn strict_at(mut self, path: &str, strict: bool) -> Self {
+        self.strict_at_overrides.push((path.to_string(), strict));
+        self
+    }
+
+    /// Register a per-key callback that runs on cascade-rejected unknown keys.
+    ///
+    /// The cascade rule decides strict/lenient first. If lenient, the key
+    /// drops silently and the callback never runs. If strict and a
+    /// callback is registered, the callback receives an
+    /// [`UnknownKeyContext`](crate::UnknownKeyContext) carrying the
+    /// dotted path, the leaf segment, the parsed value, the source file,
+    /// and the line number — enough to apply a domain-specific decision.
+    /// Returning [`UnknownKeyDecision::Accept`](crate::UnknownKeyDecision::Accept)
+    /// drops the key silently; [`Reject`](crate::UnknownKeyDecision::Reject)
+    /// produces a `ClapfigError::UnknownKeys` entry (same as no callback).
+    ///
+    /// Callers that don't register a callback see no behavior change —
+    /// strict cascade-rejected keys still produce the standard error.
+    ///
+    /// Composes naturally with the cascade for cases where typed fields
+    /// and a `#[serde(flatten)] BTreeMap` catch-all share a struct level:
+    /// the cascade alone can't distinguish them (they're siblings), but
+    /// the callback can — e.g. "leaf contains a `.` → accept (it's an
+    /// extension-emitted dotted key), otherwise reject (it's a typo)."
+    pub fn on_unknown_key<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&crate::UnknownKeyContext<'_>) -> crate::UnknownKeyDecision + Send + Sync + 'static,
+    {
+        self.unknown_key_hook = Some(std::sync::Arc::new(callback));
         self
     }
 
@@ -411,6 +538,17 @@ impl<C: Config> ClapfigBuilder<C> {
         let search_paths = self.effective_search_paths();
         let env_prefix = self.effective_env_prefix()?;
 
+        // Validate strict_at paths against the static schema before we
+        // build the resolver — typo protection on the override itself.
+        // Honor `normalize_keys(true)` by rewriting `-` → `_` on the
+        // override path before lookup, matching how keys in the config
+        // tree are compared.
+        let strict_overrides = build_strict_overrides(
+            &self.strict_at_overrides,
+            self.normalize_keys,
+            crate::spec::SchemaRef::from_meta(&C::META),
+        )?;
+
         Ok(Resolver::from_builder(
             app_name,
             file_name,
@@ -418,6 +556,8 @@ impl<C: Config> ClapfigBuilder<C> {
             self.search_mode,
             env_prefix,
             self.strict,
+            strict_overrides,
+            self.unknown_key_hook,
             self.normalize_keys,
             #[cfg(feature = "url")]
             self.url_overrides,
@@ -1818,5 +1958,208 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.port, 9999);
+    }
+
+    // --- Phase 3 cascading strictness (#37) ---
+
+    use crate::{UnknownKeyContext, UnknownKeyDecision};
+
+    #[test]
+    fn strict_at_lenient_subtree_drops_unknown_keys() {
+        // strict(true) globally, but strict_at("database", false) makes
+        // the nested subtree accept any unknown key.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("test.toml"),
+            "host = \"x\"\n[database]\nurl = \"pg://\"\nplugin_specific = 1\n",
+        )
+        .unwrap();
+
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .strict_at("database", false)
+            .load()
+            .unwrap();
+        assert_eq!(config.host, "x");
+        assert_eq!(config.database.url.as_deref(), Some("pg://"));
+    }
+
+    #[test]
+    fn strict_at_top_level_unknown_still_rejected() {
+        // strict_at("database", false) must NOT make sibling top-level
+        // unknown keys lenient.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "rogue_key = 1\n").unwrap();
+        let result: Result<TestConfig, _> = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .strict_at("database", false)
+            .load();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_at_invalid_path_errors_at_build_resolver() {
+        // Path that doesn't resolve to a section. `Resolver<C>` doesn't
+        // impl `Debug` so we map the Ok variant to a sentinel error
+        // before pattern-matching.
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .strict_at("nonexistent.section", false)
+            .build_resolver()
+            .err();
+        match result {
+            Some(ClapfigError::InvalidStrictPath { path, .. }) => {
+                assert_eq!(path, "nonexistent.section");
+            }
+            other => panic!("expected InvalidStrictPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_at_leaf_path_errors_at_build_resolver() {
+        // host is a leaf, not a section.
+        let result = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .strict_at("host", false)
+            .build_resolver()
+            .err();
+        match result {
+            Some(ClapfigError::InvalidStrictPath { path, reason }) => {
+                assert_eq!(path, "host");
+                assert!(reason.contains("leaf"));
+            }
+            other => panic!("expected InvalidStrictPath(leaf), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_at_honors_normalize_keys_kebab_path() {
+        // Path uses kebab; database is a real section under TestConfig.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("test.toml"),
+            "[database]\nurl = \"pg://\"\nplugin = 1\n",
+        )
+        .unwrap();
+        // No kebab fields needed here; we just confirm that the kebab path
+        // `data-base` doesn't exist and DOES exist under normalize_keys.
+        let err = Clapfig::builder::<TestConfig>()
+            .app_name("test")
+            .normalize_keys(true)
+            .strict_at("data-base", false) // wrong: no `data-base` field
+            .build_resolver()
+            .err();
+        // Note: `data-base` normalizes to `data_base`, still not a real
+        // field — confirms normalization runs before lookup.
+        assert!(matches!(err, Some(ClapfigError::InvalidStrictPath { .. })));
+    }
+
+    #[test]
+    fn on_unknown_key_accept_drops_silently() {
+        // strict default rejects; callback Accepts → key drops, no error.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "rogue_key = 1\nport = 3000\n").unwrap();
+        let config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .on_unknown_key(|_| UnknownKeyDecision::Accept)
+            .load()
+            .unwrap();
+        assert_eq!(config.port, 3000);
+    }
+
+    #[test]
+    fn on_unknown_key_reject_errors() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "rogue_key = 1\n").unwrap();
+        let result: Result<TestConfig, _> = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .on_unknown_key(|_| UnknownKeyDecision::Reject)
+            .load();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn on_unknown_key_context_carries_path_leaf_value_line() {
+        // The callback must see path, leaf, value, file, and line.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("test.toml"),
+            "port = 3000\n# pad\nbogus = 42\n",
+        )
+        .unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(
+            None::<(String, String, i64, Option<usize>)>,
+        ));
+        let seen_clone = std::sync::Arc::clone(&seen);
+        let _result: Result<TestConfig, _> = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .on_unknown_key(move |ctx: &UnknownKeyContext<'_>| {
+                if let Some(i) = ctx.value.as_integer() {
+                    *seen_clone.lock().unwrap() =
+                        Some((ctx.path.into(), ctx.leaf.into(), i, ctx.line));
+                }
+                UnknownKeyDecision::Accept
+            })
+            .load();
+        let captured = seen.lock().unwrap().clone();
+        match captured {
+            Some((path, leaf, value, line)) => {
+                assert_eq!(path, "bogus");
+                assert_eq!(leaf, "bogus");
+                assert_eq!(value, 42);
+                assert_eq!(line, Some(3));
+            }
+            None => panic!("callback never received the unknown key"),
+        }
+    }
+
+    #[test]
+    fn on_unknown_key_not_called_on_cascade_accepted_keys() {
+        // strict_at("database", false) → unknown nested key drops without
+        // the callback ever seeing it.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("test.toml"),
+            "[database]\nurl = \"pg://\"\nlenient_typo = 1\n",
+        )
+        .unwrap();
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = std::sync::Arc::clone(&called);
+        let _config: TestConfig = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .strict_at("database", false)
+            .on_unknown_key(move |_| {
+                called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                UnknownKeyDecision::Reject
+            })
+            .load()
+            .unwrap();
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "callback must not run for cascade-accepted keys"
+        );
     }
 }

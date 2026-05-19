@@ -27,6 +27,7 @@ use crate::resolve::{self, ResolveInput};
 use crate::runtime::Schema;
 use crate::runtime_spec::DynamicSpec;
 use crate::spec::SchemaRef;
+use crate::strict::{StrictnessOverrides, UnknownKeyHook};
 use crate::types::{ConfigAction, Layer, SearchMode, SearchPath};
 
 /// Post-merge validation hook for the runtime path: receives the merged
@@ -54,6 +55,8 @@ pub struct RuntimeBuilder {
     cli_overrides: Vec<(String, Value)>,
     layer_order: Option<Vec<Layer>>,
     post_validate: Option<RuntimePostValidateHook>,
+    strict_at_overrides: Vec<(String, bool)>,
+    unknown_key_hook: Option<UnknownKeyHook>,
 }
 
 impl RuntimeBuilder {
@@ -74,6 +77,8 @@ impl RuntimeBuilder {
             cli_overrides: Vec::new(),
             layer_order: None,
             post_validate: None,
+            strict_at_overrides: Vec::new(),
+            unknown_key_hook: None,
         }
     }
 
@@ -121,6 +126,26 @@ impl RuntimeBuilder {
 
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Set per-section strictness for the dotted path `path`. See
+    /// [`ClapfigBuilder::strict_at`](crate::ClapfigBuilder::strict_at) for
+    /// the full cascade semantics — same rule, validated against the
+    /// runtime schema instead of `C::META`.
+    pub fn strict_at(mut self, path: &str, strict: bool) -> Self {
+        self.strict_at_overrides.push((path.to_string(), strict));
+        self
+    }
+
+    /// Register a per-key callback for cascade-rejected unknown keys. See
+    /// [`ClapfigBuilder::on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
+    /// for the full decision chain.
+    pub fn on_unknown_key<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&crate::UnknownKeyContext<'_>) -> crate::UnknownKeyDecision + Send + Sync + 'static,
+    {
+        self.unknown_key_hook = Some(std::sync::Arc::new(callback));
         self
     }
 
@@ -225,6 +250,16 @@ impl RuntimeBuilder {
             Vec::new()
         };
 
+        // Validate `strict_at` paths against the runtime schema and merge
+        // with the schema's own per-node `strict` settings into a single
+        // cascade map. `build_strict_overrides` lives in `builder` so the
+        // static and runtime paths share identical typo-protection rules.
+        let strict_overrides = crate::builder::build_strict_overrides(
+            &self.strict_at_overrides,
+            self.normalize_keys,
+            SchemaRef::from_dynamic(&self.spec.schema),
+        )?;
+
         Ok(RuntimeResolver {
             spec: self.spec,
             app_name,
@@ -233,7 +268,9 @@ impl RuntimeBuilder {
             search_mode: self.search_mode,
             env_prefix,
             env_vars,
-            strict: self.strict,
+            strict_default: self.strict,
+            strict_overrides,
+            unknown_key_hook: self.unknown_key_hook,
             normalize_keys: self.normalize_keys,
             #[cfg(feature = "url")]
             url_overrides: self.url_overrides,
@@ -373,7 +410,9 @@ pub struct RuntimeResolver {
     search_mode: SearchMode,
     env_prefix: Option<String>,
     env_vars: Vec<(String, String)>,
-    strict: bool,
+    strict_default: bool,
+    strict_overrides: StrictnessOverrides,
+    unknown_key_hook: Option<UnknownKeyHook>,
     normalize_keys: bool,
     #[cfg(feature = "url")]
     url_overrides: Vec<(String, Value)>,
@@ -415,7 +454,9 @@ impl RuntimeResolver {
             #[cfg(feature = "url")]
             url_overrides: self.url_overrides.clone(),
             cli_overrides: self.cli_overrides.clone(),
-            strict: self.strict,
+            strict_default: self.strict_default,
+            strict_overrides: self.strict_overrides.clone(),
+            unknown_key_hook: self.unknown_key_hook.clone(),
             normalize_keys: self.normalize_keys,
             layer_order: self.layer_order.clone(),
         };
@@ -1037,5 +1078,175 @@ mod tests {
         assert_eq!(table.get("port"), Some(&Value::Integer(4242)));
         // `verbose` was silently ignored — not in schema.
         assert!(table.get("verbose").is_none());
+    }
+
+    // --- Phase 3 cascading strictness (#37) ---
+
+    use crate::{UnknownKeyContext, UnknownKeyDecision};
+
+    fn three_level_schema() -> Schema {
+        // Top -> mid -> deep, each a nested section. Used for the
+        // 3-level-cascade tests.
+        Schema::object("Top")
+            .field("name", RtField::string().default("x"))
+            .nested(
+                "mid",
+                Schema::object("Mid")
+                    .field("m_field", RtField::string().default("mv"))
+                    .nested(
+                        "deep",
+                        Schema::object("Deep").field("d_field", RtField::string().default("dv")),
+                    ),
+            )
+            .build()
+    }
+
+    #[test]
+    fn schema_strict_cascade_through_three_levels() {
+        // Top: strict false (the runtime equivalent of strict_at("", false))
+        // mid + deep inherit lenient. Unknown key 4 levels deep drops.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "[mid.deep]\nrogue = 1\n").unwrap();
+        let mut schema = three_level_schema();
+        schema.strict = Some(false);
+        let table = Clapfig::runtime(schema)
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap();
+        // Unknown key dropped silently; the merged table mirrors what was
+        // in the file.
+        assert!(
+            table
+                .get("mid")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("deep"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn descendant_can_re_tighten_subtree() {
+        // mid is lenient, mid.deep re-tightens — rogue at mid drops, rogue
+        // at mid.deep errors.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[mid]\nm_field = \"v\"\nmid_rogue = 1\n[mid.deep]\nd_field = \"v\"\ndeep_rogue = 1\n",
+        )
+        .unwrap();
+        let schema = Schema::object("Top")
+            .field("name", RtField::string().default("x"))
+            .nested(
+                "mid",
+                Schema::object("Mid")
+                    .strict(false)
+                    .field("m_field", RtField::string().default("v"))
+                    .nested(
+                        "deep",
+                        Schema::object("Deep")
+                            .strict(true)
+                            .field("d_field", RtField::string().default("v")),
+                    ),
+            )
+            .build();
+        let result = Clapfig::runtime(schema)
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load();
+        let err = result.unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        let names: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
+        assert!(
+            names.contains(&"mid.deep.deep_rogue"),
+            "deep_rogue should be rejected: {names:?}"
+        );
+        assert!(
+            !names.contains(&"mid.mid_rogue"),
+            "mid_rogue should be lenient under strict(false): {names:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_strict_at_overlays_schema_strict() {
+        // Schema sets mid strict=false; builder strict_at("mid", true)
+        // overrides. Result: mid rogue is rejected.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[mid]\nm_field = \"v\"\nrogue = 1\n",
+        )
+        .unwrap();
+        let schema = Schema::object("Top")
+            .field("name", RtField::string().default("x"))
+            .nested(
+                "mid",
+                Schema::object("Mid")
+                    .strict(false)
+                    .field("m_field", RtField::string().default("v")),
+            )
+            .build();
+        let result = Clapfig::runtime(schema)
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict_at("mid", true) // overlay re-tightens
+            .load();
+        let err = result.unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "mid.rogue");
+    }
+
+    #[test]
+    fn runtime_lex_fmt_style_sibling_callback() {
+        // The use-case from the proposal: typed fields and a free-form
+        // catch-all share a struct level. The cascade alone can't
+        // distinguish them; the callback applies a domain-specific rule
+        // (here: "leaf contains a `.` → accept, else reject").
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[diagnostics.rules]\nmissing_footote = \"warn\"\n\"acme.task-due-date-missing\" = \"error\"\n",
+        )
+        .unwrap();
+        let schema = Schema::object("Cfg")
+            .nested(
+                "diagnostics",
+                Schema::object("Diag").nested("rules", Schema::object("Rules")), // empty rules: any key is unknown
+            )
+            .build();
+        let result = Clapfig::runtime(schema)
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .on_unknown_key(|c: &UnknownKeyContext<'_>| {
+                if c.path.starts_with("diagnostics.rules.") && c.leaf.contains('.') {
+                    UnknownKeyDecision::Accept
+                } else {
+                    UnknownKeyDecision::Reject
+                }
+            })
+            .load();
+        let err = result.unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        let names: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
+        assert!(
+            names.iter().any(|k| k.contains("missing_footote")),
+            "bare typo must be rejected: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|k| k.contains("acme.task-due-date-missing")),
+            "dotted extension key must be accepted: {names:?}"
+        );
     }
 }

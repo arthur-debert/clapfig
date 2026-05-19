@@ -144,6 +144,13 @@ pub enum ClapfigError {
     /// `ConfigError` instead).
     #[error("Missing required key: {key}")]
     MissingRequired { key: String },
+
+    /// A `strict_at` builder override targets a path that does not resolve
+    /// to a nested-section node in the config schema. Either the path does
+    /// not exist at all, or it targets a leaf (strict is a container
+    /// property, not a per-leaf one).
+    #[error("Invalid strict_at path '{path}': {reason}")]
+    InvalidStrictPath { path: String, reason: String },
 }
 
 impl ClapfigError {

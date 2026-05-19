@@ -20,13 +20,13 @@
 //! [`Schema`]: crate::runtime::Schema
 
 use std::path::Path;
-use std::sync::Arc;
 
 use toml::{Table, Value};
 
-use crate::error::{ClapfigError, UnknownKeyInfo};
+use crate::error::ClapfigError;
 use crate::runtime::{Field, LeafType, NamedField, Schema};
 use crate::spec::{ConfigSpec, SchemaRef};
+use crate::validate::{UnknownKey, ValidateContext, filter_through_cascade};
 
 /// Runtime-path adapter: drives the resolve pipeline from an owned
 /// user-supplied schema.
@@ -52,29 +52,11 @@ impl ConfigSpec for DynamicSpec {
         table: &Table,
         source: &str,
         path: &Path,
-        normalize_keys: bool,
+        ctx: &ValidateContext<'_>,
     ) -> Result<(), ClapfigError> {
-        let mut unknown: Vec<String> = Vec::new();
+        let mut unknown: Vec<UnknownKey> = Vec::new();
         collect_unknown_paths(table, &self.schema, "", &mut unknown);
-        if unknown.is_empty() {
-            return Ok(());
-        }
-
-        let source_arc: Arc<str> = Arc::from(source);
-        let infos: Vec<UnknownKeyInfo> = unknown
-            .into_iter()
-            .map(|key| {
-                let line = crate::validate::find_key_line_public(source, &key, normalize_keys);
-                UnknownKeyInfo {
-                    key,
-                    path: path.to_path_buf(),
-                    line,
-                    source: Some(Arc::clone(&source_arc)),
-                }
-            })
-            .collect();
-
-        Err(ClapfigError::UnknownKeys(infos))
+        filter_through_cascade(table, source, path, unknown, ctx)
     }
 
     fn fill_defaults(&self, table: &mut Table) -> Result<(), ClapfigError> {
@@ -94,7 +76,12 @@ impl ConfigSpec for DynamicSpec {
 /// For nested objects (`Field::Nested`) the recursion descends into the
 /// sub-table; for `Field::ArrayOf`, each entry is validated against the
 /// item schema.
-fn collect_unknown_paths(table: &Table, schema: &Schema, prefix: &str, unknown: &mut Vec<String>) {
+fn collect_unknown_paths(
+    table: &Table,
+    schema: &Schema,
+    prefix: &str,
+    unknown: &mut Vec<UnknownKey>,
+) {
     for (key, value) in table {
         let full = if prefix.is_empty() {
             key.clone()
@@ -102,7 +89,17 @@ fn collect_unknown_paths(table: &Table, schema: &Schema, prefix: &str, unknown: 
             format!("{prefix}.{key}")
         };
         match find_field(schema, key) {
-            None => unknown.push(full),
+            None => {
+                // Capture the raw TOML key as the leaf — preserves quoted-
+                // key semantics (`"acme.task-due-date-missing"` stays as a
+                // single literal) so an `on_unknown_key` callback can
+                // pattern-match on it (e.g. lex-fmt's "leaf contains a `.`
+                // → accept" rule).
+                unknown.push(UnknownKey {
+                    path: full,
+                    leaf: key.clone(),
+                });
+            }
             Some(NamedField {
                 field: Field::Leaf(_),
                 ..
@@ -303,6 +300,22 @@ mod tests {
         toml_text.parse().unwrap()
     }
 
+    /// Default validate context — strict on, no overrides, no callback.
+    /// Phase-3 trait method takes a `&ValidateContext<'_>`; tests reach
+    /// for the same defaults via this `'static` helper.
+    fn test_ctx() -> crate::validate::ValidateContext<'static> {
+        use crate::strict::StrictnessOverrides;
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<StrictnessOverrides> = OnceLock::new();
+        let overrides = EMPTY.get_or_init(StrictnessOverrides::new);
+        crate::validate::ValidateContext {
+            overrides,
+            default_strict: true,
+            callback: None,
+            normalize_keys: false,
+        }
+    }
+
     // --- validate_unknown ---
 
     #[test]
@@ -310,7 +323,7 @@ mod tests {
         let spec = DynamicSpec::new(test_schema());
         let table = parse("port = 1\nname = \"x\"\n");
         assert!(
-            spec.validate_unknown(&table, "", std::path::Path::new("test"), false)
+            spec.validate_unknown(&table, "", std::path::Path::new("test"), &test_ctx())
                 .is_ok()
         );
     }
@@ -321,7 +334,7 @@ mod tests {
         let source = "name = \"x\"\ntypo = 1\n";
         let table = parse(source);
         let err = spec
-            .validate_unknown(&table, source, std::path::Path::new("/t"), false)
+            .validate_unknown(&table, source, std::path::Path::new("/t"), &test_ctx())
             .unwrap_err();
         let keys = err.unknown_keys().expect("unknown keys");
         assert_eq!(keys.len(), 1);
@@ -335,7 +348,7 @@ mod tests {
         let source = "name = \"x\"\n[db]\ntypo = 1\n";
         let table = parse(source);
         let err = spec
-            .validate_unknown(&table, source, std::path::Path::new("/t"), false)
+            .validate_unknown(&table, source, std::path::Path::new("/t"), &test_ctx())
             .unwrap_err();
         let keys = err.unknown_keys().expect("unknown keys");
         assert_eq!(keys.len(), 1);
