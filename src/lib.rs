@@ -324,7 +324,9 @@
 //! The [`UnknownKeyContext`] carries the dotted path, the raw TOML leaf
 //! key (preserves quoted-key semantics — `"acme.task-due-date-missing"`
 //! stays as a single literal even though it contains dots), the parsed
-//! value, the source file, and the 1-indexed line number.
+//! value as `Option<&toml::Value>` (`None` in the rare case lookup can't
+//! resolve — out-of-bounds array index, path through a non-table
+//! intermediate), the source file, and the 1-indexed line number.
 //!
 //! ### Behavior compatibility note
 //!

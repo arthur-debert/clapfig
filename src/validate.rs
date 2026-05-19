@@ -174,10 +174,11 @@ pub(crate) fn filter_through_cascade(
 /// nested-table segments (descending into `Value::Array` entries when a
 /// segment carries a `[N]` index suffix), then fetch `leaf` directly.
 ///
-/// Returns `None` only when the lookup genuinely fails: a non-table
+/// Returns `None` when the lookup genuinely fails: a non-table
 /// intermediate, a missing key, or an out-of-bounds array index. The
-/// callback path treats `None` as "value unknown" and falls back to a
-/// stand-in null so the callback still runs.
+/// callback receives this `Option` directly through
+/// [`UnknownKeyContext::value`](crate::UnknownKeyContext::value) and can
+/// decide based on path/leaf/file/line when the value is unavailable.
 fn lookup_value<'a>(table: &'a Table, path: &str, leaf: &str) -> Option<&'a Value> {
     let section = crate::strict::section_path_of(path, leaf);
     if section.is_empty() {

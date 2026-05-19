@@ -75,7 +75,9 @@ Clapfig::builder::<AppConfig>()
 The callback runs **only on cascade-strict keys** — keys the cascade
 already decided are lenient never reach it. It receives an
 `UnknownKeyContext` with the dotted path, the raw TOML leaf key, the
-parsed value, the source file, and the 1-indexed line number, and
+parsed value as `Option<&toml::Value>` (`None` in the rare case lookup
+can't resolve — out-of-bounds array index, path through a non-table
+intermediate), the source file, and the 1-indexed line number, and
 returns `Accept` (drop silently) or `Reject` (the default — error as
 today).
 
