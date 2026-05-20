@@ -29,7 +29,12 @@ jobs:
     uses: arthur-debert/release/.github/workflows/rust-lib.yml@v1
     with:
       version: ${{ inputs.version }}
-      crates: clapfig
+      # Lockstep: both crates ship at the same version, derive first
+      # (clapfig's `derive` feature pulls in clapfig-derive as a
+      # registry dep with a pinned `version = "X.Y.Z"`, so the derive
+      # crate must already exist on crates.io when clapfig publishes).
+      # Matches the serde/serde_derive, clap/clap_derive convention.
+      crates: clapfig-derive,clapfig
       changelog-path: CHANGELOG.md
     secrets:
       RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
