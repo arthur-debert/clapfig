@@ -827,9 +827,22 @@ struct WrongShapeDoc {
 }
 
 #[test]
-#[should_panic(
-    expected = "leaf attributes (default, env, optional) on a nested-struct field aren't supported"
-)]
+#[should_panic(expected = "field `inner` references type `InnerStruct`")]
 fn leaf_attrs_on_struct_typed_field_panic_at_first_schema_call() {
     let _ = WrongShapeDoc::schema();
+}
+
+// Sibling case: `Option<NestedStruct>` with no leaf attrs. The same
+// `EnumRef` path catches it, and the deferred-panic message must
+// surface the `Option`-wrapper remediation specifically — not just the
+// "drop the attributes" one — so the user knows which fix to apply.
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct OptionalStructDoc {
+    inner: Option<InnerStruct>,
+}
+
+#[test]
+#[should_panic(expected = "Option<InnerStruct>")]
+fn option_of_struct_typed_field_panic_mentions_option_wrapper() {
+    let _ = OptionalStructDoc::schema();
 }

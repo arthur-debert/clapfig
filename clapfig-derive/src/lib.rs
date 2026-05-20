@@ -1046,7 +1046,10 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
             let leaf = quote! {
                 ::clapfig::static_schema::LeafStatic {
                     doc: #doc_expr,
-                    ty: ::clapfig::static_schema::LeafTypeStatic::EnumRef(#inner_expr),
+                    ty: ::clapfig::static_schema::LeafTypeStatic::EnumRef {
+                        schema: #inner_expr,
+                        field_name: #name,
+                    },
                     default: #default_expr,
                     optional: #optional_expr,
                     env: #env_expr,

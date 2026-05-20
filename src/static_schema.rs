@@ -102,18 +102,31 @@ pub enum LeafTypeStatic {
     Enum {
         values: &'static [ValueStatic],
     },
-    /// Defer the enum variant set to a referenced `SchemaStatic` —
-    /// emitted by the derive macro when a field's type is a nested
-    /// (struct or unit-enum) reference but the field also carries leaf
-    /// attributes (`default`, `env`, `optional`). The macro can't
-    /// syntactically distinguish a unit enum from a struct at the field
-    /// site, so it routes both shapes through this variant; the
-    /// converter checks `schema.is_enum()` and either emits
-    /// [`LeafType::Enum`](crate::runtime::LeafType::Enum) with the
-    /// variant set or panics with a clear authoring-error message
-    /// pointing at the field. Same deferred-error pattern as the
-    /// datetime-default literal parsing.
-    EnumRef(&'static SchemaStatic),
+    /// Defer the enum variant set to a referenced `SchemaStatic`.
+    ///
+    /// Emitted by the derive macro in two scenarios that the runtime
+    /// representation can't tell apart syntactically:
+    ///
+    /// - **Leaf attrs on a nested-typed field** —
+    ///   `#[clapfig(default = "letter")] page_size: PdfPageSize`. The
+    ///   macro sees `Nested` and the leaf attrs together and routes
+    ///   through `EnumRef`.
+    /// - **`Option<Nested>` wrapping** — `page_size: Option<Mode>` (or
+    ///   `Option<DbStruct>`). The macro can't tell `Mode` (unit enum)
+    ///   from `DbStruct` (struct) at the field site; both classify as
+    ///   `Optional(Nested(_))`. Routing through `EnumRef` lets
+    ///   `Option<UnitEnum>` work; `Option<NestedStruct>` falls through
+    ///   to the deferred-kind check.
+    ///
+    /// `field_name` is the parent struct's field name (post any
+    /// `#[clapfig(rename = ...)]`); the converter uses it inside the
+    /// authoring-error panic message so the user can locate the
+    /// offending field without grepping. Same deferred-error pattern
+    /// as the datetime-default literal parsing.
+    EnumRef {
+        schema: &'static SchemaStatic,
+        field_name: &'static str,
+    },
     Value,
 }
 
@@ -219,25 +232,36 @@ impl LeafTypeStatic {
             LeafTypeStatic::Enum { values } => RuntimeLeafType::Enum {
                 values: values.iter().map(ValueStatic::to_toml).collect(),
             },
-            LeafTypeStatic::EnumRef(s) => {
-                // Deferred enum-kind check: the macro accepts leaf attrs
-                // on any nested-typed field (struct or unit enum) because
-                // it can't tell them apart syntactically. If the
-                // referenced schema isn't enum-kind, the user wrote
-                // `#[clapfig(default = ...)] field: SomeStruct` — which
-                // is an authoring error. Same first-`schema()`-call
-                // failure mode as a malformed datetime default.
+            LeafTypeStatic::EnumRef { schema, field_name } => {
+                // Deferred enum-kind check. The macro can't syntactically
+                // distinguish a unit enum from a struct at the field
+                // site, so two distinct authoring paths land here and
+                // need separately-named remediations:
+                //
+                //   1. `#[clapfig(default = ...)] field: SomeStruct` —
+                //      leaf attrs on a nested struct. Drop the attrs
+                //      (struct fields are nested-section shaped).
+                //   2. `field: Option<SomeStruct>` — `Option`-wrapped
+                //      nested struct. Drop the `Option` wrapper (an
+                //      absent nested section is already the empty-
+                //      table state).
+                //
+                // Same first-`schema()`-call failure mode as a
+                // malformed datetime default.
                 assert!(
-                    s.is_enum(),
-                    "clapfig: schema `{}` referenced by LeafTypeStatic::EnumRef \
-                     is a struct, not a unit-only enum — leaf attributes \
-                     (default, env, optional) on a nested-struct field aren't \
-                     supported. Drop the attribute or change the field type to \
-                     a unit-only enum that derives clapfig::Schema.",
-                    s.name
+                    schema.is_enum(),
+                    "clapfig: field `{field_name}` references type `{schema_name}` which is a \
+                     struct, not a unit-only enum. The derive macro routed this field through \
+                     `LeafTypeStatic::EnumRef` because either (a) it carries leaf attributes \
+                     (`default` / `env` / `optional`) — drop the attributes; struct fields are \
+                     nested-section shaped — or (b) the type is `Option<{schema_name}>` — drop \
+                     the `Option` wrapper; an absent nested section is already the empty-table \
+                     state. If `{schema_name}` is meant to be a unit-only enum, change its body \
+                     to `enum {schema_name} {{ ... }}` with payload-free variants.",
+                    schema_name = schema.name,
                 );
                 RuntimeLeafType::Enum {
-                    values: s
+                    values: schema
                         .enum_variants
                         .iter()
                         .map(|v| TomlValue::String((*v).to_string()))
