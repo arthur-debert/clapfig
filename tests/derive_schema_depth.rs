@@ -938,9 +938,9 @@ fn value_attribute_works_on_untagged_enum() {
 }
 
 #[test]
-fn value_attribute_untagged_enum_accepts_both_shapes_at_load() {
-    // The whole point — runtime path accepts either variant's TOML
-    // shape, and serde resolves it.
+fn value_attribute_untagged_enum_accepts_string_shape_at_load() {
+    // First of the two `#[serde(untagged)]` variants — the bare-string
+    // shape resolves to `RuleConfig::Severity`.
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "rule = \"warn\"\n").unwrap();
     let cfg: ValueOnUntaggedEnum = Clapfig::schema_builder::<ValueOnUntaggedEnum>()
@@ -950,6 +950,36 @@ fn value_attribute_untagged_enum_accepts_both_shapes_at_load() {
         .load()
         .unwrap();
     assert_eq!(cfg.rule, RuleConfig::Severity("warn".into()));
+}
+
+#[test]
+fn value_attribute_untagged_enum_accepts_array_shape_at_load() {
+    // The other untagged variant — `["severity", { ...options }]` resolves
+    // to `RuleConfig::Detailed`. This is the actually-interesting case
+    // for the lex-fmt migration: the schema must accept a TOML array
+    // value for a key the macro-emitted schema declares as a leaf.
+    // Without `#[clapfig(value)]`, the macro would emit
+    // `LeafType::Nested` (or reject) and the runtime would refuse the
+    // array shape.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("t.toml"),
+        "rule = [\"warn\", { max = 80 }]\n",
+    )
+    .unwrap();
+    let cfg: ValueOnUntaggedEnum = Clapfig::schema_builder::<ValueOnUntaggedEnum>()
+        .app_name("t")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    match &cfg.rule {
+        RuleConfig::Detailed(severity, opts) => {
+            assert_eq!(severity, "warn");
+            assert_eq!(opts.get("max").and_then(|v| v.as_integer()), Some(80));
+        }
+        other => panic!("expected Detailed variant, got {other:?}"),
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]

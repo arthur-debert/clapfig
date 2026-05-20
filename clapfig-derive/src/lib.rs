@@ -610,6 +610,23 @@ fn two_generic_arguments<'a>(
     Ok((k, v))
 }
 
+/// Syntactic accessor for the inner type of an outer-most `Option<...>`.
+/// Returns `None` for non-Option types. Used by the `value`-fast-path's
+/// `Option<Option<T>>` rejection — we need the inner type to re-check,
+/// but must not recurse through `classify_type` (the whole point of the
+/// fast path is to skip it).
+fn outer_option_inner_type(ty: &Type) -> Option<&Type> {
+    if let Type::Path(TypePath { path, qself: None }) = ty
+        && let Some(last) = path.segments.last()
+        && last.ident == "Option"
+        && let PathArguments::AngleBracketed(args) = &last.arguments
+        && let Some(GenericArgument::Type(inner)) = args.args.first()
+    {
+        return Some(inner);
+    }
+    None
+}
+
 /// Syntactic check for whether the outer-most type is `Option<...>`.
 ///
 /// Used by the `#[clapfig(value)]` escape-hatch path so we can preserve
@@ -690,6 +707,22 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
     // We only need the outer-Option signal so `optional_from_type` is
     // correct.
     let shape = if attrs.force_value {
+        // Even on the value-fast-path, `Option<Option<T>>` remains a
+        // user error — the inner None and outer None collapse to the
+        // same observable state regardless of whether we ran shape
+        // inference on the inner type. Detect at the syntactic level
+        // (no inner `classify_type` recursion, which is the whole point
+        // of the fast path).
+        if let Some(inner) = outer_option_inner_type(&field.ty)
+            && is_outer_option_type(inner)
+        {
+            return Err(syn::Error::new(
+                field.ty.span(),
+                "Option<Option<T>> is not supported even with #[clapfig(value)] — \
+                 collapse to a single Option<T>; the inner Option's None is \
+                 indistinguishable at the schema layer.",
+            ));
+        }
         if is_outer_option_type(&field.ty) {
             TypeShape::Optional(Box::new(TypeShape::Value))
         } else {
