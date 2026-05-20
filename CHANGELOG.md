@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.21.3] - 2026-05-20
+
+
 - **Added**
   - **Unit-only enum support in `#[derive(clapfig::Schema)]`** ([#54](https://github.com/arthur-debert/clapfig/issues/54)) — A field of an enum type (`page_size: PdfPageSize`) deriving `Schema` now flattens to `LeafType::Enum { values: [...] }` automatically; the `#[clapfig(value)]` workaround is no longer required. `SchemaStatic` gains `enum_variants: &'static [&'static str]`; the static→runtime converter inspects this to decide between `Field::Nested` (object) and `Field::Leaf(LeafType::Enum)`, so the macro never has to syntactically distinguish struct vs enum at the field position. Payload variants are rejected at derive time pointing at `#[clapfig(value)]`. Variants honor `#[clapfig(rename_all = "...")]` / `#[serde(rename_all = "...")]` (lowercase, UPPERCASE, PascalCase, camelCase, snake_case, SCREAMING_SNAKE_CASE, kebab-case, SCREAMING-KEBAB-CASE) with per-variant `#[clapfig(rename = "...")]` / `#[serde(rename = "...")]` overriding the global rule. `config gen` emits `# Allowed:` and JSON Schema emission carries the `enum` array, same as the runtime path.
   - **`Schema::field_paths()` — auto-generated dotted-path inventory** ([#54](https://github.com/arthur-debert/clapfig/issues/54)) — New default method on the `Schema` trait that walks the macro-emitted `SchemaStatic` and returns every dotted path in the schema (leaves + sections) in source order. Lets downstream consumers replace hand-maintained "known paths" constants — new fields show up automatically. Enum-kind nested schemas surface as one leaf path (variants are leaf metadata, not sub-paths); array-of-objects nodes contribute the array name only (entries aren't addressable at this layer). Free helper `static_schema::collect_field_paths(&SchemaStatic)` exposed for callers that hold the static directly. No macro change required — the default impl reads `Self::STATIC`.
@@ -22,7 +25,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - **`validate.rs` `fields` is now `Vec<(&str, FieldKindRef)>`** — Drops the per-field `String` allocation in the inner walker; comment now matches the implementation (linear scan; `HashMap` remains a follow-up if a hot path appears).
   - **`resolve_at` / `resolve_at_with_unknowns` deduped through a private `resolve_at_inner`** — Same dispatch shape on both the static (`Resolver<C>`) and runtime (`RuntimeResolver`) paths; the no-unknowns surface drops the second tuple element.
   - **Derive "struct attribute" diagnostics renamed to "type attribute"** — The same parser now handles unit enums; the trybuild stderr fixture for `unknown_struct_attr` is updated.
-
 ## [0.21.2] - 2026-05-20
 
 
