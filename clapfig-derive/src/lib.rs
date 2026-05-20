@@ -1003,9 +1003,12 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
         _ => None,
     };
     if let Some(inner_expr) = nested_inner_expr {
-        let outer_optional = matches!(&shape, TypeShape::Optional(_));
-        let has_leaf_attrs =
-            attrs.default.is_some() || attrs.env.is_some() || attrs.optional || outer_optional;
+        // `Option<T>` at the field type carries the same "leaf may be
+        // absent" signal as an explicit `#[clapfig(optional)]` attr —
+        // fold them both into one flag so the rest of the path checks a
+        // single condition.
+        let is_field_optional = attrs.optional || matches!(&shape, TypeShape::Optional(_));
+        let has_leaf_attrs = attrs.default.is_some() || attrs.env.is_some() || is_field_optional;
         if attrs.allowed.is_some() {
             return Err(syn::Error::new(
                 field.span(),
@@ -1039,11 +1042,7 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
                 Some(s) => quote! { Some(#s) },
                 None => quote! { None },
             };
-            let optional_expr = if attrs.optional || outer_optional {
-                quote! { true }
-            } else {
-                quote! { false }
-            };
+            let optional_expr = quote! { #is_field_optional };
             let leaf = quote! {
                 ::clapfig::static_schema::LeafStatic {
                     doc: #doc_expr,
