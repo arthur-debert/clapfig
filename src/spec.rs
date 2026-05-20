@@ -305,13 +305,18 @@ pub(crate) trait ConfigSpec {
     /// `ctx` carries the strictness cascade overrides, the builder-level
     /// default, the optional `on_unknown_key` callback, and the
     /// `normalize_keys` flag for the line-number heuristic.
+    ///
+    /// Returns the keys the callback opted to
+    /// [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect)
+    /// — empty for callers that don't use the collect path. Reject
+    /// decisions surface as `ClapfigError::UnknownKeys`.
     fn validate_unknown(
         &self,
         table: &Table,
         source: &str,
         path: &Path,
         ctx: &crate::validate::ValidateContext<'_>,
-    ) -> Result<(), ClapfigError>;
+    ) -> Result<Vec<crate::strict::CollectedUnknown>, ClapfigError>;
 
     /// Inject default values into a merged table before finalization.
     ///
@@ -357,7 +362,7 @@ where
         source: &str,
         path: &Path,
         ctx: &crate::validate::ValidateContext<'_>,
-    ) -> Result<(), ClapfigError> {
+    ) -> Result<Vec<crate::strict::CollectedUnknown>, ClapfigError> {
         crate::validate::validate_unknown_keys::<C>(table, source, path, ctx)
     }
 

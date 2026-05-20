@@ -241,11 +241,63 @@ impl<C: Config> Resolver<C> {
             layer_order: self.layer_order.clone(),
         };
 
-        let config = resolve::resolve(input)?;
+        let (config, _unknowns) = resolve::resolve(input)?;
         if let Some(hook) = self.post_validate.as_ref() {
             hook(&config).map_err(ClapfigError::PostValidationFailed)?;
         }
         Ok(config)
+    }
+
+    /// Same as [`resolve_at`](Self::resolve_at) but also returns any keys
+    /// the [`on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
+    /// callback elected to [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect).
+    pub fn resolve_at_with_unknowns(
+        &self,
+        start_dir: impl AsRef<Path>,
+    ) -> Result<(C, Vec<crate::strict::CollectedUnknown>), ClapfigError>
+    where
+        C::Layer: for<'de> Deserialize<'de>,
+    {
+        let start_dir = start_dir.as_ref();
+        let absolute = if start_dir.is_absolute() {
+            start_dir.to_path_buf()
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(start_dir),
+                Err(e) => {
+                    return Err(ClapfigError::IoError {
+                        path: start_dir.to_path_buf(),
+                        source: e,
+                    });
+                }
+            }
+        };
+        let normalized = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+
+        let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, &normalized);
+        let files = self.load_files_cached(&dirs)?;
+
+        let spec = StaticSpec::<C>::new();
+        let input = ResolveInput {
+            spec: &spec,
+            files,
+            env_vars: self.env_vars.clone(),
+            env_prefix: self.env_prefix.clone(),
+            #[cfg(feature = "url")]
+            url_overrides: self.url_overrides.clone(),
+            cli_overrides: self.cli_overrides.clone(),
+            strict_default: self.strict_default,
+            strict_overrides: self.strict_overrides.clone(),
+            unknown_key_hook: self.unknown_key_hook.clone(),
+            normalize_keys: self.normalize_keys,
+            layer_order: self.layer_order.clone(),
+        };
+
+        let (config, unknowns) = resolve::resolve(input)?;
+        if let Some(hook) = self.post_validate.as_ref() {
+            hook(&config).map_err(ClapfigError::PostValidationFailed)?;
+        }
+        Ok((config, unknowns))
     }
 
     /// Read config files from the resolved directory list, using the cache.

@@ -63,7 +63,7 @@ impl ConfigSpec for DynamicSpec {
         source: &str,
         path: &Path,
         ctx: &ValidateContext<'_>,
-    ) -> Result<(), ClapfigError> {
+    ) -> Result<Vec<crate::strict::CollectedUnknown>, ClapfigError> {
         let mut unknown: Vec<UnknownKey> = Vec::new();
         collect_unknown_paths(table, &self.schema, "", &mut unknown);
         filter_through_cascade(table, source, path, unknown, ctx)
