@@ -3,7 +3,7 @@ members = ["clapfig-derive"]
 
 [package]
 name = "clapfig"
-version = "0.21.0"
+version = "0.21.1"
 edition = "2024"
 description = "Rich, layered configuration for Rust CLI apps"
 license = "MIT"
