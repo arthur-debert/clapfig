@@ -975,21 +975,92 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
         classify_type(&field.ty)?
     };
 
-    // Nested struct → FieldStatic::Nested. Field-level attrs (default, env,
-    // allowed, optional) are leaf-only; reject them on nested fields.
-    // `value` is handled above and never reaches this branch.
-    if let TypeShape::Nested(inner_expr) = &shape {
-        if attrs.default.is_some()
-            || attrs.env.is_some()
-            || attrs.allowed.is_some()
-            || attrs.optional
-        {
+    // Nested struct OR unit-only enum field. The macro can't tell the
+    // two apart syntactically — so the routing depends on what
+    // attributes the user wrote and whether `Option<…>` is in the way:
+    //
+    //   1. Bare nested type, no leaf attrs (`db: DbConfig`,
+    //      `page_size: PdfPageSize`) → emit `FieldStatic::Nested`. The
+    //      converter inspects `enum_variants` and flattens enum-kind to
+    //      `Field::Leaf(LeafType::Enum)` automatically.
+    //
+    //   2. Nested type with leaf attrs OR wrapped in `Option<…>`
+    //      (`#[clapfig(default = "lexed")] page_size: PdfPageSize`,
+    //      `mode: Option<Mode>`) → emit `FieldStatic::Leaf` carrying
+    //      `LeafTypeStatic::EnumRef(<T as Schema>::STATIC)`. The
+    //      converter checks `is_enum()` at first `schema()` call and
+    //      either emits `LeafType::Enum` with the attrs applied OR
+    //      panics with a clear authoring-error message pointing at the
+    //      field (same deferred-error pattern as malformed datetime
+    //      defaults). `allowed` stays mutually exclusive with the
+    //      enum-of-variants set the type already declares.
+    let nested_inner_expr: Option<&TokenStream2> = match &shape {
+        TypeShape::Nested(inner) => Some(inner),
+        TypeShape::Optional(inner) => match inner.as_ref() {
+            TypeShape::Nested(expr) => Some(expr),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(inner_expr) = nested_inner_expr {
+        let outer_optional = matches!(&shape, TypeShape::Optional(_));
+        let has_leaf_attrs =
+            attrs.default.is_some() || attrs.env.is_some() || attrs.optional || outer_optional;
+        if attrs.allowed.is_some() {
             return Err(syn::Error::new(
                 field.span(),
-                "leaf attributes (default, env, allowed, optional) are not \
-                 valid on nested-struct fields",
+                "`#[clapfig(allowed = [...])]` is not valid on a \
+                 nested-schema field — the inner type's `Schema` impl already \
+                 declares the value set. For enum-typed fields, drop \
+                 `allowed`; for struct-typed fields, drop the whole attribute.",
             ));
         }
+        if has_leaf_attrs {
+            let default_expr = match &attrs.default {
+                Some(expr) => {
+                    // EnumRef leaves take a string-shaped default (variant
+                    // name). Other shapes would require knowing the
+                    // referenced schema's variant types at macro time,
+                    // which we don't have access to — string keeps the
+                    // common case (user names a variant) and the converter
+                    // will type-check it against the actual variant set.
+                    let v = expr_to_value_static(
+                        expr,
+                        &TypeShape::Scalar(
+                            ScalarKind::String,
+                            quote! { ::clapfig::static_schema::LeafTypeStatic::String },
+                        ),
+                    )?;
+                    quote! { Some(#v) }
+                }
+                None => quote! { None },
+            };
+            let env_expr = match &attrs.env {
+                Some(s) => quote! { Some(#s) },
+                None => quote! { None },
+            };
+            let optional_expr = if attrs.optional || outer_optional {
+                quote! { true }
+            } else {
+                quote! { false }
+            };
+            let leaf = quote! {
+                ::clapfig::static_schema::LeafStatic {
+                    doc: #doc_expr,
+                    ty: ::clapfig::static_schema::LeafTypeStatic::EnumRef(#inner_expr),
+                    default: #default_expr,
+                    optional: #optional_expr,
+                    env: #env_expr,
+                }
+            };
+            return Ok(quote! {
+                ::clapfig::static_schema::NamedFieldStatic {
+                    name: #name,
+                    field: ::clapfig::static_schema::FieldStatic::Leaf(#leaf),
+                }
+            });
+        }
+        // Bare nested with no leaf attrs — original path.
         return Ok(quote! {
             ::clapfig::static_schema::NamedFieldStatic {
                 name: #name,
@@ -998,10 +1069,10 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
         });
     }
 
-    // `{Hash,BTree}Map<String, NestedStruct>` → FieldStatic::MapOf. Same
-    // leaf-attr rejection as a plain nested field — the runtime side has
-    // no place to attach a `default` / `env` / `optional` to a map of
-    // user-keyed nested objects.
+    // `{Hash,BTree}Map<String, NestedStruct>` → FieldStatic::MapOf. The
+    // runtime side has no place to attach a `default` / `env` /
+    // `optional` to a map of user-keyed nested objects, so leaf attrs
+    // here remain a hard error.
     if let TypeShape::MapOfNested(inner_expr) = &shape {
         if attrs.default.is_some()
             || attrs.env.is_some()
@@ -1011,7 +1082,9 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
             return Err(syn::Error::new(
                 field.span(),
                 "leaf attributes (default, env, allowed, optional) are not \
-                 valid on map-of-nested-struct fields",
+                 valid on map-of-nested-struct fields — entry presence is \
+                 already user-controlled, and a single per-field default \
+                 has no meaning across an arbitrary set of entry keys.",
             ));
         }
         return Ok(quote! {
@@ -1022,30 +1095,18 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
         });
     }
 
-    // `Option<NestedStruct>` and `Option<EnumType>` both classify as
-    // `Optional(Nested(_))` (the macro can't syntactically tell struct
-    // from enum). `Option<{Hash,BTree}Map<String, NestedStruct>>` shows
-    // up as `Optional(MapOfNested(_))`. None of these have a place to
-    // attach the `optional` flag at the `FieldStatic` layer (Nested /
-    // MapOf carry only the static-schema reference), so reject early
-    // with a clear diagnostic instead of falling through to
-    // `inner_leaf_type` and panicking on the `unreachable!` arm.
+    // `Option<{Hash,BTree}Map<String, NestedStruct>>` — no representation:
+    // an absent MapOf is already the empty map (the natural optional
+    // state), so wrapping in Option adds no signal and there's no
+    // `FieldStatic` shape to encode it. Keep the explicit diagnostic.
     if let TypeShape::Optional(inner) = &shape
-        && matches!(
-            inner.as_ref(),
-            TypeShape::Nested(_) | TypeShape::MapOfNested(_)
-        )
+        && matches!(inner.as_ref(), TypeShape::MapOfNested(_))
     {
         return Err(syn::Error::new(
             field.ty.span(),
-            "Option<NestedStruct> / Option<EnumType> / \
-             Option<Map<String, NestedStruct>> are not yet supported by \
-             clapfig::Schema — there is no place to attach `optional` on a \
-             nested-schema reference. Drop the Option and use the bare type \
-             (an absent nested section already has the empty-table semantics \
-             for object fields, and is equivalent to the default variant for \
-             enum fields), or use `#[clapfig(value)]` with `toml::Value` if \
-             you need explicit absent-vs-present semantics.",
+            "Option<Map<String, NestedStruct>> is not supported by \
+             clapfig::Schema — an absent map is already the empty map. Drop \
+             the `Option` wrapper and use the bare map type.",
         ));
     }
 

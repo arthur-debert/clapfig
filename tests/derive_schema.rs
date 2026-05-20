@@ -686,3 +686,150 @@ fn field_paths_treats_unit_enum_field_as_a_single_leaf_path() {
     let paths = PdfDoc::field_paths();
     assert_eq!(paths, vec!["page_size".to_string()]);
 }
+
+// -- Leaf attrs on enum-typed fields (case 3 follow-up) --------------------
+//
+// Previously, `#[clapfig(default = "lexed")] page_size: PdfPageSize` errored
+// at derive time: leaf attrs on nested-struct fields were blanket-rejected
+// because the macro can't syntactically distinguish a struct from a
+// unit-only enum. Users had to fall back to `#[clapfig(value, default = ...)]`,
+// which dropped the `LeafType::Enum` metadata.
+//
+// Now the macro emits `LeafTypeStatic::EnumRef(<T as Schema>::STATIC)` for
+// these cases. The converter checks `is_enum()` at first `schema()` call:
+// enum-kind produces `LeafType::Enum` with the supplied default / env /
+// optional; struct-kind panics with a clear authoring-error message.
+
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
+struct DocWithDefaultEnum {
+    /// Default page size if the user omits the key.
+    #[clapfig(default = "letter")]
+    page_size: PdfPageSize,
+}
+
+#[test]
+fn default_on_enum_typed_field_round_trips_through_schema() {
+    let s = DocWithDefaultEnum::schema();
+    let leaf = match &s.fields[0].field {
+        clapfig::runtime::Field::Leaf(l) => l,
+        other => panic!("expected Leaf, got {other:?}"),
+    };
+    match &leaf.ty {
+        clapfig::runtime::LeafType::Enum { values } => {
+            assert_eq!(values.len(), 3);
+            assert_eq!(values[1], toml::Value::String("letter".into()));
+        }
+        other => panic!("expected Enum, got {other:?}"),
+    }
+    assert_eq!(leaf.default, Some(toml::Value::String("letter".into())));
+    assert!(!leaf.optional);
+}
+
+#[test]
+fn default_on_enum_typed_field_applies_when_no_layer_provides_value() {
+    let dir = TempDir::new().unwrap();
+    let cfg: DocWithDefaultEnum = Clapfig::schema_builder::<DocWithDefaultEnum>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.page_size, PdfPageSize::Letter);
+}
+
+#[test]
+fn default_on_enum_typed_field_loses_to_user_supplied_value() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("test.toml"), "page_size = \"a4\"\n").unwrap();
+    let cfg: DocWithDefaultEnum = Clapfig::schema_builder::<DocWithDefaultEnum>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.page_size, PdfPageSize::A4);
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
+struct DocWithOptionalEnum {
+    /// Optional page size — `None` means "let the renderer pick."
+    page_size: Option<PdfPageSize>,
+}
+
+#[test]
+fn option_of_unit_enum_emits_optional_leaf_enum() {
+    let s = DocWithOptionalEnum::schema();
+    let leaf = match &s.fields[0].field {
+        clapfig::runtime::Field::Leaf(l) => l,
+        other => panic!("expected Leaf, got {other:?}"),
+    };
+    assert!(matches!(leaf.ty, clapfig::runtime::LeafType::Enum { .. }));
+    assert!(
+        leaf.optional,
+        "Option<UnitEnum> must produce an optional leaf"
+    );
+}
+
+#[test]
+fn option_of_unit_enum_load_accepts_absence() {
+    let dir = TempDir::new().unwrap();
+    let cfg: DocWithOptionalEnum = Clapfig::schema_builder::<DocWithOptionalEnum>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.page_size, None);
+}
+
+#[test]
+fn option_of_unit_enum_load_accepts_known_variant() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("test.toml"), "page_size = \"a4\"\n").unwrap();
+    let cfg: DocWithOptionalEnum = Clapfig::schema_builder::<DocWithOptionalEnum>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.page_size, Some(PdfPageSize::A4));
+}
+
+#[test]
+fn explicit_env_on_enum_typed_field_carries_through() {
+    #[derive(Schema, Serialize, Deserialize, Debug)]
+    struct EnvEnumDoc {
+        #[clapfig(env = "PAGE_SIZE_OVERRIDE", default = "a4")]
+        page_size: PdfPageSize,
+    }
+    let s = EnvEnumDoc::schema();
+    let leaf = match &s.fields[0].field {
+        clapfig::runtime::Field::Leaf(l) => l,
+        other => panic!("expected Leaf, got {other:?}"),
+    };
+    assert_eq!(leaf.env.as_deref(), Some("PAGE_SIZE_OVERRIDE"));
+}
+
+// Struct-with-leaf-attrs: deferred error at first `schema()` call. We
+// can't catch this at derive time because the macro can't tell struct
+// from unit-enum syntactically. Same pattern as the malformed-datetime
+// default literal — authoring error, surfaces on first test run.
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct InnerStruct {
+    #[clapfig(default = 1)]
+    x: i64,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct WrongShapeDoc {
+    #[clapfig(default = "nope")]
+    inner: InnerStruct,
+}
+
+#[test]
+#[should_panic(
+    expected = "leaf attributes (default, env, optional) on a nested-struct field aren't supported"
+)]
+fn leaf_attrs_on_struct_typed_field_panic_at_first_schema_call() {
+    let _ = WrongShapeDoc::schema();
+}

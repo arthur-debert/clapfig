@@ -102,6 +102,18 @@ pub enum LeafTypeStatic {
     Enum {
         values: &'static [ValueStatic],
     },
+    /// Defer the enum variant set to a referenced `SchemaStatic` —
+    /// emitted by the derive macro when a field's type is a nested
+    /// (struct or unit-enum) reference but the field also carries leaf
+    /// attributes (`default`, `env`, `optional`). The macro can't
+    /// syntactically distinguish a unit enum from a struct at the field
+    /// site, so it routes both shapes through this variant; the
+    /// converter checks `schema.is_enum()` and either emits
+    /// [`LeafType::Enum`](crate::runtime::LeafType::Enum) with the
+    /// variant set or panics with a clear authoring-error message
+    /// pointing at the field. Same deferred-error pattern as the
+    /// datetime-default literal parsing.
+    EnumRef(&'static SchemaStatic),
     Value,
 }
 
@@ -207,6 +219,31 @@ impl LeafTypeStatic {
             LeafTypeStatic::Enum { values } => RuntimeLeafType::Enum {
                 values: values.iter().map(ValueStatic::to_toml).collect(),
             },
+            LeafTypeStatic::EnumRef(s) => {
+                // Deferred enum-kind check: the macro accepts leaf attrs
+                // on any nested-typed field (struct or unit enum) because
+                // it can't tell them apart syntactically. If the
+                // referenced schema isn't enum-kind, the user wrote
+                // `#[clapfig(default = ...)] field: SomeStruct` — which
+                // is an authoring error. Same first-`schema()`-call
+                // failure mode as a malformed datetime default.
+                assert!(
+                    s.is_enum(),
+                    "clapfig: schema `{}` referenced by LeafTypeStatic::EnumRef \
+                     is a struct, not a unit-only enum — leaf attributes \
+                     (default, env, optional) on a nested-struct field aren't \
+                     supported. Drop the attribute or change the field type to \
+                     a unit-only enum that derives clapfig::Schema.",
+                    s.name
+                );
+                RuntimeLeafType::Enum {
+                    values: s
+                        .enum_variants
+                        .iter()
+                        .map(|v| TomlValue::String((*v).to_string()))
+                        .collect(),
+                }
+            }
             LeafTypeStatic::Value => RuntimeLeafType::Value,
         }
     }
