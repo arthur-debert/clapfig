@@ -1,4 +1,4 @@
-error: unsupported #[clapfig(...)] struct attribute: `notreal`. Supported: name = "...", strict = true/false
+error: unsupported #[clapfig(...)] struct attribute: `notreal`. Supported: name = "...", strict = true/false, rename_all = "..."
  --> tests/ui/derive/unknown_struct_attr.rs:4:11
   |
 4 | #[clapfig(notreal = "x")]

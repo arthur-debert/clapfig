@@ -10,8 +10,8 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
-    Attribute, Data, DeriveInput, Expr, ExprLit, Fields, GenericArgument, Lit, Meta, PathArguments,
-    Type, TypePath, parse_macro_input, spanned::Spanned,
+    Attribute, Data, DataEnum, DeriveInput, Expr, ExprLit, Fields, GenericArgument, Lit, Meta,
+    PathArguments, Type, TypePath, Variant, parse_macro_input, spanned::Spanned,
 };
 
 /// Derive `clapfig::Schema` for a struct.
@@ -91,7 +91,7 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new(
             input.generics.span(),
-            "clapfig::Schema does not support generic structs — the emitted \
+            "clapfig::Schema does not support generic types — the emitted \
              `static SchemaStatic = ...` cannot reference type parameters. \
              Concretize the type, or build the schema dynamically via \
              `Clapfig::runtime(Schema::object(...))`.",
@@ -100,21 +100,27 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
     if input.generics.where_clause.is_some() {
         return Err(syn::Error::new(
             input.generics.where_clause.span(),
-            "clapfig::Schema does not support structs with a `where` clause; see \
-             the generic-struct diagnostic for context.",
+            "clapfig::Schema does not support types with a `where` clause; see \
+             the generic-type diagnostic for context.",
         ));
     }
-    let struct_name = &input.ident;
+    let type_name = &input.ident;
     let struct_attrs = parse_struct_attrs(&input.attrs)?;
     let schema_name = struct_attrs
         .name
         .clone()
-        .unwrap_or_else(|| struct_name.to_string());
-    let struct_doc = collect_doc_lines(&input.attrs);
+        .unwrap_or_else(|| type_name.to_string());
+    let type_doc = collect_doc_lines(&input.attrs);
 
-    let fields = match &input.data {
+    let (fields_body, enum_variants_body) = match &input.data {
         Data::Struct(s) => match &s.fields {
-            Fields::Named(named) => &named.named,
+            Fields::Named(named) => {
+                let mut field_entries = Vec::with_capacity(named.named.len());
+                for f in &named.named {
+                    field_entries.push(expand_field(f)?);
+                }
+                (quote! { &[ #(#field_entries),* ] }, quote! { &[] })
+            }
             other => {
                 return Err(syn::Error::new(
                     other.span(),
@@ -122,31 +128,29 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ));
             }
         },
+        Data::Enum(e) => {
+            let variants = expand_enum_variants(&input.attrs, &struct_attrs, e)?;
+            (quote! { &[] }, quote! { &[ #(#variants),* ] })
+        }
         other => {
             return Err(syn::Error::new(
                 input.ident.span(),
                 format!(
-                    "clapfig::Schema can only be derived for structs (not {:?})",
+                    "clapfig::Schema can only be derived for structs and unit-only enums (not {:?})",
                     discriminant(other)
                 ),
             ));
         }
     };
 
-    let mut field_entries = Vec::with_capacity(fields.len());
-    for f in fields {
-        let entry = expand_field(f)?;
-        field_entries.push(entry);
-    }
-
     let strict_expr = match struct_attrs.strict {
         Some(b) => quote! { Some(#b) },
         None => quote! { None },
     };
-    let doc_expr = doc_slice(&struct_doc);
+    let doc_expr = doc_slice(&type_doc);
 
-    let static_ident = quote::format_ident!("__CLAPFIG_SCHEMA_{}", struct_name);
-    let cache_ident = quote::format_ident!("__CLAPFIG_RUNTIME_{}", struct_name);
+    let static_ident = quote::format_ident!("__CLAPFIG_SCHEMA_{}", type_name);
+    let cache_ident = quote::format_ident!("__CLAPFIG_RUNTIME_{}", type_name);
 
     let output = quote! {
         #[allow(non_upper_case_globals)]
@@ -155,7 +159,8 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
                 name: #schema_name,
                 doc: #doc_expr,
                 strict: #strict_expr,
-                fields: &[ #(#field_entries),* ],
+                fields: #fields_body,
+                enum_variants: #enum_variants_body,
             };
 
         #[allow(non_upper_case_globals)]
@@ -163,7 +168,7 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
             ::std::sync::Arc<::clapfig::runtime::Schema>,
         > = ::std::sync::OnceLock::new();
 
-        impl ::clapfig::Schema for #struct_name {
+        impl ::clapfig::Schema for #type_name {
             const STATIC: &'static ::clapfig::static_schema::SchemaStatic = &#static_ident;
 
             fn schema() -> &'static ::clapfig::runtime::Schema {
@@ -185,6 +190,198 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
     Ok(output)
 }
 
+/// Walk a unit-only enum and emit `&'static str` tokens for each variant's
+/// schema-facing name. Errors at derive time on non-unit variants — clapfig's
+/// `LeafType::Enum` is value-shape-flat (variants carry no payload), so a
+/// `Newtype(T)` / `Tuple(T, U)` / struct-form variant has no faithful
+/// representation. Callers needing union shapes can opt into
+/// `#[clapfig(value)]` on the field instead.
+///
+/// Variant names are rewritten through `#[clapfig(rename_all = "...")]` /
+/// `#[serde(rename_all = "...")]` on the enum, and per-variant
+/// `#[clapfig(rename = "name")]` / `#[serde(rename = "name")]` overrides
+/// take precedence over the global rule. The serde forms are accepted for
+/// migration convenience — the same enum can derive both `Schema` and
+/// `Deserialize` without restating the rename rule.
+fn expand_enum_variants(
+    type_attrs: &[Attribute],
+    struct_attrs: &StructAttrs,
+    data: &DataEnum,
+) -> syn::Result<Vec<TokenStream2>> {
+    if data.variants.is_empty() {
+        return Err(syn::Error::new(
+            data.variants.span(),
+            "clapfig::Schema requires at least one variant on an enum (an \
+             empty enum is uninhabited and cannot be deserialized)",
+        ));
+    }
+    // `#[clapfig(rename_all = ...)]` wins over `#[serde(rename_all = ...)]`
+    // when both are present — the clapfig form is the authoritative spelling
+    // for what reaches the schema. We still accept the serde form so users
+    // don't have to duplicate the attribute.
+    let rename_all = struct_attrs
+        .rename_all
+        .clone()
+        .or_else(|| parse_serde_rename_all(type_attrs).ok().flatten());
+    let mut out = Vec::with_capacity(data.variants.len());
+    let mut seen = std::collections::HashSet::new();
+    for variant in &data.variants {
+        if !matches!(variant.fields, Fields::Unit) {
+            return Err(syn::Error::new(
+                variant.fields.span(),
+                "clapfig::Schema on enums only supports unit-only variants \
+                 (no payload). For variants with payload, use #[clapfig(value)] \
+                 on the field and provide your own deserialize.",
+            ));
+        }
+        let name = variant_schema_name(variant, rename_all.as_deref())?;
+        if !seen.insert(name.clone()) {
+            return Err(syn::Error::new(
+                variant.ident.span(),
+                format!(
+                    "duplicate enum variant name {name:?} after rename — \
+                     two variants would produce the same schema value"
+                ),
+            ));
+        }
+        out.push(quote! { #name });
+    }
+    Ok(out)
+}
+
+/// Resolve a single variant's schema-facing name: per-variant `rename`
+/// wins, otherwise the enum-level `rename_all` applies, otherwise the
+/// variant ident verbatim.
+fn variant_schema_name(variant: &Variant, rename_all: Option<&str>) -> syn::Result<String> {
+    if let Some(name) = parse_variant_rename(&variant.attrs)? {
+        return Ok(name);
+    }
+    let raw = variant.ident.to_string();
+    match rename_all {
+        Some(rule) => apply_rename_all(&raw, rule).ok_or_else(|| {
+            syn::Error::new(
+                variant.ident.span(),
+                format!(
+                    "unsupported rename_all rule {rule:?}; supported: \
+                     lowercase, UPPERCASE, PascalCase, camelCase, snake_case, \
+                     SCREAMING_SNAKE_CASE, kebab-case, SCREAMING-KEBAB-CASE"
+                ),
+            )
+        }),
+        None => Ok(raw),
+    }
+}
+
+/// Apply a serde-compatible `rename_all` rule to a PascalCase variant
+/// name. Returns `None` for unsupported rules so the caller can produce a
+/// diagnostic with the offending value.
+fn apply_rename_all(name: &str, rule: &str) -> Option<String> {
+    match rule {
+        "lowercase" => Some(name.to_lowercase()),
+        "UPPERCASE" => Some(name.to_uppercase()),
+        "PascalCase" => Some(name.to_string()),
+        "camelCase" => Some(pascal_to_camel(name)),
+        "snake_case" => Some(pascal_to_snake(name, '_')),
+        "SCREAMING_SNAKE_CASE" => Some(pascal_to_snake(name, '_').to_uppercase()),
+        "kebab-case" => Some(pascal_to_snake(name, '-')),
+        "SCREAMING-KEBAB-CASE" => Some(pascal_to_snake(name, '-').to_uppercase()),
+        _ => None,
+    }
+}
+
+/// Convert PascalCase to camelCase by lowercasing only the first character.
+/// `MyVariant` → `myVariant`. Multi-uppercase runs at the start (`HTTP`)
+/// stay as `hTTP` — matching serde's behavior, which doesn't disambiguate
+/// acronyms.
+fn pascal_to_camel(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) => {
+            let mut out = String::with_capacity(name.len());
+            out.extend(c.to_lowercase());
+            out.extend(chars);
+            out
+        }
+        None => String::new(),
+    }
+}
+
+/// Convert PascalCase to a separator-joined lowercase form. `sep = '_'`
+/// produces snake_case, `sep = '-'` produces kebab-case. An uppercase
+/// letter that isn't at position 0 emits the separator first; consecutive
+/// uppercase runs (acronyms) get the separator before the first upper, not
+/// inside the run — `MyHTTPApi` → `my_h_t_t_p_api`, matching serde.
+fn pascal_to_snake(name: &str, sep: char) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                out.push(sep);
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Parse `#[clapfig(rename = "name")]` or `#[serde(rename = "name")]` off a
+/// variant. Returns the override string or `None` if neither is present.
+fn parse_variant_rename(attrs: &[Attribute]) -> syn::Result<Option<String>> {
+    let mut found: Option<String> = None;
+    for attr in attrs {
+        let path = attr.path();
+        let is_clapfig = path.is_ident("clapfig");
+        let is_serde = path.is_ident("serde");
+        if !is_clapfig && !is_serde {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                let value: syn::LitStr = meta.value()?.parse()?;
+                // clapfig wins over serde if both are present on the same
+                // variant. We accept serde for migration convenience; the
+                // clapfig form is the authoritative spelling.
+                if is_clapfig || found.is_none() {
+                    found = Some(value.value());
+                }
+                Ok(())
+            } else {
+                // Silently skip other meta items — serde has many unrelated
+                // attrs (`alias`, `borrow`, etc.) we mustn't choke on.
+                let _ = meta.input.parse::<proc_macro2::TokenStream>();
+                Ok(())
+            }
+        })?;
+    }
+    Ok(found)
+}
+
+/// Parse `#[serde(rename_all = "...")]` off the enum's attrs as a fallback
+/// when no `#[clapfig(rename_all = ...)]` was given.
+fn parse_serde_rename_all(attrs: &[Attribute]) -> syn::Result<Option<String>> {
+    let mut found: Option<String> = None;
+    for attr in attrs {
+        if !attr.path().is_ident("serde") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                let value: syn::LitStr = meta.value()?.parse()?;
+                if found.is_none() {
+                    found = Some(value.value());
+                }
+                Ok(())
+            } else {
+                let _ = meta.input.parse::<proc_macro2::TokenStream>();
+                Ok(())
+            }
+        })?;
+    }
+    Ok(found)
+}
+
 fn discriminant(data: &Data) -> &'static str {
     match data {
         Data::Struct(_) => "struct",
@@ -197,6 +394,12 @@ fn discriminant(data: &Data) -> &'static str {
 struct StructAttrs {
     name: Option<String>,
     strict: Option<bool>,
+    /// `#[clapfig(rename_all = "...")]` — applies to every variant of a
+    /// unit-only enum that derives `Schema`. Unused on structs (an
+    /// equivalent rename for struct fields would conflict with serde's
+    /// existing `#[serde(rename_all)]` rule, which we leave authoritative
+    /// for deserialize.)
+    rename_all: Option<String>,
 }
 
 fn parse_struct_attrs(attrs: &[Attribute]) -> syn::Result<StructAttrs> {
@@ -214,10 +417,15 @@ fn parse_struct_attrs(attrs: &[Attribute]) -> syn::Result<StructAttrs> {
                 let value: syn::LitBool = meta.value()?.parse()?;
                 out.strict = Some(value.value());
                 Ok(())
+            } else if meta.path.is_ident("rename_all") {
+                let value: syn::LitStr = meta.value()?.parse()?;
+                out.rename_all = Some(value.value());
+                Ok(())
             } else {
                 Err(meta.error(format!(
                     "unsupported #[clapfig(...)] struct attribute: `{}`. \
-                     Supported: name = \"...\", strict = true/false",
+                     Supported: name = \"...\", strict = true/false, \
+                     rename_all = \"...\"",
                     meta.path
                         .get_ident()
                         .map(|i| i.to_string())

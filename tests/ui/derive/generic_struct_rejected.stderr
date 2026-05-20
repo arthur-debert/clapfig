@@ -1,4 +1,4 @@
-error: clapfig::Schema does not support generic structs — the emitted `static SchemaStatic = ...` cannot reference type parameters. Concretize the type, or build the schema dynamically via `Clapfig::runtime(Schema::object(...))`.
+error: clapfig::Schema does not support generic types — the emitted `static SchemaStatic = ...` cannot reference type parameters. Concretize the type, or build the schema dynamically via `Clapfig::runtime(Schema::object(...))`.
  --> tests/ui/derive/generic_struct_rejected.rs:8:19
   |
 8 | struct WithGeneric<T> {
