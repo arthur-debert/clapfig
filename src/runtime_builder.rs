@@ -339,6 +339,22 @@ impl RuntimeBuilder {
         self.build_resolver()?.resolve_at(start_dir)
     }
 
+    /// Same as [`load`](Self::load) but also returns any keys the
+    /// [`on_unknown_key`](Self::on_unknown_key) callback elected to
+    /// [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect).
+    /// The list is empty when no callback is registered or no key opts in
+    /// — this is the direct fix for callers that currently smuggle a
+    /// shared `Vec` through closure captures to get the same data out.
+    pub fn load_with_unknowns(
+        self,
+    ) -> Result<(Table, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
+        let start_dir = std::env::current_dir().map_err(|e| ClapfigError::IoError {
+            path: PathBuf::from("."),
+            source: e,
+        })?;
+        self.build_resolver()?.resolve_at_with_unknowns(start_dir)
+    }
+
     /// Dispatch a [`ConfigAction`] and print the result. Runtime-path
     /// analogue of
     /// [`ClapfigBuilder::handle_and_print`](crate::ClapfigBuilder::handle_and_print).
@@ -517,11 +533,61 @@ impl RuntimeResolver {
             layer_order: self.layer_order.clone(),
         };
 
-        let table = resolve::resolve(input)?;
+        let (table, _unknowns) = resolve::resolve(input)?;
         if let Some(hook) = self.post_validate.as_ref() {
             hook(&table).map_err(ClapfigError::PostValidationFailed)?;
         }
         Ok(table)
+    }
+
+    /// Same as [`resolve_at`](Self::resolve_at) but also returns any keys
+    /// the [`on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
+    /// callback elected to [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect).
+    /// Runtime-path analogue of
+    /// [`Resolver::resolve_at_with_unknowns`](crate::Resolver::resolve_at_with_unknowns).
+    pub fn resolve_at_with_unknowns(
+        &self,
+        start_dir: impl AsRef<std::path::Path>,
+    ) -> Result<(Table, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
+        let start_dir = start_dir.as_ref();
+        let absolute = if start_dir.is_absolute() {
+            start_dir.to_path_buf()
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(start_dir),
+                Err(e) => {
+                    return Err(ClapfigError::IoError {
+                        path: start_dir.to_path_buf(),
+                        source: e,
+                    });
+                }
+            }
+        };
+        let normalized = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+
+        let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, &normalized);
+        let files = self.load_files_cached(&dirs)?;
+
+        let input = ResolveInput {
+            spec: self.spec.as_ref(),
+            files,
+            env_vars: self.env_vars.clone(),
+            env_prefix: self.env_prefix.clone(),
+            #[cfg(feature = "url")]
+            url_overrides: self.url_overrides.clone(),
+            cli_overrides: self.cli_overrides.clone(),
+            strict_default: self.strict_default,
+            strict_overrides: self.strict_overrides.clone(),
+            unknown_key_hook: self.unknown_key_hook.clone(),
+            normalize_keys: self.normalize_keys,
+            layer_order: self.layer_order.clone(),
+        };
+
+        let (table, unknowns) = resolve::resolve(input)?;
+        if let Some(hook) = self.post_validate.as_ref() {
+            hook(&table).map_err(ClapfigError::PostValidationFailed)?;
+        }
+        Ok((table, unknowns))
     }
 
     fn load_files_cached(&self, dirs: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, ClapfigError> {

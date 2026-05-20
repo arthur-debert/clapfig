@@ -624,6 +624,25 @@ impl<C: Config> ClapfigBuilder<C> {
         self.build_resolver()?.resolve_at(start_dir)
     }
 
+    /// Same as [`load`](Self::load) but also returns any keys the
+    /// [`on_unknown_key`](Self::on_unknown_key) callback elected to
+    /// [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect).
+    /// The list is empty when no callback is registered or no key opts in
+    /// — this is the direct fix for callers that currently smuggle a
+    /// shared `Vec` through closure captures to get the same data out.
+    pub fn load_with_unknowns(
+        self,
+    ) -> Result<(C, Vec<crate::strict::CollectedUnknown>), ClapfigError>
+    where
+        C::Layer: for<'de> Deserialize<'de>,
+    {
+        let start_dir = std::env::current_dir().map_err(|e| ClapfigError::IoError {
+            path: PathBuf::from("."),
+            source: e,
+        })?;
+        self.build_resolver()?.resolve_at_with_unknowns(start_dir)
+    }
+
     /// Handle a `ConfigAction` and print the result to stdout.
     ///
     /// Convenience wrapper around [`handle()`](Self::handle) for CLI apps that
@@ -2181,6 +2200,83 @@ mod tests {
             }
             None => panic!("callback never received the unknown key"),
         }
+    }
+
+    #[test]
+    fn on_unknown_key_collect_routes_into_load_with_unknowns_list() {
+        // Collect decision: load succeeds AND the key shows up in the list.
+        // The strict default rejects, the cascade flags the key, the callback
+        // says Collect — no error, but the caller can inspect what was seen.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("test.toml"),
+            "port = 3000\n[database]\nurl = \"pg://\"\nlenient_typo = 1\n",
+        )
+        .unwrap();
+        let (config, unknowns): (TestConfig, _) = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .on_unknown_key(|_| UnknownKeyDecision::Collect)
+            .load_with_unknowns()
+            .unwrap();
+        assert_eq!(config.port, 3000);
+        assert_eq!(unknowns.len(), 1);
+        assert_eq!(unknowns[0].path, "database.lenient_typo");
+        assert_eq!(unknowns[0].leaf, "lenient_typo");
+        assert_eq!(unknowns[0].value, Some(toml::Value::Integer(1)));
+        assert!(unknowns[0].file.is_some());
+        assert!(unknowns[0].line.is_some());
+    }
+
+    #[test]
+    fn load_returns_no_collected_unknowns_when_no_callback() {
+        // Plain `load_with_unknowns` on a config with no callback registered
+        // and no unknown keys present: empty list, no error.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("test.toml"), "port = 9090\n").unwrap();
+        let (config, unknowns): (TestConfig, _) = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load_with_unknowns()
+            .unwrap();
+        assert_eq!(config.port, 9090);
+        assert!(unknowns.is_empty());
+    }
+
+    #[test]
+    fn on_unknown_key_collect_mixed_with_reject_still_errors() {
+        // Two unknowns: one the callback Collects, one it Rejects. The
+        // Reject wins — `load_with_unknowns` returns the error, the
+        // collected list is dropped along with the typed output.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("test.toml"),
+            "port = 3000\ncollect_me = 1\nreject_me = 2\n",
+        )
+        .unwrap();
+        let result: Result<(TestConfig, _), _> = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .on_unknown_key(|ctx: &UnknownKeyContext<'_>| {
+                if ctx.leaf.starts_with("collect_") {
+                    UnknownKeyDecision::Collect
+                } else {
+                    UnknownKeyDecision::Reject
+                }
+            })
+            .load_with_unknowns();
+        let err = result.unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "reject_me");
     }
 
     #[test]

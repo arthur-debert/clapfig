@@ -15,7 +15,9 @@ use toml::{Table, Value};
 
 use crate::error::{ClapfigError, UnknownKeyInfo};
 use crate::normalize::normalize_key;
-use crate::strict::{StrictnessOverrides, UnknownKeyContext, UnknownKeyDecision, UnknownKeyHook};
+use crate::strict::{
+    CollectedUnknown, StrictnessOverrides, UnknownKeyContext, UnknownKeyDecision, UnknownKeyHook,
+};
 
 /// Per-resolution strictness configuration passed into the validate path.
 ///
@@ -40,12 +42,17 @@ pub(crate) struct ValidateContext<'a> {
 /// The `serde_ignored` step also runs `C::Layer` deserialization, so type
 /// errors in the merged-table phase surface here as `ParseError`. (Same
 /// behavior as before Phase 3 — only the post-collect filtering changed.)
+///
+/// Returns the keys the callback elected to [`UnknownKeyDecision::Collect`]
+/// (empty when no callback is registered or no key opts in). Reject
+/// decisions become a `ClapfigError::UnknownKeys` error; lenient keys are
+/// dropped silently.
 pub fn validate_unknown_keys<C: Config>(
     table: &Table,
     source: &str,
     path: &Path,
     ctx: &ValidateContext<'_>,
-) -> Result<(), ClapfigError>
+) -> Result<Vec<CollectedUnknown>, ClapfigError>
 where
     C::Layer: for<'de> Deserialize<'de>,
 {
@@ -101,20 +108,28 @@ impl UnknownKey {
 ///
 /// 1. If the cascade says **lenient**, drop silently. Done.
 /// 2. If the cascade says **strict** and a callback is registered, call it
-///    — `Accept` drops silently; `Reject` produces an `UnknownKeys` entry.
+///    — `Accept` drops silently; `Reject` produces an `UnknownKeys` entry;
+///    `Collect` appends a [`CollectedUnknown`] to the returned list and
+///    keeps loading.
 /// 3. If no callback, the cascade decision stands (reject).
+///
+/// Returns the keys collected via [`UnknownKeyDecision::Collect`]. Empty
+/// when no callback is registered, no key opts in, or every unknown key
+/// fell through to a Reject decision (in which case the error path runs
+/// instead).
 pub(crate) fn filter_through_cascade(
     table: &Table,
     source: &str,
     path: &Path,
     unknown_keys: Vec<UnknownKey>,
     ctx: &ValidateContext<'_>,
-) -> Result<(), ClapfigError> {
+) -> Result<Vec<CollectedUnknown>, ClapfigError> {
     if unknown_keys.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let source_arc: Arc<str> = Arc::from(source);
     let mut rejected: Vec<UnknownKeyInfo> = Vec::new();
+    let mut collected: Vec<CollectedUnknown> = Vec::new();
     for entry in unknown_keys {
         let UnknownKey { path: key, leaf } = entry;
         let strict = ctx
@@ -126,6 +141,7 @@ pub(crate) fn filter_through_cascade(
         }
 
         let line = find_key_line(source, &key, &leaf, ctx.normalize_keys);
+        let value_ref = lookup_value(table, &key, &leaf);
 
         if let Some(callback) = ctx.callback {
             // Callback runs only on cascade-strict keys. Look the value up
@@ -140,12 +156,23 @@ pub(crate) fn filter_through_cascade(
             let context = UnknownKeyContext {
                 path: &key,
                 leaf: &leaf,
-                value: lookup_value(table, &key, &leaf),
+                value: value_ref,
                 file: Some(path),
                 line: if line > 0 { Some(line) } else { None },
             };
-            if matches!(callback(&context), UnknownKeyDecision::Accept) {
-                continue;
+            match callback(&context) {
+                UnknownKeyDecision::Accept => continue,
+                UnknownKeyDecision::Collect => {
+                    collected.push(CollectedUnknown {
+                        path: key,
+                        leaf,
+                        value: value_ref.cloned(),
+                        file: Some(path.to_path_buf()),
+                        line: if line > 0 { Some(line) } else { None },
+                    });
+                    continue;
+                }
+                UnknownKeyDecision::Reject => { /* fall through to reject */ }
             }
         }
 
@@ -157,7 +184,7 @@ pub(crate) fn filter_through_cascade(
         });
     }
     if rejected.is_empty() {
-        Ok(())
+        Ok(collected)
     } else {
         Err(ClapfigError::UnknownKeys(rejected))
     }

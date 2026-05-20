@@ -186,6 +186,18 @@ impl<C: Schema + DeserializeOwned> SchemaConfigBuilder<C> {
         deserialize_table::<C>(table)
     }
 
+    /// Same as [`load`](Self::load) but also returns any keys the
+    /// [`on_unknown_key`](Self::on_unknown_key) callback elected to
+    /// [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect).
+    /// The list is empty when no callback is registered or no key opts in.
+    pub fn load_with_unknowns(
+        self,
+    ) -> Result<(C, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
+        let (table, unknowns) = self.inner.load_with_unknowns()?;
+        let typed = deserialize_table::<C>(table)?;
+        Ok((typed, unknowns))
+    }
+
     /// Dispatch a [`ConfigAction`] and return the rendered output.
     ///
     /// The action surface is identical to the runtime path —

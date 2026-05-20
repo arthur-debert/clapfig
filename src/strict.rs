@@ -96,6 +96,40 @@ pub enum UnknownKeyDecision {
     Reject,
     /// Drop the key silently (same outcome as a lenient subtree).
     Accept,
+    /// Route the key into the collected-unknowns list returned by
+    /// [`load_with_unknowns`](crate::ClapfigBuilder::load_with_unknowns).
+    /// The key is NOT a strict-mode violation — load succeeds — but the
+    /// caller can inspect the list to surface diagnostic-style "we saw
+    /// this key, it wasn't in the schema, here's what to do" feedback
+    /// without rebuilding the loader's parse/merge pipeline themselves.
+    Collect,
+}
+
+/// One collected unknown-key entry returned alongside the loaded config
+/// from [`load_with_unknowns`](crate::ClapfigBuilder::load_with_unknowns).
+///
+/// Produced when an [`on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
+/// callback returns [`UnknownKeyDecision::Collect`] for a key the
+/// strictness cascade flagged. Owned variant of [`UnknownKeyContext`] —
+/// the values are cloned out of the parsed table so the caller can use
+/// the list after the resolver / merged table have been dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectedUnknown {
+    /// Full dotted path, e.g. `diagnostics.rules.acme.task-due-date`.
+    pub path: String,
+    /// Raw TOML key at the leaf position. See
+    /// [`UnknownKeyContext::leaf`] for the quoted-key semantics.
+    pub leaf: String,
+    /// Parsed value cloned out of the source table. `None` when the
+    /// lookup couldn't resolve (out-of-bounds array index, path through
+    /// a non-table) — matches the `None` semantics of
+    /// [`UnknownKeyContext::value`].
+    pub value: Option<Value>,
+    /// File the key came from, when sourced from a config file.
+    pub file: Option<std::path::PathBuf>,
+    /// 1-indexed line number in `file`, if the `find_key_line` heuristic
+    /// located the key.
+    pub line: Option<usize>,
 }
 
 /// Internal type-alias for the boxed callback. `Send + Sync` is required so

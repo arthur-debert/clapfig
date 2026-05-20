@@ -656,5 +656,5 @@ pub use resolver::Resolver;
 pub use runtime_builder::{RuntimeBuilder, RuntimeResolver};
 pub use schema_builder::SchemaConfigBuilder;
 pub use static_schema::Schema;
-pub use strict::{UnknownKeyContext, UnknownKeyDecision};
+pub use strict::{CollectedUnknown, UnknownKeyContext, UnknownKeyDecision};
 pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};

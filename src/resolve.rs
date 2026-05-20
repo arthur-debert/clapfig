@@ -24,7 +24,7 @@ use crate::merge::deep_merge;
 use crate::normalize::{normalize_key, normalize_table};
 use crate::overrides;
 use crate::spec::ConfigSpec;
-use crate::strict::{StrictnessOverrides, UnknownKeyHook};
+use crate::strict::{CollectedUnknown, StrictnessOverrides, UnknownKeyHook};
 use crate::types::Layer;
 use crate::validate::ValidateContext;
 
@@ -102,10 +102,14 @@ pub(crate) fn default_layer_order() -> Vec<Layer> {
 ///
 /// Builds each layer independently, merges them in the configured order
 /// (default: files < env < URL < CLI), then hands the merged table to the
-/// spec for finalization.
+/// spec for finalization. Returns the typed output plus any keys the
+/// `on_unknown_key` callback elected to
+/// [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect);
+/// callers that don't need the collected list (the plain `load()`
+/// surface) simply discard it via `let (out, _) = resolve(...)?;`.
 pub(crate) fn resolve<S: ConfigSpec>(
     input: ResolveInput<'_, S>,
-) -> Result<S::Output, ClapfigError> {
+) -> Result<(S::Output, Vec<CollectedUnknown>), ClapfigError> {
     // Build each layer independently, then merge in the configured order.
 
     let validate_ctx = ValidateContext {
@@ -132,6 +136,7 @@ pub(crate) fn resolve<S: ConfigSpec>(
     // Files layer: parse → (optionally) normalize → validate → merge.
     // Validation runs against the parsed Table — never the raw text — so
     // normalized keys are checked in the same form they will reach the merge.
+    let mut collected_unknowns: Vec<CollectedUnknown> = Vec::new();
     let files_table = {
         let mut t = Table::new();
         for (path, content) in &input.files {
@@ -150,9 +155,11 @@ pub(crate) fn resolve<S: ConfigSpec>(
                 })?;
             }
             if cascade_active {
-                input
-                    .spec
-                    .validate_unknown(&table, content, path, &validate_ctx)?;
+                let mut per_file =
+                    input
+                        .spec
+                        .validate_unknown(&table, content, path, &validate_ctx)?;
+                collected_unknowns.append(&mut per_file);
             }
             t = deep_merge(t, table);
         }
@@ -210,7 +217,8 @@ pub(crate) fn resolve<S: ConfigSpec>(
     // table here so `finalize` only has to check required fields.
     input.spec.fill_defaults(&mut merged)?;
 
-    input.spec.finalize(merged)
+    let output = input.spec.finalize(merged)?;
+    Ok((output, collected_unknowns))
 }
 
 #[cfg(test)]
@@ -244,7 +252,7 @@ mod tests {
 
     #[test]
     fn defaults_only() {
-        let config: TestConfig = resolve(empty_input(&TEST_SPEC)).unwrap();
+        let (config, _): (TestConfig, _) = resolve(empty_input(&TEST_SPEC)).unwrap();
         assert_eq!(config.host, "localhost");
         assert_eq!(config.port, 8080);
         assert!(!config.debug);
@@ -258,7 +266,7 @@ mod tests {
             files: vec![("test.toml".into(), "port = 3000\n".into())],
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.port, 3000);
         assert_eq!(config.host, "localhost"); // default preserved
     }
@@ -272,7 +280,7 @@ mod tests {
             ],
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.port, 2000);
     }
 
@@ -284,7 +292,7 @@ mod tests {
             env_prefix: Some("MYAPP".into()),
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.port, 5000);
     }
 
@@ -304,7 +312,7 @@ mod tests {
             normalize_keys: false,
             layer_order: None,
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.port, 9999);
     }
 
@@ -327,7 +335,7 @@ mod tests {
             normalize_keys: false,
             layer_order: None,
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.host, "filehost"); // from file
         assert_eq!(config.port, 4000); // from env
         assert!(config.debug); // from cli
@@ -346,7 +354,7 @@ mod tests {
             ],
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.database.url.as_deref(), Some("pg://base")); // from base
         assert_eq!(config.database.pool_size, 50); // overridden by local
     }
@@ -360,7 +368,7 @@ mod tests {
             unknown_key_hook: None,
             ..empty_input(&TEST_SPEC)
         };
-        let result: Result<TestConfig, _> = resolve(input);
+        let result: Result<(TestConfig, _), _> = resolve(input);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("typo") || msg.contains("Unknown"));
@@ -373,7 +381,7 @@ mod tests {
             strict_default: false,
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.port, 3000);
     }
 
@@ -385,7 +393,7 @@ mod tests {
             files: vec![("test.toml".into(), "color = \"BLUE\"\n".into())],
             ..empty_input(&NORM_SPEC)
         };
-        let config: NormalizedConfig = resolve(input).unwrap();
+        let (config, _): (NormalizedConfig, _) = resolve(input).unwrap();
         assert_eq!(config.color, "blue");
     }
 
@@ -396,7 +404,7 @@ mod tests {
             env_prefix: Some("APP".into()),
             ..empty_input(&NORM_SPEC)
         };
-        let config: NormalizedConfig = resolve(input).unwrap();
+        let (config, _): (NormalizedConfig, _) = resolve(input).unwrap();
         assert_eq!(config.color, "green");
     }
 
@@ -406,7 +414,7 @@ mod tests {
             cli_overrides: vec![("color".into(), Value::String("MAGENTA".into()))],
             ..empty_input(&NORM_SPEC)
         };
-        let config: NormalizedConfig = resolve(input).unwrap();
+        let (config, _): (NormalizedConfig, _) = resolve(input).unwrap();
         assert_eq!(config.color, "magenta");
     }
 
@@ -414,7 +422,7 @@ mod tests {
     fn deserialize_with_default_is_not_normalized() {
         // confique defaults bypass deserialize_with — they are injected directly.
         // This is confique's documented behavior: the default string is used as-is.
-        let config: NormalizedConfig = resolve(empty_input(&NORM_SPEC)).unwrap();
+        let (config, _): (NormalizedConfig, _) = resolve(empty_input(&NORM_SPEC)).unwrap();
         assert_eq!(config.color, "red");
     }
 
@@ -429,7 +437,7 @@ mod tests {
             url_overrides: vec![("port".into(), Value::Integer(7777))],
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.port, 7777);
     }
 
@@ -441,7 +449,7 @@ mod tests {
             cli_overrides: vec![("port".into(), Value::Integer(9999))],
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.port, 9999);
     }
 
@@ -452,7 +460,7 @@ mod tests {
             url_overrides: vec![("database.pool_size".into(), Value::Integer(42))],
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.database.pool_size, 42);
     }
 
@@ -468,7 +476,7 @@ mod tests {
             layer_order: Some(vec![Layer::Cli, Layer::Env]),
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         // Env comes after Cli in the order, so Env wins
         assert_eq!(config.port, 5000);
     }
@@ -483,7 +491,7 @@ mod tests {
             layer_order: Some(vec![Layer::Env, Layer::Files]),
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         // Files come after Env, so Files win
         assert_eq!(config.port, 3000);
     }
@@ -498,7 +506,7 @@ mod tests {
             layer_order: Some(vec![Layer::Files, Layer::Cli]),
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         // Env is not in layer_order, so the file value stands
         assert_eq!(config.port, 3000);
     }
@@ -514,7 +522,7 @@ mod tests {
             layer_order: Some(vec![Layer::Cli]),
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.port, 7777);
     }
 
@@ -529,7 +537,7 @@ mod tests {
             layer_order: Some(vec![]),
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         // No layers applied, so confique default (8080) stands
         assert_eq!(config.port, 8080);
     }
@@ -545,7 +553,7 @@ mod tests {
             layer_order: None,
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.port, 9999); // CLI wins
     }
 
@@ -566,7 +574,7 @@ mod tests {
             layer_order: Some(vec![Layer::Cli, Layer::Files, Layer::Env]),
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         // Env is last → highest priority for port
         assert_eq!(config.port, 5000);
         // Files overrides Cli for host (file has it, cli doesn't set host)
@@ -587,7 +595,7 @@ mod tests {
             layer_order: Some(vec![Layer::Files, Layer::Env, Layer::Cli, Layer::Url]),
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         // Url is last → highest priority
         assert_eq!(config.port, 7777);
     }
@@ -602,7 +610,7 @@ mod tests {
             files: vec![("test.toml".into(), "[database]\npool-size = 25\n".into())],
             ..empty_input(&TEST_SPEC)
         };
-        let result: Result<TestConfig, _> = resolve(input);
+        let result: Result<(TestConfig, _), _> = resolve(input);
         assert!(result.is_err());
     }
 
@@ -613,7 +621,7 @@ mod tests {
             normalize_keys: true,
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.database.pool_size, 25);
     }
 
@@ -626,7 +634,7 @@ mod tests {
             normalize_keys: true,
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.database.pool_size, 30);
     }
 
@@ -637,7 +645,7 @@ mod tests {
             normalize_keys: true,
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.database.pool_size, 77);
     }
 
@@ -649,7 +657,7 @@ mod tests {
             normalize_keys: true,
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.database.pool_size, 88);
     }
 
@@ -662,7 +670,7 @@ mod tests {
             normalize_keys: true,
             ..empty_input(&TEST_SPEC)
         };
-        let result: Result<TestConfig, _> = resolve(input);
+        let result: Result<(TestConfig, _), _> = resolve(input);
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
@@ -682,7 +690,7 @@ mod tests {
             normalize_keys: true,
             ..empty_input(&TEST_SPEC)
         };
-        let result: Result<TestConfig, _> = resolve(input);
+        let result: Result<(TestConfig, _), _> = resolve(input);
         match result {
             Err(ClapfigError::NormalizedKeyCollision {
                 normalized_key,
@@ -708,7 +716,7 @@ mod tests {
             normalize_keys: true,
             ..empty_input(&TEST_SPEC)
         };
-        let config: TestConfig = resolve(input).unwrap();
+        let (config, _): (TestConfig, _) = resolve(input).unwrap();
         assert_eq!(config.host, "x");
         assert_eq!(config.database.pool_size, 10);
         assert_eq!(config.database.url.as_deref(), Some("pg://y"));
