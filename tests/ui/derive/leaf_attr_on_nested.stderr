@@ -1,5 +1,0 @@
-error: leaf attributes (default, env, allowed, optional) are not valid on nested-struct fields
-  --> tests/ui/derive/leaf_attr_on_nested.rs:12:5
-   |
-12 |     #[clapfig(default = "nope")]
-   |     ^
