@@ -1,0 +1,5 @@
+error: Option<Option<T>> is not supported even with #[clapfig(value)] — collapse to a single Option<T>; the inner Option's None is indistinguishable at the schema layer.
+ --> tests/ui/derive/value_option_of_option_rejected.rs:9:12
+  |
+9 |     field: Option<Option<String>>,
+  |            ^^^^^^
