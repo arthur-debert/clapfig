@@ -15,6 +15,7 @@ use toml::{Table, Value};
 
 use crate::error::{ClapfigError, UnknownKeyInfo};
 use crate::normalize::normalize_key;
+use crate::spec::{FieldKindRef, SchemaRef};
 use crate::strict::{
     CollectedUnknown, StrictnessOverrides, UnknownKeyContext, UnknownKeyDecision, UnknownKeyHook,
 };
@@ -97,6 +98,86 @@ impl UnknownKey {
     pub fn from_path(path: String) -> Self {
         let leaf = path.rsplit('.').next().unwrap_or(&path).to_string();
         Self { path, leaf }
+    }
+}
+
+/// Schema-driven unknown-key walker that works against any
+/// [`SchemaRef`] (static or runtime). The walker recurses through
+/// [`FieldKindRef::Nested`] and [`FieldKindRef::MapOf`] subtrees; arrays-
+/// of-tables don't show up in non-file layers (env / CLI / URL), so
+/// `ArrayOf` is skipped at this layer.
+///
+/// Used by the env-layer validator: env vars are merged after the
+/// per-file validate pass, so an `MYAPP__ROGUE_KEY=...` would otherwise
+/// slip into the merged result without ever reaching the cascade or the
+/// `on_unknown_key` callback. The same walker can be reused for any
+/// layer whose values are already a `Table` without source text — the
+/// caller threads the resulting `UnknownKey` list through
+/// [`filter_through_cascade`].
+pub(crate) fn collect_unknown_paths_ref(
+    table: &Table,
+    schema: SchemaRef<'_>,
+    prefix: &str,
+) -> Vec<UnknownKey> {
+    let mut out = Vec::new();
+    walk_against_schema(table, schema, prefix, &mut out);
+    out
+}
+
+fn walk_against_schema(
+    table: &Table,
+    schema: SchemaRef<'_>,
+    prefix: &str,
+    out: &mut Vec<UnknownKey>,
+) {
+    // Build a name→kind lookup once per recursion level — schemas are
+    // small enough that a linear scan would also be fine, but the map
+    // avoids quadratic behavior on wide tables.
+    let mut fields: Vec<(String, FieldKindRef<'_>)> = Vec::new();
+    for f in schema.fields() {
+        fields.push((f.name.to_string(), f.kind));
+    }
+    for (key, value) in table {
+        let full = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        let kind = fields.iter().find(|(n, _)| n == key).map(|(_, k)| *k);
+        match kind {
+            None => {
+                out.push(UnknownKey {
+                    path: full,
+                    leaf: key.clone(),
+                });
+            }
+            Some(FieldKindRef::Leaf(_)) => {
+                // Leaf — type checking is the merged-table's job, not ours.
+            }
+            Some(FieldKindRef::Nested { schema: nested }) => {
+                if let Value::Table(t) = value {
+                    walk_against_schema(t, nested, &full, out);
+                }
+            }
+            Some(FieldKindRef::MapOf {
+                schema: item_schema,
+            }) => {
+                if let Value::Table(entries) = value {
+                    for (entry_key, entry_value) in entries {
+                        if let Value::Table(t) = entry_value {
+                            let entry_path = format!("{full}.{entry_key}");
+                            walk_against_schema(t, item_schema, &entry_path, out);
+                        }
+                    }
+                }
+            }
+            Some(FieldKindRef::ArrayOf { .. }) => {
+                // Arrays-of-tables can't be expressed via env / CLI / URL
+                // dotted-key syntax; nothing to recurse into for non-file
+                // layers. If the value happens to be a table here, the
+                // type check at finalize will surface the mismatch.
+            }
+        }
     }
 }
 
