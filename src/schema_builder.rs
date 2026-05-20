@@ -124,6 +124,19 @@ impl<C: Schema> SchemaConfigBuilder<C> {
         self
     }
 
+    /// Convenience: "accept dotted, reject bare" at a dotted-path
+    /// subtree. See
+    /// [`ClapfigBuilder::accept_dotted_extension_keys_in`](crate::ClapfigBuilder::accept_dotted_extension_keys_in)
+    /// for the full semantics.
+    pub fn accept_dotted_extension_keys_in(
+        mut self,
+        path: &str,
+        decision: crate::UnknownKeyDecision,
+    ) -> Self {
+        self.inner = self.inner.accept_dotted_extension_keys_in(path, decision);
+        self
+    }
+
     /// Accept kebab-case keys in config files and CLI/URL overrides.
     pub fn normalize_keys(mut self, normalize: bool) -> Self {
         self.inner = self.inner.normalize_keys(normalize);

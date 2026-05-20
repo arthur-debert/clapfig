@@ -138,6 +138,42 @@ pub struct CollectedUnknown {
 pub(crate) type UnknownKeyHook =
     Arc<dyn Fn(&UnknownKeyContext<'_>) -> UnknownKeyDecision + Send + Sync>;
 
+/// Build an `on_unknown_key` callback implementing the "accept dotted,
+/// reject bare" pattern: under the configured `path` subtree, an unknown
+/// key whose raw TOML leaf contains a `.` is treated as a schema-
+/// extension key and resolved with `decision` (typically
+/// [`UnknownKeyDecision::Accept`] for CLI hosts or
+/// [`UnknownKeyDecision::Collect`] for LSP hosts that want to surface
+/// them to users); any other unknown key falls through to
+/// [`UnknownKeyDecision::Reject`].
+///
+/// `path` bounds where the rule applies. `""` means "anywhere in the
+/// schema"; `"diagnostics.rules"` means "only under the `diagnostics.rules`
+/// subtree." A path-segment boundary is enforced: `"diag"` won't match a
+/// key under `"diagnostics.rules"`.
+///
+/// The cascade still fires first — keys flagged lenient by `strict_at`
+/// drop silently without the callback ever running. This helper only
+/// decides what to do with keys the cascade decided to reject.
+pub(crate) fn dotted_extension_callback(
+    path: String,
+    decision: UnknownKeyDecision,
+) -> UnknownKeyHook {
+    Arc::new(move |ctx: &UnknownKeyContext<'_>| {
+        let in_subtree = path.is_empty()
+            || ctx.path == path
+            || ctx
+                .path
+                .strip_prefix(&path)
+                .is_some_and(|rest| rest.starts_with('.'));
+        if in_subtree && ctx.leaf.contains('.') {
+            decision
+        } else {
+            UnknownKeyDecision::Reject
+        }
+    })
+}
+
 /// Flat, path-keyed strictness overrides — the data backing the cascade.
 ///
 /// Built once at `build_resolver` time from:

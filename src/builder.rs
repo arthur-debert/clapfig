@@ -358,6 +358,50 @@ impl<C: Config> ClapfigBuilder<C> {
         self
     }
 
+    /// Convenience: register an [`on_unknown_key`](Self::on_unknown_key)
+    /// callback implementing the "accept dotted, reject bare" pattern at
+    /// a dotted-path subtree.
+    ///
+    /// Under `path` (and only there), any unknown key whose raw TOML leaf
+    /// contains a `.` — typically a `[serde(flatten)]` extension key
+    /// emitted by some other tool, like a quoted TOML literal
+    /// `"acme.task-due-date-missing"` — is treated as a schema-extension
+    /// key and `decision` decides its fate ([`UnknownKeyDecision::Accept`]
+    /// drops it silently; [`UnknownKeyDecision::Collect`] routes it into
+    /// [`load_with_unknowns`](Self::load_with_unknowns)). Bare unknown
+    /// keys (no `.` in the leaf) fall through to
+    /// [`UnknownKeyDecision::Reject`] — they look like typos, and the
+    /// usual strict-mode error surfaces.
+    ///
+    /// `path` is bounded by segment: `"diag"` will not match keys under
+    /// `"diagnostics.rules"`. Pass `""` to apply the rule everywhere.
+    ///
+    /// Calling this method replaces any previously-registered
+    /// `on_unknown_key` callback (it is implemented in terms of one). For
+    /// more nuanced logic — multiple subtrees with different decisions,
+    /// per-leaf inspection, etc. — register your own
+    /// [`on_unknown_key`](Self::on_unknown_key) closure directly.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// Clapfig::builder::<AppConfig>()
+    ///     .app_name("myapp")
+    ///     .accept_dotted_extension_keys_in("diagnostics.rules", UnknownKeyDecision::Accept)
+    ///     .load()?;
+    /// ```
+    pub fn accept_dotted_extension_keys_in(
+        mut self,
+        path: &str,
+        decision: crate::UnknownKeyDecision,
+    ) -> Self {
+        self.unknown_key_hook = Some(crate::strict::dotted_extension_callback(
+            path.to_string(),
+            decision,
+        ));
+        self
+    }
+
     /// Accept kebab-case keys in config files and CLI/URL overrides
     /// (default: `false`).
     ///
@@ -2277,6 +2321,36 @@ mod tests {
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key, "reject_me");
+    }
+
+    #[test]
+    fn accept_dotted_extension_keys_in_still_rejects_bare_typos() {
+        // The static path's serde_ignored loses quoted-key semantics
+        // (TOML `"acme.x"` becomes `["acme", "x"]` after deserialize),
+        // so the helper's "leaf contains a dot" predicate only fires
+        // at all on the runtime/derive paths in practice. On the static
+        // path it still keeps its other half of the contract: a bare-
+        // leaf typo continues to error out, which is what we verify
+        // here. End-to-end Accept/Collect coverage lives in
+        // `runtime_builder::tests::*` and `tests/derive_schema.rs`.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("test.toml"),
+            "port = 3000\n[database]\nurl = \"pg://\"\nbare_typo = 1\n",
+        )
+        .unwrap();
+        let result: Result<TestConfig, _> = Clapfig::builder()
+            .app_name("test")
+            .file_name("test.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .accept_dotted_extension_keys_in("database", UnknownKeyDecision::Accept)
+            .load();
+        let err = result.unwrap_err();
+        let keys = err.unknown_keys().expect("UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "database.bare_typo");
     }
 
     #[test]

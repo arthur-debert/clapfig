@@ -182,6 +182,22 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Convenience: "accept dotted, reject bare" at a dotted-path
+    /// subtree. See
+    /// [`ClapfigBuilder::accept_dotted_extension_keys_in`](crate::ClapfigBuilder::accept_dotted_extension_keys_in)
+    /// for the full semantics — same rule, runtime-path schema.
+    pub fn accept_dotted_extension_keys_in(
+        mut self,
+        path: &str,
+        decision: crate::UnknownKeyDecision,
+    ) -> Self {
+        self.unknown_key_hook = Some(crate::strict::dotted_extension_callback(
+            path.to_string(),
+            decision,
+        ));
+        self
+    }
+
     /// Accept kebab-case keys in config files and CLI/URL overrides. See
     /// [`ClapfigBuilder::normalize_keys`](crate::ClapfigBuilder::normalize_keys).
     pub fn normalize_keys(mut self, normalize: bool) -> Self {
@@ -1470,6 +1486,136 @@ mod tests {
                 .iter()
                 .any(|k| k.contains("acme.task-due-date-missing")),
             "dotted extension key must be accepted: {names:?}"
+        );
+    }
+
+    // --- `accept_dotted_extension_keys_in` helper (issue #54 item 6) ---
+
+    fn dotted_ext_schema() -> Schema {
+        Schema::object("Cfg")
+            .nested(
+                "diagnostics",
+                Schema::object("Diag").nested("rules", Schema::object("Rules")),
+            )
+            .build()
+    }
+
+    #[test]
+    fn dotted_ext_helper_accepts_dotted_under_path() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[diagnostics.rules]\n\"acme.task-due-date-missing\" = \"error\"\n",
+        )
+        .unwrap();
+        let result = Clapfig::runtime(dotted_ext_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .accept_dotted_extension_keys_in("diagnostics.rules", crate::UnknownKeyDecision::Accept)
+            .load();
+        assert!(
+            result.is_ok(),
+            "dotted leaf under configured path must be accepted: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn dotted_ext_helper_rejects_bare_typo_under_path() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[diagnostics.rules]\nmissing_footote = \"warn\"\n",
+        )
+        .unwrap();
+        let result = Clapfig::runtime(dotted_ext_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .accept_dotted_extension_keys_in("diagnostics.rules", crate::UnknownKeyDecision::Accept)
+            .load();
+        let err = result.unwrap_err();
+        let keys = err.unknown_keys().expect("UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].key.contains("missing_footote"));
+    }
+
+    #[test]
+    fn dotted_ext_helper_path_boundary_enforced_by_segment() {
+        // `diag` would substring-match `diagnostics` but the helper
+        // enforces a segment boundary, so the rule does NOT apply.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[diagnostics.rules]\n\"acme.x\" = \"warn\"\n",
+        )
+        .unwrap();
+        let result = Clapfig::runtime(dotted_ext_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .accept_dotted_extension_keys_in("diag", crate::UnknownKeyDecision::Accept)
+            .load();
+        // `diag` is not a real prefix of `diagnostics.rules` at segment
+        // level, so the helper's rule doesn't fire — the dotted key
+        // falls through to Reject.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dotted_ext_helper_collect_routes_into_load_with_unknowns_list() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[diagnostics.rules]\n\"acme.x-rule\" = \"warn\"\n",
+        )
+        .unwrap();
+        let (_table, unknowns) = Clapfig::runtime(dotted_ext_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .accept_dotted_extension_keys_in(
+                "diagnostics.rules",
+                crate::UnknownKeyDecision::Collect,
+            )
+            .load_with_unknowns()
+            .unwrap();
+        assert_eq!(unknowns.len(), 1);
+        assert_eq!(unknowns[0].leaf, "acme.x-rule");
+    }
+
+    #[test]
+    fn dotted_ext_helper_empty_path_applies_everywhere() {
+        // Empty path → rule applies at every level. A dotted leaf at the
+        // top level (rare but possible with quoted keys) is accepted.
+        let dir = TempDir::new().unwrap();
+        // Use a schema with NO declared sections so the top-level dotted
+        // key is unknown to the schema. Using an empty Cfg schema with
+        // a known field would still leave the dotted key unknown — what
+        // matters is the unknown-key path triggers.
+        fs::write(dir.path().join("demo.toml"), "\"acme.x\" = \"warn\"\n").unwrap();
+        let schema = Schema::object("Cfg").build();
+        let result = Clapfig::runtime(schema)
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .accept_dotted_extension_keys_in("", crate::UnknownKeyDecision::Accept)
+            .load();
+        assert!(
+            result.is_ok(),
+            "empty path must apply rule globally: {:?}",
+            result.err()
         );
     }
 
