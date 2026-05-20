@@ -57,6 +57,11 @@ pub enum FieldStatic {
     Leaf(LeafStatic),
     Nested(&'static SchemaStatic),
     ArrayOf(&'static SchemaStatic),
+    /// Maps of nested objects (TOML `[name.<key>]`). Emitted by the
+    /// derive macro for `HashMap<String, NestedStruct>` /
+    /// `BTreeMap<String, NestedStruct>` fields where the value type
+    /// derives [`Schema`](crate::Schema).
+    MapOf(&'static SchemaStatic),
 }
 
 /// `const`-friendly mirror of [`runtime::Leaf`](crate::runtime::Leaf).
@@ -172,6 +177,7 @@ impl FieldStatic {
             }),
             FieldStatic::Nested(s) => RuntimeField::Nested(s.to_runtime()),
             FieldStatic::ArrayOf(s) => RuntimeField::ArrayOf(s.to_runtime()),
+            FieldStatic::MapOf(s) => RuntimeField::MapOf(s.to_runtime()),
         }
     }
 }
@@ -318,7 +324,9 @@ pub fn collect_field_paths(schema: &SchemaStatic, prefix: &str, out: &mut Vec<St
                 // leaf path, not a section + variant paths.
                 out.push(dotted);
             }
-            FieldStatic::Nested(child) | FieldStatic::ArrayOf(child) => {
+            FieldStatic::Nested(child)
+            | FieldStatic::ArrayOf(child)
+            | FieldStatic::MapOf(child) => {
                 out.push(dotted.clone());
                 collect_field_paths(child, &dotted, out);
             }

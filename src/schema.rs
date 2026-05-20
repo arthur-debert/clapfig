@@ -131,6 +131,23 @@ fn field_to_property(field: FieldRef<'_>) -> (String, Value, bool) {
             prop.insert("items".into(), schema_to_object(item));
             (field.name.into(), Value::Object(prop), false)
         }
+        FieldKindRef::MapOf { schema: item } => {
+            // TOML `[name.<key>]` with arbitrary entry keys. JSON Schema
+            // models this as `type: object` with `additionalProperties:
+            // <entry schema>` — entry keys are user-supplied so there are
+            // no fixed properties, but each value must satisfy the item
+            // schema.
+            //
+            // Not marked required: `DynamicSpec::finalize` treats an
+            // absent map-of as the empty map (no entries).
+            let mut prop = Map::new();
+            if !field.doc.is_empty() {
+                prop.insert("description".into(), Value::String(join_doc(field.doc)));
+            }
+            prop.insert("type".into(), Value::String("object".into()));
+            prop.insert("additionalProperties".into(), schema_to_object(item));
+            (field.name.into(), Value::Object(prop), false)
+        }
         FieldKindRef::Leaf(leaf) => {
             let mut prop = Map::new();
             if !field.doc.is_empty() {

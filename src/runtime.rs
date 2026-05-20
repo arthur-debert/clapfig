@@ -131,6 +131,24 @@ impl SchemaBuilder {
         self
     }
 
+    /// Add a string-keyed map of nested objects (TOML `[name.<key>]`).
+    /// Same `name` constraints as [`field`](Self::field).
+    ///
+    /// Each entry's value must itself satisfy `item`'s schema — type
+    /// checks, required-field enforcement, and nested unknown-key
+    /// detection all recurse into entry tables. Keys are arbitrary
+    /// user-supplied strings, so the cascade walks the item schema
+    /// rather than the map level for strictness purposes.
+    pub fn map_of(mut self, name: impl Into<String>, item: SchemaBuilder) -> Self {
+        let name = name.into();
+        validate_field_name(&self.schema, &name);
+        self.schema.fields.push(NamedField {
+            name,
+            field: Field::MapOf(item.build()),
+        });
+        self
+    }
+
     /// Finalize the builder into a [`Schema`].
     pub fn build(self) -> Schema {
         self.schema
@@ -144,7 +162,8 @@ pub struct NamedField {
     pub field: Field,
 }
 
-/// A schema field — leaf scalar / array, nested object, or array-of-objects.
+/// A schema field — leaf scalar / array, nested object, array-of-objects,
+/// or map-of-objects.
 #[derive(Debug, Clone)]
 pub enum Field {
     Leaf(Leaf),
@@ -152,6 +171,12 @@ pub enum Field {
     Nested(Schema),
     /// An array of nested objects — TOML `[[plugins]]`.
     ArrayOf(Schema),
+    /// A string-keyed map of nested objects — TOML `[plugins.<key>]` with
+    /// arbitrary `<key>` names. Sibling of [`ArrayOf`](Field::ArrayOf) for
+    /// the dual shape: keyed map of objects instead of indexed array of
+    /// objects. Deserializes to `BTreeMap<String, T>` / `HashMap<String, T>`
+    /// where `T` is a struct deriving [`Schema`](crate::Schema).
+    MapOf(Schema),
 }
 
 impl Field {

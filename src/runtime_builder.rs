@@ -1172,6 +1172,188 @@ mod tests {
         }
     }
 
+    // --- Field::MapOf (issue #54 item 2) ---
+
+    fn map_of_schema() -> Schema {
+        Schema::object("Cfg")
+            .map_of(
+                "plugins",
+                Schema::object("Plugin")
+                    .field("enabled", RtField::boolean().default(false))
+                    .field("severity", RtField::string()),
+            )
+            .build()
+    }
+
+    #[test]
+    fn map_of_accepts_user_keyed_entries() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[plugins.audit]\nseverity = \"warn\"\n\n[plugins.fmt]\nenabled = true\nseverity = \"error\"\n",
+        )
+        .unwrap();
+        let table = Clapfig::runtime(map_of_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap();
+        let plugins = table["plugins"].as_table().unwrap();
+        assert_eq!(plugins.len(), 2);
+        assert!(plugins.contains_key("audit"));
+        assert!(plugins.contains_key("fmt"));
+    }
+
+    #[test]
+    fn map_of_fills_defaults_into_each_entry() {
+        let dir = TempDir::new().unwrap();
+        // Two entries: `audit` omits `enabled`, `fmt` sets it. The default
+        // (`false`) should fill `audit.enabled` without touching `fmt.enabled`.
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[plugins.audit]\nseverity = \"warn\"\n[plugins.fmt]\nenabled = true\nseverity = \"e\"\n",
+        )
+        .unwrap();
+        let table = Clapfig::runtime(map_of_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap();
+        let plugins = table["plugins"].as_table().unwrap();
+        assert!(
+            !plugins["audit"].as_table().unwrap()["enabled"]
+                .as_bool()
+                .unwrap(),
+            "missing leaf in map entry must get the default"
+        );
+        assert!(
+            plugins["fmt"].as_table().unwrap()["enabled"]
+                .as_bool()
+                .unwrap(),
+            "explicit leaf in map entry must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn map_of_required_field_in_entry_errors_when_missing() {
+        // `severity` is required (no default) on the item schema. An
+        // entry missing it must surface a MissingRequired pointing at the
+        // entry-qualified path.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[plugins.audit]\nenabled = true\n",
+        )
+        .unwrap();
+        let result = Clapfig::runtime(map_of_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load();
+        match result.unwrap_err() {
+            ClapfigError::MissingRequired { key } => {
+                assert_eq!(key, "plugins.audit.severity");
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_of_unknown_key_in_entry_is_flagged_with_entry_path() {
+        // Unknown keys inside a map entry: dotted path includes the entry
+        // key. `plugins.audit.rogue` is the path the cascade walks.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[plugins.audit]\nseverity = \"warn\"\nrogue = 1\n",
+        )
+        .unwrap();
+        let err = Clapfig::runtime(map_of_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .load()
+            .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "plugins.audit.rogue");
+    }
+
+    #[test]
+    fn map_of_empty_is_valid_when_absent() {
+        // Like ArrayOf, an absent MapOf is the empty map — not an error.
+        let dir = TempDir::new().unwrap();
+        let table = Clapfig::runtime(map_of_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap();
+        // `plugins` may or may not be present in the resulting table;
+        // what matters is that load doesn't error.
+        if let Some(plugins) = table.get("plugins") {
+            let plugins_table = plugins.as_table().unwrap();
+            assert!(plugins_table.is_empty());
+        }
+    }
+
+    #[test]
+    fn map_of_json_schema_emits_additional_properties() {
+        let result = Clapfig::runtime(map_of_schema())
+            .app_name("demo")
+            .no_env()
+            .handle(&ConfigAction::Schema { output: None })
+            .unwrap();
+        match result {
+            ConfigResult::Schema(s) => {
+                let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+                let plugins = &v["properties"]["plugins"];
+                assert_eq!(plugins["type"], "object");
+                let additional = &plugins["additionalProperties"];
+                assert_eq!(additional["type"], "object");
+                assert_eq!(additional["title"], "Plugin");
+                // Required-field listing recurses into the per-entry schema.
+                let req: Vec<&str> = additional["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_str().unwrap())
+                    .collect();
+                assert!(req.contains(&"severity"));
+            }
+            other => panic!("expected Schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_of_invalid_value_shape_errors_on_load() {
+        // `[plugins]` is a leaf scalar in the source file. The schema says
+        // it must be a table-of-tables; loading must error.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "plugins = \"oops\"\n").unwrap();
+        let result = Clapfig::runtime(map_of_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load();
+        match result.unwrap_err() {
+            ClapfigError::InvalidValue { key, reason } => {
+                assert_eq!(key, "plugins");
+                assert!(reason.contains("expected table"));
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
     #[test]
     fn array_of_keys_not_addressable_via_persist_set() {
         // Regression: `valid_keys` used to recurse into ArrayOf subtrees,

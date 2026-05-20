@@ -85,7 +85,9 @@ impl ConfigSpec for DynamicSpec {
 ///
 /// For nested objects (`Field::Nested`) the recursion descends into the
 /// sub-table; for `Field::ArrayOf`, each entry is validated against the
-/// item schema.
+/// item schema; for `Field::MapOf`, each entry's value is validated
+/// against the item schema (with the user-supplied key forming a path
+/// segment).
 fn collect_unknown_paths(
     table: &Table,
     schema: &Schema,
@@ -137,6 +139,23 @@ fn collect_unknown_paths(
                     }
                 }
             }
+            Some(NamedField {
+                field: Field::MapOf(item_schema),
+                ..
+            }) => {
+                // Each map entry's value is a nested object. The entry key
+                // forms a path segment, so `plugins.audit.rogue` is the
+                // path for an unknown key inside the `audit` entry of a
+                // `plugins` MapOf.
+                if let Value::Table(entries) = value {
+                    for (entry_key, entry_value) in entries {
+                        if let Value::Table(t) = entry_value {
+                            let entry_path = format!("{full}.{entry_key}");
+                            collect_unknown_paths(t, item_schema, &entry_path, unknown);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -171,6 +190,17 @@ fn fill_defaults_into(table: &mut Table, schema: &Schema) {
                 if let Some(Value::Array(items)) = table.get_mut(&nf.name) {
                     for item in items {
                         if let Value::Table(t) = item {
+                            fill_defaults_into(t, item_schema);
+                        }
+                    }
+                }
+            }
+            Field::MapOf(item_schema) => {
+                // Map entries are user-supplied — only push defaults into
+                // existing entries, never synthesize missing map values.
+                if let Some(Value::Table(entries)) = table.get_mut(&nf.name) {
+                    for (_entry_key, entry_value) in entries.iter_mut() {
+                        if let Value::Table(t) = entry_value {
                             fill_defaults_into(t, item_schema);
                         }
                     }
@@ -255,6 +285,38 @@ fn check_required_and_types(
                     return Err(ClapfigError::InvalidValue {
                         key: path,
                         reason: format!("expected array, got {}", value_type_name(other)),
+                    });
+                }
+            },
+            Field::MapOf(item_schema) => match table.get(&nf.name) {
+                None => {
+                    // Absent map-of: empty map is the natural default, not
+                    // an error. Same rule as ArrayOf — user-supplied
+                    // entries can be zero.
+                }
+                Some(Value::Table(entries)) => {
+                    for (entry_key, entry_value) in entries {
+                        let entry_path = format!("{path}.{entry_key}");
+                        match entry_value {
+                            Value::Table(inner) => {
+                                check_required_and_types(inner, item_schema, &entry_path)?;
+                            }
+                            other => {
+                                return Err(ClapfigError::InvalidValue {
+                                    key: entry_path,
+                                    reason: format!(
+                                        "expected table, got {}",
+                                        value_type_name(other)
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                Some(other) => {
+                    return Err(ClapfigError::InvalidValue {
+                        key: path,
+                        reason: format!("expected table, got {}", value_type_name(other)),
                     });
                 }
             },

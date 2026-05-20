@@ -554,6 +554,76 @@ fn unit_enum_variant_rename_overrides_rename_all() {
     assert_eq!(s.enum_variants, &["alpha_beta", "GAMMA"]);
 }
 
+// -- BTreeMap<String, NestedStruct> → Field::MapOf (issue #54 item 2) ------
+
+use std::collections::BTreeMap;
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct Plugin {
+    /// Whether this plugin is enabled.
+    #[clapfig(default = false)]
+    enabled: bool,
+
+    /// Severity threshold for emitted diagnostics.
+    severity: String,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct PluginHost {
+    /// Map of installed plugins, keyed by plugin name.
+    plugins: BTreeMap<String, Plugin>,
+}
+
+#[test]
+fn map_of_nested_struct_emits_map_of_field() {
+    let s = PluginHost::schema_static();
+    let plugins = &s.fields[0];
+    assert!(matches!(
+        plugins.field,
+        clapfig::static_schema::FieldStatic::MapOf(_)
+    ));
+}
+
+#[test]
+fn map_of_nested_struct_loads_user_keyed_entries() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("test.toml"),
+        "[plugins.audit]\nseverity = \"warn\"\n[plugins.fmt]\nenabled = true\nseverity = \"error\"\n",
+    )
+    .unwrap();
+    let cfg: PluginHost = Clapfig::schema_builder::<PluginHost>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.plugins.len(), 2);
+    assert!(!cfg.plugins["audit"].enabled);
+    assert_eq!(cfg.plugins["audit"].severity, "warn");
+    assert!(cfg.plugins["fmt"].enabled);
+}
+
+#[test]
+fn map_of_nested_struct_rejects_unknown_key_in_entry() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("test.toml"),
+        "[plugins.audit]\nseverity = \"warn\"\nrogue = 1\n",
+    )
+    .unwrap();
+    let result: Result<PluginHost, _> = Clapfig::schema_builder::<PluginHost>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .strict(true)
+        .load();
+    let err = result.unwrap_err();
+    let keys = err.unknown_keys().expect("expected UnknownKeys");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].key, "plugins.audit.rogue");
+}
+
 // -- Macro-emitted field path enumeration (issue #54 item 7) ---------------
 
 #[test]

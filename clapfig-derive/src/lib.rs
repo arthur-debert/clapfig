@@ -541,6 +541,12 @@ enum TypeShape {
     /// `HashMap<String, V>` / `BTreeMap<String, V>` where V is a leaf shape —
     /// emits `LeafType::Map(V)`. TOML map keys must be strings.
     Map(TokenStream2),
+    /// `HashMap<String, NestedStruct>` / `BTreeMap<String, NestedStruct>` —
+    /// emits `FieldStatic::MapOf(<NestedStruct as Schema>::STATIC)`. The
+    /// inner token is the same `<T as Schema>::STATIC` reference produced
+    /// for plain nested fields; the converter routes it into a `Field::MapOf`
+    /// at the runtime layer.
+    MapOfNested(TokenStream2),
     /// Nested type referencing another struct's `clapfig::Schema` impl.
     Nested(TokenStream2),
     /// `toml::Value` — emits `LeafType::Value`.
@@ -637,7 +643,7 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
                 "Vec<toml::Value> is not supported; use a single `toml::Value` with \
                  #[clapfig(value)] instead",
             )),
-            TypeShape::Map(_) => Err(syn::Error::new(
+            TypeShape::Map(_) | TypeShape::MapOfNested(_) => Err(syn::Error::new(
                 inner.span(),
                 "Vec<HashMap<...>> / Vec<BTreeMap<...>> is not supported by clapfig::Schema. \
                  Use `#[clapfig(value)]` with `toml::Value` for free-form nested shapes.",
@@ -675,21 +681,18 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
                      already 'optional'; omit the Option<T> wrapper."
                 ),
             )),
-            TypeShape::Map(_) => Err(syn::Error::new(
+            TypeShape::Map(_) | TypeShape::MapOfNested(_) => Err(syn::Error::new(
                 value_ty.span(),
                 format!(
                     "{name}<String, {name}<...>> (map-of-map) is not yet supported by clapfig::Schema. \
                      Use `#[clapfig(value)]` with `toml::Value` for free-form nested shapes."
                 ),
             )),
-            TypeShape::Nested(_) => Err(syn::Error::new(
-                value_ty.span(),
-                format!(
-                    "{name}<String, NestedStruct> is not supported by clapfig::Schema — \
-                     `LeafType::Map` carries leaf values only. For maps of nested objects use the \
-                     runtime path (`Schema::object(...).field(...)`) or `#[clapfig(value)]`."
-                ),
-            )),
+            // {Hash,BTree}Map<String, NestedStruct> → `FieldStatic::MapOf` at the
+            // runtime layer. The inner expression is the same `<T as Schema>::STATIC`
+            // we use for plain Nested fields; the converter sees a `MapOf` and
+            // emits `Field::MapOf(schema)`.
+            TypeShape::Nested(inner_expr) => Ok(TypeShape::MapOfNested(inner_expr)),
         };
     }
 
@@ -963,6 +966,30 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
         });
     }
 
+    // `{Hash,BTree}Map<String, NestedStruct>` → FieldStatic::MapOf. Same
+    // leaf-attr rejection as a plain nested field — the runtime side has
+    // no place to attach a `default` / `env` / `optional` to a map of
+    // user-keyed nested objects.
+    if let TypeShape::MapOfNested(inner_expr) = &shape {
+        if attrs.default.is_some()
+            || attrs.env.is_some()
+            || attrs.allowed.is_some()
+            || attrs.optional
+        {
+            return Err(syn::Error::new(
+                field.span(),
+                "leaf attributes (default, env, allowed, optional) are not \
+                 valid on map-of-nested-struct fields",
+            ));
+        }
+        return Ok(quote! {
+            ::clapfig::static_schema::NamedFieldStatic {
+                name: #name,
+                field: ::clapfig::static_schema::FieldStatic::MapOf(#inner_expr),
+            }
+        });
+    }
+
     // For everything else we build a Leaf.
     let (leaf_type_expr, optional_from_type) = leaf_type_for_shape(&shape, &attrs, field.span())?;
     let optional = attrs.optional || optional_from_type;
@@ -1072,7 +1099,11 @@ fn shape_accepts_allowed(shape: &TypeShape) -> bool {
     match shape {
         TypeShape::Scalar(_, _) => true,
         TypeShape::Optional(inner) => shape_accepts_allowed(inner),
-        TypeShape::Array(_) | TypeShape::Map(_) | TypeShape::Value | TypeShape::Nested(_) => false,
+        TypeShape::Array(_)
+        | TypeShape::Map(_)
+        | TypeShape::MapOfNested(_)
+        | TypeShape::Value
+        | TypeShape::Nested(_) => false,
     }
 }
 
@@ -1102,7 +1133,9 @@ fn inner_leaf_type(shape: &TypeShape) -> syn::Result<(TokenStream2, bool)> {
             quote! { ::clapfig::static_schema::LeafTypeStatic::Value },
             false,
         )),
-        TypeShape::Nested(_) => unreachable!("nested handled before leaf-type dispatch"),
+        TypeShape::Nested(_) | TypeShape::MapOfNested(_) => {
+            unreachable!("nested / map-of-nested handled before leaf-type dispatch")
+        }
     }
 }
 

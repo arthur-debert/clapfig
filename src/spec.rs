@@ -189,6 +189,12 @@ impl<'a> FieldRef<'a> {
                     schema: SchemaRef::from_dynamic(schema),
                 },
             ),
+            runtime::Field::MapOf(schema) => (
+                DocSource::Dynamic(&schema.doc),
+                FieldKindRef::MapOf {
+                    schema: SchemaRef::from_dynamic(schema),
+                },
+            ),
         };
         FieldRef {
             name: f.name.as_str(),
@@ -207,6 +213,14 @@ pub(crate) enum FieldKindRef<'a> {
     /// Array-of-objects, TOML `[[name]]`. Static schemas don't produce this
     /// variant; it's exclusive to the runtime path's `Field::ArrayOf(...)`.
     ArrayOf {
+        schema: SchemaRef<'a>,
+    },
+    /// Map-of-objects, TOML `[name.<key>]` with arbitrary user-supplied
+    /// keys. Each entry's value is itself an object validated against
+    /// `schema`. Produced by runtime `Field::MapOf(...)` and by the
+    /// derive macro for `HashMap<String, NestedStruct>` /
+    /// `BTreeMap<String, NestedStruct>` fields.
+    MapOf {
         schema: SchemaRef<'a>,
     },
 }
