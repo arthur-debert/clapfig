@@ -1,0 +1,18 @@
+---
+# yamllint defaults, with line-length relaxed (matches the portfolio's
+# wide-line tolerance baked into .markdownlint.json) and document-start
+# made optional (most of our yaml is GitHub Actions or config — no need
+# to require a leading `---`).
+extends: default
+
+rules:
+  line-length:
+    max: 120
+    level: warning
+  document-start:
+    present: false
+  truthy:
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable

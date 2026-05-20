@@ -34,6 +34,6 @@ This is a Rust project (CLI, library crate, or workspace).
 - Style nits in code that already follows the project's style.
 - Defensive error handling for invariants the type system already enforces.
 - Comments that restate what the code does.
-- Pinning org-internal reusable workflows (e.g. `arthur-debert/gh-dagentic`)
+- Pinning org-internal reusable workflows (e.g. `arthur-debert/release`)
   to SHA — the reusable pattern is "fix once, propagate", and same-owner
   supply-chain risk is negligible.
