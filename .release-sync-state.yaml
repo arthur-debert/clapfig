@@ -1,8 +1,8 @@
 # Managed by release-sync. Do not edit.
 synced_from: arthur-debert/release
 ref: take-iii
-sha: b7496f9586a1288557d926fb2fb22d5048bf19fc
-synced_at: 2026-05-20T05:05:16Z
+sha: c36c73a104d2b00db52de3770eeccc5237132a41
+synced_at: 2026-05-20T18:11:50Z
 stack: rust
 components:
   - shell-quality
@@ -19,9 +19,10 @@ files:
   - .release-sync-state.yaml
   - .shellcheckrc
   - .yamllint
+  - bin/check
+  - bin/check-fmt
+  - bin/check-lint
+  - bin/check-tests
+  - bin/diff-since-release
   - lefthook.yml
-  - scripts/check
-  - scripts/check-fmt
-  - scripts/check-lint
-  - scripts/check-tests
   - scripts/setup-dev-env.sh
