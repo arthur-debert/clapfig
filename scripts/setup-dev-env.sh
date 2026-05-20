@@ -210,6 +210,10 @@ if [ "$(uname -s)" = "Linux" ] \
   # AND doesn't overwrite a process-wide EXIT trap. The subshell exits
   # when this block finishes, the trap fires, the tmp dir is gone — no
   # leak even if awk/cp/openssl error out below.
+  #
+  # The trailing `|| true` matches the script's stated philosophy
+  # (line ~19: errors are best-effort). A cert-import failure shouldn't
+  # abort the rest of the dev-env bootstrap.
   (
     _ca_tmp="$(mktemp -d)"
     trap 'rm -rf "${_ca_tmp}"' EXIT
@@ -256,7 +260,7 @@ if [ "$(uname -s)" = "Linux" ] \
         esac
       done
     fi
-  )
+  ) || true
 fi
 
 # --- 3. Pre-commit hook wiring -------------------------------------------
