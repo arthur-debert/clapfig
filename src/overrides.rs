@@ -74,6 +74,17 @@ fn collect_keys(schema: SchemaRef<'_>, prefix: &str, keys: &mut HashSet<String>)
                 // consumers parses. Until then, ArrayOf keys are not
                 // addressable by dotted path.
             }
+            FieldKindRef::MapOf { .. } => {
+                // Skip MapOf subtrees for the same reason ArrayOf is
+                // skipped: dotted-key consumers can't tell whether
+                // `plugins.audit` means "set the `audit` entry" (a real
+                // user-supplied key) or "set the `audit` leaf inside a
+                // known schema field." The entries' inner keys aren't
+                // declared in the schema, so listing them up-front isn't
+                // possible — callers writing to map entries need a
+                // different surface (top-level `[plugins.audit]` in a
+                // config file, not a dotted CLI override).
+            }
         }
     }
 }

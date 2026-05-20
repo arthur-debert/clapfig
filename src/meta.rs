@@ -72,8 +72,9 @@ fn walk_segments(schema: SchemaRef<'_>, segments: &[&str]) -> Option<Vec<String>
                 return Some(field.doc.iter().map(|s| s.to_string()).collect());
             }
             return match field.kind {
-                FieldKindRef::Nested { schema: nested } => walk_segments(nested, &segments[1..]),
-                FieldKindRef::ArrayOf { schema: nested } => walk_segments(nested, &segments[1..]),
+                FieldKindRef::Nested { schema: nested }
+                | FieldKindRef::ArrayOf { schema: nested }
+                | FieldKindRef::MapOf { schema: nested } => walk_segments(nested, &segments[1..]),
                 // Hit a leaf with segments still pending — the rest of the
                 // path can't resolve.
                 FieldKindRef::Leaf(_) => None,

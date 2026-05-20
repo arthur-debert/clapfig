@@ -287,7 +287,9 @@ fn walk_schema_strict(schema: SchemaRef<'_>, prefix: &str, out: &mut StrictnessO
             FieldKindRef::Leaf(_) => {
                 // Leaves don't carry a `strict` override.
             }
-            FieldKindRef::Nested { schema: nested } | FieldKindRef::ArrayOf { schema: nested } => {
+            FieldKindRef::Nested { schema: nested }
+            | FieldKindRef::ArrayOf { schema: nested }
+            | FieldKindRef::MapOf { schema: nested } => {
                 walk_schema_strict(nested, &dotted, out);
             }
         }
@@ -372,7 +374,9 @@ pub(crate) fn resolve_path_kind(schema: SchemaRef<'_>, dotted: &str) -> PathKind
                     PathKind::Leaf
                 };
             }
-            FieldKindRef::Nested { schema: nested } | FieldKindRef::ArrayOf { schema: nested } => {
+            FieldKindRef::Nested { schema: nested }
+            | FieldKindRef::ArrayOf { schema: nested }
+            | FieldKindRef::MapOf { schema: nested } => {
                 if segments.peek().is_none() {
                     return PathKind::Section;
                 }

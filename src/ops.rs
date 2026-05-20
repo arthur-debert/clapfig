@@ -331,6 +331,33 @@ fn emit_schema(out: &mut String, schema: &crate::runtime::Schema, prefix: &str) 
                     }
                 }
             }
+            Field::MapOf(child) => {
+                let path = if prefix.is_empty() {
+                    nf.name.clone()
+                } else {
+                    format!("{prefix}.{}", nf.name)
+                };
+                for line in &child.doc {
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        out.push_str("#\n");
+                    } else {
+                        let _ = writeln!(out, "# {trimmed}");
+                    }
+                }
+                // Map-of-objects: entry keys are user-supplied so emit a
+                // commented example using a placeholder entry name.
+                let _ = writeln!(out, "#[{path}.<key>]");
+                let mut buf = String::new();
+                emit_schema(&mut buf, child, &format!("{path}.<key>"));
+                for line in buf.lines() {
+                    if line.is_empty() {
+                        out.push('\n');
+                    } else {
+                        let _ = writeln!(out, "#{line}");
+                    }
+                }
+            }
         }
     }
 }
