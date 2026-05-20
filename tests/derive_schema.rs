@@ -422,3 +422,134 @@ fn vec_default_loads_via_runtime_pipeline() {
         .unwrap();
     assert_eq!(cfg.tags, vec!["a".to_string(), "b".to_string()]);
 }
+
+// -- Unit-only enum support (issue #54 item 1) -----------------------------
+
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[clapfig(rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+enum PdfPageSize {
+    A4,
+    Letter,
+    Legal,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct PdfDoc {
+    /// Page size for the rendered document.
+    page_size: PdfPageSize,
+}
+
+#[test]
+fn unit_enum_schema_carries_variant_names_post_rename() {
+    let s = PdfPageSize::schema_static();
+    assert_eq!(s.enum_variants, &["a4", "letter", "legal"]);
+    assert!(s.fields.is_empty());
+}
+
+#[test]
+fn unit_enum_field_flattens_to_runtime_leaf_enum() {
+    let s = PdfDoc::schema();
+    let leaf = match &s.fields[0].field {
+        clapfig::runtime::Field::Leaf(l) => l,
+        other => panic!("expected Leaf, got {other:?}"),
+    };
+    match &leaf.ty {
+        clapfig::runtime::LeafType::Enum { values } => {
+            assert_eq!(values.len(), 3);
+            assert_eq!(values[0], toml::Value::String("a4".into()));
+            assert_eq!(values[1], toml::Value::String("letter".into()));
+            assert_eq!(values[2], toml::Value::String("legal".into()));
+        }
+        other => panic!("expected Enum, got {other:?}"),
+    }
+}
+
+#[test]
+fn unit_enum_template_emits_allowed_hint() {
+    let result = Clapfig::schema_builder::<PdfDoc>()
+        .app_name("test")
+        .no_env()
+        .handle(&ConfigAction::Gen { output: None })
+        .unwrap();
+    let t = match result {
+        ConfigResult::Template(t) => t,
+        other => panic!("expected Template, got {other:?}"),
+    };
+    assert!(
+        t.contains("# Allowed: \"a4\" | \"letter\" | \"legal\""),
+        "unit enum must surface allowed hint in template. Got:\n{t}"
+    );
+}
+
+#[test]
+fn unit_enum_load_accepts_known_variant() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("test.toml"), "page_size = \"letter\"\n").unwrap();
+    let cfg: PdfDoc = Clapfig::schema_builder::<PdfDoc>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.page_size, PdfPageSize::Letter);
+}
+
+#[test]
+fn unit_enum_load_rejects_unknown_variant() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("test.toml"), "page_size = \"a3\"\n").unwrap();
+    let result: Result<PdfDoc, _> = Clapfig::schema_builder::<PdfDoc>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load();
+    assert!(result.is_err());
+}
+
+#[test]
+fn unit_enum_json_schema_carries_enum_array() {
+    let result = Clapfig::schema_builder::<PdfDoc>()
+        .app_name("test")
+        .no_env()
+        .handle(&ConfigAction::Schema { output: None })
+        .unwrap();
+    let s = match result {
+        ConfigResult::Schema(s) => s,
+        other => panic!("expected Schema, got {other:?}"),
+    };
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    let arr = v["properties"]["page_size"]["enum"]
+        .as_array()
+        .expect("unit enum field must emit JSON Schema enum array");
+    let names: Vec<&str> = arr.iter().map(|x| x.as_str().unwrap()).collect();
+    assert_eq!(names, vec!["a4", "letter", "legal"]);
+}
+
+// Enum without rename_all keeps variant names verbatim.
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq, Eq)]
+enum Mode {
+    Fast,
+    Slow,
+}
+
+#[test]
+fn unit_enum_without_rename_all_keeps_pascal_names() {
+    let s = Mode::schema_static();
+    assert_eq!(s.enum_variants, &["Fast", "Slow"]);
+}
+
+// Per-variant `#[clapfig(rename = "...")]` overrides the rename_all rule.
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[clapfig(rename_all = "snake_case")]
+enum Mixed {
+    AlphaBeta,
+    #[clapfig(rename = "GAMMA")]
+    Gamma,
+}
+
+#[test]
+fn unit_enum_variant_rename_overrides_rename_all() {
+    let s = Mixed::schema_static();
+    assert_eq!(s.enum_variants, &["alpha_beta", "GAMMA"]);
+}

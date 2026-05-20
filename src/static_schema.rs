@@ -24,12 +24,24 @@ use toml::Value as TomlValue;
 /// The macro emits one of these per struct (and one per nested struct).
 /// Convert to the runtime form via [`SchemaStatic::to_runtime`] or read
 /// the cached runtime view via [`Schema::schema`].
+///
+/// Unit-only enums also derive [`Schema`] (so a field of that type can
+/// compose via the same `<T as Schema>::STATIC` reference the macro uses
+/// for nested structs). For an enum the `fields` slice is empty and
+/// `enum_variants` carries the variant names (post-`rename_all` /
+/// per-variant `rename`). The converter inspects `enum_variants` when
+/// flattening a `FieldStatic::Nested(...)`: a non-empty list becomes a
+/// `Field::Leaf` with `LeafType::Enum`, while an empty list keeps the
+/// nested-object shape.
 #[derive(Debug)]
 pub struct SchemaStatic {
     pub name: &'static str,
     pub doc: &'static [&'static str],
     pub strict: Option<bool>,
     pub fields: &'static [NamedFieldStatic],
+    /// For unit-only enum types: variant names (post-rename). For struct
+    /// schemas this slice is empty.
+    pub enum_variants: &'static [&'static str],
 }
 
 /// `const`-friendly mirror of [`runtime::NamedField`](crate::runtime::NamedField).
@@ -116,6 +128,14 @@ impl SchemaStatic {
                 .collect(),
         }
     }
+
+    /// `true` when this schema represents a unit-only enum rather than a
+    /// struct. The macro emits an empty `fields` slice for enums and
+    /// populates `enum_variants` instead; the converter consults this
+    /// when flattening a `FieldStatic::Nested(...)` into the runtime form.
+    pub fn is_enum(&self) -> bool {
+        !self.enum_variants.is_empty()
+    }
 }
 
 impl NamedFieldStatic {
@@ -131,6 +151,25 @@ impl FieldStatic {
     fn to_runtime(&self) -> RuntimeField {
         match self {
             FieldStatic::Leaf(leaf) => RuntimeField::Leaf(leaf.to_runtime()),
+            // Flatten an enum-kind nested schema (a unit-only enum that
+            // derived `Schema`) into a runtime leaf carrying the variant
+            // list. The macro can't tell at parse time whether a field's
+            // type is a struct or an enum — so it always emits
+            // `FieldStatic::Nested(<T as Schema>::STATIC)`, and the kind
+            // distinction happens here.
+            FieldStatic::Nested(s) if s.is_enum() => RuntimeField::Leaf(RuntimeLeaf {
+                doc: s.doc.iter().map(|d| (*d).to_string()).collect(),
+                ty: RuntimeLeafType::Enum {
+                    values: s
+                        .enum_variants
+                        .iter()
+                        .map(|v| TomlValue::String((*v).to_string()))
+                        .collect(),
+                },
+                default: None,
+                optional: false,
+                env: None,
+            }),
             FieldStatic::Nested(s) => RuntimeField::Nested(s.to_runtime()),
             FieldStatic::ArrayOf(s) => RuntimeField::ArrayOf(s.to_runtime()),
         }
@@ -276,6 +315,7 @@ mod tests {
                 env: None,
             }),
         }],
+        enum_variants: &[],
     };
 
     #[test]
@@ -359,6 +399,7 @@ mod tests {
                 env: None,
             }),
         }],
+        enum_variants: &[],
     };
 
     static NESTED_OUTER: SchemaStatic = SchemaStatic {
@@ -369,7 +410,50 @@ mod tests {
             name: "db",
             field: FieldStatic::Nested(&NESTED_INNER),
         }],
+        enum_variants: &[],
     };
+
+    static ENUM_PDF_PAGE: SchemaStatic = SchemaStatic {
+        name: "PdfPageSize",
+        doc: EMPTY_DOC,
+        strict: None,
+        fields: &[],
+        enum_variants: &["a4", "letter"],
+    };
+
+    static ENUM_CONTAINER: SchemaStatic = SchemaStatic {
+        name: "Doc",
+        doc: EMPTY_DOC,
+        strict: None,
+        fields: &[NamedFieldStatic {
+            name: "page_size",
+            field: FieldStatic::Nested(&ENUM_PDF_PAGE),
+        }],
+        enum_variants: &[],
+    };
+
+    #[test]
+    fn enum_kind_static_flattens_to_runtime_leaf_enum() {
+        let s = ENUM_CONTAINER.to_runtime();
+        assert_eq!(s.fields.len(), 1);
+        match &s.fields[0].field {
+            RuntimeField::Leaf(leaf) => match &leaf.ty {
+                RuntimeLeafType::Enum { values } => {
+                    assert_eq!(values.len(), 2);
+                    assert_eq!(values[0], TomlValue::String("a4".into()));
+                    assert_eq!(values[1], TomlValue::String("letter".into()));
+                }
+                other => panic!("expected Enum, got {other:?}"),
+            },
+            other => panic!("expected Leaf (enum flattened), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_enum_distinguishes_struct_from_enum_schema() {
+        assert!(!MINIMAL_SCHEMA.is_enum());
+        assert!(ENUM_PDF_PAGE.is_enum());
+    }
 
     #[test]
     fn nested_static_schemas_compose_via_static_reference() {
