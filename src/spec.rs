@@ -310,8 +310,9 @@ pub(crate) trait ConfigSpec {
     /// `StaticSpec<C>` returns `C`; `DynamicSpec` returns `toml::Table`.
     type Output;
 
-    /// The schema as a borrowed view.
-    #[allow(dead_code)] // consumed by spec-aware consumers (handle, persist)
+    /// The schema as a borrowed view. Consumed by the env-layer
+    /// validator in `resolve::resolve` and by spec-aware consumers
+    /// (handle, persist).
     fn schema(&self) -> SchemaRef<'_>;
 
     /// Detect unknown keys in a parsed config table.

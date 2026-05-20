@@ -172,6 +172,32 @@ pub(crate) fn resolve<S: ConfigSpec>(
         .as_ref()
         .map(|prefix| env::env_to_table(prefix, input.env_vars));
 
+    // Validate the env-derived table against the schema. Before this pass
+    // env-unknown keys merged in unnoticed: `validate_unknown` only ran
+    // per-file, the env layer landed afterwards, and `finalize` doesn't
+    // re-check unknown keys. Now an env var like `MYAPP__ROGUE` flows
+    // through the same cascade (and `on_unknown_key` callback) as a
+    // file-supplied `rogue = 1` key, with the source path rendered as
+    // `<env>` and no line number.
+    //
+    // The walker is schema-driven (no serde_ignored / typed deserialize)
+    // so type mismatches between env's heuristic value parsing (e.g.
+    // string "1.5" for an integer field) don't fail validation — that's
+    // still the job of the final-merge type check inside `finalize`.
+    if cascade_active && let Some(env_table_ref) = env_table.as_ref() {
+        let env_unknowns =
+            crate::validate::collect_unknown_paths_ref(env_table_ref, input.spec.schema(), "");
+        let env_path = std::path::PathBuf::from("<env>");
+        let mut env_filtered = crate::validate::filter_through_cascade(
+            env_table_ref,
+            "",
+            &env_path,
+            env_unknowns,
+            &validate_ctx,
+        )?;
+        collected_unknowns.append(&mut env_filtered);
+    }
+
     // URL layer
     #[cfg(feature = "url")]
     let url_table = if input.url_overrides.is_empty() {
@@ -372,6 +398,86 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("typo") || msg.contains("Unknown"));
+    }
+
+    #[test]
+    fn env_unknown_key_rejected_when_strict() {
+        // Issue #54 item 3: env-derived unknown keys used to merge in
+        // unnoticed. They now flow through the same cascade as file
+        // keys — `MYAPP__ROGUE=1` errors the same way `rogue = 1` in a
+        // file would.
+        let input = ResolveInput {
+            env_vars: vec![("MYAPP__ROGUE_KEY".into(), "1".into())],
+            env_prefix: Some("MYAPP".into()),
+            strict_default: true,
+            ..empty_input(&TEST_SPEC)
+        };
+        let result: Result<(TestConfig, _), _> = resolve(input);
+        let err = result.unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "rogue_key");
+    }
+
+    #[test]
+    fn env_unknown_key_invokes_on_unknown_key_callback() {
+        // The callback fires on env-derived unknowns the same as file
+        // unknowns — closing the gap where dotted-extension keys from
+        // the env layer reached `extra` without ever being seen by
+        // user code.
+        let saw_env_unknown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw = std::sync::Arc::clone(&saw_env_unknown);
+        let input = ResolveInput {
+            env_vars: vec![("MYAPP__ROGUE_KEY".into(), "1".into())],
+            env_prefix: Some("MYAPP".into()),
+            strict_default: true,
+            unknown_key_hook: Some(std::sync::Arc::new(move |ctx| {
+                if ctx.path == "rogue_key" {
+                    saw.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                crate::strict::UnknownKeyDecision::Accept
+            })),
+            ..empty_input(&TEST_SPEC)
+        };
+        let result: Result<(TestConfig, _), _> = resolve(input);
+        assert!(result.is_ok());
+        assert!(
+            saw_env_unknown.load(std::sync::atomic::Ordering::SeqCst),
+            "on_unknown_key must run for env-derived unknown keys"
+        );
+    }
+
+    #[test]
+    fn env_unknown_key_dropped_under_lenient_subtree() {
+        // Cascade still applies: `strict_at("section", false)` makes that
+        // subtree lenient for env-derived keys too.
+        let mut overrides = StrictnessOverrides::new();
+        overrides.insert("database", false);
+        let input = ResolveInput {
+            env_vars: vec![("APP__DATABASE__ROGUE".into(), "x".into())],
+            env_prefix: Some("APP".into()),
+            strict_default: true,
+            strict_overrides: overrides,
+            ..empty_input(&TEST_SPEC)
+        };
+        // Should load cleanly — the cascade marks `database.*` lenient.
+        let result: Result<(TestConfig, _), _> = resolve(input);
+        assert!(result.is_ok(), "lenient subtree applies to env: {result:?}");
+    }
+
+    #[test]
+    fn env_layer_does_not_re_validate_when_cascade_inactive() {
+        // No strict default, no strict overrides → validation is skipped
+        // entirely, both for files AND for the env layer. Unknown env vars
+        // pass through silently (matches pre-Phase-3 behavior).
+        let input = ResolveInput {
+            env_vars: vec![("APP__ROGUE_KEY".into(), "1".into())],
+            env_prefix: Some("APP".into()),
+            strict_default: false,
+            ..empty_input(&TEST_SPEC)
+        };
+        let result: Result<(TestConfig, _), _> = resolve(input);
+        assert!(result.is_ok());
     }
 
     #[test]
