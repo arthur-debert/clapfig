@@ -841,6 +841,177 @@ fn option_of_map_emits_optional_map_leaf() {
     assert!(matches!(leaf.ty, LeafTypeStatic::Map(_)));
 }
 
+// -- `#[clapfig(value)]` works on non-toml::Value field types ------------
+//
+// Regression coverage for the migration bug: the macro previously rejected
+// `#[clapfig(value)]` on any field whose Rust type classified as
+// `TypeShape::Nested` (the fallback for custom Pascal-case types).
+// In practice that's almost everything you'd actually want to use the
+// escape hatch *for* — `#[serde(untagged)]` enums, custom Rust enums,
+// even primitives we don't recognize as scalars (`char`). Each test
+// here covers one of the four real cases the lex-fmt migration hit.
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct ValueOnChar {
+    /// `char` isn't in our scalar set, so it falls through to
+    /// `TypeShape::Nested`. With `#[clapfig(value)]` set, the macro must
+    /// bypass that branch and emit a Value leaf instead of rejecting.
+    #[clapfig(value)]
+    marker: char,
+}
+
+#[test]
+fn value_attribute_works_on_unrecognized_primitive() {
+    let leaf = match &<ValueOnChar as Schema>::STATIC.fields[0].field {
+        FieldStatic::Leaf(l) => l,
+        other => panic!("expected Leaf, got {other:?}"),
+    };
+    assert!(matches!(leaf.ty, LeafTypeStatic::Value));
+    assert!(!leaf.optional);
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum PageSize {
+    A4,
+    Letter,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct ValueOnCustomEnum {
+    /// A plain custom Rust enum (no `#[serde(untagged)]`). Classifies as
+    /// `TypeShape::Nested` because the macro can't tell syntactically
+    /// that it isn't a struct deriving Schema. The escape hatch must
+    /// still work.
+    #[clapfig(value)]
+    size: PageSize,
+}
+
+#[test]
+fn value_attribute_works_on_custom_enum() {
+    let leaf = match &<ValueOnCustomEnum as Schema>::STATIC.fields[0].field {
+        FieldStatic::Leaf(l) => l,
+        other => panic!("expected Leaf, got {other:?}"),
+    };
+    assert!(matches!(leaf.ty, LeafTypeStatic::Value));
+}
+
+#[test]
+fn value_attribute_custom_enum_loads_end_to_end() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("t.toml"), "size = \"a4\"\n").unwrap();
+    let cfg: ValueOnCustomEnum = Clapfig::schema_builder::<ValueOnCustomEnum>()
+        .app_name("t")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.size, PageSize::A4);
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(untagged)]
+enum RuleConfig {
+    /// Bare severity string.
+    Severity(String),
+    /// Severity plus per-rule options.
+    Detailed(String, std::collections::BTreeMap<String, toml::Value>),
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct ValueOnUntaggedEnum {
+    /// `#[serde(untagged)]` enums are the *original* motivating use case
+    /// for `#[clapfig(value)]` per the proposal. They classify as
+    /// `TypeShape::Nested`. The macro must emit a Value leaf so the
+    /// runtime accepts any TOML shape and serde resolves the variant.
+    #[clapfig(value)]
+    rule: RuleConfig,
+}
+
+#[test]
+fn value_attribute_works_on_untagged_enum() {
+    let leaf = match &<ValueOnUntaggedEnum as Schema>::STATIC.fields[0].field {
+        FieldStatic::Leaf(l) => l,
+        other => panic!("expected Leaf, got {other:?}"),
+    };
+    assert!(matches!(leaf.ty, LeafTypeStatic::Value));
+}
+
+#[test]
+fn value_attribute_untagged_enum_accepts_both_shapes_at_load() {
+    // The whole point — runtime path accepts either variant's TOML
+    // shape, and serde resolves it.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("t.toml"), "rule = \"warn\"\n").unwrap();
+    let cfg: ValueOnUntaggedEnum = Clapfig::schema_builder::<ValueOnUntaggedEnum>()
+        .app_name("t")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.rule, RuleConfig::Severity("warn".into()));
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct NamespaceSpec {
+    name: String,
+    aliases: Vec<String>,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct ValueOnMapOfCustom {
+    /// `BTreeMap<String, NamespaceSpec>` would normally be rejected at
+    /// derive time because the map-value classification refuses
+    /// `Nested`. With `#[clapfig(value)]` the user is opting out of
+    /// shape inference for the whole map; classify_type must be
+    /// bypassed entirely.
+    #[clapfig(value)]
+    labels: std::collections::BTreeMap<String, NamespaceSpec>,
+}
+
+#[test]
+fn value_attribute_works_on_map_of_custom_struct() {
+    let leaf = match &<ValueOnMapOfCustom as Schema>::STATIC.fields[0].field {
+        FieldStatic::Leaf(l) => l,
+        other => panic!("expected Leaf, got {other:?}"),
+    };
+    assert!(matches!(leaf.ty, LeafTypeStatic::Value));
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct ValueOnOptionalCustom {
+    /// `Option<CustomEnum>` — must produce an *optional* Value leaf, not
+    /// a non-optional one. The escape hatch needs to preserve outer
+    /// Option-ness so a missing key is accepted.
+    #[clapfig(value)]
+    size: Option<PageSize>,
+}
+
+#[test]
+fn value_attribute_preserves_outer_option_optionality() {
+    let leaf = match &<ValueOnOptionalCustom as Schema>::STATIC.fields[0].field {
+        FieldStatic::Leaf(l) => l,
+        other => panic!("expected Leaf, got {other:?}"),
+    };
+    assert!(matches!(leaf.ty, LeafTypeStatic::Value));
+    assert!(
+        leaf.optional,
+        "Option<CustomEnum> with #[clapfig(value)] must produce an optional Value leaf"
+    );
+}
+
+#[test]
+fn value_attribute_optional_loads_absent_as_none() {
+    let dir = TempDir::new().unwrap();
+    let cfg: ValueOnOptionalCustom = Clapfig::schema_builder::<ValueOnOptionalCustom>()
+        .app_name("t")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert!(cfg.size.is_none());
+}
+
 // -- handle_to_string surface forwards correctly --------------------------
 
 #[test]

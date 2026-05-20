@@ -610,6 +610,22 @@ fn two_generic_arguments<'a>(
     Ok((k, v))
 }
 
+/// Syntactic check for whether the outer-most type is `Option<...>`.
+///
+/// Used by the `#[clapfig(value)]` escape-hatch path so we can preserve
+/// the field's optionality without recursing into the inner type — `value`
+/// explicitly bypasses shape inference, so we must not run
+/// `classify_type` on the inner. Accepts any path whose last segment is
+/// `Option` (works for `Option<T>`, `std::option::Option<T>`, etc.).
+fn is_outer_option_type(ty: &Type) -> bool {
+    if let Type::Path(TypePath { path, qself: None }) = ty
+        && let Some(last) = path.segments.last()
+    {
+        return last.ident == "Option";
+    }
+    false
+}
+
 /// Last-segment check for `String` (or qualified `std::string::String`).
 fn is_string_path(ty: &Type) -> bool {
     if let Type::Path(TypePath { path, qself: None }) = ty
@@ -663,20 +679,38 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
     let name = attrs.rename.clone().unwrap_or_else(|| ident.to_string());
     let doc_expr = doc_slice(&doc_lines);
 
-    let shape = classify_type(&field.ty)?;
+    // `#[clapfig(value)]` is the universal escape hatch: the user opts out
+    // of shape inference and takes responsibility for the deserialize side
+    // (typically a `#[serde(untagged)]` enum, a custom Rust enum, or any
+    // other type clapfig wouldn't otherwise recognize as a leaf). Skip
+    // `classify_type` entirely — running it would either route through the
+    // Nested-branch rejection below (for custom Pascal-case types) or
+    // through `Map<String, NestedStruct>` rejection (for maps of custom
+    // values), neither of which fits the override's documented contract.
+    // We only need the outer-Option signal so `optional_from_type` is
+    // correct.
+    let shape = if attrs.force_value {
+        if is_outer_option_type(&field.ty) {
+            TypeShape::Optional(Box::new(TypeShape::Value))
+        } else {
+            TypeShape::Value
+        }
+    } else {
+        classify_type(&field.ty)?
+    };
 
     // Nested struct → FieldStatic::Nested. Field-level attrs (default, env,
-    // allowed, value) are leaf-only; reject them.
+    // allowed, optional) are leaf-only; reject them on nested fields.
+    // `value` is handled above and never reaches this branch.
     if let TypeShape::Nested(inner_expr) = &shape {
         if attrs.default.is_some()
             || attrs.env.is_some()
-            || attrs.force_value
             || attrs.allowed.is_some()
             || attrs.optional
         {
             return Err(syn::Error::new(
                 field.span(),
-                "leaf attributes (default, env, value, allowed, optional) are not \
+                "leaf attributes (default, env, allowed, optional) are not \
                  valid on nested-struct fields",
             ));
         }
