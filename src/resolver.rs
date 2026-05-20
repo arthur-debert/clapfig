@@ -192,6 +192,38 @@ impl<C: Config> Resolver<C> {
     where
         C::Layer: for<'de> Deserialize<'de>,
     {
+        self.resolve_at_inner(start_dir.as_ref())
+            .map(|(config, _unknowns)| config)
+    }
+
+    /// Same as [`resolve_at`](Self::resolve_at) but also returns any keys
+    /// the [`on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
+    /// callback elected to [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect).
+    pub fn resolve_at_with_unknowns(
+        &self,
+        start_dir: impl AsRef<Path>,
+    ) -> Result<(C, Vec<crate::strict::CollectedUnknown>), ClapfigError>
+    where
+        C::Layer: for<'de> Deserialize<'de>,
+    {
+        self.resolve_at_inner(start_dir.as_ref())
+    }
+
+    /// Shared implementation behind [`resolve_at`](Self::resolve_at) and
+    /// [`resolve_at_with_unknowns`](Self::resolve_at_with_unknowns).
+    ///
+    /// Normalizes the start dir, expands search paths, loads files
+    /// through the cache, builds the `ResolveInput`, drives the resolve
+    /// pipeline, and runs the `post_validate` hook. Returns the typed
+    /// `C` plus any `UnknownKeyDecision::Collect`-routed unknown keys;
+    /// the no-unknowns surface discards the second tuple element.
+    fn resolve_at_inner(
+        &self,
+        start_dir: &Path,
+    ) -> Result<(C, Vec<crate::strict::CollectedUnknown>), ClapfigError>
+    where
+        C::Layer: for<'de> Deserialize<'de>,
+    {
         // Normalize the start dir to an absolute (and, when possible,
         // canonicalized) path before threading it through. A relative
         // `start_dir` like `"./leaf"` would otherwise break in three ways:
@@ -206,59 +238,6 @@ impl<C: Config> Resolver<C> {
         // Canonicalization can fail (e.g. the directory doesn't exist yet),
         // in which case we fall back to the plain absolute form so the call
         // still runs rather than erroring the whole walk.
-        let start_dir = start_dir.as_ref();
-        let absolute = if start_dir.is_absolute() {
-            start_dir.to_path_buf()
-        } else {
-            match std::env::current_dir() {
-                Ok(cwd) => cwd.join(start_dir),
-                Err(e) => {
-                    return Err(ClapfigError::IoError {
-                        path: start_dir.to_path_buf(),
-                        source: e,
-                    });
-                }
-            }
-        };
-        let normalized = std::fs::canonicalize(&absolute).unwrap_or(absolute);
-
-        let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, &normalized);
-        let files = self.load_files_cached(&dirs)?;
-
-        let spec = StaticSpec::<C>::new();
-        let input = ResolveInput {
-            spec: &spec,
-            files,
-            env_vars: self.env_vars.clone(),
-            env_prefix: self.env_prefix.clone(),
-            #[cfg(feature = "url")]
-            url_overrides: self.url_overrides.clone(),
-            cli_overrides: self.cli_overrides.clone(),
-            strict_default: self.strict_default,
-            strict_overrides: self.strict_overrides.clone(),
-            unknown_key_hook: self.unknown_key_hook.clone(),
-            normalize_keys: self.normalize_keys,
-            layer_order: self.layer_order.clone(),
-        };
-
-        let (config, _unknowns) = resolve::resolve(input)?;
-        if let Some(hook) = self.post_validate.as_ref() {
-            hook(&config).map_err(ClapfigError::PostValidationFailed)?;
-        }
-        Ok(config)
-    }
-
-    /// Same as [`resolve_at`](Self::resolve_at) but also returns any keys
-    /// the [`on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
-    /// callback elected to [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect).
-    pub fn resolve_at_with_unknowns(
-        &self,
-        start_dir: impl AsRef<Path>,
-    ) -> Result<(C, Vec<crate::strict::CollectedUnknown>), ClapfigError>
-    where
-        C::Layer: for<'de> Deserialize<'de>,
-    {
-        let start_dir = start_dir.as_ref();
         let absolute = if start_dir.is_absolute() {
             start_dir.to_path_buf()
         } else {

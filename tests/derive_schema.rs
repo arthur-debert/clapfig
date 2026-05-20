@@ -554,6 +554,41 @@ fn unit_enum_variant_rename_overrides_rename_all() {
     assert_eq!(s.enum_variants, &["alpha_beta", "GAMMA"]);
 }
 
+// Acronym runs in variant names render the serde way: consecutive
+// uppercase letters stay together; the new-word boundary is the *next*
+// uppercase letter that's followed by a lowercase letter.
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[clapfig(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+enum AcronymVariants {
+    MyHTTPApi,
+    IOError,
+    HTTPServer,
+    MyVariant,
+}
+
+#[test]
+fn rename_all_snake_case_groups_acronym_runs() {
+    let s = AcronymVariants::schema_static();
+    assert_eq!(
+        s.enum_variants,
+        &["my_http_api", "io_error", "http_server", "my_variant"]
+    );
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[clapfig(rename_all = "camelCase")]
+enum CamelAcronyms {
+    MyHTTPApi,
+    IOError,
+}
+
+#[test]
+fn rename_all_camel_case_groups_acronym_runs() {
+    let s = CamelAcronyms::schema_static();
+    assert_eq!(s.enum_variants, &["myHttpApi", "ioError"]);
+}
+
 // -- BTreeMap<String, NestedStruct> → Field::MapOf (issue #54 item 2) ------
 
 use std::collections::BTreeMap;
