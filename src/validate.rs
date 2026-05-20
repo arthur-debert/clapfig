@@ -124,26 +124,30 @@ pub(crate) fn collect_unknown_paths_ref(
     out
 }
 
-fn walk_against_schema(
+fn walk_against_schema<'a>(
     table: &Table,
-    schema: SchemaRef<'_>,
+    schema: SchemaRef<'a>,
     prefix: &str,
     out: &mut Vec<UnknownKey>,
 ) {
-    // Build a name→kind lookup once per recursion level — schemas are
-    // small enough that a linear scan would also be fine, but the map
-    // avoids quadratic behavior on wide tables.
-    let mut fields: Vec<(String, FieldKindRef<'_>)> = Vec::new();
-    for f in schema.fields() {
-        fields.push((f.name.to_string(), f.kind));
-    }
+    // Snapshot the schema's fields into a `Vec` of `&str`-borrowed
+    // entries up front, so we can iterate `table` (a borrow) without
+    // re-running the schema iterator's setup on every key. Schemas in
+    // practice are small enough that a linear `iter().find(...)` per
+    // key is fast; if a hot path appears with a wide schema we can
+    // switch to `HashMap<&str, ...>` here without touching callers.
+    let fields: Vec<(&'a str, FieldKindRef<'a>)> =
+        schema.fields().map(|f| (f.name, f.kind)).collect();
     for (key, value) in table {
         let full = if prefix.is_empty() {
             key.clone()
         } else {
             format!("{prefix}.{key}")
         };
-        let kind = fields.iter().find(|(n, _)| n == key).map(|(_, k)| *k);
+        let kind = fields
+            .iter()
+            .find(|(n, _)| *n == key.as_str())
+            .map(|(_, k)| *k);
         match kind {
             None => {
                 out.push(UnknownKey {

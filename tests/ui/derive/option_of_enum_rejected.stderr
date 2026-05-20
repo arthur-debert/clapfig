@@ -1,0 +1,5 @@
+error: Option<NestedStruct> / Option<EnumType> / Option<Map<String, NestedStruct>> are not yet supported by clapfig::Schema — there is no place to attach `optional` on a nested-schema reference. Drop the Option and use the bare type (an absent nested section already has the empty-table semantics for object fields, and is equivalent to the default variant for enum fields), or use `#[clapfig(value)]` with `toml::Value` if you need explicit absent-vs-present semantics.
+  --> tests/ui/derive/option_of_enum_rejected.rs:11:11
+   |
+11 |     mode: Option<Mode>,
+   |           ^^^^^^

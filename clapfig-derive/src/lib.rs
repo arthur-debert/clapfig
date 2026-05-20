@@ -289,35 +289,67 @@ fn apply_rename_all(name: &str, rule: &str) -> Option<String> {
     }
 }
 
-/// Convert PascalCase to camelCase by lowercasing only the first character.
-/// `MyVariant` → `myVariant`. Multi-uppercase runs at the start (`HTTP`)
-/// stay as `hTTP` — matching serde's behavior, which doesn't disambiguate
-/// acronyms.
+/// Convert PascalCase to camelCase, matching serde's `rename_all` behavior:
+/// `MyVariant` → `myVariant`, `MyHTTPApi` → `myHttpApi`. Derived from the
+/// snake_case form so acronym runs collapse the same way serde does (no
+/// internal separators inside an acronym; the first letter of a new word
+/// after an acronym keeps the upper-case boundary).
 fn pascal_to_camel(name: &str) -> String {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) => {
-            let mut out = String::with_capacity(name.len());
-            out.extend(c.to_lowercase());
-            out.extend(chars);
-            out
+    let snake = pascal_to_snake(name, '_');
+    let mut out = String::with_capacity(snake.len());
+    let mut next_upper = false;
+    for (i, c) in snake.chars().enumerate() {
+        if c == '_' {
+            next_upper = true;
+        } else if i == 0 {
+            out.push(c);
+        } else if next_upper {
+            out.extend(c.to_uppercase());
+            next_upper = false;
+        } else {
+            out.push(c);
         }
-        None => String::new(),
     }
+    out
 }
 
-/// Convert PascalCase to a separator-joined lowercase form. `sep = '_'`
-/// produces snake_case, `sep = '-'` produces kebab-case. An uppercase
-/// letter that isn't at position 0 emits the separator first; consecutive
-/// uppercase runs (acronyms) get the separator before the first upper, not
-/// inside the run — `MyHTTPApi` → `my_h_t_t_p_api`, matching serde.
+/// Convert PascalCase to a separator-joined lowercase form, matching the
+/// algorithm serde / `heck::AsSnakeCase` use. `sep = '_'` produces
+/// snake_case, `sep = '-'` produces kebab-case.
+///
+/// An uppercase letter inserts the separator *before itself* in two
+/// cases — and no other — so acronym runs are kept together:
+///   1. it follows a lowercase letter: `MyHttp` → boundary before `H`.
+///   2. it follows another uppercase AND is followed by a lowercase
+///      letter: in `HTTPApi`, the `A` is the boundary because it starts
+///      a new word inside the acronym run; the inner `T`/`T`/`P` keep
+///      the previous word's letters together.
+///
+/// Concretely:
+///   `MyVariant`   → `my_variant`
+///   `MyHTTPApi`   → `my_http_api`
+///   `IOError`     → `io_error`
+///   `HTTPServer`  → `http_server`
+///
+/// (Verified against serde's rename_all in upstream issues; reproducing
+/// the algorithm here lets `clapfig-derive` avoid adding a `heck`
+/// dependency for a single text transform.)
 fn pascal_to_snake(name: &str, sep: char) -> String {
+    let chars: Vec<char> = name.chars().collect();
     let mut out = String::with_capacity(name.len() + 4);
-    for (i, c) in name.chars().enumerate() {
-        if c.is_uppercase() {
-            if i > 0 {
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            let prev = chars[i - 1];
+            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            // Boundary 1: lowercase → upper.
+            // Boundary 2: upper → upper, followed by a lowercase letter
+            // (i.e. the current upper starts a new word inside an
+            // acronym-then-PascalCase sequence).
+            if prev.is_lowercase() || (prev.is_uppercase() && next_lower) {
                 out.push(sep);
             }
+        }
+        if c.is_uppercase() {
             out.extend(c.to_lowercase());
         } else {
             out.push(c);
@@ -423,7 +455,7 @@ fn parse_struct_attrs(attrs: &[Attribute]) -> syn::Result<StructAttrs> {
                 Ok(())
             } else {
                 Err(meta.error(format!(
-                    "unsupported #[clapfig(...)] struct attribute: `{}`. \
+                    "unsupported #[clapfig(...)] type attribute: `{}`. \
                      Supported: name = \"...\", strict = true/false, \
                      rename_all = \"...\"",
                     meta.path
@@ -988,6 +1020,33 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
                 field: ::clapfig::static_schema::FieldStatic::MapOf(#inner_expr),
             }
         });
+    }
+
+    // `Option<NestedStruct>` and `Option<EnumType>` both classify as
+    // `Optional(Nested(_))` (the macro can't syntactically tell struct
+    // from enum). `Option<{Hash,BTree}Map<String, NestedStruct>>` shows
+    // up as `Optional(MapOfNested(_))`. None of these have a place to
+    // attach the `optional` flag at the `FieldStatic` layer (Nested /
+    // MapOf carry only the static-schema reference), so reject early
+    // with a clear diagnostic instead of falling through to
+    // `inner_leaf_type` and panicking on the `unreachable!` arm.
+    if let TypeShape::Optional(inner) = &shape
+        && matches!(
+            inner.as_ref(),
+            TypeShape::Nested(_) | TypeShape::MapOfNested(_)
+        )
+    {
+        return Err(syn::Error::new(
+            field.ty.span(),
+            "Option<NestedStruct> / Option<EnumType> / \
+             Option<Map<String, NestedStruct>> are not yet supported by \
+             clapfig::Schema — there is no place to attach `optional` on a \
+             nested-schema reference. Drop the Option and use the bare type \
+             (an absent nested section already has the empty-table semantics \
+             for object fields, and is equivalent to the default variant for \
+             enum fields), or use `#[clapfig(value)]` with `toml::Value` if \
+             you need explicit absent-vs-present semantics.",
+        ));
     }
 
     // For everything else we build a Leaf.

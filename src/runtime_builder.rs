@@ -515,45 +515,8 @@ impl RuntimeResolver {
         &self,
         start_dir: impl AsRef<std::path::Path>,
     ) -> Result<Table, ClapfigError> {
-        let start_dir = start_dir.as_ref();
-        let absolute = if start_dir.is_absolute() {
-            start_dir.to_path_buf()
-        } else {
-            match std::env::current_dir() {
-                Ok(cwd) => cwd.join(start_dir),
-                Err(e) => {
-                    return Err(ClapfigError::IoError {
-                        path: start_dir.to_path_buf(),
-                        source: e,
-                    });
-                }
-            }
-        };
-        let normalized = std::fs::canonicalize(&absolute).unwrap_or(absolute);
-
-        let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, &normalized);
-        let files = self.load_files_cached(&dirs)?;
-
-        let input = ResolveInput {
-            spec: self.spec.as_ref(),
-            files,
-            env_vars: self.env_vars.clone(),
-            env_prefix: self.env_prefix.clone(),
-            #[cfg(feature = "url")]
-            url_overrides: self.url_overrides.clone(),
-            cli_overrides: self.cli_overrides.clone(),
-            strict_default: self.strict_default,
-            strict_overrides: self.strict_overrides.clone(),
-            unknown_key_hook: self.unknown_key_hook.clone(),
-            normalize_keys: self.normalize_keys,
-            layer_order: self.layer_order.clone(),
-        };
-
-        let (table, _unknowns) = resolve::resolve(input)?;
-        if let Some(hook) = self.post_validate.as_ref() {
-            hook(&table).map_err(ClapfigError::PostValidationFailed)?;
-        }
-        Ok(table)
+        self.resolve_at_inner(start_dir.as_ref())
+            .map(|(table, _unknowns)| table)
     }
 
     /// Same as [`resolve_at`](Self::resolve_at) but also returns any keys
@@ -565,7 +528,17 @@ impl RuntimeResolver {
         &self,
         start_dir: impl AsRef<std::path::Path>,
     ) -> Result<(Table, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
-        let start_dir = start_dir.as_ref();
+        self.resolve_at_inner(start_dir.as_ref())
+    }
+
+    /// Shared implementation behind [`resolve_at`](Self::resolve_at) and
+    /// [`resolve_at_with_unknowns`](Self::resolve_at_with_unknowns). See
+    /// the static-path counterpart `Resolver::resolve_at_inner` for the
+    /// design rationale — same shape, runtime spec.
+    fn resolve_at_inner(
+        &self,
+        start_dir: &std::path::Path,
+    ) -> Result<(Table, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
         let absolute = if start_dir.is_absolute() {
             start_dir.to_path_buf()
         } else {
