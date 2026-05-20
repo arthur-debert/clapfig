@@ -17,4 +17,4 @@ updates:
     open-pull-requests-limit: 5
     groups:
       gh-actions:
-        patterns: ["*"]
+        patterns: ['*']

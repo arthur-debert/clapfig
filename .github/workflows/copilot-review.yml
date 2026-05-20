@@ -1,12 +1,23 @@
 name: Copilot Review
 
+# Trigger policy:
+#   - Fires once at PR creation (`opened`), regardless of draft state.
+#     Drafts get Copilot too — the Auto-fix loop can address comments
+#     while the PR is still draft.
+#   - `ready_for_review` is intentionally NOT in the types list — going
+#     draft → ready does not re-trigger Copilot, since it already
+#     reviewed at open. Avoids the "two Copilot reviews per PR" pattern
+#     that the prior policy produced.
+#   - Fork PRs still skipped (security: don't pass RELEASE_TOKEN to
+#     untrusted source).
+
 on:
   pull_request:
-    types: [opened, ready_for_review]
+    types: [opened]
 
 jobs:
   request:
-    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.fork == false
+    if: github.event.pull_request.head.repo.fork == false
     permissions:
       contents: read
       pull-requests: write
