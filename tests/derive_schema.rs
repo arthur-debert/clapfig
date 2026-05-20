@@ -553,3 +553,31 @@ fn unit_enum_variant_rename_overrides_rename_all() {
     let s = Mixed::schema_static();
     assert_eq!(s.enum_variants, &["alpha_beta", "GAMMA"]);
 }
+
+// -- Macro-emitted field path enumeration (issue #54 item 7) ---------------
+
+#[test]
+fn field_paths_lists_leaves_and_sections_in_source_order() {
+    let paths = AppConfig::field_paths();
+    // Source order: host, port, debug, database (section, then its leaves).
+    assert_eq!(
+        paths,
+        vec![
+            "host".to_string(),
+            "port".into(),
+            "debug".into(),
+            "database".into(),
+            "database.url".into(),
+            "database.pool_size".into(),
+        ]
+    );
+}
+
+#[test]
+fn field_paths_treats_unit_enum_field_as_a_single_leaf_path() {
+    // Enum-kind nested schemas flatten to a leaf at the runtime layer; the
+    // variant names are metadata on the leaf, not separate paths, so they
+    // must not appear in the path inventory.
+    let paths = PdfDoc::field_paths();
+    assert_eq!(paths, vec!["page_size".to_string()]);
+}

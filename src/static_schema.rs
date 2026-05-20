@@ -268,6 +268,62 @@ pub trait Schema {
     /// reference-counted handles to it. Cost: one `Arc::clone` per call
     /// (atomic increment, no allocation).
     fn schema_arc() -> Arc<RuntimeSchema>;
+
+    /// Flat list of every dotted path the schema knows about: leaf
+    /// addressable keys plus every nested-section and array-of-objects
+    /// node. Lets consumer code (extension registries, doc generators,
+    /// `--list-keys` flags) replace hand-maintained "known paths"
+    /// constants — the macro recomputes the list every time a field is
+    /// added or removed.
+    ///
+    /// Ordering is depth-first, matching the order fields appear in the
+    /// source struct (parents emit their own path before recursing into
+    /// children). Array-of-objects nodes contribute the array name once
+    /// (`"plugins"`); individual array entries are not addressable as
+    /// distinct paths at this layer so no `plugins[N]` form is emitted.
+    /// Unit-enum leaves contribute only their own path (the variant set
+    /// is metadata on the leaf, not a separate sub-path).
+    ///
+    /// The default impl walks `Self::STATIC`. Override is rarely needed.
+    fn field_paths() -> Vec<String> {
+        let mut out = Vec::new();
+        collect_field_paths(Self::STATIC, "", &mut out);
+        out
+    }
+}
+
+/// Depth-first walk of a [`SchemaStatic`] tree that appends each node's
+/// dotted path to `out`. Backs [`Schema::field_paths`]; exposed publicly
+/// because consumers that already have a `&SchemaStatic` (rare — usually
+/// they have the trait impl instead) can reuse the same traversal.
+///
+/// `prefix` is the dotted path of the *current* schema's parent (or `""`
+/// at the root). Each child appends its own name to the prefix; for a
+/// leaf the appended path is added to `out`, and for a nested or
+/// array-of subtree the section path is added *before* recursing so
+/// downstream consumers can use the list as a section/path inventory in
+/// one read.
+pub fn collect_field_paths(schema: &SchemaStatic, prefix: &str, out: &mut Vec<String>) {
+    for field in schema.fields {
+        let dotted = if prefix.is_empty() {
+            field.name.to_string()
+        } else {
+            format!("{prefix}.{}", field.name)
+        };
+        match &field.field {
+            FieldStatic::Leaf(_) => out.push(dotted),
+            FieldStatic::Nested(child) if child.is_enum() => {
+                // Enum-kind nested schemas flatten to a `LeafType::Enum`
+                // at the runtime layer; surface them here as a single
+                // leaf path, not a section + variant paths.
+                out.push(dotted);
+            }
+            FieldStatic::Nested(child) | FieldStatic::ArrayOf(child) => {
+                out.push(dotted.clone());
+                collect_field_paths(child, &dotted, out);
+            }
+        }
+    }
 }
 
 /// Shared helper invoked by macro-generated [`Schema::schema`] bodies.
