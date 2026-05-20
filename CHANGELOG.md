@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- **Added**
+  - **Leaf attrs on enum-typed fields + `Option<UnitEnum>` in `#[derive(clapfig::Schema)]`** ([#56](https://github.com/arthur-debert/clapfig/pull/56)) — Closes the case-3 gap from the post-0.21.3 review: `PdfPageSize`-style unit-enum fields with a `#[clapfig(default = "letter")]` (or `env`, `optional`) attribute used to error at derive time, forcing the `#[clapfig(value, default = ...)]` workaround that drops the `LeafType::Enum` metadata. The macro now emits `LeafTypeStatic::EnumRef { name, schema: <T as Schema>::STATIC }` for these cases and the converter pulls the variant set from the referenced schema at first `schema()` call. User-visible: `#[clapfig(default = "letter")] page_size: PdfPageSize` works and the default round-trips through schema metadata + JSON Schema `enum`; `page_size: Option<Mode>` works for `Option<UnitEnum>` (previously a hard `Option<NestedStruct>/Option<EnumType> not supported` derive error), surfacing the leaf with `optional = true`; `#[clapfig(env = "PAGE_SIZE")] page_size: PdfPageSize` also routes through the new path. Authoring error: leaf attrs on a struct-typed field (e.g. `#[clapfig(default = "x")] db: DbStruct`) now deferred-panic at first `schema()` call with a precise message — names the field, names the referenced type, and walks the user through both possible remediations (drop the attribute, or drop the `Option` wrapper). Macro-time errors still cover obvious wrong-shape cases (`allowed = [...]` on a nested field, `Option<Map<String, NestedStruct>>`); the wrong-shape struct case is rare enough that first-test-run discovery beats requiring a `#[clapfig(unit_enum)]` opt-in attribute everywhere. `MapOfNested` + leaf attrs still rejected at derive time — entry presence is user-controlled, a per-field default has no meaning across arbitrary entry keys.
+
 ## [0.21.3] - 2026-05-20
 
 
