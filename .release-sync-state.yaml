@@ -1,8 +1,8 @@
 # Managed by release-sync. Do not edit.
 synced_from: arthur-debert/release
-ref: take-iii
-sha: c36c73a104d2b00db52de3770eeccc5237132a41
-synced_at: 2026-05-20T18:11:50Z
+ref: origin/main
+sha: 245ccc855ad47e90320bd067274c52ea11b3237e
+synced_at: 2026-05-24T17:25:59Z
 stack: rust
 components:
   - shell-quality
@@ -19,10 +19,19 @@ files:
   - .release-sync-state.yaml
   - .shellcheckrc
   - .yamllint
+  - bin/build
+  - bin/changelog
+  - bin/changelog-add
+  - bin/changelog-cut
+  - bin/changelog-render
   - bin/check
   - bin/check-fmt
   - bin/check-lint
   - bin/check-tests
   - bin/diff-since-release
+  - CHANGELOG/README.txt
   - lefthook.yml
   - scripts/setup-dev-env.sh
+  - vendor/semver-tool/LICENSE
+  - vendor/semver-tool/README.md
+  - vendor/semver-tool/semver

@@ -1,0 +1,1 @@
+Adopt fragment-directory changelog model ([#201](https://github.com/arthur-debert/release/issues/201)). Historical entries preserved verbatim in CHANGELOG/legacy.md; new entries land as files under CHANGELOG/unreleased/.
