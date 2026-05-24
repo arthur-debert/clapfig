@@ -1,2 +1,6 @@
+# Changelog files are generated / historical content where markdownlint
+# defaults structurally disagree with Keep-a-Changelog convention
+# (MD024 duplicate headings, MD041 first-line heading, MD013 line length).
+# Per arthur-debert/release#237.
 CHANGELOG.md
-CHANGELOG/legacy.md
+CHANGELOG/
