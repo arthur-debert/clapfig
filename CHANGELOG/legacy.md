@@ -1,11 +1,3 @@
-<!-- generated - do not edit. See CHANGELOG/README.txt -->
-
-# Changelog
-
-## Unreleased
-
-Adopt fragment-directory changelog model ([#201](https://github.com/arthur-debert/release/issues/201)). Historical entries preserved verbatim in CHANGELOG/legacy.md; new entries land as files under CHANGELOG/unreleased/.
-
 
 All notable changes to this project will be documented in this file.
 

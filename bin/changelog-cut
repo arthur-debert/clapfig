@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# changelog-cut <version>
+#
+# Concatenate all CHANGELOG/unreleased-*.md fragments into
+# CHANGELOG/<version>.md with a "## <version> - YYYY-MM-DD" header,
+# then delete the fragments. Fails if no fragments exist.
+set -euo pipefail
+export LC_ALL=C
+
+self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SEMVER="$self_dir/../vendor/semver-tool/semver"
+
+version="${1:-}"
+if [[ -z "$version" ]]; then
+  echo "usage: changelog-cut <version>" >&2
+  exit 2
+fi
+
+# Reject 'v' prefix per the documented contract (#220). semver-tool
+# accepts vX.Y.Z but the rendered file convention is bare semver.
+if [[ "$version" =~ ^[vV] ]]; then
+  echo "error: version must be bare semver without 'v' prefix (got: $version)" >&2
+  exit 2
+fi
+
+# Validate via vendored semver-tool (handles full semver §2/§9/§11
+# correctness — pre-release tags, build metadata, the lot). The tool
+# always exits 0 and emits "valid"/"invalid" on stdout — check that.
+if [[ "$("$SEMVER" validate "$version" 2>/dev/null)" != "valid" ]]; then
+  echo "error: version must be valid semver (got: $version)" >&2
+  exit 2
+fi
+
+# Resolve the CHANGELOG/ root regardless of which subdir we were
+# invoked from (#219). Walk up looking for an existing CHANGELOG/;
+# fall back to git root if not found (the next check catches the
+# "git root but no CHANGELOG/ either" case loudly).
+resolve_changelog_root() {
+  local dir=$PWD
+  while [[ "$dir" != "/" ]]; do
+    [[ -d "$dir/CHANGELOG" ]] && { echo "$dir"; return 0; }
+    dir=$(dirname "$dir")
+  done
+  git rev-parse --show-toplevel 2>/dev/null
+}
+if ! repo_root=$(resolve_changelog_root) || [[ -z "$repo_root" ]]; then
+  echo "error: no CHANGELOG/ found above cwd and not inside a git repository" >&2
+  exit 1
+fi
+cd "$repo_root"
+
+if [[ ! -d CHANGELOG ]]; then
+  echo "error: CHANGELOG/ directory not found" >&2
+  exit 1
+fi
+
+shopt -s nullglob
+fragments=(CHANGELOG/unreleased-*.md)
+
+if [[ ${#fragments[@]} -eq 0 ]]; then
+  echo "error: no CHANGELOG/unreleased-*.md fragments to cut" >&2
+  exit 1
+fi
+
+target="CHANGELOG/${version}.md"
+if [[ -e "$target" ]]; then
+  echo "error: $target already exists; refuse to overwrite an existing version file" >&2
+  exit 1
+fi
+
+today="$(date -u +%Y-%m-%d)"
+
+{
+  printf '## %s - %s\n\n' "$version" "$today"
+  for f in "${fragments[@]}"; do
+    cat "$f"
+  done
+} > "$target"
+
+for f in "${fragments[@]}"; do
+  rm "$f"
+done
+
+echo "cut $target (${#fragments[@]} fragment(s))"
