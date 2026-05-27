@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# scripts/setup-dev-env.sh — per-session dev-environment setup, invoked by
+# bin/setup-dev-env.sh — per-session dev-environment setup, invoked by
 # the SessionStart hook in .claude/settings.json.
 #
-# Source of truth: arthur-debert/release templates/setup-dev-env.sh.
-# To re-sync, copy this file verbatim over the consumer's
-# scripts/setup-dev-env.sh. (The gh-repo-setup skill does not currently
-# route this top-level template; it only handles per-stack trees under
-# templates/<stack>/.)
+# Source of truth: arthur-debert/release templates/commons/bin/setup-dev-env.sh.
+# Synced to consumers by release-sync (full file replace, no markers).
+#
 # Repos that need project-specific extras (Xvfb daemon, pinned-binary
-# fetch, extra rustup targets, etc.) append them below the marker at the
-# bottom — anything above it is rsync'd from the template.
+# fetch, extra rustup targets, etc.) put them in app-bin/post-setup-hook.sh
+# — this script calls that hook at the end if it exists.
 #
 # Pre-commit hook wiring runs in BOTH local and cloud sessions (a fresh
 # clone has no `.git/hooks/pre-commit` wired regardless of where the dev
@@ -242,7 +240,7 @@ if { [ -f pyproject.toml ] || [ -f requirements.txt ] || [ -f setup.py ]; } \
     # (pinned-binary downloads from GitHub releases, etc) should drop
     # them directly into ${HOME}/.local/bin rather than .venv/bin, so
     # they're discoverable on the same PATH without needing a second
-    # symlink pass below the marker.
+    # symlink pass.
     if [ -d .venv/bin ]; then
       # Create ~/.local/bin if missing — env/setup.sh doesn't and Ubuntu
       # cloud images don't ship it by default in fresh users. The
@@ -359,20 +357,12 @@ if [ "$(uname -s)" = "Linux" ] \
   ) || true
 fi
 
-# --- 4. Project-local extras ---------------------------------------------
-# Everything above this marker is the canonical cross-repo setup-dev-env.sh
-# from arthur-debert/release templates/setup-dev-env.sh. Do NOT modify it
-# in-place; consumers append project-specific steps BELOW this marker.
-# (See e.g. lex-fmt/lexed for an Xvfb start, lex-fmt/nvim for pinned-bin
-# fetches.)
-#
-# No trailing `exit 0` — bash exits 0 on EOF when `set -euo pipefail`
-# succeeded. Adding one here would make appended extras unreachable.
-#
-# Below: the `release-sync:marker-end` sentinel marks the end of the
-# canonical section. release-sync splits the consumer's file at this
-# sentinel — content at or above is replaced on every sync from
-# release/; content below is the consumer's project-local extras and is
-# preserved across syncs. The sentinel must be the LAST line of the
-# canonical (no trailing prose) so the splitter knows where to cut.
-# release-sync:marker-end
+# --- 4. Per-repo hook -------------------------------------------------------
+_hook="${REPO_ROOT}/app-bin/post-setup-hook.sh"
+if [ -f "${_hook}" ]; then
+  if [ -x "${_hook}" ]; then
+    "${_hook}"
+  else
+    echo "warning: ${_hook} exists but is not executable; skipping" >&2
+  fi
+fi
