@@ -15,7 +15,7 @@ set -euo pipefail
 export LC_ALL=C
 
 self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SEMVER="$self_dir/../vendor/semver-tool/semver"
+SEMVER="$self_dir/share/semver-tool/semver"
 
 # Resolve the CHANGELOG/ root regardless of which subdir we were
 # invoked from (#219). Walk up looking for an existing CHANGELOG/;
@@ -128,6 +128,7 @@ trap 'rm -f "${tmp:-}"' EXIT
   if [[ ${#unreleased[@]} -gt 0 ]]; then
     for f in "${unreleased[@]}"; do
       cat "$f"
+      [[ -s "$f" && "$(tail -c1 "$f")" != "" ]] && printf '\n'
     done
     printf '\n'
   fi

@@ -8,7 +8,7 @@ set -euo pipefail
 export LC_ALL=C
 
 self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SEMVER="$self_dir/../vendor/semver-tool/semver"
+SEMVER="$self_dir/share/semver-tool/semver"
 
 version="${1:-}"
 if [[ -z "$version" ]]; then
@@ -74,6 +74,8 @@ today="$(date -u +%Y-%m-%d)"
   printf '## %s - %s\n\n' "$version" "$today"
   for f in "${fragments[@]}"; do
     cat "$f"
+    # Ensure a trailing newline between fragments
+    [[ -s "$f" && "$(tail -c1 "$f")" != "" ]] && printf '\n'
   done
 } > "$target"
 
