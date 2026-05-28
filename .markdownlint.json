@@ -1,4 +1,1 @@
-{
-  "MD013": false,
-  "line-length": false
-}
+.release/.markdownlint.json

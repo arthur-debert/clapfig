@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Canonical rust-cli build entry point. Same script local + CI.
+#
+# Runs `cargo build --release` for the current host target. Produces
+# binaries under `target/release/`. Matches what rust-cli.yml's
+# release-time build job does per matrix target (the workflow adds
+# `--target <T>` for cross-builds; locally you typically want the host
+# target, which cargo picks up by default).
+#
+# Usage:
+#   bin/build                      # cargo build --release (host target)
+#   bin/build --target <triple>    # cross-build to a specific target
+#   bin/build -p mypackage         # workspace member by name
+#   bin/build --features foo,bar   # build with specific features
+#
+# All args forward to `cargo build` verbatim; cargo handles its own
+# arg parsing (target, package, features, etc.).
+#
+# `bin/build` is the canonical release-build entry point — `--release`
+# is hardcoded. For a local debug build, invoke `cargo build` directly.
+#
+# CWD: respects the caller's working directory. Cargo resolves the
+# nearest Cargo.toml from CWD upward, matching cargo's own behavior.
+#
+# Source of truth: arthur-debert/release templates/rust/bin/build.
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "bin/build: cargo not found on \$PATH" >&2
+    echo "  install: https://rustup.rs (or your package manager)" >&2
+    exit 1
+fi
+
+exec cargo build --release "$@"
