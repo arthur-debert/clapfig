@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# changelog-render
+#
+# Regenerate CHANGELOG.md from CHANGELOG/* per the proposal's
+# Rendered format spec:
+#   1. prelude ("<!-- generated ... -->" + "# Changelog")
+#   2. "## Unreleased" + concatenated unreleased fragments (byte-sorted)
+#   3. one section per CHANGELOG/<version>.md, descending semver order
+#      with bare-release ABOVE its pre-releases (semver §11 in
+#      newest-first form)
+#   4. optional CHANGELOG/legacy.md appended verbatim
+#
+# Fails loud on unparseable CHANGELOG/<name>.md filenames.
+set -euo pipefail
+export LC_ALL=C
+
+self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SEMVER="$self_dir/share/semver-tool/semver"
+
+# Resolve the CHANGELOG/ root regardless of which subdir we were
+# invoked from (#219). Walk up looking for an existing CHANGELOG/;
+# fall back to git root if not found (the next check catches the
+# "git root but no CHANGELOG/ either" case loudly).
+resolve_changelog_root() {
+  local dir=$PWD
+  while [[ "$dir" != "/" ]]; do
+    [[ -d "$dir/CHANGELOG" ]] && { echo "$dir"; return 0; }
+    dir=$(dirname "$dir")
+  done
+  git rev-parse --show-toplevel 2>/dev/null
+}
+if ! repo_root=$(resolve_changelog_root) || [[ -z "$repo_root" ]]; then
+  echo "error: no CHANGELOG/ found above cwd and not inside a git repository" >&2
+  exit 1
+fi
+cd "$repo_root"
+
+if [[ ! -d CHANGELOG ]]; then
+  echo "error: CHANGELOG/ directory not found" >&2
+  exit 1
+fi
+
+# Precondition: sort with -V (version-aware). Available on modern BSD
+# sort (recent macOS) and GNU coreutils. Fail loud with guidance.
+if ! sort -V </dev/null >/dev/null 2>&1; then
+  echo "error: 'sort -V' not available — install GNU coreutils (brew install coreutils) or upgrade BSD sort" >&2
+  exit 1
+fi
+
+# Validate every version filename via semver-tool, surface bad ones.
+# Also reject the v-prefix even though semver-tool accepts it (#220):
+# the rendered file convention is bare semver per the README contract.
+shopt -s nullglob
+bad=()
+versions=()
+for f in CHANGELOG/*.md; do
+  name="${f##*/}"
+  stem="${name%.md}"
+  [[ "$stem" == "README" || "$stem" == "legacy" ]] && continue
+  [[ "$stem" == unreleased-* ]] && continue
+  if [[ "$stem" =~ ^[vV] ]]; then
+    bad+=("$name")
+    continue
+  fi
+  # semver-tool's validate always exits 0; check the stdout token.
+  if [[ "$("$SEMVER" validate "$stem" 2>/dev/null)" == "valid" ]]; then
+    versions+=("$stem")
+  else
+    bad+=("$name")
+  fi
+done
+
+if [[ ${#bad[@]} -gt 0 ]]; then
+  printf 'error: unparseable version filename(s) in CHANGELOG/: %s\n' "${bad[*]}" >&2
+  exit 1
+fi
+
+# Sort descending. `sort -V -r` orders numeric components correctly
+# (1.2.10 > 1.2.2) and groups pre-releases with their release, but
+# places the BARE release at the BOTTOM of each group (i.e. after
+# its pre-releases in descending output). Per semver §11, the bare
+# release outranks its pre-releases; flip that one swap with awk.
+sort_versions() {
+  printf '%s\n' "${versions[@]}" | sort -V -r | awk '
+    function base(v,    p) { p = index(v, "-"); return (p ? substr(v, 1, p-1) : v) }
+    {
+      b = base($0)
+      if (index($0, "-")) {
+        pre_buf[++pre_n] = $0
+        pre_base = b
+      } else {
+        if (pre_n > 0 && pre_base == b) {
+          print $0
+          for (i = 1; i <= pre_n; i++) print pre_buf[i]
+        } else {
+          for (i = 1; i <= pre_n; i++) print pre_buf[i]
+          print $0
+        }
+        pre_n = 0
+        pre_base = ""
+      }
+    }
+    END {
+      for (i = 1; i <= pre_n; i++) print pre_buf[i]
+    }
+  '
+}
+
+versions_output=""
+if [[ ${#versions[@]} -gt 0 ]]; then
+  versions_output=$(sort_versions)
+fi
+
+# Collect unreleased fragments in stable byte order
+unreleased=(CHANGELOG/unreleased-*.md)
+
+target=CHANGELOG.md
+tmp=$(mktemp "${target}.tmp.XXXXXX")
+# ${tmp:-} guards against set -u: if mktemp failed and the script
+# exits before $tmp is set, the trap would error on the unbound var.
+trap 'rm -f "${tmp:-}"' EXIT
+
+{
+  printf '<!-- generated - do not edit. See CHANGELOG/README.txt -->\n\n'
+  printf '# Changelog\n\n'
+
+  printf '## Unreleased\n\n'
+  if [[ ${#unreleased[@]} -gt 0 ]]; then
+    for f in "${unreleased[@]}"; do
+      cat "$f"
+      [[ -s "$f" && "$(tail -c1 "$f")" != "" ]] && printf '\n'
+    done
+    printf '\n'
+  fi
+
+  if [[ -n "$versions_output" ]]; then
+    while IFS= read -r v; do
+      [[ -z "$v" ]] && continue
+      cat "CHANGELOG/${v}.md"
+      printf '\n'
+    done <<< "$versions_output"
+  fi
+
+  if [[ -f CHANGELOG/legacy.md ]]; then
+    cat CHANGELOG/legacy.md
+  fi
+} > "$tmp"
+
+mv "$tmp" "$target"
+trap - EXIT
+echo "rendered $target"

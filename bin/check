@@ -1,14 +1,1 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Shared checks used by both pre-commit hook and CI.
-# Each step is its own script so they can be run individually.
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-"$SCRIPT_DIR/check-fmt"
-"$SCRIPT_DIR/check-lint"
-"$SCRIPT_DIR/check-tests"
-
-echo ""
-echo "All checks passed!"
+../.release/bin/check

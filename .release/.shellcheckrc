@@ -1,0 +1,18 @@
+# shellcheck config — applies to every shell file linted in this repo.
+
+# Allow sourcing files from outside the repo (common for setup scripts
+# that source env files or shared profile fragments).
+external-sources=true
+
+# SC1091: sourced file not found / not following — too noisy for repos
+# that source `~/.cargo/env`, `$HOME/.bashrc`, etc., where the file
+# exists on the runner but not in static analysis.
+disable=SC1091
+
+# Severity floor: warning. Info/style level findings (SC2028 echo
+# escape, SC2086 quoting nits, SC2015 A&&B||C, SC2129 redirect
+# grouping, etc.) are suppressed entirely from shellcheck output —
+# not just kept out of the exit code. Run `shellcheck --severity=info`
+# locally to see them. Real bugs and risky patterns (warning+) still
+# fail. Each consumer tracks their own info-level cleanup separately.
+severity=warning

@@ -1,0 +1,1 @@
+../../../.release/bin/share/semver-tool/README.md

@@ -1,0 +1,27 @@
+---
+# yamllint defaults, with line-length relaxed (matches the portfolio's
+# wide-line tolerance baked into .markdownlint.json) and document-start
+# made optional (most of our yaml is GitHub Actions or config — no need
+# to require a leading `---`).
+extends: default
+
+rules:
+  line-length:
+    max: 120
+    level: warning
+  document-start:
+    present: false
+  truthy:
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  # `colons` requires exactly one space after `:`. Stylistic only;
+  # consumer-authored .github/workflows/*.yml in the fleet often have
+  # extra spacing for alignment (e.g. `name:         value`) and we
+  # don't want to gate migrations on that. Tracked in release#288.
+  colons: disable
+  # `indentation` requires consistent indent levels. Some hand-written
+  # YAML in the fleet uses mixed indent for readability inside long
+  # lists; allow it.
+  indentation: disable

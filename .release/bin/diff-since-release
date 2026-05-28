@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Show commits on the current branch since the last final release.
+#
+# Skips pre-release tags (e.g. `v1.0.0-rc.1`) so the diff is against the
+# last *final* release — pre-releases share `## [Unreleased]` changelog
+# entries with the final they lead up to; the relevant scope is what's
+# accumulated since that final.
+#
+# Usage: diff-since-release
+# Exits 1 if no release tags exist yet.
+
+set -euo pipefail
+
+# Fail fast if `git tag` itself errors (corrupt .git, unborn HEAD,
+# etc.) — capture into a variable so the | grep | head pipeline can't
+# mask a git-level failure with an empty-result false-positive.
+all_tags=$(git tag --list 'v*' --sort=-version:refname --merged HEAD)
+
+# Filter pre-release tags (anything with `-`); pre-releases share
+# `## [Unreleased]` entries with the final they lead up to, so the
+# diff that matters is against the last *final* release. `--merged
+# HEAD` scopes to tags reachable from the current branch (relevant on
+# maintenance branches with an older tip than main).
+#
+# Guard the pipeline behind a non-empty check on `$all_tags` because
+# `printf '%s\n' ""` emits a stray newline that grep -v '-' would
+# accept, producing an empty `latest_tag` via a phantom row rather
+# than the clean empty-result path. `|| true` on the grep|head chain
+# is for "no final tags exist (only pre-releases)" — grep exits 1 on
+# no-match, which is data, not failure.
+latest_tag=""
+if [ -n "$all_tags" ]; then
+    latest_tag=$(printf '%s\n' "$all_tags" | grep -v -- '-' | head -n1 || true)
+fi
+
+if [ -z "$latest_tag" ]; then
+    echo "No release tags found (on this branch)" >&2
+    exit 1
+fi
+
+echo "Changes since $latest_tag:"
+echo "---"
+git --no-pager log --oneline "$latest_tag"..HEAD
