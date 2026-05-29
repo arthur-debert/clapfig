@@ -9,7 +9,7 @@ merge behavior, and common patterns.
 
 By default, layers are merged in this order (later wins):
 
-```
+```text
 Compiled defaults     #[config(default = ...)]
        ↑ overridden by
 Config files          search paths in order, later paths win
@@ -84,7 +84,7 @@ SearchPath::Ancestors(Boundary::Root)
 Deep-merges all files. Each file is a sparse overlay — later files override
 earlier ones key by key. Use this when configs are additive:
 
-```
+```text
 ~/.config/myapp/myapp.toml    → host = "0.0.0.0", port = 8080
 ./myapp.toml                  → port = 3000
 ```
