@@ -99,7 +99,7 @@ clapfig = { version = "0.10", default-features = false }
 
 ## Layer Precedence
 
-```
+```text
 Compiled defaults     #[config(default = ...)]
        ↑ overridden by
 Config files          search paths in order, later paths win

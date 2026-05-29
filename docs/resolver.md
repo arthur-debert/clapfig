@@ -81,7 +81,7 @@ during a walk:
 Deep-merges all found files. Each file is a sparse overlay — later files
 (closer to the leaf) override earlier ones key by key:
 
-```
+```text
 /project/.myssg.toml       → host = "base", port = 8080
 /project/blog/.myssg.toml  → port = 3000
 ```

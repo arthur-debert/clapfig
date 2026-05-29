@@ -118,7 +118,7 @@ $ myapp config set port hello
 With `--scope`:
 
 ```sh
-$ myapp config set port 9090 --scope global
+myapp config set port 9090 --scope global
 ```
 
 ### `config unset <key>`

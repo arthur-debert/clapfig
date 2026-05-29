@@ -365,7 +365,7 @@ Things to settle during review of this proposal, before macro code lands:
   to reinvent it.
 - Schema validation of partially-known shapes (e.g. "this field accepts
   either `String` or `[String, Table]`"). That's what `LeafType::Value`
-  + caller-side `post_validate` is for; we're not adding a richer union
+  - caller-side `post_validate` is for; we're not adding a richer union
   type to `LeafType`.
 - Persistence-time round-tripping of schema metadata. The schema is
   derived from source code at compile time; we don't read it back from
