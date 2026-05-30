@@ -1,0 +1,103 @@
+"""Gather all raw GitHub state for one PR into a `PullContext`.
+
+The only module that calls `ghapi` on read paths. The raw-JSON -> model parsing
+is split out (`context_from_raw`) so tests can build a context from recorded
+fixtures without the network, exercising the exact code `gather()` runs live.
+"""
+
+from __future__ import annotations
+
+from . import ghapi
+from .model import PullContext, Review, ReviewComment, Thread
+
+_THREADS_QUERY = """
+query($owner: String!, $name: String!, $pr: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          comments(first: 50) {
+            nodes { databaseId path line originalLine body author { login } }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def gather(pr: int) -> PullContext:
+    """Fetch every raw input the engine needs for `pr`, live, via `gh`."""
+    owner, name = ghapi.repo_slug()
+    base = f"repos/{owner}/{name}"
+    meta = ghapi.pr_meta(pr)
+    thread_data = ghapi.graphql(_THREADS_QUERY, owner=owner, name=name, pr=pr)
+    thread_nodes = thread_data["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    return context_from_raw(
+        meta=meta,
+        reviews_json=ghapi.rest(f"{base}/pulls/{pr}/reviews", paginate=True) or [],
+        thread_nodes=thread_nodes,
+        reactions=ghapi.rest(f"{base}/issues/{pr}/reactions", paginate=True) or [],
+        issue_comments=ghapi.rest(f"{base}/issues/{pr}/comments", paginate=True) or [],
+        review_comments=ghapi.rest(f"{base}/pulls/{pr}/comments", paginate=True) or [],
+    )
+
+
+def context_from_raw(
+    *,
+    meta: dict,
+    reviews_json: list[dict],
+    thread_nodes: list[dict],
+    reactions: list[dict],
+    issue_comments: list[dict],
+    review_comments: list[dict] | None = None,
+) -> PullContext:
+    """Pure: assemble a `PullContext` from raw gh payloads. No network."""
+    return PullContext(
+        number=meta["number"],
+        head_sha=meta["headRefOid"],
+        is_draft=bool(meta.get("isDraft")),
+        base_ref=meta.get("baseRefName"),
+        mergeable=meta.get("mergeable"),
+        merge_state=meta.get("mergeStateStatus"),
+        reviews=[_review(r) for r in reviews_json],
+        threads=[_thread(n) for n in thread_nodes],
+        reactions=reactions,
+        issue_comments=issue_comments,
+        requested_logins=_requested_logins(meta.get("reviewRequests") or []),
+        checks=meta.get("statusCheckRollup") or [],
+        review_comments=review_comments or [],
+    )
+
+
+def _review(raw: dict) -> Review:
+    return Review(
+        review_id=raw["id"],
+        author=(raw.get("user") or {}).get("login", ""),
+        state=raw.get("state", ""),
+        commit_id=raw.get("commit_id", ""),
+        body=raw.get("body") or "",
+    )
+
+
+def _thread(node: dict) -> Thread:
+    comments = tuple(
+        ReviewComment(
+            comment_id=c["databaseId"],
+            path=c.get("path") or "",
+            line=c.get("line") or c.get("originalLine"),
+            body=c.get("body") or "",
+            author=(c.get("author") or {}).get("login", ""),
+        )
+        for c in node["comments"]["nodes"]
+    )
+    return Thread(thread_id=node["id"], is_resolved=node["isResolved"], comments=comments)
+
+
+def _requested_logins(review_requests: list[dict]) -> list[str]:
+    # User/Bot requests carry `login`; team requests carry `name`/`slug`.
+    out = [(rr.get("login") or rr.get("name") or rr.get("slug") or "") for rr in review_requests]
+    return [x for x in out if x]
