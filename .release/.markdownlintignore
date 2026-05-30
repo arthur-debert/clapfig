@@ -12,3 +12,22 @@ CHANGELOG/
 # out of the gate; consumers can lint them on demand if they want to.
 .claude/skills/
 docs/skills/
+
+# Vendored third-party content (e.g. vendor/semver-tool/README.md). Not
+# ours to clean; cleaning it churns on upstream updates. Same class as
+# the skills exclude above.
+vendor/
+
+# mdBook part-title pages: a SUMMARY.md legitimately uses multiple H1
+# headings as part titles, which mdBook REQUIRES (converting them to H2
+# deletes them from the rendered TOC). That conflicts with MD025
+# (single-H1), and the content cannot be "fixed" without breaking the
+# book — so SUMMARY.md is excluded fleet-wide. Caught via standout#164.
+**/SUMMARY.md
+
+# Test fixture content is DATA, not authored docs: gallery content,
+# parser inputs, byte-exact template fixtures, etc. They intentionally
+# model raw/varied/malformed input (headingless captions, URL-only
+# pages, deliberately broken markdown), so forcing them to pass
+# markdownlint corrupts what's under test. Caught via simple-gal#107.
+**/fixtures/**
