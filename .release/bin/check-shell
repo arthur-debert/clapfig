@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# check-shell — shellcheck ONLY the actual shell files among its arguments.
+#
+# The single place "lint the shell" lives (the unified gate, release#348 +
+# docs/proposals/unified-gate.lex). It selects files by CONTENT — a shell
+# shebang, or a .sh/.bash extension — never by path glob. So non-shell files
+# that legitimately live under bin/ (the gh-task-status Python shim,
+# Dockerfiles, etc.) fall out STRUCTURALLY, instead of via per-file `exclude`
+# globs that drift across lefthook invocation modes. Vendored trees under
+# */share/ carry their own provenance and are exempt.
+#
+# Invoked identically by the pre-commit gate, by CI, and by
+# release-verify-fleet — one implementation, so a green here means green
+# everywhere. It is mode-invariant: it filters whatever file list it is
+# handed, so staged-commit and --all-files behave the same.
+#
+# Usage:
+#   check-shell <file>...
+#
+# Exit codes:
+#   0  — every shell file passed (or shellcheck missing, or no shell files)
+#   1  — a shell file failed shellcheck
+set -euo pipefail
+
+if ! command -v shellcheck >/dev/null 2>&1; then
+  echo "shellcheck not installed (skipping; install: see https://github.com/koalaman/shellcheck#installing)" >&2
+  exit 0
+fi
+
+# Is $1 a shell file we own and should lint?
+is_lintable_shell() {
+  case "$1" in
+    */share/*) return 1 ;; # vendored (carries its own provenance) — exempt
+    *.sh | *.bash) return 0 ;;
+  esac
+  # Extensionless or other extension: decide by shebang. `head` follows
+  # symlinks, so a shim symlinked into bin/ but pointing at a Python file
+  # under .release/ reads as non-shell and is skipped.
+  head -n1 "$1" 2>/dev/null | grep -qE '^#!.*[ /](bash|sh|dash|ksh)( |$)'
+}
+
+shell_files=()
+for f in "$@"; do
+  [ -f "$f" ] || continue
+  if is_lintable_shell "$f"; then
+    shell_files+=("$f")
+  fi
+done
+
+[ ${#shell_files[@]} -eq 0 ] && exit 0
+shellcheck --severity=info -- "${shell_files[@]}"

@@ -54,7 +54,10 @@ class CopilotAdapter(ReviewerAdapter):
         return "copilot" in login.lower()
 
     def detect(self, ctx: PullContext) -> ReviewLifecycle:
-        if any(self.matches(r.author) for r in ctx.reviews_on_head()):
+        # A DISMISSED review (cleared by an admin or the author) is no longer a
+        # standing verdict — it must not count as done, or the PR reads REVIEWED
+        # off a review that was explicitly retracted.
+        if any(self.matches(r.author) and r.state != "DISMISSED" for r in ctx.reviews_on_head()):
             return self._done_state(ctx)
         if any(self.matches(login) for login in ctx.requested_logins):
             return ReviewLifecycle.REQUESTED
@@ -86,7 +89,8 @@ class GeminiAdapter(ReviewerAdapter):
 
     def detect(self, ctx: PullContext) -> ReviewLifecycle:
         # Any-head, not head-strict: Gemini won't review the new head again.
-        if any(self.matches(r.author) for r in ctx.reviews):
+        # A DISMISSED review is retracted, so it doesn't count as done.
+        if any(self.matches(r.author) and r.state != "DISMISSED" for r in ctx.reviews):
             return self._done_state(ctx)
         if any(self.matches((c.get("user") or {}).get("login", "")) for c in ctx.issue_comments):
             return ReviewLifecycle.DONE_COMMENTS

@@ -10,15 +10,21 @@ from __future__ import annotations
 from . import ghapi
 from .model import PullContext, Review, ReviewComment, Thread
 
+# `comments(first: 100)` is deliberately un-paginated: the engine gates on a
+# thread's existence + `isResolved` + its root author, all of which live in the
+# thread node and its first comment, so truncating a >100-comment thread's tail
+# can't flip a gating decision. Thread COUNT is the real risk (a missed thread
+# is a missed unresolved blocker), so reviewThreads IS paginated via the cursor.
 _THREADS_QUERY = """
-query($owner: String!, $name: String!, $pr: Int!) {
+query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $pr) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id
           isResolved
-          comments(first: 50) {
+          comments(first: 100) {
             nodes { databaseId path line originalLine body author { login } }
           }
         }
@@ -29,13 +35,30 @@ query($owner: String!, $name: String!, $pr: Int!) {
 """
 
 
+def _all_review_threads(owner: str, name: str, pr: int) -> list[dict]:
+    """Every review-thread node for the PR, following the cursor to the end.
+
+    Without pagination a PR with >100 threads would silently truncate, and a
+    dropped unresolved thread reads as READY when it isn't.
+    """
+    nodes: list[dict] = []
+    cursor: str | None = None
+    while True:
+        data = ghapi.graphql(_THREADS_QUERY, owner=owner, name=name, pr=pr, cursor=cursor)
+        conn = data["repository"]["pullRequest"]["reviewThreads"]
+        nodes.extend(conn["nodes"])
+        page = conn["pageInfo"]
+        if not page["hasNextPage"]:
+            return nodes
+        cursor = page["endCursor"]
+
+
 def gather(pr: int) -> PullContext:
     """Fetch every raw input the engine needs for `pr`, live, via `gh`."""
     owner, name = ghapi.repo_slug()
     base = f"repos/{owner}/{name}"
     meta = ghapi.pr_meta(pr)
-    thread_data = ghapi.graphql(_THREADS_QUERY, owner=owner, name=name, pr=pr)
-    thread_nodes = thread_data["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    thread_nodes = _all_review_threads(owner, name, pr)
     return context_from_raw(
         meta=meta,
         reviews_json=ghapi.rest(f"{base}/pulls/{pr}/reviews", paginate=True) or [],

@@ -20,12 +20,19 @@ def diff_sizer(base_ref: str | None) -> DiffSizer | None:
 
     def size(commit_id: str) -> int | None:
         try:
-            merge_base = subprocess.run(
+            merge_base_out = subprocess.run(
                 ["git", "merge-base", base_ref, commit_id],
                 capture_output=True,
                 text=True,
                 check=True,
             ).stdout.strip()
+            if not merge_base_out:
+                return None
+            # Criss-cross histories can yield multiple merge bases (one per
+            # line); the first is a valid common ancestor. Taking it keeps the
+            # `base..commit` range well-formed instead of embedding a newline
+            # that makes `git diff` fail and silently disables this breaker.
+            merge_base = merge_base_out.splitlines()[0].strip()
             numstat = subprocess.run(
                 ["git", "diff", "--numstat", f"{merge_base}..{commit_id}"],
                 capture_output=True,

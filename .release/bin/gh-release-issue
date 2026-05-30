@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# File a bug against arthur-debert/release from inside a consumer repo.
+#
+# Usage:
+#   gh-release-issue <component> <one-line-symptom>
+#
+# Components (free-form, but standardize on these):
+#   copilot-review     — copilot-review.yml workflow misbehaves
+#   pr-review-loop     — gh-copilot-{on,off,wait} or related helpers
+#   rust-cli-release   — rust-cli reusable release workflow
+#   ruleset            — apply-ruleset / branch protection
+#   sweep-policy       — sweep-github-policy / templates
+#   install-token      — install-release-token / install-release-secrets
+#   other              — anything else
+#
+# The script auto-collects the current repo, branch, and (when run inside a
+# PR branch) the PR number + most recent run of the relevant workflow, so
+# the issue body has reproduction context. The reporting agent should add
+# more detail to the issue after it's filed (logs, conjecture, etc.).
+#
+# Why this exists: agents hitting an infra bug in a consumer repo can't
+# fix it in place — the fix lives in arthur-debert/release. Filing here
+# gives one inbox for cross-repo, cross-org infra bugs.
+#
+# Exit codes:
+#   0  — issue filed (URL printed to stdout)
+#   64 — bad usage
+#
+# Example:
+#   gh-release-issue copilot-review "workflow ran SUCCESS but requested_reviewers stayed empty"
+
+set -euo pipefail
+
+show_help() { sed -n '2,/^$/p' "$0" | sed -E 's/^# ?//'; }
+
+case "${1:-}" in
+  -h|--help) show_help; exit 0 ;;
+  '') show_help >&2; exit 64 ;;
+esac
+
+if [ $# -lt 2 ]; then
+  echo "error: need <component> <symptom>" >&2
+  show_help >&2
+  exit 64
+fi
+
+component=$1
+symptom=$2
+
+# ─── Reproduction context ──────────────────────────────────────────────────
+repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "(unknown)")
+branch=$(git branch --show-current 2>/dev/null || echo "(unknown)")
+
+pr_number=""
+pr_url=""
+if [ "$repo" != "(unknown)" ] && [ "$branch" != "(unknown)" ]; then
+  pr_number=$(gh pr list --head "$branch" --json number -q '.[0].number // empty' 2>/dev/null || true)
+  [ -n "$pr_number" ] && pr_url="https://github.com/$repo/pull/$pr_number"
+fi
+
+# Try to find the most recent run of the relevant workflow, when applicable.
+run_url=""
+case "$component" in
+  copilot-review)
+    run_url=$(gh run list --workflow copilot-review.yml --limit 1 --json url -q '.[0].url // empty' 2>/dev/null || true)
+    ;;
+  rust-cli-release)
+    run_url=$(gh run list --workflow release.yml --limit 1 --json url -q '.[0].url // empty' 2>/dev/null || true)
+    ;;
+esac
+
+title="[$component] $symptom"
+
+body=$(cat <<EOF
+**Component:** $component
+**Reported from:** $repo
+**Branch:** $branch
+${pr_url:+**PR:** $pr_url}
+${run_url:+**Workflow run:** $run_url}
+
+**Symptom:** $symptom
+
+---
+
+_Filed via \`gh-release-issue\`. The reporting agent should follow up with
+logs, suspected cause, and any reproduction steps that aren't obvious
+from the links above._
+EOF
+)
+
+url=$(gh issue create \
+  --repo arthur-debert/release \
+  --title "$title" \
+  --body "$body")
+
+echo "$url"
