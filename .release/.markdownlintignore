@@ -5,6 +5,14 @@
 CHANGELOG.md
 CHANGELOG/
 
+# CLAUDE.md is agent-instruction content, not published prose — the same
+# class as the skills exclude below. release-sync also injects a managed
+# orientation block at its top (an HTML-comment-delimited `@.release/...`
+# import, release#348), which legitimately makes the first line a comment
+# rather than a heading (MD041) and uses inline HTML (MD033). Linting it
+# fights the managed block for no real benefit.
+CLAUDE.md
+
 # .claude/skills/** and docs/skills/** are agent-authored skill
 # documentation. AI-generated markdown often has stylistic quirks
 # (in-table section headers, mixed list styles) that are intentional

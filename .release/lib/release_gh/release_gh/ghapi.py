@@ -76,6 +76,11 @@ def graphql(query: str, **variables: object) -> dict:
     """Run a GraphQL query/mutation; return the `data` object, raising on errors."""
     args = ["api", "graphql", "-f", f"query={query}"]
     for key, value in variables.items():
+        # Omit None entirely: an unprovided nullable GraphQL variable defaults
+        # to null, which is what a first-page `after: $cursor` wants. Passing
+        # it through would send the literal string "None".
+        if value is None:
+            continue
         # -F type-infers ints/bools; -f forces a string (needed for ID! vars).
         flag = "-F" if isinstance(value, (int, bool)) else "-f"
         args += [flag, f"{key}={value}"]
