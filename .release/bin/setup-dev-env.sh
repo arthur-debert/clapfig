@@ -251,7 +251,11 @@ if { [ -f pyproject.toml ] || [ -f requirements.txt ] || [ -f setup.py ]; } \
         # Require both regular file (after symlink resolution) AND
         # executable bit. `-x` alone matches directories, which would
         # produce a useless dangling symlink if the glob ever did.
-        [ -f "${_venv_bin}" ] && [ -x "${_venv_bin}" ] || continue
+        # Two separate guards, not `A && B || continue`: older shellcheck
+        # (Ubuntu's 0.9/0.10, which consumers run in CI) flags that form as
+        # SC2015. Equivalent behaviour, clean on every shellcheck version.
+        [ -f "${_venv_bin}" ] || continue
+        [ -x "${_venv_bin}" ] || continue
         # Parameter expansion avoids forking basename per iteration.
         _name="${_venv_bin##*/}"
         case "${_name}" in
