@@ -8,7 +8,16 @@
 #   new-version <version>           cut + render
 set -euo pipefail
 
-self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks so we exec the sibling changelog-* scripts from
+# .release/bin even when invoked via a bin/ symlink under the build-dir
+# layout (release#292). Portable: avoids GNU-only `readlink -f`.
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(CDPATH='' cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+self_dir="$(CDPATH='' cd "$(dirname "$src")" && pwd)"
 
 usage() {
   cat <<EOF

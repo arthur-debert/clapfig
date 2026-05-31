@@ -14,7 +14,16 @@
 set -euo pipefail
 export LC_ALL=C
 
-self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks so we locate share/semver-tool in .release/bin even when
+# invoked via a bin/ symlink under the build-dir layout (release#292).
+# Portable: avoids the GNU-only `readlink -f` (macOS lacks it).
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(CDPATH='' cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+self_dir="$(CDPATH='' cd "$(dirname "$src")" && pwd)"
 SEMVER="$self_dir/share/semver-tool/semver"
 
 # Resolve the CHANGELOG/ root regardless of which subdir we were

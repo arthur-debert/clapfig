@@ -45,7 +45,11 @@ if [ $# -lt 2 ]; then
 fi
 
 component=$1
-symptom=$2
+# Everything after the component is the symptom, so an unquoted multi-word
+# symptom (the common case when an agent types it) is captured whole rather
+# than truncated to the first word.
+shift
+symptom="$*"
 
 # ─── Reproduction context ──────────────────────────────────────────────────
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "(unknown)")
@@ -59,13 +63,17 @@ if [ "$repo" != "(unknown)" ] && [ "$branch" != "(unknown)" ]; then
 fi
 
 # Try to find the most recent run of the relevant workflow, when applicable.
+# Scope to the current branch when known, so the URL points at this work's run
+# rather than the latest run of that workflow on any branch.
 run_url=""
+branch_filter=()
+[ "$branch" != "(unknown)" ] && branch_filter=(--branch "$branch")
 case "$component" in
   copilot-review)
-    run_url=$(gh run list --workflow copilot-review.yml --limit 1 --json url -q '.[0].url // empty' 2>/dev/null || true)
+    run_url=$(gh run list --workflow copilot-review.yml "${branch_filter[@]}" --limit 1 --json url -q '.[0].url // empty' 2>/dev/null || true)
     ;;
   rust-cli-release)
-    run_url=$(gh run list --workflow release.yml --limit 1 --json url -q '.[0].url // empty' 2>/dev/null || true)
+    run_url=$(gh run list --workflow release.yml "${branch_filter[@]}" --limit 1 --json url -q '.[0].url // empty' 2>/dev/null || true)
     ;;
 esac
 
@@ -88,9 +96,14 @@ from the links above._
 EOF
 )
 
+# The `consumer-filed` label is the marker the fleet inbox (release-inbox,
+# release#348 Phase C) filters on — title-prefix search is best-effort, a label
+# is reliable. It must exist on arthur-debert/release (it does; part of the
+# inbox contract).
 url=$(gh issue create \
   --repo arthur-debert/release \
   --title "$title" \
-  --body "$body")
+  --body "$body" \
+  --label consumer-filed)
 
 echo "$url"
