@@ -1,60 +1,23 @@
-#!/usr/bin/env bash
-# changelog — orchestrator for the bin/changelog-* family.
+#!/usr/bin/env python3
+# changelog — orchestrator for the changelog-* family.
 #
-# Subcommands:
-#   add [--force] <slug> [body...]  add an unreleased fragment
-#   cut <version>                   cut fragments into CHANGELOG/<version>.md
-#   render                          regenerate CHANGELOG.md
-#   new-version <version>           cut + render
-set -euo pipefail
+# Thin shim (shell→Python migration, docs/proposals/shell-to-python.md): put the
+# stdlib-only release_core package on sys.path and dispatch. changelog is
+# distributed to consumers (real file here; bin/changelog is a symlink into
+# this dir), so realpath lands in templates/commons/bin/ and the package sits at
+# ../lib/release_core (the contract's variant (a)). CLI contract preserved
+# byte-for-byte.
+import os
+import sys
 
-self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "..", "lib", "release_core"
+    ),
+)
 
-usage() {
-  cat <<EOF
-usage: changelog <command> [args...]
+from release_core.verbs import changelog  # noqa: E402 — sys.path set above
 
-Commands:
-  add [--force] <slug> [body...]   add an unreleased fragment
-  cut <version>                    cut unreleased fragments into a version file
-  render                           regenerate CHANGELOG.md
-  new-version <version>            cut + render
-
-See CHANGELOG/README.txt and docs/proposals/changelog-handling.md.
-EOF
-}
-
-cmd="${1:-}"
-[[ $# -gt 0 ]] && shift
-
-case "$cmd" in
-  add)
-    exec "$self_dir/changelog-add" "$@"
-    ;;
-  cut)
-    exec "$self_dir/changelog-cut" "$@"
-    ;;
-  render)
-    exec "$self_dir/changelog-render"
-    ;;
-  new-version)
-    if [[ $# -eq 0 ]]; then
-      echo "usage: changelog new-version <version>" >&2
-      exit 2
-    fi
-    "$self_dir/changelog-cut" "$1"
-    "$self_dir/changelog-render"
-    ;;
-  -h|--help|help)
-    usage
-    ;;
-  "")
-    usage >&2
-    exit 2
-    ;;
-  *)
-    echo "unknown command: $cmd" >&2
-    usage >&2
-    exit 2
-    ;;
-esac
+if __name__ == "__main__":
+    sys.exit(changelog.orchestrator_main(sys.argv[1:]))
