@@ -28,7 +28,104 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
-# --- 0. Pre-commit hook wiring (BOTH local and cloud) -------------------
+# --- 0. Arm the gate: ensure the lefthook toolset is installed ----------
+# THE gate (lefthook.yml) is HARD — a missing tool FAILS the commit, it does
+# not skip. So the bootstrap must guarantee the toolset in every environment
+# (the gate runs at session start, local pre-commit, and CI alike). Runs ABOVE
+# the cloud-only gate because the lint gate runs everywhere, not just in cloud.
+# Idempotent: each tool installs only when absent (no-op on a set-up machine);
+# a loud warning (never silent) surfaces an unarmed gate HERE rather than at
+# commit time. Best-effort installs — a transient failure shouldn't abort setup.
+
+_warn_unarmed() {
+  echo "warning: '$1' not installed and could not be auto-installed — the lefthook gate will FAIL until it is present. Install it, then re-run." >&2
+}
+
+# npm globals: lefthook + prettier + markdownlint. Installed before the hook
+# wiring below so `lefthook install` finds the binary.
+if ! command -v lefthook >/dev/null 2>&1 \
+  || ! command -v prettier >/dev/null 2>&1 \
+  || ! command -v markdownlint >/dev/null 2>&1; then
+  if command -v npm >/dev/null 2>&1; then
+    npm install -g lefthook prettier markdownlint-cli >/dev/null 2>&1 || true
+  fi
+fi
+command -v lefthook >/dev/null 2>&1 || _warn_unarmed lefthook
+command -v prettier >/dev/null 2>&1 || _warn_unarmed prettier
+command -v markdownlint >/dev/null 2>&1 || _warn_unarmed markdownlint
+
+# ruff, pinned to the CI version so local and CI never disagree on findings.
+# Modern Debian/Ubuntu (PEP 668) reject a global pip install without
+# --break-system-packages; try that first, fall back to a plain install (older
+# distros / venvs reject the flag). Install stderr is left visible — a failure
+# reason should surface, not be swallowed.
+_RUFF_VERSION="0.15.12"
+if ! command -v ruff >/dev/null 2>&1; then
+  if command -v pip3 >/dev/null 2>&1; then
+    pip3 install --quiet --break-system-packages "ruff==${_RUFF_VERSION}" >/dev/null \
+      || pip3 install --quiet "ruff==${_RUFF_VERSION}" >/dev/null || true
+  elif command -v brew >/dev/null 2>&1; then
+    brew install ruff >/dev/null || true
+  fi
+fi
+command -v ruff >/dev/null 2>&1 || _warn_unarmed ruff
+
+# yamllint — the consumer gate's YAML check (commons lefthook fragment). Like
+# ruff it's a pip tool: --break-system-packages first (PEP 668), plain pip
+# fallback, then brew. Install stderr stays visible for diagnostics.
+if ! command -v yamllint >/dev/null 2>&1; then
+  if command -v pip3 >/dev/null 2>&1; then
+    pip3 install --quiet --break-system-packages yamllint >/dev/null \
+      || pip3 install --quiet yamllint >/dev/null || true
+  elif command -v brew >/dev/null 2>&1; then
+    brew install yamllint >/dev/null || true
+  fi
+fi
+command -v yamllint >/dev/null 2>&1 || _warn_unarmed yamllint
+
+# System tools: shellcheck + actionlint (brew on macOS, apt on Linux). `sudo -n`
+# (non-interactive) so a password prompt fails fast instead of hanging a
+# session-start hook; install stderr stays visible for diagnostics.
+for _gate_tool in shellcheck actionlint; do
+  command -v "${_gate_tool}" >/dev/null 2>&1 && continue
+  if command -v brew >/dev/null 2>&1; then
+    brew install "${_gate_tool}" >/dev/null || true
+  elif command -v apt-get >/dev/null 2>&1; then
+    sudo -n apt-get install -y "${_gate_tool}" >/dev/null || true
+  fi
+  command -v "${_gate_tool}" >/dev/null 2>&1 || _warn_unarmed "${_gate_tool}"
+done
+
+# golangci-lint — the go-quality gate's linter. Only Go repos run that hook, so
+# gate the install on a root go.mod existing (we cd'd to REPO_ROOT above; the
+# §2 `go mod download` block uses the same root check). brew on macOS; on Linux
+# the canonical install script drops the binary into the Go bin dir, with `go
+# install` as the fallback when go is present but curl/sh isn't. Pinned to a
+# version (single source) for reproducibility. Install stderr stays visible —
+# matches the ruff/yamllint blocks; only stdout is muted.
+_GOLANGCI_LINT_VERSION="v1.64.8"
+if [ -f go.mod ] && ! command -v golangci-lint >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    brew install golangci-lint >/dev/null || true
+  elif command -v go >/dev/null 2>&1; then
+    # GOBIN wins if set; else the FIRST entry of a (possibly colon-separated)
+    # GOPATH — `$(go env GOPATH)/bin` would be a broken path on a multi-entry
+    # GOPATH. The install script and `go install` both land the binary here.
+    _go_bin="$(go env GOBIN)"
+    [ -n "${_go_bin}" ] || _go_bin="$(go env GOPATH | cut -d: -f1)/bin"
+    if command -v curl >/dev/null 2>&1; then
+      curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+        | sh -s -- -b "${_go_bin}" "${_GOLANGCI_LINT_VERSION}" >/dev/null \
+        || go install "github.com/golangci/golangci-lint/cmd/golangci-lint@${_GOLANGCI_LINT_VERSION}" >/dev/null \
+        || true
+    else
+      go install "github.com/golangci/golangci-lint/cmd/golangci-lint@${_GOLANGCI_LINT_VERSION}" >/dev/null || true
+    fi
+  fi
+  command -v golangci-lint >/dev/null 2>&1 || _warn_unarmed golangci-lint
+fi
+
+# --- 0.1. Pre-commit hook wiring (BOTH local and cloud) -----------------
 # Wiring `.git/hooks/pre-commit` is per-clone state — every fresh clone
 # (and cloud snapshot) starts without it, so we wire it on every session
 # and in both contexts. Runs ABOVE the cloud-only gate because skipping
@@ -38,7 +135,7 @@ cd "${REPO_ROOT}"
 #
 # Default: lefthook (binary installed at env-setup time in cloud, by
 # brew/cargo/npm locally). Fallback for repos that ship a hand-rolled
-# scripts/pre-commit instead (zed-lex, tree-sitter-lex pattern): symlink
+# app-bin/pre-commit instead (zed-lex, tree-sitter-lex pattern): symlink
 # it into .git/hooks/.
 #
 # Husky migration: if a previous `husky install` set
@@ -52,7 +149,7 @@ cd "${REPO_ROOT}"
 # installed at `node_modules/.bin/lefthook` (via `prepare: lefthook install`
 # in package.json) — `command -v lefthook` doesn't find that location, so
 # without this check the script silently falls through to the
-# scripts/pre-commit branch in cloud sessions for npm consumers.
+# app-bin/pre-commit branch in cloud sessions for npm consumers.
 _lefthook=""
 if [ -x node_modules/.bin/lefthook ]; then
   _lefthook="node_modules/.bin/lefthook"
@@ -83,7 +180,7 @@ if [ -f lefthook.yml ] && [ -n "${_lefthook}" ]; then
   if ! "${_lefthook}" install >/dev/null; then
     echo "warning: lefthook install failed — pre-commit hook NOT wired" >&2
   fi
-elif [ -x scripts/pre-commit ]; then
+elif [ -x app-bin/pre-commit ]; then
   # Resolve the hooks dir via git plumbing rather than hardcoding
   # `.git/hooks`. In a git-worktree the per-worktree hooks live under
   # `.git/worktrees/<name>/hooks/`, and `.git` itself is a file (not
@@ -103,8 +200,8 @@ elif [ -x scripts/pre-commit ]; then
   # (e.g. "Permission denied" pinpoints the actual issue).
   if ! mkdir -p "${_hooks_dir}"; then
     echo "warning: failed to mkdir -p \"${_hooks_dir}\" — pre-commit hook NOT wired" >&2
-  elif ! ln -sf "${REPO_ROOT}/scripts/pre-commit" "${_hooks_dir}/pre-commit"; then
-    echo "warning: failed to symlink scripts/pre-commit into \"${_hooks_dir}\" — pre-commit hook NOT wired" >&2
+  elif ! ln -sf "${REPO_ROOT}/app-bin/pre-commit" "${_hooks_dir}/pre-commit"; then
+    echo "warning: failed to symlink app-bin/pre-commit into \"${_hooks_dir}\" — pre-commit hook NOT wired" >&2
   fi
 fi
 

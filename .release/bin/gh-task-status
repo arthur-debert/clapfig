@@ -7,10 +7,16 @@
 import os
 import sys
 
-sys.path.insert(
-    0,
-    os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "release_gh"),
-)
+_here = os.path.dirname(os.path.realpath(__file__))
+# Normal checkout: bin/<name> is a symlink into templates/commons/bin/, so
+# realpath redirects and ../lib/release_gh resolves. GitHub DEREFERENCES the
+# symlink when packaging an action (real file at bin/<name>), so ../lib/ misses
+# — also try ../templates/commons/lib. (release: action-deref shim fix)
+for _rel in ("../lib/release_gh", "../templates/commons/lib/release_gh"):
+    _cand = os.path.join(_here, _rel)
+    if os.path.isdir(os.path.join(_cand, "release_gh")):
+        sys.path.insert(0, _cand)
+        break
 
 from release_gh.cli import task_status  # noqa: E402 — sys.path set above
 

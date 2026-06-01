@@ -20,7 +20,7 @@ upstream — see **Escalation** below.
 
 ## The dev flow at a glance
 
-Pull requests are driven to *ready for human merge* by a reviewer-agnostic state
+Pull requests are driven to _ready for human merge_ by a reviewer-agnostic state
 engine. Rather than piecing together which reviews are pending, which threads
 are open, and whether the PR is mergeable, ask the engine where the PR stands:
 

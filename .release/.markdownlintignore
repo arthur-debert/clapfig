@@ -4,6 +4,12 @@
 # arthur-debert/release#234.
 CHANGELOG.md
 CHANGELOG/
+# Changelog-staging files (the "Unreleased" section some repos keep as a
+# separate file) are the same class: they lead with an HTML comment / `###`
+# rather than a top-level heading (MD041) and accrete bullet fragments. Exempt
+# them like CHANGELOG. See docs/references/lint-debt-model.md.
+UNRELEASED.md
+CHANGELOG_UNRELEASED.md
 
 # CLAUDE.md is agent-instruction content, not published prose — the same
 # class as the skills exclude below. release-sync also injects a managed
@@ -39,3 +45,9 @@ vendor/
 # pages, deliberately broken markdown), so forcing them to pass
 # markdownlint corrupts what's under test. Caught via simple-gal#107.
 **/fixtures/**
+# Generated regression/benchmark corpora are the same DATA class: golden
+# converter output (e.g. lex→markdown) that deliberately exercises edge
+# cases which by design DON'T produce clean markdown (citation/section-ref
+# anchors without in-doc targets, etc.). Linting golden output fights the
+# test. Fix the generator (e.g. lex#715), not the fixture. Caught via comms.
+**/benchmark/**
