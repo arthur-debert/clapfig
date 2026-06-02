@@ -1,67 +1,25 @@
-#!/usr/bin/env bash
-# changelog-add [--force] <slug> [body...]
+#!/usr/bin/env python3
+# changelog-add — write an unreleased CHANGELOG fragment.
 #
-# Write CHANGELOG/unreleased-<slug>.md. Body comes from stdin when no
-# body args are passed, otherwise from the joined args. A numeric slug
-# is prefixed with "pr-". Fails if the target already exists; --force
-# overwrites.
-set -euo pipefail
+# Thin shim (shell→Python migration, docs/proposals/shell-to-python.md): put the
+# stdlib-only release_core package on sys.path and dispatch. Distributed to
+# consumers (variant (a)) — realpath lands in templates/commons/bin/, package at
+# ../lib/release_core. CLI contract preserved byte-for-byte.
+import os
+import sys
 
-# Resolve the CHANGELOG/ root regardless of which subdir we were
-# invoked from (#219). Walk up looking for an existing CHANGELOG/;
-# fall back to git root for the first-migration case (no CHANGELOG/
-# anywhere yet — add will create it at git root). Error if neither.
-resolve_changelog_root() {
-  local dir=$PWD
-  while [[ "$dir" != "/" ]]; do
-    [[ -d "$dir/CHANGELOG" ]] && { echo "$dir"; return 0; }
-    dir=$(dirname "$dir")
-  done
-  git rev-parse --show-toplevel 2>/dev/null
-}
-if ! repo_root=$(resolve_changelog_root) || [[ -z "$repo_root" ]]; then
-  echo "error: no CHANGELOG/ found above cwd and not inside a git repository" >&2
-  exit 1
-fi
-cd "$repo_root"
+_here = os.path.dirname(os.path.realpath(__file__))
+# Normal checkout: bin/<name> is a symlink into templates/commons/bin/, so
+# realpath redirects and ../lib/release_core resolves. GitHub DEREFERENCES the
+# symlink when packaging an action (real file at bin/<name>), so ../lib/ misses
+# — also try ../templates/commons/lib. (release: action-deref shim fix)
+for _rel in ("../lib/release_core", "../templates/commons/lib/release_core"):
+    _cand = os.path.join(_here, _rel)
+    if os.path.isdir(os.path.join(_cand, "release_core")):
+        sys.path.insert(0, _cand)
+        break
 
-force=0
-if [[ "${1:-}" == "--force" ]]; then
-  force=1
-  shift
-fi
+from release_core.verbs import changelog  # noqa: E402 — sys.path set above
 
-slug="${1:-}"
-if [[ -z "$slug" ]]; then
-  echo "usage: changelog-add [--force] <slug> [body...]" >&2
-  exit 2
-fi
-shift
-
-# Numeric slug → prefixed with pr-
-if [[ "$slug" =~ ^[0-9]+$ ]]; then
-  slug="pr-$slug"
-fi
-
-# Reject slugs that would escape CHANGELOG/ or break the filename pattern.
-if [[ ! "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-  echo "error: slug must match [A-Za-z0-9][A-Za-z0-9._-]* (got: $slug)" >&2
-  exit 2
-fi
-
-mkdir -p CHANGELOG
-target="CHANGELOG/unreleased-${slug}.md"
-
-if [[ -e "$target" && "$force" -eq 0 ]]; then
-  echo "error: $target already exists (pass --force to overwrite)" >&2
-  exit 1
-fi
-
-# Direct redirection preserves stdin bytes exactly (no trailing-newline
-# stripping that $(cat) would cause).
-if [[ $# -gt 0 ]]; then
-  printf '%s\n' "$*" > "$target"
-else
-  cat > "$target"
-fi
-echo "wrote $target"
+if __name__ == "__main__":
+    sys.exit(changelog.add_main(sys.argv[1:]))

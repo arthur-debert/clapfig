@@ -18,25 +18,43 @@
 #   check-shell <file>...
 #
 # Exit codes:
-#   0  — every shell file passed (or shellcheck missing, or no shell files)
-#   1  — a shell file failed shellcheck
+#   0  — every shell file passed (or no shell files matched)
+#   1  — a shell file failed shellcheck, or shellcheck is not installed
+#        (a missing tool is a HARD gate failure — the gate does not skip)
 set -euo pipefail
 
 if ! command -v shellcheck >/dev/null 2>&1; then
-  echo "shellcheck not installed (skipping; install: see https://github.com/koalaman/shellcheck#installing)" >&2
-  exit 0
+  echo "ERROR: shellcheck not installed — the gate does not skip. Re-run the bootstrap (setup-dev-env.sh)." >&2
+  exit 1
 fi
 
 # Is $1 a shell file we own and should lint?
 is_lintable_shell() {
   case "$1" in
     */share/*) return 1 ;; # vendored (carries its own provenance) — exempt
+  esac
+  # The shebang is AUTHORITATIVE when present: route by interpreter so a
+  # .sh/.bash file whose shebang names a shell shellcheck can't handle (zsh,
+  # fish, …) is skipped instead of forced through it (consumer#374: a zsh
+  # `assets/generate_icons.sh` tripped SC1071). Pure builtins — `read <file`
+  # follows symlinks (so a Python shim symlinked into bin/ reads as non-shell
+  # and is skipped) and avoids a head+grep subprocess per file, which matters
+  # since this runs in a loop over every staged file.
+  local first=""
+  read -r first < "$1" 2>/dev/null || true
+  if [ "${first#'#!'}" != "$first" ]; then
+    # Has a shebang → it decides: shellcheck-supported shell ⇒ lint, else skip.
+    local shellcheck_shebang='^#!.*[ /](bash|sh|dash|ksh)( |$)'
+    if [[ "$first" =~ $shellcheck_shebang ]]; then
+      return 0
+    fi
+    return 1
+  fi
+  # No shebang → fall back to the .sh/.bash extension.
+  case "$1" in
     *.sh | *.bash) return 0 ;;
   esac
-  # Extensionless or other extension: decide by shebang. `head` follows
-  # symlinks, so a shim symlinked into bin/ but pointing at a Python file
-  # under .release/ reads as non-shell and is skipped.
-  head -n1 "$1" 2>/dev/null | grep -qE '^#!.*[ /](bash|sh|dash|ksh)( |$)'
+  return 1
 }
 
 shell_files=()
