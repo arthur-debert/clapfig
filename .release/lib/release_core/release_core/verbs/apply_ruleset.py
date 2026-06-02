@@ -7,9 +7,11 @@ Auto-detects:
   - repo from current git/gh context (gh repo view)
   - required checks: actual job names from the most recent default-branch
     run of each PR-trigger workflow (excluding copilot-review.yml — it
-    isn't a gate). This catches matrix expansion (e.g. "Build
-    (aarch64-apple-darwin)") and `name:` overrides that yq can't see.
-    Falls back to yq job IDs if no runs exist yet.
+    isn't a gate — and `paths:`/`paths-ignore:`-filtered workflows, whose
+    jobs are conditional and would deadlock unrelated PRs; see release#416).
+    This catches matrix expansion (e.g. "Build (aarch64-apple-darwin)") and
+    `name:` overrides that yq can't see. Falls back to yq job IDs if no runs
+    exist yet.
 Override checks with --checks (comma-separated). Use --dry-run to print the
 payload without sending it.
 
@@ -79,6 +81,34 @@ def is_pr_workflow(workflow: object) -> bool:
     return "pull_request" in workflow_triggers(workflow)
 
 
+def pr_trigger_is_path_filtered(workflow: object) -> bool:
+    """True if the workflow's `pull_request` trigger carries a `paths:` /
+    `paths-ignore:` filter.
+
+    A path-filtered workflow only runs when the PR touches matching files, so
+    its job names are CONDITIONAL — they must never be auto-marked as globally
+    required. A required check that never runs on an unrelated PR leaves the PR
+    permanently BLOCKED (the check stays "expected", never "success"). The
+    fleet of `bats` suites (changelog/audit/release-sync/…), each filtered to
+    its own `tests/<area>/` paths, is the canonical case: auto-detection saw
+    `bats` in the latest default-branch run and required it, deadlocking every
+    workflow-only or docs-only PR (release#416).
+
+    Only `pull_request` triggers WITHOUT a path filter are always-run gates and
+    safe to require. A string/array `on:` (no per-trigger config) cannot carry
+    a path filter, so it is treated as unfiltered.
+    """
+    if not isinstance(workflow, dict):
+        return False
+    on = workflow.get("on")
+    if not isinstance(on, dict):
+        return False
+    pr = on.get("pull_request")
+    if not isinstance(pr, dict):
+        return False
+    return bool(pr.get("paths") or pr.get("paths-ignore"))
+
+
 def checks_json(checks: list[str]) -> list[dict]:
     """Map a list of check names → the `required_status_checks` array.
 
@@ -121,10 +151,15 @@ def _existing_ruleset_id(rulesets: object, name: str) -> int | None:
 
 
 def _pr_workflow_paths(workflows_dir: str) -> list[str]:
-    """Relative .github/workflows/<name> paths of PR-triggered, non-gate workflows.
+    """Relative .github/workflows/<name> paths of workflows that can contribute
+    globally-required checks.
 
     Globs *.yml then *.yaml (matching the bash loop order), parses each via yq,
-    and keeps the ones triggered on pull_request.
+    and keeps a workflow only when it is an always-run PR gate: triggered on
+    pull_request, not a `_NON_GATE_WORKFLOWS` basename (copilot-review), and
+    WITHOUT a `paths:` / `paths-ignore:` filter. Path-filtered workflows are
+    conditional and must not be required — see `pr_trigger_is_path_filtered`
+    (release#416).
     """
     import glob
 
@@ -140,7 +175,7 @@ def _pr_workflow_paths(workflows_dir: str) -> list[str]:
             doc = yamlio.load(path)
         except yamlio.YamlError:
             continue
-        if is_pr_workflow(doc):
+        if is_pr_workflow(doc) and not pr_trigger_is_path_filtered(doc):
             paths.append(f".github/workflows/{base}")
     return paths
 

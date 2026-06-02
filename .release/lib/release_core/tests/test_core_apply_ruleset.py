@@ -104,6 +104,51 @@ def test_is_pr_workflow():
     assert apply_ruleset.is_pr_workflow({"on": "push"}) is False
 
 
+def test_pr_trigger_is_path_filtered():
+    # Unfiltered pull_request → always-run gate, not filtered.
+    assert apply_ruleset.pr_trigger_is_path_filtered({"on": {"pull_request": None}}) is False
+    assert apply_ruleset.pr_trigger_is_path_filtered({"on": {"pull_request": {}}}) is False
+    # A `paths:` filter makes it conditional.
+    assert (
+        apply_ruleset.pr_trigger_is_path_filtered(
+            {"on": {"pull_request": {"paths": ["tests/changelog/**"]}}}
+        )
+        is True
+    )
+    # `paths-ignore:` is equally conditional.
+    assert (
+        apply_ruleset.pr_trigger_is_path_filtered(
+            {"on": {"pull_request": {"paths-ignore": ["docs/**"]}}}
+        )
+        is True
+    )
+    # String / array `on:` can't carry a path filter → unfiltered.
+    assert apply_ruleset.pr_trigger_is_path_filtered({"on": "pull_request"}) is False
+    assert apply_ruleset.pr_trigger_is_path_filtered({"on": ["push", "pull_request"]}) is False
+    assert apply_ruleset.pr_trigger_is_path_filtered("not a dict") is False
+
+
+def test_pr_workflow_paths_excludes_path_filtered_workflows(tmp_path, monkeypatch):
+    # Two PR workflows: one always-run (the gate), one path-filtered (a bats
+    # suite). Only the unfiltered one should contribute a required check —
+    # regression for the release#416 conditional-check deadlock. yamlio.load is
+    # monkeypatched (the suite has no yq) to return the parsed doc per file.
+    wf = tmp_path / "workflows"
+    wf.mkdir()
+    (wf / "ci.yml").write_text("placeholder")
+    (wf / "changelog-tests.yml").write_text("placeholder")
+
+    docs = {
+        "ci.yml": {"on": {"pull_request": None}, "jobs": {"gate": {}}},
+        "changelog-tests.yml": {
+            "on": {"pull_request": {"paths": ["tests/changelog/**"]}},
+            "jobs": {"bats": {}},
+        },
+    }
+    monkeypatch.setattr(apply_ruleset.yamlio, "load", lambda path: docs[os.path.basename(path)])
+    assert apply_ruleset._pr_workflow_paths(str(wf)) == [".github/workflows/ci.yml"]
+
+
 # --------------------------------------------------------------------------
 # Malformed-YAML handling: yamlio.load raises yamlio.YamlError (NOT
 # proc.ProcError, since _yq calls proc.run(check=False)). Both yaml-reading
