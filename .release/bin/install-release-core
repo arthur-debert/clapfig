@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# install-release-core — the boot resolver for the pull-model distribution.
+#
+# Resolves the release_core wheel attached to a GitHub release and installs it.
+# This is THE single definition of "how a repo gets the current release_core"
+# (ADR-0003, docs/proposals/pip-bootstrap-contract.md §Transport). Both boot
+# contexts call it: the SessionStart hook (setup-dev-env.sh) and the reusable CI
+# workflows. It runs BEFORE release_core is installed, so it is pure shell — it
+# cannot itself be a release_core console-script.
+#
+# Install model = "latest, force-reinstall":
+#   - Default source is the repo's `releases/latest`.
+#   - `--major vN` instead picks the LATEST release in that major line that
+#     carries the wheel. This is the load-bearing v3-safety filter: the wheel
+#     version is not stamped from the tag (it is a static 0.0.1), so once a v3
+#     release exists, `releases/latest` would hand a v2-pinned consumer the v3
+#     wheel. Pinning to the consumer's major line keeps `@vN` honest.
+#   - Install is `pip install --force-reinstall --no-deps "$url"`, NOT `-U`:
+#     because the wheel version is static, `pip install -U` sees the same 0.0.1
+#     already satisfied and SKIPS it, defeating the pull model. --force-reinstall
+#     always reinstalls; --no-deps because release_core is dependency-light
+#     (stdlib-only) and we must never let a boot mutate the environment's other
+#     packages.
+#
+# Exactly ONE wheel asset must match per release (ADR: "select one URL and error
+# otherwise"). Zero or many is a release-side packaging bug, surfaced loudly here
+# rather than silently installing the wrong artifact.
+#
+# After installing, this runs `release-core init` in the current repo by default
+# (--no-init to skip) — the "one command does the boot" ergonomic. It is NOT a
+# pip post-install hook (wheels have none, and init is repo-specific while pip is
+# environment-level): the resolver runs init explicitly, at the repo root, on the
+# JUST-installed console-script (resolved across venv / --user / system layouts).
+# init is best-effort — its failure does NOT fail the resolver (committed config
+# degrades gracefully; the install, the resolver's core job, still succeeded).
+#
+# Source of truth: arthur-debert/release bin/install-release-core. Sister to
+# install-release-token / install-release-secrets.
+
+set -euo pipefail
+
+REPO="arthur-debert/release"
+MAJOR=""
+PRINT_URL=0
+NO_INIT=0
+PYTHON="${PYTHON:-python3}"
+PIP_EXTRA=""   # extra pip flags (e.g. --user, --break-system-packages)
+
+usage() {
+  cat <<'EOF'
+Usage: install-release-core [--major vN] [--repo OWNER/REPO] [--print-url]
+                            [--no-init] [--user] [--break-system-packages]
+
+Resolve the release_core wheel from a GitHub release, pip-install it
+(--force-reinstall --no-deps), then run `release-core init` in the current repo.
+The pull-model boot resolver — one command does the whole boot.
+
+Options:
+  --major vN        Pin to the latest release in major line vN (e.g. --major v2).
+                    Default: the repo's releases/latest.
+  --repo OWNER/REPO Source repo for the release (default: arthur-debert/release).
+  --print-url       Print the resolved wheel URL and exit (resolve only, no
+                    install, no init). Used by tests and CI dry-runs.
+  --no-init         Install only; do NOT run `release-core init` afterwards
+                    (pure-transport mode, e.g. just updating the package).
+  --user            Pass --user to pip (install into the user site so the
+                    console-scripts land in ~/.local/bin). Don't combine with a
+                    venv PYTHON — pip rejects --user inside a venv.
+  --break-system-packages
+                    Pass --break-system-packages to pip (PEP-668 system pythons).
+  -h, --help        Show this help.
+
+Env:
+  PYTHON            Python interpreter to install into (default: python3).
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --major)
+      [ $# -ge 2 ] || { echo "install-release-core: --major needs a value (e.g. v2)" >&2; exit 64; }
+      MAJOR="$2"; shift 2 ;;
+    --major=*) MAJOR="${1#--major=}"; shift ;;
+    --repo)
+      [ $# -ge 2 ] || { echo "install-release-core: --repo needs a value" >&2; exit 64; }
+      REPO="$2"; shift 2 ;;
+    --repo=*) REPO="${1#--repo=}"; shift ;;
+    --print-url) PRINT_URL=1; shift ;;
+    --no-init) NO_INIT=1; shift ;;
+    --user) PIP_EXTRA="${PIP_EXTRA:+$PIP_EXTRA }--user"; shift ;;
+    --break-system-packages)
+      PIP_EXTRA="${PIP_EXTRA:+$PIP_EXTRA }--break-system-packages"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "install-release-core: unknown argument '$1'" >&2; usage >&2; exit 64 ;;
+  esac
+done
+
+# The wheel asset name pattern (must match the publish job's output name).
+# Two forms: a human-readable one for messages, and a jq-string form whose
+# backslash is doubled so it survives embedding in a jq string literal
+# (jq parses "\." as an invalid escape; "\\." is a literal-dot regex).
+WHEEL_DESC='release_core-*.whl'
+WHEEL_JQ_RE='^release_core-.*\\.whl$'
+
+# Emit the single wheel URL for the chosen release, or fail loudly.
+#
+# Strategy:
+#   - no --major: read releases/latest directly (GitHub computes "latest",
+#     excluding drafts/prereleases) and pull its wheel asset URLs.
+#   - --major vN: list releases (newest-first), drop drafts/prereleases, keep
+#     those whose tag is vN or vN.* AND that carry a wheel asset, take the first
+#     (newest), emit its wheel URL.
+# Either way the result is the array of matching asset URLs; we then require
+# exactly one.
+resolve_url() {
+  urls="$(_resolve_url_list)" || return 1
+
+  n=0
+  if [ -n "$urls" ]; then
+    n="$(printf '%s\n' "$urls" | grep -c .)"
+  fi
+  if [ "$n" -eq 0 ]; then
+    if [ -n "$MAJOR" ]; then
+      echo "install-release-core: no release in major line '$MAJOR' of $REPO carries a wheel asset matching $WHEEL_DESC" >&2
+    else
+      echo "install-release-core: releases/latest of $REPO has no wheel asset matching $WHEEL_DESC" >&2
+    fi
+    return 1
+  fi
+  if [ "$n" -gt 1 ]; then
+    echo "install-release-core: expected exactly 1 wheel asset, found $n — release packaging bug:" >&2
+    printf '%s\n' "$urls" | sed 's/^/  /' >&2
+    return 1
+  fi
+  printf '%s\n' "$urls"
+}
+
+_resolve_url_list() {
+  if [ -n "$MAJOR" ]; then
+    # Escape dots in the major for the jq regex; double the backslash so it
+    # survives the jq string literal. Anchor so `v2` matches v2 / v2.x but not
+    # v20.x — `^v2(\.|$)`. per_page=100 (not --paginate) keeps the page
+    # deterministic and well past any realistic single-major release count.
+    esc="$(printf '%s' "$MAJOR" | sed 's/\./\\\\./g')"
+    gh api "repos/${REPO}/releases?per_page=100" --jq "
+      [ .[]
+        | select(.draft == false and .prerelease == false)
+        | select(.tag_name | test(\"^${esc}(\\\\.|\$)\"))
+        | select(any(.assets[]; .name | test(\"${WHEEL_JQ_RE}\")))
+      ]
+      | first
+      | .assets[]?
+      | select(.name | test(\"${WHEEL_JQ_RE}\"))
+      | .browser_download_url
+    "
+  else
+    gh api "repos/${REPO}/releases/latest" --jq "
+      .assets[]?
+      | select(.name | test(\"${WHEEL_JQ_RE}\"))
+      | .browser_download_url
+    "
+  fi
+}
+
+url="$(resolve_url)"
+
+if [ "$PRINT_URL" -eq 1 ]; then
+  printf '%s\n' "$url"
+  exit 0
+fi
+
+echo "install-release-core: installing $url" >&2
+# --force-reinstall (static wheel version → -U would skip) + --no-deps
+# (dependency-light package; never touch the environment's other packages).
+# $PIP_EXTRA carries any --user / --break-system-packages the caller chose; it is
+# intentionally word-split (each token a separate pip arg), empty by default.
+# shellcheck disable=SC2086
+"$PYTHON" -m pip install --force-reinstall --no-deps $PIP_EXTRA "$url"
+
+if [ "$NO_INIT" -eq 1 ]; then
+  echo "install-release-core: installed (--no-init; skipping release-core init)." >&2
+  exit 0
+fi
+
+# Locate the JUST-installed release-core console-script across install layouts:
+#   1. the installing python's own bin dir (venv, or a system python whose
+#      scripts sit beside it);
+#   2. anything already on PATH (e.g. --user on Linux → ~/.local/bin);
+#   3. the python's --user scripts dir (e.g. macOS → ~/Library/Python/X.Y/bin),
+#      which is NOT ~/.local/bin and often not on PATH.
+_find_release_core() {
+  # Resolve $PYTHON to an absolute path first: a bare command name (the default
+  # `python3`) would make `dirname` yield `.` and check ./release-core in the
+  # repo root instead of beside the actual interpreter. Only use the
+  # interpreter-adjacent candidate when the resolution yielded a real PATH (it
+  # contains a `/`); if `command -v` fails (empty), skip straight to the PATH and
+  # --user-scripts probes rather than degrading to a bare-name `dirname .`.
+  local python_path cand udir
+  python_path="$(command -v "$PYTHON" 2>/dev/null || true)"
+  case "$python_path" in
+    */*)
+      cand="$(dirname "$python_path")/release-core"
+      [ -x "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+      ;;
+  esac
+  if command -v release-core >/dev/null 2>&1; then command -v release-core; return 0; fi
+  udir="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_path("scripts", "posix_user"))' 2>/dev/null || true)"
+  [ -n "$udir" ] && [ -x "$udir/release-core" ] && { printf '%s\n' "$udir/release-core"; return 0; }
+  return 1
+}
+
+# init is best-effort: a failure (e.g. an older published wheel, or a Kind that
+# composes no config) must NOT fail the resolver — the install succeeded, and the
+# committed config degrades gracefully. Runs in the CURRENT repo (the boot caller
+# cd's to the repo root first).
+rc="$(_find_release_core || true)"
+if [ -n "$rc" ]; then
+  echo "install-release-core: installed; running release-core init" >&2
+  "$rc" init || echo "warning: release-core init failed — repo config not refreshed" >&2
+else
+  echo "warning: release-core not found after install — skipping init" >&2
+fi

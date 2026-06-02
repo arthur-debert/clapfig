@@ -205,6 +205,50 @@ elif [ -x app-bin/pre-commit ]; then
   fi
 fi
 
+# --- 0.2. Pull-model: self-update release_core from the published wheel --
+# The north star (ADR-0003): repos AUTO-UPDATE on session start, retiring the
+# hand-run `orc propagate` treadmill. The boot resolver `install-release-core`
+# resolves the latest release wheel, pip-installs it (--force-reinstall --no-deps
+# — the wheel version is static, so `-U` would skip it), THEN runs `release-core
+# init` itself (it locates the just-installed console-script across venv/--user/
+# system layouts). One command does the whole boot. Runs in BOTH local and cloud
+# (above the cloud-only gate) — auto-update is the whole point.
+#
+# BEST-EFFORT, never aborts the session: every call is `|| warn`, and init
+# failure inside the resolver is itself best-effort. The committed config already
+# in the repo degrades gracefully if the pull fails (a stale repo is
+# older-but-working, never broken).
+#
+# The resolver is part of the committed bootstrap: it ships in the synced set
+# (templates/commons/bin/ → consumer bin/install-release-core), so it is found at
+# `$REPO_ROOT/bin/install-release-core` without needing the consumer's bin/ on
+# PATH. Fall back to a PATH lookup (release-dev, where dodot puts bin/ on PATH).
+# If neither resolves (a consumer not yet seeded with the resolver), the block
+# no-ops — safe to land fleet-wide before the seeding propagate.
+#
+# Install target (so the console-scripts land on PATH): a repo `.venv` if one is
+# already present (its bin/ is symlinked onto PATH by §2 / dodot), else `--user`
+# → the user site (ensured on PATH below). `--break-system-packages` is tried
+# first for PEP-668 system pythons, with a plain `--user` fallback (older pip
+# rejects the flag), mirroring the ruff/yamllint blocks above.
+_resolver=""
+if [ -x "${REPO_ROOT}/bin/install-release-core" ]; then
+  _resolver="${REPO_ROOT}/bin/install-release-core"
+elif command -v install-release-core >/dev/null 2>&1; then
+  _resolver="install-release-core"
+fi
+if [ -n "${_resolver}" ]; then
+  mkdir -p "${HOME}/.local/bin"
+  if [ -x .venv/bin/python ]; then
+    PYTHON="${REPO_ROOT}/.venv/bin/python" "${_resolver}" \
+      || echo "warning: install-release-core (.venv) failed — release_core not updated this session" >&2
+  else
+    "${_resolver}" --user --break-system-packages \
+      || "${_resolver}" --user \
+      || echo "warning: install-release-core (--user) failed — release_core not updated this session" >&2
+  fi
+fi
+
 # Cloud-only gate. Everything below is cloud-only — local sessions
 # already have submodules, project deps, the NSS cert DB, etc., set up
 # by the dev's machine.
