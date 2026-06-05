@@ -15,7 +15,7 @@ Auto-detects:
 Override checks with --checks (comma-separated). Use --dry-run to print the
 payload without sending it.
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the ruleset payload
+Shell→Python migration: the ruleset payload
 that was built with `yq -o json | jq` is now constructed as a Python dict and
 PUT/POSTed via gh.rest(..., method=, body=) (the `gh api --input -` seam). The
 payload is byte-identical to the old jq output, and the three stdout lines

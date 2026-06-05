@@ -1,6 +1,6 @@
 """release_core — shared stdlib-only primitives for release's Python verbs.
 
-The migration substrate (docs/proposals/shell-to-python.md): one place for the
+The migration substrate: one place for the
 subprocess/gh/git boundary, the CLI arg harness, YAML I/O, semver math, and
 Kind/manifest detection that the per-verb shims (the proven gh-task-status
 pattern) build on. stdlib only — no third-party runtime deps — so it rides the

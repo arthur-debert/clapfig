@@ -1,54 +1,46 @@
 [project]
 name = "release-core"
 version = "0.0.1"
-description = "Shared stdlib-only primitives for release's Python verbs (proc/gh/cli/yaml/semver/manifest)"
+description = "Shared primitives + CLI for release's Python verbs (proc/gh/cli/yaml/semver/manifest)"
 requires-python = ">=3.11"
-# INTENTIONALLY EMPTY and must stay so (Phase 0–1): this package runs in
-# GitHub Actions and Claude Cloud, where only the stdlib + the `gh`/`yq` CLIs
-# are guaranteed. A third-party runtime dep here breaks 3-env parity and the
-# zero-install shim model. See docs/proposals/shell-to-python.md §dependency
-# frontier. YAML goes through yamlio (shell out to `yq`), never PyYAML.
-dependencies = []
+# Third-party runtime deps ARE permitted (reversing the Phase 0–1 stdlib-only
+# freeze). The boot resolver `install-release-core` no longer passes `--no-deps`,
+# so pip resolves these from PyPI on every boot — and PyPI is reachable in all
+# three envs (GitHub Actions / Claude Cloud / local) precisely because the wheel
+# itself already arrives over that same network. Keep deps PURE-PYTHON, no native
+# build step (click qualifies), so install stays a no-compile wheel pull. YAML
+# still goes through yamlio (shell out to `yq`), never PyYAML — that's a `yq`-CLI
+# contract, not a dependency-policy rule.
+#   click — the CLI framework backing the `release-core <group> <command>` tree.
+dependencies = ["click>=8,<9"]
 
-# Console-scripts: each on-PATH command name (hyphenated, matching today's
-# bin/<name> shims exactly) → its zero-arg wrapper in release_core.entrypoints.
-# The set == exactly the bin/ shims that dispatch to release_core. Bash tools
-# (fetch-deps, fetch-artifact, gh-*, clone-*, migrate-*) and the release_gh-
-# backed gh-task-status are intentionally absent. hatchling installs these as
-# console-scripts by default (no extra config needed).
-# The top-level `release-core` CLI (release_core.cli_entry:main) — the `init`
-# subcommand dispatcher (PoC §2) — is registered here alongside the per-verb
-# scripts so `release-core init` lands on PATH from the same wheel install.
+# Console-scripts. The CLI cutover (#468, epic #461) retired the flat
+# maintainer-only command names — every maintainer/fleet verb is now reachable
+# ONLY through the hierarchical `release-core <group> <command>` tree (the map is
+# `release-core --help`). What remains on PATH as a flat name is the SHORT LIST
+# of CONSUMER-FACING aliases that a consumer's own committed config / docs may
+# reference directly, plus the root `release-core` CLI itself:
+#   release-core              — the CLI root (cli_entry:main); `release-core init`
+#                               and every `<group> <command>` land from one wheel.
+#   changelog (+add/cut/render) — consumer changelog tooling.
+#   semver, detect-kind         — consumer-facing primitives.
+#   release-sync, release-drift-check — the consumer sync/drift gate.
+#   gh-task-status              — the PR state engine (folded in; release#459).
+#   gh-release-issue            — the consumer escalation entry point.
+# Bash tools (fetch-deps, fetch-artifact, gh-*, clone-*, migrate-*) are
+# intentionally absent. hatchling installs these as console-scripts by default.
 [project.scripts]
 release-core = "release_core.cli_entry:main"
-apply-ruleset = "release_core.entrypoints:apply_ruleset_main"
-audit-portfolio = "release_core.entrypoints:audit_portfolio_main"
-audit-repo = "release_core.entrypoints:audit_repo_main"
-audit-smoke-test = "release_core.entrypoints:audit_smoke_test_main"
 changelog = "release_core.entrypoints:changelog_main"
 changelog-add = "release_core.entrypoints:changelog_add_main"
 changelog-cut = "release_core.entrypoints:changelog_cut_main"
 changelog-render = "release_core.entrypoints:changelog_render_main"
 detect-kind = "release_core.entrypoints:detect_kind_main"
-done-check = "release_core.entrypoints:done_check_main"
-enable-dependabot-security = "release_core.entrypoints:enable_dependabot_security_main"
 gh-release-issue = "release_core.entrypoints:gh_release_issue_main"
-install-release-secrets = "release_core.entrypoints:install_release_secrets_main"
-install-release-token = "release_core.entrypoints:install_release_token_main"
-list-repo-pr = "release_core.entrypoints:list_repo_pr_main"
-list-repo-scripts = "release_core.entrypoints:list_repo_scripts_main"
-managed-repos = "release_core.entrypoints:managed_repos_main"
-release-advance-major = "release_core.entrypoints:release_advance_major_main"
-release-beta-list = "release_core.entrypoints:release_beta_list_main"
-release-cut = "release_core.entrypoints:release_cut_main"
+gh-task-status = "release_core.entrypoints:gh_task_status_main"
 release-drift-check = "release_core.entrypoints:release_drift_check_main"
-release-inbox = "release_core.entrypoints:release_inbox_main"
-release-lex = "release_core.entrypoints:release_lex_main"
-release-notify-source = "release_core.entrypoints:release_notify_source_main"
 release-sync = "release_core.entrypoints:release_sync_main"
-release-verify-fleet = "release_core.entrypoints:release_verify_fleet_main"
 semver = "release_core.entrypoints:semver_main"
-sweep-github-policy = "release_core.entrypoints:sweep_github_policy_main"
 
 [dependency-groups]
 dev = ["pytest>=8"]

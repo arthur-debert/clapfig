@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# Canonical `bin/release` shim. Forwards to `release-cut` from the
-# release portfolio (arthur-debert/release/bin/release-cut). What CI
-# does after dispatch is per-Kind — see .github/workflows/release.yml
-# and CHANGELOG/.
+# Canonical `bin/release` shim. Forwards to `release-core cut` from the
+# release portfolio (arthur-debert/release). What CI does after dispatch
+# is per-Kind — see .github/workflows/release.yml and CHANGELOG/.
 #
-# release-cut is kind-aware: it dispatches through detect-kind and
+# `release-core cut` is kind-aware: it dispatches through detect-kind and
 # reads the current version from each Kind's canonical source
 # (Cargo.toml, package.json, extension.toml, or the latest git tag
 # for kinds without a manifest). No per-Consumer overrides needed.
 set -euo pipefail
 
-if ! command -v release-cut >/dev/null 2>&1; then
-    echo "bin/release: release-cut not on \$PATH" >&2
+if ! command -v release-core >/dev/null 2>&1; then
+    echo "bin/release: release-core not on \$PATH" >&2
     echo "  install: clone arthur-debert/release and add its bin/ to \$PATH" >&2
     exit 1
 fi
 
-exec release-cut "$@"
+exec release-core cut "$@"

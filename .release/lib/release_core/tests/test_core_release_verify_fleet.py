@@ -1,7 +1,8 @@
 """release_verify_fleet verb — fleet iteration, result aggregation, exit policy.
 
-Fully offline. The gh ref-resolution and EVERY subprocess (managed-repos clone +
---paths, detect-kind, release-sync, lefthook) are mocked at the proc/gh layer —
+Fully offline. The gh ref-resolution and EVERY subprocess (`release-core admin
+repos list` clone + --paths, detect-kind, release-sync, lefthook) are mocked at
+the proc/gh layer —
 nothing is cloned or synced. We assert on the table rows, the per-repo
 sync/gate columns, the combined-output logs, and the exit-code policy
 (0 all-pass, 1 any sync-FAIL/gate-FAIL/missing, 2 setup error, 64 bad usage).
@@ -41,9 +42,14 @@ def env(monkeypatch, tmp_path):
 class _Driver:
     """Records proc.run calls and returns scripted CompletedProcesses by command.
 
-    `paths` is the managed-repos --paths stdout (the TAB lines the verb parses);
-    `kinds`/`sync_rc`/`gate_rc` map an abspath → its detect-kind / sync / gate
-    result so a test can make individual repos pass or fail."""
+    `paths` is the `release-core admin repos list --paths` stdout (the TAB lines
+    the verb parses); `kinds`/`sync_rc`/`gate_rc` map an abspath → its
+    detect-kind / sync / gate result so a test can make individual repos pass or
+    fail."""
+
+    # The fleet accessor is now invoked as the hierarchical CLI (`managed-repos`
+    # was retired in the B2 cutover; #468). Match on the leading command vector.
+    _REPOS_LIST = ["release-core", "admin", "repos", "list"]
 
     def __init__(self, paths, kinds=None, sync_rc=None, gate_rc=None, clone_rc=0):
         self.paths = paths
@@ -56,9 +62,9 @@ class _Driver:
     def __call__(self, cmd, **kw):
         self.calls.append((cmd, kw))
         tool = cmd[0]
-        if tool == "managed-repos" and "--clone" in cmd:
+        if cmd[: len(self._REPOS_LIST)] == self._REPOS_LIST and "--clone" in cmd:
             return _cp(returncode=self.clone_rc)
-        if tool == "managed-repos" and "--paths" in cmd:
+        if cmd[: len(self._REPOS_LIST)] == self._REPOS_LIST and "--paths" in cmd:
             return _cp(stdout=self.paths)
         if tool == "detect-kind":
             cwd = kw.get("cwd")
@@ -188,7 +194,7 @@ def test_only_is_split_and_forwarded_to_both_managed_repos_calls(env, monkeypatc
     driver = _Driver(paths)
     monkeypatch.setattr(proc, "run", driver)
     rvf.main(["--root", root, "--only", "o/a,o/b"])
-    mr_calls = [c for c in driver.calls if c[0][0] == "managed-repos"]
+    mr_calls = [c for c in driver.calls if c[0][: len(_Driver._REPOS_LIST)] == _Driver._REPOS_LIST]
     for cmd, kw in mr_calls:
         assert cmd[-2:] == ["o/a", "o/b"]
         assert kw["env"]["REPOS_ROOT"] == root

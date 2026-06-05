@@ -79,7 +79,7 @@ def main(argv: list[str]) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 — f
     release_home = os.environ.get("RELEASE_HOME") or os.path.join(
         os.path.expanduser("~"), "release"
     )
-    if not os.path.isdir(os.path.join(release_home, ".git")):
+    if not gh.is_git_worktree(release_home):
         _err(f"release-sync: $RELEASE_HOME='{release_home}' is not a git clone")
         return 1
     if shutil.which("yq") is None:
@@ -161,7 +161,7 @@ def main(argv: list[str]) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 — f
     print()
 
     # --- Build the plan + materialize into a sibling tempdir -------------
-    plan = sync.build_plan(release_home, ref, kind, caps.names)
+    plan = sync.build_plan(release_home, ref, kind, caps.names, repo_root=repo_real)
 
     # Sibling tempdir so the final mv is a same-filesystem rename (atomic).
     tmp_release = tempfile.mkdtemp(prefix=".release-build.", dir=".")
@@ -360,6 +360,22 @@ def _apply(mirror: sync.MirrorPlan, claude: sync.ClaudeDecision) -> None:
 
 
 def _rm_f(path: str) -> None:
-    """`rm -f` — remove if present, ignore absence."""
+    """`rm -rf` — remove if present (file, symlink, or directory), ignore absence
+    but surface real errors (permission/IO), like `rm -f` does for a file.
+
+    A pre-existing managed dest is usually a real file (e.g. a stale hand-copied
+    .claude/skills/<name>/SKILL.md). It can also be a real directory; remove that
+    too so the managed symlink can take its place.
+
+    Absence (FileNotFoundError) is ignored — matching `rm -f` — including the
+    TOCTOU window where the dir vanishes between the isdir() check and the
+    rmtree (a concurrent/CI race). But a real failure (permission/IO) must
+    propagate rather than be silently swallowed (which would leave the path in
+    place and make the later os.symlink fail with a confusing FileExistsError),
+    so we do NOT pass ignore_errors=True; instead we suppress ONLY
+    FileNotFoundError."""
     with contextlib.suppress(FileNotFoundError):
-        os.remove(path)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)

@@ -1,0 +1,8 @@
+# Provenance marker for a vendored (third-party) skill.
+# Its presence tells the skill-lint gate (bin-internal/lint-skills.sh)
+# to SKIP this directory: we do not own it, so cleaning its markdown
+# would churn against upstream. Doubles as the update-provenance record.
+repo: https://github.com/mattpocock/skills
+path: skills/productivity/handoff
+ref: refs/heads/main
+commit: 7bbb60d64c911617cee7f71b2ba9e24364faa14e

@@ -29,7 +29,7 @@ Discovery: queries every repo under the given owners that has the
 `main-branch-protection` ruleset (same set install-release-token uses),
 then filters to those with Cargo.toml at the repo root.
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the gh-api+jq
+Shell→Python migration: the gh-api+jq
 discovery and the `gh secret set` loop moved into Python (gh.rest /
 gh.secret_set, no jq). The set-of-7-secrets contract, the optional NPM_TOKEN
 8th slot, stdout lines, and exit codes are preserved byte-for-byte.

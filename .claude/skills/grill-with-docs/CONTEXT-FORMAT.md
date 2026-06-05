@@ -1,0 +1,1 @@
+../../../.release/.claude/skills/grill-with-docs/CONTEXT-FORMAT.md

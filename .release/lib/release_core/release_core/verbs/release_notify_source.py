@@ -31,7 +31,7 @@ Exit codes:
   3  — the issue points at no source PR (nothing to notify; reported loud)
   64 — bad usage
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the jq blob
+Shell→Python migration: the jq blob
 flattening + grep PR/repo extraction moved into Python over the parsed issue
 dict (gh porcelain, no jq). The dry-run/--post/--close gating, the notification
 body, and every stdout/stderr line are preserved byte-for-byte.

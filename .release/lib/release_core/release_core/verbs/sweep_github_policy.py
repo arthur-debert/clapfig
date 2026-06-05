@@ -16,7 +16,7 @@ that stack. Destination path = source path with the prefix stripped.
 To add a new managed file, drop it where you want it to land — no code
 edit required.
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the find/cp/cmp
+Shell→Python migration: the find/cp/cmp
 subtree walk moves into Python (stdlib filecmp/shutil); kind detection comes
 from release_core.manifest.detect_kind (byte-equal to bin/detect-kind). The
 per-file lines (created/ok/updated/conflict), the summary line, and the

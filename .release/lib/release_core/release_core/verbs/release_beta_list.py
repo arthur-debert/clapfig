@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import sys
 
-from .. import proc
+from .. import gh, proc
 
 
 def _help_text() -> str:
@@ -45,7 +45,7 @@ def main(argv: list[str]) -> int:
     release_home = os.environ.get("RELEASE_HOME") or os.path.join(
         os.path.expanduser("~"), "release"
     )
-    if not os.path.isdir(os.path.join(release_home, ".git")):
+    if not gh.is_git_worktree(release_home):
         print(
             f"release-beta-list: $RELEASE_HOME='{release_home}' is not a git clone",
             file=sys.stderr,

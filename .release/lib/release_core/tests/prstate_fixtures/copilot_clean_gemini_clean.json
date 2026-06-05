@@ -1,0 +1,29 @@
+{
+  "meta": {
+    "number": 102,
+    "headRefOid": "bbb222",
+    "isDraft": true,
+    "mergeable": "MERGEABLE",
+    "mergeStateStatus": "CLEAN",
+    "reviewRequests": []
+  },
+  "reviews": [
+    {
+      "id": 5101,
+      "user": { "login": "Copilot" },
+      "state": "APPROVED",
+      "commit_id": "bbb222",
+      "body": "Looks good."
+    },
+    {
+      "id": 5102,
+      "user": { "login": "gemini-code-assist[bot]" },
+      "state": "COMMENTED",
+      "commit_id": "bbb222",
+      "body": "No concerns."
+    }
+  ],
+  "threads": [],
+  "reactions": [],
+  "issue_comments": []
+}

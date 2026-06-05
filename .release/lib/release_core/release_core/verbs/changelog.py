@@ -349,7 +349,7 @@ Commands:
   render                           regenerate CHANGELOG.md
   new-version <version>            cut + render
 
-See CHANGELOG/README.txt and docs/proposals/changelog-handling.md."""
+See CHANGELOG/README.txt."""
 
 
 def orchestrator_main(argv: list[str]) -> int:

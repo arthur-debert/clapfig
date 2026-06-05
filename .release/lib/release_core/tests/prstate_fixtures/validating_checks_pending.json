@@ -1,0 +1,36 @@
+{
+  "meta": {
+    "number": 202,
+    "headRefOid": "f00d02",
+    "isDraft": true,
+    "mergeable": "MERGEABLE",
+    "mergeStateStatus": "BLOCKED",
+    "reviewRequests": [],
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "name": "ci / check",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS"
+      },
+      {
+        "__typename": "CheckRun",
+        "name": "py-lint",
+        "status": "IN_PROGRESS",
+        "conclusion": null
+      }
+    ]
+  },
+  "reviews": [
+    {
+      "id": 7101,
+      "user": { "login": "Copilot" },
+      "state": "APPROVED",
+      "commit_id": "f00d02",
+      "body": ""
+    }
+  ],
+  "threads": [],
+  "reactions": [],
+  "issue_comments": []
+}

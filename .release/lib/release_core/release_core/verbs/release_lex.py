@@ -23,12 +23,14 @@ no-tags case (a first release is human-driven). Release is dispatched by the
 maintainer's `release-cut`, run in each repo's cwd, with an EXPLICIT version
 derived from that same latest final tag (TAG-AUTHORITATIVE — see below):
 
-  release-cut <X.Y.Z>     — resolved from the maintainer's PATH (the release
-                            repo's bin/), invoked with the repo as cwd. We
-                            DERIVE the explicit X.Y.Z here by applying the run's
-                            bump-kind to the latest final TAG decide_release
-                            computed (e.g. v0.10.8 + patch → 0.10.9), and dispatch
-                            THAT exact version — NOT the bump-kind. release-cut then
+  release-core cut <X.Y.Z> — resolved from the maintainer's PATH (the release
+                            repo's bin/), invoked with the repo as cwd (the flat
+                            `release-cut` console-script was retired in the B2
+                            cutover; #468). We DERIVE the explicit X.Y.Z here by
+                            applying the run's bump-kind to the latest final TAG
+                            decide_release computed (e.g. v0.10.8 + patch →
+                            0.10.9), and dispatch THAT exact version — NOT the
+                            bump-kind. release-core cut then
                             DISPATCHES cwd's `.github/workflows/release.yml` with
                             our explicit version. CI (the reusable per-Kind release
                             workflow) does the actual bump + CHANGELOG roll +
@@ -104,15 +106,21 @@ import time
 from .. import gh, proc, version
 
 # The maintainer-side dispatch tool. release-lex runs from the maintainer's
-# release clone, so `release-cut` is on the maintainer's PATH (the release repo's
-# bin/ dir). We invoke it DIRECTLY in each repo's cwd rather than the repo's
-# `bin/release` shim — release-cut reads cwd's manifest + dispatches cwd's
-# release.yml, so calling it per-repo-cwd is per-repo-correct, and it drops the
-# dependency on each target repo carrying a current `bin/release` (which is
-# missing on stale chain repos — tree-sitter-lex, nvim — whose mains lag). This
-# is the same self-contained pattern already applied to the should-release
-# decision (generic git, no per-repo bin/diff-since-release).
-RELEASE_CUT = "release-cut"
+# release clone, so `release-core` is on the maintainer's PATH (the release
+# repo's bin/ dir), and `release-core cut` is the cut command (the flat
+# `release-cut` console-script was retired in the B2 cutover; #468). We invoke it
+# DIRECTLY in each repo's cwd rather than the repo's `bin/release` shim —
+# `release-core cut` reads cwd's manifest + dispatches cwd's release.yml, so
+# calling it per-repo-cwd is per-repo-correct, and it drops the dependency on
+# each target repo carrying a current `bin/release` (which is missing on stale
+# chain repos — tree-sitter-lex, nvim — whose mains lag). This is the same
+# self-contained pattern already applied to the should-release decision (generic
+# git, no per-repo bin/diff-since-release).
+#
+# Only `release-core` is a single PATH executable (shutil.which-resolvable); the
+# `cut` subcommand is an argv token appended at dispatch.
+RELEASE_CORE = "release-core"
+CUT_SUBCOMMAND = "cut"
 
 # should-release decision states (the generic git decision, computed by
 # `decide_release`). Replaces the old `diff-since-release` exit-code contract —
@@ -429,20 +437,21 @@ def _validate(cfg: dict) -> int | None:
         print("release-lex: no repo paths supplied", file=sys.stderr)
         return 64
 
-    # Cut mode dispatches via the maintainer's `release-cut` (run in each repo's
-    # cwd), so require it on PATH ONCE here rather than a bin/release per repo.
-    # Resolve to an ABSOLUTE path now: dispatch runs after os.chdir into each
-    # repo, so a relative PATH entry (`.`/`bin`) would otherwise re-resolve
-    # against the changed cwd and break. Same spirit as the #404 abs-path fix.
+    # Cut mode dispatches via the maintainer's `release-core cut` (run in each
+    # repo's cwd), so require `release-core` on PATH ONCE here rather than a
+    # bin/release per repo. Resolve to an ABSOLUTE path now: dispatch runs after
+    # os.chdir into each repo, so a relative PATH entry (`.`/`bin`) would
+    # otherwise re-resolve against the changed cwd and break. Same spirit as the
+    # #404 abs-path fix.
     if not cfg["status_mode"]:
-        resolved = shutil.which(RELEASE_CUT)
+        resolved = shutil.which(RELEASE_CORE)
         if resolved is None:
             print(
-                f"release-lex: {RELEASE_CUT} not on PATH — add the release repo's bin/ to PATH",
+                f"release-lex: {RELEASE_CORE} not on PATH — add the release repo's bin/ to PATH",
                 file=sys.stderr,
             )
             return 1
-        cfg["release_cut_path"] = resolved
+        cfg["release_core_path"] = resolved
 
     # Validate paths. We iterate in the stable ORDER so the first failure
     # reported is deterministic. No per-repo bin/ tool is required anymore.
@@ -555,23 +564,28 @@ def _release_one(key: str, cfg: dict) -> int:
         # Explicit X.Y.Z passed straight through; no tag math, so don't claim any.
         print(f"  ↳ next version {cut_version} (explicit; tag {decision.tag} unused)")
 
-    # `release-cut <X.Y.Z>` (maintainer's PATH tool, run in the repo cwd)
+    # `release-core cut <X.Y.Z>` (maintainer's PATH tool, run in the repo cwd)
     # dispatches cwd's release.yml with the EXACT version we computed. CI does the
     # bump + CHANGELOG roll + commit + tag + build + GitHub Release. We call it
     # directly rather than the repo's `bin/release` shim so the cascade doesn't
     # depend on each target repo's tooling being current.
     if dry_run:
-        print(f"  $ {RELEASE_CUT} {cut_version}")
-        print("  ↳ dry-run: skipping release-cut dispatch + CI wait")
+        print(f"  $ {RELEASE_CORE} {CUT_SUBCOMMAND} {cut_version}")
+        print("  ↳ dry-run: skipping release-core cut dispatch + CI wait")
         return 0
 
-    print(f"  $ {RELEASE_CUT} {cut_version}")
+    print(f"  $ {RELEASE_CORE} {CUT_SUBCOMMAND} {cut_version}")
     # Use the absolute path resolved in _validate (before any os.chdir) and
     # route through the centralized subprocess chokepoint (proc.run).
-    release_cut_cmd = cfg.get("release_cut_path", RELEASE_CUT)
-    cut = proc.run([release_cut_cmd, cut_version], check=False, capture_output=False)
+    release_core_cmd = cfg.get("release_core_path", RELEASE_CORE)
+    cut = proc.run(
+        [release_core_cmd, CUT_SUBCOMMAND, cut_version], check=False, capture_output=False
+    )
     if cut.returncode != 0:
-        print(f"  ✗ {RELEASE_CUT} {cut_version} failed (exit {cut.returncode})", file=sys.stderr)
+        print(
+            f"  ✗ {RELEASE_CORE} {CUT_SUBCOMMAND} {cut_version} failed (exit {cut.returncode})",
+            file=sys.stderr,
+        )
         return 1
     print(f"  ↳ release.yml dispatched for {key} ({cut_version})")
 

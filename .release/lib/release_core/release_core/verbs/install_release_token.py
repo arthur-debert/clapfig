@@ -16,7 +16,7 @@ Discovery: queries every repo under the given owners for a ruleset named
 "main-branch-protection". Same logic apply-ruleset uses to find onboarded
 repos.
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the gh-api+jq
+Shell→Python migration: the gh-api+jq
 discovery + the `gh secret set`/`gh secret list` set-then-verify loop moved
 into Python (gh.rest / gh.secret_set / gh.secret_list, no jq). Token validation
 still shells to `curl /user` (via proc, no shell string) because it must read

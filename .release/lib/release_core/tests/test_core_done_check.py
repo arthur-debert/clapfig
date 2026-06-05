@@ -2,8 +2,7 @@
 
 The contract oracles (workflow-name→stack map, aggregate(), render_json/table)
 are tested directly. main() is exercised by monkeypatching the gh boundary +
-the check_* helpers — mocking at the data layer, never at subprocess (the
-shell-to-python contract's rule). No network, no gh.
+the check_* helpers — mocking at the data layer, never at subprocess. No network, no gh.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # changelog-cut — cut unreleased fragments into CHANGELOG/<version>.md.
 #
-# Thin shim (shell→Python migration, docs/proposals/shell-to-python.md): put the
+# Thin shim (shell→Python migration): put the
 # stdlib-only release_core package on sys.path and dispatch. Distributed to
 # consumers (variant (a)) — realpath lands in templates/commons/bin/, package at
 # ../lib/release_core. CLI contract preserved byte-for-byte.

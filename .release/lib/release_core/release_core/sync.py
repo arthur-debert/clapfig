@@ -24,13 +24,63 @@ from . import gh
 
 MANAGED_MARKER = "# Managed by release-sync — do not edit. Regenerate via release-sync."
 SOURCE_MARKER = ".release-sync-source"
+GITIGNORE_FILE = ".gitignore"
+GITIGNORE_BODY = (
+    f"{MANAGED_MARKER}\n"
+    "# Keeps host/Python-version-specific bytecode out of the committed .release/\n"
+    "# even if a local regeneration writes it on disk (release#450).\n"
+    "__pycache__/\n"
+    "*.pyc\n"
+    "*.pyo\n"
+)
 
 CLAUDE_FILE = "CLAUDE.md"
 CLAUDE_BEGIN = "<!-- BEGIN release-managed orientation — managed by release-sync; do not edit -->"
 CLAUDE_END = "<!-- END release-managed orientation -->"
 
-PR_LOOP_SKILL_SRC = "skills/gh-pr-review-loop/SKILL.md"
-PR_LOOP_SKILL_DEST = ".claude/skills/gh-pr-review-loop/SKILL.md"
+# ── Skill distribution catalogs (release owns infra/dev-cycle skills) ─────────
+#
+# release/ is the single source of truth for infra + general-dev skills. Every
+# consumer carries release's official set (synced whole-directory as symlinks
+# into .release/, never hand-copied); a consumer owns ONLY its own
+# application-domain skills. Two catalogs drive distribution:
+#
+#   PUSH_ALL_SKILLS         — pushed to EVERY consumer, unconditionally.
+#   REPLACE_IF_PRESENT_SKILLS — upgrade-only: synced into a consumer ONLY when
+#                               that consumer already has .claude/skills/<name>
+#                               (real dir OR symlink). Never adds the skill to a
+#                               consumer that doesn't already carry it.
+#
+# Everything else under skills/ (release-fleet-ops, release-fleet-triage,
+# setup-matt-pocock-skills, gh-repo-setup, migrate-consumer-to-build-dir) is
+# release-only and NEVER distributed.
+PUSH_ALL_SKILLS = [
+    "gh-pr-review-loop",
+    "pr-review-respond",
+    "release-issue-relay",
+    "diagnose",
+    "tdd",
+    "review",
+    "triage",
+    "to-issues",
+    "handoff",
+    "qa",
+    "grill-me",
+    "grill-with-docs",
+    "improve-codebase-architecture",
+    "request-refactor-plan",
+    "ubiquitous-language",
+    "zoom-out",
+    "teach",
+    "padz-for-agents",
+]
+
+REPLACE_IF_PRESENT_SKILLS = [
+    "lex-primer",
+    "lex-multirepo",
+    "electron-e2e-testing",
+    "macos-signing-notarization",
+]
 
 
 # ── Classification predicates (the bash case statements) ──────────────────────
@@ -38,12 +88,24 @@ PR_LOOP_SKILL_DEST = ".claude/skills/gh-pr-review-loop/SKILL.md"
 
 def should_skip_source(rel: str) -> bool:
     """Mirror should_skip_source(): drop lefthook.fragment.yaml, manifest.yaml,
-    templates/components/_*, and *.DS_Store."""
+    templates/components/_*, and *.DS_Store.
+
+    Also drops Python bytecode (__pycache__/, *.pyc, *.pyo): host- and
+    Python-version-specific build artifacts that must never be materialized into
+    a consumer's .release/ (release#450). The release repo gitignores these, so
+    a clean ls-tree never lists them — this is defense-in-depth for a future
+    source tree that tracks them, paired with the managed .release/.gitignore."""
     if rel.endswith("/lefthook.fragment.yaml"):
         return True
     if rel.endswith("/manifest.yaml"):
         return True
     if rel.startswith("templates/components/_"):
+        return True
+    # git paths are always '/'-separated, so a path-segment test is exact:
+    # match a __pycache__ dir anywhere in the path, plus loose .pyc/.pyo files.
+    if "/__pycache__/" in f"/{rel}":
+        return True
+    if rel.endswith((".pyc", ".pyo")):
         return True
     return rel.endswith(".DS_Store")
 
@@ -54,13 +116,25 @@ def needs_real_file(dest: str) -> bool:
     return dest.startswith(".github/workflows/")
 
 
+def is_distributed_skill_dest(dest: str) -> bool:
+    """True for a managed skill discovery path (.claude/skills/<name>/…). These
+    are release-owned: a pre-existing REAL file/dir at such a dest is a stale
+    hand-copy and is replaced by the managed symlink unconditionally (no
+    --migrate needed). This is the load-bearing fix for the lex pr-review-respond
+    regression — a consumer shipping a stale real .claude/skills/<name>/SKILL.md
+    must be upgraded to release's official copy, not left as a conflict."""
+    return dest.startswith(".claude/skills/")
+
+
 def is_release_internal(dest: str) -> bool:
     """Mirror is_release_internal(): content materialized into .release/ but NOT
-    mirrored out as a symlink/copy. The provenance marker, the Python engine
-    packages (lib/release_gh/*, lib/release_core/*), and ORIENTATION.md."""
+    mirrored out as a symlink/copy. The provenance marker, the managed .gitignore
+    (release#450), the Python engine package (lib/release_core/* — note the
+    folded PR state engine ships by pip wheel now, not sync; release#459), and
+    ORIENTATION.md."""
     if dest == SOURCE_MARKER:
         return True
-    if dest.startswith("lib/release_gh/"):
+    if dest == GITIGNORE_FILE:
         return True
     if dest.startswith("lib/release_core/"):
         return True
@@ -195,10 +269,21 @@ def subtree_list(kind: str, capabilities: list[str]) -> list[str]:
     return subtrees
 
 
-def build_plan(release_home: str, ref: str, kind: str, capabilities: list[str]) -> Plan:
+def build_plan(
+    release_home: str,
+    ref: str,
+    kind: str,
+    capabilities: list[str],
+    *,
+    repo_root: str | None = None,
+) -> Plan:
     """Mirror the `--- Plan ---` block: walk each subtree with ls-tree -r, skip
     the should_skip_source paths, strip the subtree prefix to get the dest, then
-    add the PR-loop skill and compose the lefthook fragment list."""
+    add the distributed skills and compose the lefthook fragment list.
+
+    ``repo_root`` is the consumer working tree. It gates the REPLACE_IF_PRESENT
+    skills (synced only when the consumer already carries .claude/skills/<name>);
+    when None (e.g. a clone-less init), those upgrade-only skills are skipped."""
     plan = Plan()
 
     for st in subtree_list(kind, capabilities):
@@ -222,12 +307,15 @@ def build_plan(release_home: str, ref: str, kind: str, capabilities: list[str]) 
             plan.mode[dest] = file_mode
             plan.source[dest] = rel
 
-    # #348 A3: distribute the canonical PR-loop skill, sourced directly from skills/.
-    if gh.git_cat_file_exists(f"{ref}:{PR_LOOP_SKILL_SRC}", cwd=release_home):
-        if PR_LOOP_SKILL_DEST not in plan.source:
-            plan.order.append(PR_LOOP_SKILL_DEST)
-        plan.mode[PR_LOOP_SKILL_DEST] = "100644"
-        plan.source[PR_LOOP_SKILL_DEST] = PR_LOOP_SKILL_SRC
+    # #348: distribute the official infra/dev-cycle skill set, sourced directly
+    # from skills/ — whole-directory (every file under skills/<name>/), so
+    # multi-file skills (tdd, triage, …) reach the consumer in full.
+    for name in PUSH_ALL_SKILLS:
+        _add_skill_dir(plan, release_home, ref, name)
+    if repo_root is not None:
+        for name in REPLACE_IF_PRESENT_SKILLS:
+            if _consumer_has_skill(repo_root, name):
+                _add_skill_dir(plan, release_home, ref, name)
 
     # Compose lefthook.yml fragment list: base < commons < each capability < kind.
     frags: list[str] = []
@@ -249,6 +337,37 @@ def build_plan(release_home: str, ref: str, kind: str, capabilities: list[str]) 
     plan.lefthook_frags = frags
 
     return plan
+
+
+def _add_skill_dir(plan: Plan, release_home: str, ref: str, name: str) -> None:
+    """Add every file under skills/<name>/ at ``ref`` to the plan, mapping each to
+    a consumer dest of .claude/skills/<name>/<subpath>. Tolerant: a skill whose
+    dir doesn't exist at the ref (empty ls-tree) is silently skipped."""
+    src_dir = f"skills/{name}"
+    listing = gh.git_ls_tree(ref, src_dir, cwd=release_home, recursive=True)
+    for line in listing.splitlines():
+        if not line:
+            continue
+        meta, tab, rel = line.partition("\t")
+        if not tab or not rel:
+            continue
+        if should_skip_source(rel):
+            continue
+        file_mode = meta.split(" ", 1)[0]
+        # rel == "skills/<name>/<subpath>"; the consumer dest mirrors it under
+        # .claude/ → ".claude/skills/<name>/<subpath>".
+        dest = f".claude/{rel}"
+        if dest not in plan.source:
+            plan.order.append(dest)
+        plan.mode[dest] = file_mode
+        plan.source[dest] = rel
+
+
+def _consumer_has_skill(repo_root: str, name: str) -> bool:
+    """True iff the consumer working tree already carries .claude/skills/<name>
+    as a real directory OR a symlink — the REPLACE_IF_PRESENT gate (upgrade an
+    existing copy; never add the skill to a consumer that lacks it)."""
+    return os.path.lexists(os.path.join(repo_root, ".claude", "skills", name))
 
 
 # ── Symlink target computation ────────────────────────────────────────────────
@@ -287,6 +406,12 @@ def materialize(release_home: str, ref: str, ref_sha: str, plan: Plan, tmp_relea
 
     if plan.lefthook_frags:
         _write_lefthook(release_home, ref, ref_sha, plan.lefthook_frags, tmp_release)
+
+    # Managed .gitignore (release#450): keeps bytecode out of the committed
+    # .release/ even when a consumer regenerates from the working tree.
+    gitignore = os.path.join(tmp_release, GITIGNORE_FILE)
+    with open(gitignore, "w", encoding="utf-8") as fh:
+        fh.write(GITIGNORE_BODY)
 
     # Provenance marker (ADR-0002): static comment lines + the full source SHA.
     marker = os.path.join(tmp_release, SOURCE_MARKER)
@@ -425,6 +550,18 @@ def compute_mirror(
     relative to it (the bash ran after `cd "$repo_root"`)."""
     mp = MirrorPlan()
 
+    # A consumer's skill ROOT (.claude/skills/<name>) may itself be a SYMLINK —
+    # REPLACE_IF_PRESENT treats that as "present", and an old hand-symlinked dir
+    # is exactly the kind of stale copy we replace. If we did NOT handle it here,
+    # the per-file abs_f below would resolve THROUGH that symlink, so _rm_f /
+    # os.symlink would mutate the symlink's TARGET (possibly inside .release/)
+    # instead of the consumer path. So: find each symlinked skill root carrying a
+    # planned file, schedule its removal first (migrated → _rm_f removes the link,
+    # not its target), and treat files under it as absent (plain create) below.
+    symlinked_skill_roots = _symlinked_skill_roots(new_files, repo_root)
+    for root in symlinked_skill_roots:
+        mp.migrated.append(root)
+
     for f in new_files:
         if is_release_internal(f):
             continue
@@ -434,13 +571,21 @@ def compute_mirror(
 
         target = link_target(f)
         abs_f = os.path.join(repo_root, f)
-        if os.path.islink(abs_f):
+        # If f sits under a symlinked skill root we're removing, the root is gone
+        # by apply time — plan a plain create against the (soon-to-be) clean path,
+        # never reading through the still-present symlink.
+        if _under_any(f, symlinked_skill_roots):
+            mp.symlinks_to_create.append(f"{f} -> {target}")
+        elif os.path.islink(abs_f):
             current = os.readlink(abs_f)
             if current != target:
                 mp.symlinks_to_create.append(f"{f} -> {target}")
         elif os.path.lexists(abs_f):
-            # exists (non-symlink): a real file at the managed location.
-            if migrate:
+            # exists (non-symlink): a real file/dir at the managed location.
+            # Distributed-skill dests are release-owned: a stale hand-copy there
+            # is always replaced (no --migrate needed). Everything else keeps the
+            # conflict-guard unless --migrate.
+            if migrate or is_distributed_skill_dest(f):
                 mp.migrated.append(f)
                 mp.symlinks_to_create.append(f"{f} -> {target}")
             else:
@@ -451,6 +596,39 @@ def compute_mirror(
     mp.symlinks_to_remove = _find_broken_release_links(repo_root, tmp_release)
     mp.copies_to_remove = _find_stale_managed_copies(repo_root, set(mp.copies_to_write))
     return mp
+
+
+def _skill_root_of(dest: str) -> str | None:
+    """The `.claude/skills/<name>` root for a distributed-skill dest, else None.
+    `.claude/skills/tdd/mocking.md` → `.claude/skills/tdd`."""
+    if not is_distributed_skill_dest(dest):
+        return None
+    parts = dest.split("/")
+    # parts == [".claude", "skills", "<name>", ...] — need at least the name.
+    if len(parts) < 4:
+        return None
+    return "/".join(parts[:3])
+
+
+def _symlinked_skill_roots(new_files: list[str], repo_root: str) -> list[str]:
+    """The distinct `.claude/skills/<name>` roots that (a) carry a planned file
+    and (b) exist in the consumer tree as a SYMLINK. First-seen order, no dups."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for f in new_files:
+        root = _skill_root_of(f)
+        if root is None or root in seen:
+            continue
+        seen.add(root)
+        if os.path.islink(os.path.join(repo_root, root)):
+            out.append(root)
+    return out
+
+
+def _under_any(dest: str, roots: list[str]) -> bool:
+    """True if ``dest`` is a file under one of the given `.claude/skills/<name>`
+    roots (root + '/')."""
+    return any(dest == r or dest.startswith(r + "/") for r in roots)
 
 
 def _find_broken_release_links(repo_root: str, tmp_release: str) -> list[str]:

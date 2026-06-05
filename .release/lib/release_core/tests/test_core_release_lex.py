@@ -2,9 +2,10 @@
 
 Post `scripts/release` retirement: release-lex computes the should-release
 decision GENERICALLY via plain git (commits since the last final release tag) and
-dispatches each repo via the MAINTAINER's `release-cut` (resolved from PATH, run
-in the repo's cwd — it reads the version from cwd's manifest, computes the bump,
-and dispatches cwd's release.yml; CI does the bump/CHANGELOG/commit/tag/build).
+dispatches each repo via the MAINTAINER's `release-core cut` (resolved from PATH,
+run in the repo's cwd — it reads the version from cwd's manifest, computes the
+bump, and dispatches cwd's release.yml; CI does the bump/CHANGELOG/commit/tag/
+build).
 The per-repo `bin/release` and `bin/diff-since-release` dependencies were dropped
 — they were absent / stale on chain repos whose mains lag. The live multi-repo
 orchestration (fetch/checkout/pull/submodule, release-cut dispatch, gh run
@@ -406,32 +407,32 @@ def _make_repo(path):
 
 
 @pytest.fixture
-def _release_cut_on_path(monkeypatch):
-    """Pretend `release-cut` is on PATH so cut-mode validation gets past the
+def _release_core_on_path(monkeypatch):
+    """Pretend `release-core` is on PATH so cut-mode validation gets past the
     up-front PATH check and reaches the per-repo path validation under test."""
     real_which = shutil.which
 
     def fake_which(name, *a, **k):
-        if name == rlx.RELEASE_CUT:
-            return "/fake/bin/release-cut"
+        if name == rlx.RELEASE_CORE:
+            return "/fake/bin/release-core"
         return real_which(name, *a, **k)
 
     monkeypatch.setattr(rlx.shutil, "which", fake_which)
 
 
-def test_validate_release_cut_not_on_path_exits_1(capsys, tmp_path, monkeypatch):
-    # Cut mode requires `release-cut` on the maintainer's PATH, checked once up
+def test_validate_release_core_not_on_path_exits_1(capsys, tmp_path, monkeypatch):
+    # Cut mode requires `release-core` on the maintainer's PATH, checked once up
     # front. Absent it -> exit 1 with a clear maintainer-facing message.
     _make_repo(tmp_path)
     monkeypatch.setattr(rlx.shutil, "which", lambda *a, **k: None)
     rc = rlx.main(["patch", "--comms", str(tmp_path)])
     assert rc == 1
     err = capsys.readouterr().err
-    assert "release-cut not on PATH" in err
+    assert "release-core not on PATH" in err
     assert "add the release repo's bin/ to PATH" in err
 
 
-def test_validate_not_a_directory_exits_1(capsys, tmp_path, _release_cut_on_path):
+def test_validate_not_a_directory_exits_1(capsys, tmp_path, _release_core_on_path):
     missing = tmp_path / "nope"
     rc = rlx.main(["patch", "--comms", str(missing)])
     assert rc == 1
@@ -440,8 +441,8 @@ def test_validate_not_a_directory_exits_1(capsys, tmp_path, _release_cut_on_path
     assert "(for --comms)" in err
 
 
-def test_validate_cut_mode_needs_no_per_repo_bin_tool(tmp_path, _release_cut_on_path):
-    # With release-cut on PATH, a bare repo dir (no bin/ at all) passes cut-mode
+def test_validate_cut_mode_needs_no_per_repo_bin_tool(tmp_path, _release_core_on_path):
+    # With release-core on PATH, a bare repo dir (no bin/ at all) passes cut-mode
     # validation — no per-repo bin/release is required anymore.
     _make_repo(tmp_path)
     cfg = {
@@ -454,13 +455,13 @@ def test_validate_cut_mode_needs_no_per_repo_bin_tool(tmp_path, _release_cut_on_
     assert rlx._validate(cfg) is None
 
 
-def test_validate_stores_resolved_absolute_release_cut_path(tmp_path, monkeypatch):
-    # _validate must resolve release-cut to an ABSOLUTE path ONCE (before any
-    # os.chdir) and stash it in cfg["release_cut_path"]; dispatch then uses that
+def test_validate_stores_resolved_absolute_release_core_path(tmp_path, monkeypatch):
+    # _validate must resolve release-core to an ABSOLUTE path ONCE (before any
+    # os.chdir) and stash it in cfg["release_core_path"]; dispatch then uses that
     # rather than re-resolving the bare name against a changed cwd. Same spirit
     # as the #404 abs-path fix.
     _make_repo(tmp_path)
-    monkeypatch.setattr(rlx.shutil, "which", lambda name, *a, **k: "/abs/bin/release-cut")
+    monkeypatch.setattr(rlx.shutil, "which", lambda name, *a, **k: "/abs/bin/release-core")
     cfg = {
         "status_mode": False,
         "bump_kind": "patch",
@@ -469,13 +470,13 @@ def test_validate_stores_resolved_absolute_release_cut_path(tmp_path, monkeypatc
         "repos": {"comms": str(tmp_path)},
     }
     assert rlx._validate(cfg) is None
-    assert cfg["release_cut_path"] == "/abs/bin/release-cut"
-    assert os.path.isabs(cfg["release_cut_path"])
+    assert cfg["release_core_path"] == "/abs/bin/release-core"
+    assert os.path.isabs(cfg["release_core_path"])
 
 
-def test_validate_status_mode_does_not_store_release_cut_path(tmp_path):
+def test_validate_status_mode_does_not_store_release_core_path(tmp_path):
     # Read-only --status mode never dispatches, so it must NOT consult PATH or
-    # set release_cut_path.
+    # set release_core_path.
     _make_repo(tmp_path)
     cfg = {
         "status_mode": True,
@@ -485,7 +486,7 @@ def test_validate_status_mode_does_not_store_release_cut_path(tmp_path):
         "repos": {"comms": str(tmp_path)},
     }
     assert rlx._validate(cfg) is None
-    assert "release_cut_path" not in cfg
+    assert "release_core_path" not in cfg
 
 
 def test_validate_status_mode_needs_no_bin_tool(tmp_path):
@@ -577,19 +578,20 @@ def test_release_one_success_with_commits_proceeds_to_dispatch(monkeypatch, caps
     out = capsys.readouterr().out
     assert "2 commit(s) since v1.2.3" in out
     # The explicit derived version is dispatched — NOT the bump-kind.
-    assert "release-cut 1.2.4" in out
-    assert "release-cut patch" not in out
+    assert "release-core cut 1.2.4" in out
+    assert "release-core cut patch" not in out
 
 
 def test_release_one_dispatch_uses_resolved_path_via_proc_run(monkeypatch, capsys):
-    # The live (non-dry-run) dispatch must invoke the ABSOLUTE release-cut path
-    # stashed by _validate, routed through the centralized proc.run chokepoint —
-    # not the bare name via subprocess.run directly. We make release-cut return
-    # nonzero so _release_one returns right after dispatch (no gh/sleep needed).
+    # The live (non-dry-run) dispatch must invoke the ABSOLUTE release-core path
+    # stashed by _validate, with the `cut` subcommand, routed through the
+    # centralized proc.run chokepoint — not the bare name via subprocess.run
+    # directly. We make release-core cut return nonzero so _release_one returns
+    # right after dispatch (no gh/sleep needed).
     cfg = {
         **_CFG,
         "dry_run": False,
-        "release_cut_path": "/abs/bin/release-cut",
+        "release_core_path": "/abs/bin/release-core",
     }
     captured: dict[str, list[str]] = {}
 
@@ -598,7 +600,7 @@ def test_release_one_dispatch_uses_resolved_path_via_proc_run(monkeypatch, capsy
             return _Res(0, stdout="v1.2.3\n")
         if "log" in cmd:
             return _Res(0, stdout="abc1234 feat: a\n")
-        # The release-cut dispatch: capture argv + kwargs, fail it to bail early.
+        # The release-core cut dispatch: capture argv + kwargs, fail it to bail.
         captured["cmd"] = cmd
         captured["kw"] = kw
         return _Res(1)
@@ -609,14 +611,14 @@ def test_release_one_dispatch_uses_resolved_path_via_proc_run(monkeypatch, capsy
     monkeypatch.setattr(rlx.os.path, "isfile", lambda *a, **k: False)
 
     rc = rlx._release_one("comms", cfg)
-    assert rc == 1  # release-cut failed -> surfaced, not a silent 0
+    assert rc == 1  # release-core cut failed -> surfaced, not a silent 0
     # TAG-authoritative: dispatches the EXPLICIT version (v1.2.3 + patch = 1.2.4),
     # NOT the bump-kind, so a drifted manifest can't drive the version.
-    assert captured["cmd"] == ["/abs/bin/release-cut", "1.2.4"]
+    assert captured["cmd"] == ["/abs/bin/release-core", "cut", "1.2.4"]
     # Honors the proc.run contract used for a live, streaming dispatch.
     assert captured["kw"].get("check") is False
     assert captured["kw"].get("capture_output") is False
-    assert "release-cut 1.2.4 failed" in capsys.readouterr().err
+    assert "release-core cut 1.2.4 failed" in capsys.readouterr().err
 
 
 def test_release_one_malformed_tag_fails_cleanly_no_traceback(monkeypatch, capsys):
@@ -627,7 +629,7 @@ def test_release_one_malformed_tag_fails_cleanly_no_traceback(monkeypatch, capsy
     cfg = {
         **_CFG,
         "dry_run": False,
-        "release_cut_path": "/abs/bin/release-cut",
+        "release_core_path": "/abs/bin/release-core",
     }
     dispatched: list[list[str]] = []
 
@@ -636,7 +638,7 @@ def test_release_one_malformed_tag_fails_cleanly_no_traceback(monkeypatch, capsy
             return _Res(0, stdout="v1.2\n")  # malformed: not X.Y.Z
         if "log" in cmd:
             return _Res(0, stdout="abc1234 feat: a\n")
-        dispatched.append(cmd)  # release-cut must NOT be reached
+        dispatched.append(cmd)  # release-core cut must NOT be reached
         return _Res(0)
 
     monkeypatch.setattr(rlx.proc, "run", fake_run)
@@ -646,7 +648,7 @@ def test_release_one_malformed_tag_fails_cleanly_no_traceback(monkeypatch, capsy
 
     rc = rlx._release_one("comms", cfg)
     assert rc == 1  # clean failure, not a traceback crash
-    assert dispatched == []  # no release-cut dispatch on an unparseable tag
+    assert dispatched == []  # no release-core cut dispatch on an unparseable tag
     err = capsys.readouterr().err
     assert "failed to parse tag 'v1.2' as semver" in err
 
@@ -703,7 +705,7 @@ def test_vscode_stale_manifest_does_not_drive_version(monkeypatch):
     cfg = {
         "dry_run": False,
         "bump_kind": "patch",
-        "release_cut_path": "/abs/bin/release-cut",
+        "release_core_path": "/abs/bin/release-core",
         "repos": {"vscode": "/tmp/vscode"},
     }
     captured: dict[str, list[str]] = {}
@@ -725,8 +727,8 @@ def test_vscode_stale_manifest_does_not_drive_version(monkeypatch):
     rlx._release_one("vscode", cfg)
     # The dispatched version is derived from the TAG (0.10.9), NOT the stale
     # manifest's 0.4.2 — this is the regression the fix prevents.
-    assert captured["cmd"] == ["/abs/bin/release-cut", "0.10.9"]
-    assert captured["cmd"][1] != "0.4.2"
+    assert captured["cmd"] == ["/abs/bin/release-core", "cut", "0.10.9"]
+    assert captured["cmd"][2] != "0.4.2"
     # version.parse was fed the TAG, never the stale manifest's 0.4.1-rc.1.
     assert parse_inputs == ["v0.10.8"]
     assert "0.4.1-rc.1" not in parse_inputs
@@ -760,7 +762,7 @@ def test_notags_decision_never_guesses_a_version(monkeypatch, capsys):
     cfg = {
         "dry_run": False,
         "bump_kind": "patch",
-        "release_cut_path": "/abs/bin/release-cut",
+        "release_core_path": "/abs/bin/release-core",
         "repos": {"nvim": "/tmp/nvim"},
     }
     dispatched: list[str] = []
@@ -778,8 +780,8 @@ def test_notags_decision_never_guesses_a_version(monkeypatch, capsys):
 
     rc = rlx._release_one("nvim", cfg)
     assert rc == 0
-    # No release-cut dispatch happened (only the tag listing ran).
-    assert not any("release-cut" in str(c) for c in dispatched)
+    # No release-core cut dispatch happened (only the tag listing ran).
+    assert not any("release-core" in str(c) for c in dispatched)
     assert "no final release tags yet" in capsys.readouterr().out
 
 

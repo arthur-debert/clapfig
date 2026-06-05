@@ -7,7 +7,7 @@ if undetermined.
 
 Usage: detect-kind [<dir>]   (defaults to current dir)
 
-Canary for the shell→Python migration (docs/proposals/shell-to-python.md): the
+Canary for the shell→Python migration: the
 logic lives in release_core.manifest.detect_kind; this verb is the thin CLI
 edge that preserves bin/detect-kind's contract byte-for-byte.
 """

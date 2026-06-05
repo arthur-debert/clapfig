@@ -1,0 +1,14 @@
+{
+  "meta": {
+    "number": 106,
+    "headRefOid": "fff666",
+    "isDraft": true,
+    "mergeable": "MERGEABLE",
+    "mergeStateStatus": "BLOCKED",
+    "reviewRequests": []
+  },
+  "reviews": [],
+  "threads": [],
+  "reactions": [],
+  "issue_comments": []
+}

@@ -36,7 +36,7 @@ What's deliberately out of scope:
   - the "e2e (L/C)" column for stacks without an e2e flow
   - per-component checks (audit-repo covers those)
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the grep/sed/awk
+Shell→Python migration: the grep/sed/awk
 release.yml parsing + jq CI/run aggregation moved into Python over gh.rest's
 parsed dicts (no jq). Raw workflow-file bodies are read via the contents API +
 base64 decode rather than the `Accept: vnd.github.raw` header, so the existing
