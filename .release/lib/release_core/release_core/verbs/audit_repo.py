@@ -46,7 +46,7 @@ Conformance checks (WARN-only — don't fail; surface adoption gaps):
                              (WARN, migrate per #201) / two-file (WARN) /
                              none (WARN) / mixed (FAIL).
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the base64/jq/grep
+Shell→Python migration: the base64/jq/grep
 YAML gymnastics moved into Python (gh.rest → parsed dicts + base64-decoded file
 bodies, no jq). The --json shape ({"repo","checks":[{"name","status","message"}]})
 and the exit codes (1 fail / 2 warn / 0 ok) are preserved byte-for-byte;

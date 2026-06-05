@@ -15,7 +15,7 @@ Usage:
   list-repo-scripts --only-app-bin  # show only app-bin/ column
   list-repo-scripts --only-bin --only-scripts  # composable
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the mktemp/sed/wc
+Shell→Python migration: the mktemp/sed/wc
 column-printing machinery moved into Python. The columnar output (30-col width,
 headers, rules, the per-dir totals footer) is preserved byte-for-byte. Filesystem
 only — no gh, no network.
@@ -32,8 +32,8 @@ USAGE = __doc__ or ""
 # ~/.claude/projects/-Users-adebert-h-release/memory/project_managed_repos.md
 REPOS = [
     ("arthur-debert/release", "{home}/h/release"),
-    ("arthur-debert/phos-app", "{home}/h/phos/phos-app"),
-    ("arthur-debert/phos-core", "{home}/h/phos/phos-core"),
+    ("phos-editor/app", "{home}/h/phos/phos-app"),
+    ("phos-editor/core", "{home}/h/phos/phos-core"),
     ("arthur-debert/burgertocow", "{home}/h/burgertocow"),
     ("arthur-debert/clapfig", "{home}/h/clapfig"),
     ("arthur-debert/dodot", "{home}/h/dodot"),

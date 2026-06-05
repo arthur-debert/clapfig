@@ -48,6 +48,10 @@ class FakeGit:
         if cmd[:1] != ["git"]:
             raise AssertionError(f"unexpected non-git proc.run: {cmd}")
         rest = cmd[1:]
+        # gh.is_git_worktree probe: `git -C <home> rev-parse --is-inside-work-tree`.
+        # The fixture stands in for a real release clone → report a work tree.
+        if rest[:1] == ["-C"] and rest[2:] == ["rev-parse", "--is-inside-work-tree"]:
+            return _completed(cmd, returncode=0, stdout="true\n")
         if rest[:2] == ["remote", "get-url"]:
             return _completed(cmd, returncode=0, stdout=self.origin + "\n")
         if rest[0] == "fetch":

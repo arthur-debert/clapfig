@@ -35,7 +35,9 @@ def _fixture_sources(tmp_path) -> dict[str, str]:
 def _patch(monkeypatch, repo, sources):
     """Wire init's repo-root + source resolution to the fixture repo/sources."""
     monkeypatch.setattr(init.gh, "repo_root", lambda: str(repo))
-    monkeypatch.setattr(init, "_materialize_config_sources", lambda root, name: sources)
+    monkeypatch.setattr(
+        init, "_materialize_config_sources", lambda root, name, *, source_ref=None: sources
+    )
 
 
 # --------------------------------------------------------------------------
@@ -260,7 +262,7 @@ def test_init_kind_error_exits_1(tmp_path, monkeypatch, capsys):
     repo.mkdir()
     monkeypatch.setattr(init.gh, "repo_root", lambda: str(repo))
 
-    def raise_kind(root, name):
+    def raise_kind(root, name, *, source_ref=None):
         raise manifest.KindError("nope")
 
     monkeypatch.setattr(init, "_materialize_config_sources", raise_kind)
@@ -275,7 +277,7 @@ def test_init_sync_error_exits_1(tmp_path, monkeypatch, capsys):
     repo.mkdir()
     monkeypatch.setattr(init.gh, "repo_root", lambda: str(repo))
 
-    def raise_sync(root, name):
+    def raise_sync(root, name, *, source_ref=None):
         raise sync.SyncError("release-core init: $RELEASE_HOME=... is not a git clone")
 
     monkeypatch.setattr(init, "_materialize_config_sources", raise_sync)
@@ -325,7 +327,7 @@ def test_init_yaml_error_exits_1_not_traceback(tmp_path, monkeypatch, capsys):
     repo.mkdir()
     monkeypatch.setattr(init.gh, "repo_root", lambda: str(repo))
 
-    def raise_yaml(root, name):
+    def raise_yaml(root, name, *, source_ref=None):
         raise yamlio.YamlError("yq -o=json . failed (1): bad YAML")
 
     monkeypatch.setattr(init, "_materialize_config_sources", raise_yaml)
@@ -575,6 +577,9 @@ def test_materialize_sources_release_home_overrides_bundle(tmp_path, monkeypatch
     repo.mkdir()
     clone = tmp_path / "clone"
     (clone / ".git").mkdir(parents=True)
+    # The guard now probes git (is_git_worktree) instead of os.path.isdir(.git),
+    # so this fake clone is reported as a work tree without a real `git init`.
+    monkeypatch.setattr(init.gh, "is_git_worktree", lambda path: True)
     monkeypatch.setenv("RELEASE_HOME", str(clone))
     monkeypatch.setattr(init, "_bundle_templates_root", lambda: tpl_root)
     monkeypatch.setattr(init.manifest, "detect_kind", lambda root: "go-cli")
@@ -605,6 +610,312 @@ def test_materialize_sources_release_home_overrides_bundle(tmp_path, monkeypatch
     sources = init._materialize_config_sources(str(repo), "repo")
     assert set(sources) == set(init.CONFIG_FILES)
     assert _read(sources["lefthook.yml"]) == "# git-engine lefthook.yml\n"
+
+
+# --------------------------------------------------------------------------
+# --commit / --push (the pull-model commit-hygiene seam)
+#
+# These drive init.main() against a REAL throwaway git repo (git is already a
+# release dependency and present in CI) so the staging/commit scoping is
+# exercised for real, not mocked. The source content is still the fixture tree
+# via _patch, so no yq/templates are needed.
+# --------------------------------------------------------------------------
+
+import subprocess as _subprocess  # noqa: E402
+
+_HAVE_GIT = _shutil.which("git") is not None
+_needs_git = pytest.mark.skipif(not _HAVE_GIT, reason="git not installed")
+
+
+def _git(repo, *args):
+    return _subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _init_git_repo(repo, *, default_branch="main"):
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-q", "-b", default_branch)
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "Test")
+    # An initial commit so HEAD exists (commit --only needs a real HEAD).
+    (repo / "README.md").write_text("# repo\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-q", "-m", "initial")
+    return repo
+
+
+def _tracked_status(repo):
+    return _git(repo, "status", "--porcelain")
+
+
+@_needs_git
+def test_commit_commits_only_managed_files_when_changed(tmp_path, monkeypatch, capsys):
+    repo = _init_git_repo(tmp_path / "repo")
+    sources = _fixture_sources(tmp_path)
+    _patch(monkeypatch, repo, sources)
+
+    rc = init.main(["--commit"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # A new commit was made; its tree contains exactly the managed config files
+    # (+ the pre-existing README from the initial commit).
+    assert "committed 7 managed file(s)" in out
+    assert "chore(release): sync managed config" in out
+    last = _git(repo, "log", "-1", "--name-only", "--pretty=format:%s")
+    lines = last.splitlines()
+    assert lines[0].startswith("chore(release): sync managed config")
+    committed = set(lines[1:])
+    assert committed == set(init.CONFIG_FILES)
+    # Working tree is clean after the commit (everything managed is committed).
+    assert _tracked_status(repo) == ""
+
+
+@_needs_git
+def test_commit_message_includes_source_ref_when_known(tmp_path, monkeypatch, capsys):
+    repo = _init_git_repo(tmp_path / "repo")
+    sources = _fixture_sources(tmp_path)
+    monkeypatch.setattr(init.gh, "repo_root", lambda: str(repo))
+
+    # Hand back a source_ref the way the bundle/git-engine path would.
+    def _materialize(root, name, *, source_ref=None):
+        if source_ref is not None:
+            source_ref["ref"] = "deadbeef1234"
+        return sources
+
+    monkeypatch.setattr(init, "_materialize_config_sources", _materialize)
+
+    rc = init.main(["--commit"])
+    assert rc == 0
+    capsys.readouterr()
+    subject = _git(repo, "log", "-1", "--pretty=format:%s")
+    assert subject == "chore(release): sync managed config to deadbeef1234"
+
+
+@_needs_git
+def test_commit_no_commit_when_unchanged(tmp_path, monkeypatch, capsys):
+    repo = _init_git_repo(tmp_path / "repo")
+    sources = _fixture_sources(tmp_path)
+    _patch(monkeypatch, repo, sources)
+
+    assert init.main(["--commit"]) == 0
+    capsys.readouterr()
+    head_before = _git(repo, "rev-parse", "HEAD")
+
+    # Second run: everything present, changed == 0 → no commit.
+    rc = init.main(["--commit"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "committed" not in out
+    assert _git(repo, "rev-parse", "HEAD") == head_before
+
+
+@_needs_git
+def test_commit_does_not_stage_unrelated_working_tree_changes(tmp_path, monkeypatch, capsys):
+    repo = _init_git_repo(tmp_path / "repo")
+    sources = _fixture_sources(tmp_path)
+    _patch(monkeypatch, repo, sources)
+
+    # A user's in-progress work: one modified tracked file + one new untracked
+    # file, neither managed. Must survive the managed commit untouched.
+    (repo / "README.md").write_text("# repo — WIP edit\n")
+    (repo / "feature.txt").write_text("user work\n")
+
+    rc = init.main(["--commit"])
+    assert rc == 0
+    capsys.readouterr()
+    # The managed commit must NOT include the user's files.
+    committed = set(_git(repo, "log", "-1", "--name-only", "--pretty=format:").splitlines())
+    committed.discard("")
+    assert committed == set(init.CONFIG_FILES)
+    # The user's changes are still present and uncommitted.
+    status = _tracked_status(repo)
+    # README is still modified and feature.txt still untracked — both left for the
+    # user. The critical guarantee (README not in the managed commit) is asserted
+    # above; here we confirm the user's work survived intact and uncommitted.
+    assert "README.md" in status
+    assert "?? feature.txt" in status
+    # And README is NOT in the index as staged-for-commit (its worktree X column
+    # is unmodified): no managed commit should have staged it.
+    diff_cached = _git(repo, "diff", "--cached", "--name-only")
+    assert "README.md" not in diff_cached.splitlines()
+    assert (repo / "README.md").read_text() == "# repo — WIP edit\n"
+
+
+@_needs_git
+def test_commit_does_not_fold_in_pre_staged_unrelated_changes(tmp_path, monkeypatch, capsys):
+    repo = _init_git_repo(tmp_path / "repo")
+    sources = _fixture_sources(tmp_path)
+    _patch(monkeypatch, repo, sources)
+
+    # A user already STAGED an unrelated change. The pathspec-scoped commit must
+    # not absorb it.
+    (repo / "staged.txt").write_text("already staged\n")
+    _git(repo, "add", "staged.txt")
+
+    rc = init.main(["--commit"])
+    assert rc == 0
+    capsys.readouterr()
+    committed = set(_git(repo, "log", "-1", "--name-only", "--pretty=format:").splitlines())
+    committed.discard("")
+    assert "staged.txt" not in committed
+    assert committed == set(init.CONFIG_FILES)
+    # staged.txt is still staged, still uncommitted.
+    assert "A  staged.txt" in _tracked_status(repo)
+
+
+@_needs_git
+def test_commit_dry_run_never_commits(tmp_path, monkeypatch, capsys):
+    repo = _init_git_repo(tmp_path / "repo")
+    sources = _fixture_sources(tmp_path)
+    _patch(monkeypatch, repo, sources)
+    head_before = _git(repo, "rev-parse", "HEAD")
+
+    rc = init.main(["--commit", "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "committed" not in out
+    assert _git(repo, "rev-parse", "HEAD") == head_before
+    # Nothing was written either.
+    for dest in init.CONFIG_FILES:
+        assert not (repo / dest).exists()
+
+
+def test_commit_in_non_git_dir_is_safe_no_op(tmp_path, monkeypatch, capsys):
+    # repo_root is monkeypatched to a plain dir (no .git). init must still
+    # materialize and succeed; --commit is a quiet no-op.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sources = _fixture_sources(tmp_path)
+    _patch(monkeypatch, repo, sources)
+
+    rc = init.main(["--commit"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    for dest in init.CONFIG_FILES:
+        assert (repo / dest).is_file()
+    assert "committed" not in out
+
+
+@_needs_git
+def test_commit_on_unborn_branch_is_safe_no_op(tmp_path, monkeypatch, capsys):
+    # A freshly `git init`'d repo with NO commits yet (unborn HEAD). A
+    # pathspec-scoped commit cannot run there ("partial commit during
+    # bootstrap"); init must skip silently and still succeed — consistently
+    # across layouts (Gemini review on #443).
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "Test")
+    # No initial commit → HEAD is unborn.
+    sources = _fixture_sources(tmp_path)
+    _patch(monkeypatch, repo, sources)
+
+    rc = init.main(["--commit"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    # Files were still materialized.
+    for dest in init.CONFIG_FILES:
+        assert (repo / dest).is_file()
+    # No commit, and no noisy "cannot do partial commit" failure surfaced.
+    assert "committed" not in captured.out
+    assert "bootstrap" not in captured.err
+    assert "--commit skipped" not in captured.err
+
+
+@_needs_git
+def test_push_only_on_default_branch(tmp_path, monkeypatch, capsys):
+    # On a feature branch, --push must keep the commit local (no push attempt).
+    repo = _init_git_repo(tmp_path / "repo", default_branch="main")
+    # Give it an origin so git_default_branch resolves to 'main'.
+    bare = tmp_path / "origin.git"
+    _subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    _git(repo, "remote", "add", "origin", str(bare))
+    _git(repo, "push", "-q", "-u", "origin", "main")
+    _git(repo, "remote", "set-head", "origin", "main")
+    # Now switch to a feature branch.
+    _git(repo, "checkout", "-q", "-b", "feat/x")
+    sources = _fixture_sources(tmp_path)
+    _patch(monkeypatch, repo, sources)
+
+    pushes = []
+    monkeypatch.setattr(init.gh, "git_push_ff", lambda branch, **k: pushes.append(branch))
+
+    rc = init.main(["--push"])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert pushes == [], "must NOT push from a feature branch"
+    assert "push skipped" in err
+    # But the commit was still made locally on the feature branch.
+    assert "chore(release)" in _git(repo, "log", "-1", "--pretty=format:%s")
+
+
+@_needs_git
+def test_push_skipped_when_tree_dirty_on_default_branch(tmp_path, monkeypatch, capsys):
+    repo = _init_git_repo(tmp_path / "repo", default_branch="main")
+    bare = tmp_path / "origin.git"
+    _subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    _git(repo, "remote", "add", "origin", str(bare))
+    _git(repo, "push", "-q", "-u", "origin", "main")
+    _git(repo, "remote", "set-head", "origin", "main")
+    sources = _fixture_sources(tmp_path)
+    _patch(monkeypatch, repo, sources)
+
+    # A non-managed dirty file on the default branch → push must be skipped.
+    (repo / "dirty.txt").write_text("uncommitted\n")
+
+    pushes = []
+    monkeypatch.setattr(init.gh, "git_push_ff", lambda branch, **k: pushes.append(branch))
+
+    rc = init.main(["--push"])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert pushes == [], "must NOT push with an otherwise-dirty tree"
+    assert "push skipped" in err
+
+
+@_needs_git
+def test_push_happens_on_clean_default_branch(tmp_path, monkeypatch, capsys):
+    repo = _init_git_repo(tmp_path / "repo", default_branch="main")
+    bare = tmp_path / "origin.git"
+    _subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    _git(repo, "remote", "add", "origin", str(bare))
+    _git(repo, "push", "-q", "-u", "origin", "main")
+    _git(repo, "remote", "set-head", "origin", "main")
+    sources = _fixture_sources(tmp_path)
+    _patch(monkeypatch, repo, sources)
+
+    rc = init.main(["--push"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "pushed to main." in out
+    # The bare origin now has the managed commit. Read the explicit `main` ref,
+    # not the bare's default HEAD: `git init --bare` points HEAD at
+    # init.defaultBranch (often `master` on CI), so `git log` with no ref hits an
+    # empty branch and exits 128 even though the push to `main` succeeded.
+    assert "chore(release)" in _git(bare, "log", "-1", "--pretty=format:%s", "main")
+
+
+@_needs_git
+def test_commit_failure_does_not_fail_init(tmp_path, monkeypatch, capsys):
+    # If the commit itself errors, init must still exit 0 (commit is best-effort).
+    repo = _init_git_repo(tmp_path / "repo")
+    sources = _fixture_sources(tmp_path)
+    _patch(monkeypatch, repo, sources)
+
+    def boom(*a, **k):
+        raise init.gh.proc.ProcError(["git", "commit"], 1, "nope")
+
+    monkeypatch.setattr(init.gh, "git_commit_paths", boom)
+
+    rc = init.main(["--commit"])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "--commit skipped" in err
 
 
 @_needs_yq

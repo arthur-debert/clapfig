@@ -20,7 +20,7 @@ Exit codes:
   1  — smoke test failed (one or more checks below)
   64 — bad usage
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the gh-api/jq polling
+Shell→Python migration: the gh-api/jq polling
 of workflow runs + timeline moved into Python (gh.rest → parsed dicts, no jq).
 The orchestration (clone/commit/push/PR open/close) is genuine side-effecting
 glue and stays a sequence of proc/gh calls; the testable decisions (target-file

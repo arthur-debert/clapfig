@@ -28,7 +28,7 @@ Exit codes:
 Example:
   gh-release-issue copilot-review "workflow ran SUCCESS but requested_reviewers stayed empty"
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the gh-porcelain
+Shell→Python migration: the gh-porcelain
 context collection + heredoc body assembly moved into Python (no jq -q
 extraction). Title, body (including the conditional PR/run lines), the
 consumer-filed label, and the stdout URL are preserved byte-for-byte.

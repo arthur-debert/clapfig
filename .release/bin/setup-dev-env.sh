@@ -208,8 +208,8 @@ fi
 # --- 0.2. Pull-model: self-update release_core from the published wheel --
 # The north star (ADR-0003): repos AUTO-UPDATE on session start, retiring the
 # hand-run `orc propagate` treadmill. The boot resolver `install-release-core`
-# resolves the latest release wheel, pip-installs it (--force-reinstall --no-deps
-# — the wheel version is static, so `-U` would skip it), THEN runs `release-core
+# resolves the latest release wheel, pip-installs it (--force-reinstall — the
+# wheel version is static, so `-U` would skip it; deps resolve from PyPI), THEN runs `release-core
 # init` itself (it locates the just-installed console-script across venv/--user/
 # system layouts). One command does the whole boot. Runs in BOTH local and cloud
 # (above the cloud-only gate) — auto-update is the whole point.

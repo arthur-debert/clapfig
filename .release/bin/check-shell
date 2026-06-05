@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # check-shell — shellcheck ONLY the actual shell files among its arguments.
 #
-# The single place "lint the shell" lives (the unified gate, release#348 +
-# docs/proposals/unified-gate.lex). It selects files by CONTENT — a shell
+# The single place "lint the shell" lives (the unified gate, release#348).
+# It selects files by CONTENT — a shell
 # shebang, or a .sh/.bash extension — never by path glob. So non-shell files
 # that legitimately live under bin/ (the gh-task-status Python shim,
 # Dockerfiles, etc.) fall out STRUCTURALLY, instead of via per-file `exclude`

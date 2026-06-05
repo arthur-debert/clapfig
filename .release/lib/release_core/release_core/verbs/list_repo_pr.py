@@ -10,7 +10,7 @@ Usage:
   list-repo-pr --only-present  # skip repos missing locally
   list-repo-pr --owner lex-fmt # filter by owner prefix
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the per-PR jq field
+Shell→Python migration: the per-PR jq field
 extraction moved into Python over the parsed GraphQL dict (gh.graphql, no jq).
 The human table — column widths, ANSI colors, the merge-ready green URL — is
 preserved byte-for-byte.
@@ -30,8 +30,8 @@ USAGE = __doc__ or ""
 # from the bash so the contract is byte-identical.
 REPOS = [
     ("arthur-debert/release", "{home}/h/release"),
-    ("arthur-debert/phos-app", "{home}/h/phos/phos-app"),
-    ("arthur-debert/phos-core", "{home}/h/phos/phos-core"),
+    ("phos-editor/app", "{home}/h/phos/phos-app"),
+    ("phos-editor/core", "{home}/h/phos/phos-core"),
     ("arthur-debert/burgertocow", "{home}/h/burgertocow"),
     ("arthur-debert/clapfig", "{home}/h/clapfig"),
     ("arthur-debert/dodot", "{home}/h/dodot"),

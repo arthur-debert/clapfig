@@ -18,7 +18,7 @@ Usage:
   enable-dependabot-security --repos arthur-debert/dodot,lex-fmt/lex
   enable-dependabot-security --dry-run
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the rulesets-membership
+Shell→Python migration: the rulesets-membership
 discovery (gh + jq) and the two enable PUTs (`gh api -X PUT … --silent`) move into
 Python. The PUTs go through gh.rest(..., method="PUT") (no body); stdout (discovery
 header, per-repo ok/FAIL lines, summary) and exit codes are preserved byte-for-byte.

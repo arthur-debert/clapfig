@@ -24,7 +24,14 @@ CLAUDE.md
 # (in-table section headers, mixed list styles) that are intentional
 # for AI consumption but trip strict markdownlint rules. Keep them
 # out of the gate; consumers can lint them on demand if they want to.
+# `.release/.claude/skills/` is the SYNCED copy of that same tree (the real
+# blobs the `.claude/skills/` symlinks point at); a consumer gate runs from the
+# repo root and would otherwise lint those materialized files — exclude that
+# path too, or distributing vendored skills (release#474) breaks the consumer
+# gate on their non-conforming markdown (MD033/MD041). Caught in the v2.9.0
+# fleet propagate.
 .claude/skills/
+.release/.claude/skills/
 docs/skills/
 
 # Vendored third-party content (e.g. vendor/semver-tool/README.md). Not

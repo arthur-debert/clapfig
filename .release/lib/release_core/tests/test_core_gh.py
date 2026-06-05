@@ -482,3 +482,58 @@ def test_issue_close_argv(gh_on_path, monkeypatch):
         "--comment",
         "fixed upstream",
     ]
+
+
+# --- is_git_worktree (worktree-aware $RELEASE_HOME guard) -------------------
+#
+# Regression for the dogfood-friction bug: the old guard
+# `os.path.isdir(<home>/.git)` rejected a git WORKTREE, whose `.git` is a
+# *file* (a gitdir pointer), not a directory. These run against real throwaway
+# git repos (git is already a release dependency and present in CI).
+
+import shutil as _shutil  # noqa: E402
+
+_HAVE_GIT = _shutil.which("git") is not None
+_needs_git = pytest.mark.skipif(not _HAVE_GIT, reason="git not installed")
+
+
+def _git(repo, *args):
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
+
+
+def _init_repo(path):
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.email", "t@example.com")
+    _git(path, "config", "user.name", "t")
+    (path / "f.txt").write_text("x\n")
+    _git(path, "add", "f.txt")
+    _git(path, "commit", "-qm", "init")
+    return path
+
+
+@_needs_git
+def test_is_git_worktree_true_for_normal_clone(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    assert gh.is_git_worktree(str(repo)) is True
+
+
+@_needs_git
+def test_is_git_worktree_true_for_linked_worktree(tmp_path):
+    # The whole point: a linked worktree's `.git` is a FILE, not a dir.
+    repo = _init_repo(tmp_path / "repo")
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-q", str(wt), "-b", "feat")
+    assert (wt / ".git").is_file(), "precondition: worktree .git is a file"
+    assert gh.is_git_worktree(str(wt)) is True
+
+
+@_needs_git
+def test_is_git_worktree_false_for_plain_dir(tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert gh.is_git_worktree(str(plain)) is False
+
+
+def test_is_git_worktree_false_for_missing_path(tmp_path):
+    assert gh.is_git_worktree(str(tmp_path / "does-not-exist")) is False

@@ -23,7 +23,7 @@ Exit codes:
   2  — dependency or auth error
   64 — bad usage
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the jq clustering
+Shell→Python migration: the jq clustering
 pass moved into Python (gh.rest → parsed dicts, no jq). The --json shape and the
 human digest are preserved; release#348 Phase C consumes the --json clusters.
 """

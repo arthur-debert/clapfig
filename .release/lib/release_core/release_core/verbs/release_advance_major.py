@@ -35,7 +35,7 @@ import os
 import re
 import sys
 
-from .. import proc
+from .. import gh, proc
 
 
 def _help_text() -> str:
@@ -77,7 +77,7 @@ def main(argv: list[str]) -> int:  # noqa: C901 — flat dispatch mirrors the ba
     release_home = os.environ.get("RELEASE_HOME") or os.path.join(
         os.path.expanduser("~"), "release"
     )
-    if os.path.isdir(os.path.join(release_home, ".git")):
+    if gh.is_git_worktree(release_home):
         os.chdir(release_home)
     else:
         top = proc.run(["git", "rev-parse", "--show-toplevel"], check=False)

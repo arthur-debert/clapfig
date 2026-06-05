@@ -52,7 +52,7 @@ After dispatch:
   gh run watch
   gh run list --workflow=release.yml --limit=1
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the kind-aware
+Shell→Python migration: the kind-aware
 version readers + semver math moved here; bin/release-cut is a thin shim.
 release-cut is release-only (a real file in bin/, NOT synced to consumers);
 the distributed templates/commons/bin/release shim execs whatever release-cut

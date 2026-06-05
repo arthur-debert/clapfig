@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "number": 204,
+    "headRefOid": "f00d04",
+    "isDraft": true,
+    "mergeable": "CONFLICTING",
+    "mergeStateStatus": "DIRTY",
+    "reviewRequests": [],
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "name": "ci / check",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS"
+      }
+    ]
+  },
+  "reviews": [
+    {
+      "id": 7301,
+      "user": { "login": "Copilot" },
+      "state": "APPROVED",
+      "commit_id": "f00d04",
+      "body": ""
+    }
+  ],
+  "threads": [],
+  "reactions": [],
+  "issue_comments": []
+}

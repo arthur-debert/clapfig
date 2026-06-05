@@ -1,10 +1,10 @@
 """init — materialize the per-repo COMMITTED config files into a consumer repo.
 
 Usage:
-  release-core init [--force] [--dry-run]
+  release-core init [--force] [--dry-run] [--commit] [--push]
 
-`release-core init` is the seam (pip-bootstrap PoC, docs/proposals/pip-bootstrap-contract.md
-§2) that replaces release-sync's *config* materialization. The package arrives
+`release-core init` is the seam (pip-bootstrap PoC) that replaces release-sync's
+*config* materialization. The package arrives
 via `pip install`; the files a consumer must have committed IN ITS OWN GIT TREE —
 the gate definition (`lefthook.yml`) and the managed lint/format configs — are
 written here.
@@ -20,7 +20,7 @@ templates/commons/; see CONFIG_FILES below and sync.py for provenance):
   .prettierignore
 
 NOT in scope (deliberately small seam — the full sync->init migration is post-PoC):
-  - package code (lib/release_core/**, lib/release_gh/**) — arrives via pip
+  - package code (lib/release_core/**, incl. the folded prstate engine) — via pip
   - release-internal files (.release-sync-source, ORIENTATION.md)
   - the CLAUDE.md orientation block, skills, .claude/settings.json, CHANGELOG/
   - git-hook wiring (stays in setup-dev-env.sh)
@@ -34,6 +34,29 @@ Behavior:
   - --dry-run: print what WOULD happen, write nothing.
   - exits NON-ZERO on any real failure (cannot write a file it intended to). No
     silent best-effort swallowing for init's own writes.
+
+Auto-commit (the pull-model commit-hygiene seam):
+  - --commit: after a materialization that actually changed files, stage and
+    commit ONLY the exact managed paths init wrote (never `git add -A`, never
+    fold in a user's other staged/unstaged work) with a deterministic message.
+    The managed config tree is fully GENERATED — nothing to review — so it can
+    and should auto-commit itself instead of riding along, uncommitted, in some
+    unrelated feature PR. Conservative by construction: no changes → no commit;
+    --dry-run → no commit; an unborn branch (no HEAD) or any git error makes the
+    commit *step* a quiet no-op; if the managed paths can't be staged cleanly it
+    prints a notice and skips the commit. The commit step never fails init (init
+    itself still requires its normal git context). Opt-in: a plain `init` stays
+    non-committing.
+  - --push (implies --commit): fast-forward push the managed commit ONLY when
+    ALL hold — --push given, the current branch IS the repo's default branch,
+    and the working tree is otherwise clean (no non-managed changes). On a
+    feature branch (or a dirty tree) the commit stays local and just rides the
+    branch — visible, and excluded from review as a managed change. Never
+    force-pushes, never merges a PR.
+
+  Scope: --commit/--push cover ONLY the CONFIG subset init materializes (see
+  CONFIG_FILES) — NOT the full `.release/` tree (that is release-sync; the
+  sync->init migration is separate).
 
 Source resolution: the canonical config content is composed from the
 wheel-bundled templates (release_core/_bundled_templates/, staged at build time
@@ -178,7 +201,9 @@ def _materialize_config_from_bundle(
     return sources
 
 
-def _materialize_config_sources(repo_root: str, repo_name: str) -> dict[str, str]:
+def _materialize_config_sources(
+    repo_root: str, repo_name: str, *, source_ref: dict[str, str] | None = None
+) -> dict[str, str]:
     """Compose the canonical config content and return {dest -> absolute path in
     a temp tree} for every CONFIG_FILES dest produced.
 
@@ -187,9 +212,13 @@ def _materialize_config_sources(repo_root: str, repo_name: str) -> dict[str, str
     (release-dev uses live templates via the full sync engine). May raise
     manifest.KindError / sync.SyncError / yamlio.YamlError — main() maps each to
     a clean exit 1.
+
+    ``source_ref``, when given, is populated with a ``"ref"`` key describing the
+    source the config was composed from (the resolved tip on the git-engine path;
+    the wheel version on the bundle path), for use in the --commit message.
     """
     release_home = os.environ.get("RELEASE_HOME")
-    have_clone = bool(release_home) and os.path.isdir(os.path.join(release_home, ".git"))
+    have_clone = bool(release_home) and gh.is_git_worktree(release_home)
     tpl_root = _bundle_templates_root()
 
     kind = manifest.detect_kind(repo_root)
@@ -202,6 +231,10 @@ def _materialize_config_sources(repo_root: str, repo_name: str) -> dict[str, str
             caps_names = sync._yq_list_capabilities(sync_yaml_text)
         else:
             caps_names = _capabilities_from_bundle(tpl_root, kind)
+        if source_ref is not None:
+            from .. import __version__ as _v
+
+            source_ref["ref"] = f"release-core {_v}"
         return _materialize_config_from_bundle(tpl_root, repo_root, kind, caps_names)
 
     if not have_clone:
@@ -213,6 +246,10 @@ def _materialize_config_sources(repo_root: str, repo_name: str) -> dict[str, str
     release_ref = os.environ.get("RELEASE_REF") or None
     ref = sync.select_ref(release_home, repo_name, kind, release_ref)
     ref_sha = gh.git_rev_parse(ref, cwd=release_home)
+    if source_ref is not None:
+        # The short SHA is the most precise, reproducible description of what
+        # the managed config was composed from.
+        source_ref["ref"] = ref_sha[:12] if ref_sha else ref
 
     # Honor a consumer .release-sync.yaml capability override, exactly as
     # release-sync does (verbs/release_sync.py) — so init composes the SAME
@@ -224,7 +261,7 @@ def _materialize_config_sources(repo_root: str, repo_name: str) -> dict[str, str
             sync_yaml_text = fh.read()
 
     caps = sync.resolve_capabilities(release_home, ref, kind, sync_yaml_text=sync_yaml_text)
-    plan = sync.build_plan(release_home, ref, kind, caps.names)
+    plan = sync.build_plan(release_home, ref, kind, caps.names, repo_root=repo_root)
 
     tmp_root = tempfile.mkdtemp(prefix=".release-core-init.")
     sync.materialize(release_home, ref, ref_sha, plan, tmp_root)
@@ -262,6 +299,82 @@ def _write_file(dest: str, src: str, *, exists: bool) -> None:
         shutil.copyfile(src, dest)
 
 
+def _commit_message(source_ref: dict[str, str]) -> str:
+    """The deterministic auto-commit message. Includes the source ref/tip when
+    init resolved one; otherwise omits the trailing ' to <ref>'."""
+    ref = source_ref.get("ref")
+    if ref:
+        return f"chore(release): sync managed config to {ref}"
+    return "chore(release): sync managed config"
+
+
+def _auto_commit(repo_root: str, written: list[str], message: str, *, push: bool) -> None:
+    """Stage + commit ONLY ``written`` (paths relative to repo_root that init
+    just created/overwrote/repaired), then optionally fast-forward push.
+
+    Conservative and never-fail: any git error or unmet precondition prints a
+    notice and returns without raising — init's own exit code is unaffected.
+    NEVER stages anything beyond ``written`` (no `git add -A`); a user's other
+    staged/unstaged work is left exactly as it was.
+    """
+    # Not a git repo, git unavailable, or an unborn branch (no commits yet) →
+    # quiet no-op (init still succeeded). git_rev_parse_verify("HEAD") is the one
+    # consistent probe across every layout (standard repo, submodule, worktree):
+    # it is True iff a real HEAD commit exists. A pathspec-scoped commit cannot
+    # run on an unborn branch (`fatal: cannot do partial commit during
+    # bootstrap`), so gating on HEAD here also avoids that noisy failure.
+    try:
+        if not gh.git_rev_parse_verify("HEAD", cwd=repo_root):
+            return
+    except Exception:
+        return
+
+    try:
+        gh.git_add(written, cwd=repo_root)
+        # Commit ONLY the managed pathspecs. A pathspec-scoped commit ignores any
+        # other staged changes, so a user's in-progress staging is never folded
+        # in. If staging produced nothing to commit (e.g. the managed bytes were
+        # already identical in the index/HEAD), git commit exits non-zero — caught
+        # below as a benign skip, not a failure.
+        gh.git_commit_paths(written, message, cwd=repo_root)
+    except Exception as exc:  # ProcError or anything git surfaces
+        print(
+            f"release-core init: --commit skipped (could not commit managed config: {exc})",
+            file=sys.stderr,
+        )
+        return
+
+    print(f"committed {len(written)} managed file(s): {message}")
+
+    if not push:
+        return
+
+    # --push guard: ONLY when on the default branch AND the tree is otherwise
+    # clean (no non-managed changes — the managed paths are now committed, so a
+    # clean check needs no exceptions). Otherwise the commit stays local.
+    branch = gh.git_current_branch(cwd=repo_root)
+    default = gh.git_default_branch(cwd=repo_root)
+    if branch is None or default is None or branch != default:
+        print(
+            f"  push skipped: on '{branch or 'detached HEAD'}', not the default "
+            f"branch ('{default or 'unknown'}') — commit kept local.",
+            file=sys.stderr,
+        )
+        return
+    if not gh.git_is_clean(cwd=repo_root):
+        print(
+            "  push skipped: working tree has other uncommitted changes — commit kept local.",
+            file=sys.stderr,
+        )
+        return
+    try:
+        gh.git_push_ff(branch, cwd=repo_root)
+    except Exception as exc:
+        print(f"  push skipped: {exc}", file=sys.stderr)
+        return
+    print(f"  pushed to {branch}.")
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         values, _ = cli.parse(
@@ -269,6 +382,8 @@ def main(argv: list[str] | None = None) -> int:
             [
                 cli.Opt("--force"),
                 cli.Opt("--dry-run"),
+                cli.Opt("--commit"),
+                cli.Opt("--push"),
             ],
             doc=_usage_block(),
         )
@@ -277,6 +392,9 @@ def main(argv: list[str] | None = None) -> int:
 
     force = bool(values["force"])
     dry_run = bool(values["dry-run"])
+    push = bool(values["push"])
+    # --push implies --commit (you cannot push a commit you never made).
+    commit = bool(values["commit"]) or push
 
     try:
         repo_root = gh.repo_root()
@@ -292,8 +410,9 @@ def main(argv: list[str] | None = None) -> int:
     os.chdir(repo_root)
     repo_name = os.path.basename(repo_root)
 
+    source_ref: dict[str, str] = {}
     try:
-        sources = _materialize_config_sources(repo_root, repo_name)
+        sources = _materialize_config_sources(repo_root, repo_name, source_ref=source_ref)
     except manifest.KindError:
         print(f"release-core init: could not detect kind of {repo_root}", file=sys.stderr)
         return 1
@@ -378,4 +497,10 @@ def main(argv: list[str] | None = None) -> int:
             print("done. (no changes — already initialized)")
         else:
             print("done.")
+
+    # Auto-commit (opt-in). Only when changes were actually written, not in
+    # dry-run. Idempotent by construction: changed == 0 → nothing to commit.
+    if commit and not dry_run and changed:
+        written = created + overwritten + repaired
+        _auto_commit(repo_root, written, _commit_message(source_ref), push=push)
     return 0

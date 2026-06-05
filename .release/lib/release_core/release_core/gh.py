@@ -1,7 +1,10 @@
 """gh — the single boundary to GitHub/git: shell out, parse JSON with stdlib.
 
-Mirrors release_gh/ghapi.py conventions (they consolidate in a later phase;
-duplication is tolerated in Phase 0). Why `gh` rather than a Python client:
+Mirrors the conventions of release_core.prstate.ghapi (the folded PR state
+engine's gh boundary; release#459). The two boundaries are kept distinct on
+purpose: prstate.ghapi is stdlib-only (it runs identically in CI / Cloud /
+local), whereas this helper backs the verb layer. Why `gh` rather than a Python
+client:
 it is already provisioned in every environment release runs in, handles auth +
 pagination, and speaks GraphQL. Keeping the boundary here means every migrated
 verb is pure data transformation over the returned dicts — **no `jq`**.
@@ -165,6 +168,39 @@ def repo_root(start: str | None = None) -> str:
     return os.path.realpath(top)
 
 
+def is_git_worktree(path: str) -> bool:
+    """True iff ``path`` is inside a git working tree (a normal clone OR a
+    linked worktree).
+
+    Replaces the ``os.path.isdir(<path>/.git)`` guard, which wrongly rejected
+    git worktrees: a linked worktree's ``.git`` is a *file* (a gitdir pointer),
+    not a directory, so the isdir check reports a real worktree as "not a git
+    clone". ``git rev-parse --is-inside-work-tree`` resolves the gitdir pointer
+    natively and is true for both layouts. Returns False (never raises) when
+    ``path`` is missing, not a repo, or git is unavailable — preserving the
+    old guard's boolean contract."""
+    import os
+
+    if not os.path.isdir(path):
+        return False
+    try:
+        result = proc.run(
+            ["git", "-C", path, "rev-parse", "--is-inside-work-tree"],
+            check=False,
+        )
+    except OSError:
+        # git not installed / not on PATH — preserve the documented "never
+        # raises, returns False when git is unavailable" contract.
+        return False
+    # exit 0 ⟺ git resolves a repo of some kind here (a clone root, a linked
+    # worktree, or a $RELEASE_HOME we only read refs/trees from). A non-repo path
+    # exits non-zero. We deliberately accept exit 0 rather than require "true"
+    # output: this guard replaces the original os.path.isdir(.git) check, which
+    # also accepted any git dir — narrowing it to checked-out work trees only
+    # would over-reject (and breaks the $RELEASE_HOME guards' fixtures).
+    return result.returncode == 0
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # git plumbing wrappers (added Phase 2 / s2p2-release-sync — ADDITIVE, flagged).
 #
@@ -257,6 +293,82 @@ def git_log_oneline(rev_range: str, *, cwd: str):
         ["git", "-C", cwd, "--no-pager", "log", "--oneline", rev_range],
         check=False,
     )
+
+
+def git_current_branch(*, cwd: str) -> str | None:
+    """`git -C <cwd> rev-parse --abbrev-ref HEAD` → the current branch name, or
+    None on a detached HEAD (returns "HEAD") / failure (unborn branch, not a
+    repo). Used by init's --commit/--push guard."""
+    res = proc.run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    if res.returncode != 0:
+        return None
+    name = res.stdout.strip()
+    if not name or name == "HEAD":
+        return None
+    return name
+
+
+def git_default_branch(*, cwd: str) -> str | None:
+    """The repo's default branch name, or None if it can't be resolved.
+
+    Reads `origin/HEAD`'s symbolic target (`refs/remotes/origin/HEAD` →
+    `origin/<default>`); falls back to None when there is no `origin` remote or
+    its HEAD is unset. The --push guard uses this to push ONLY when the local
+    branch IS the default branch — never inventing 'main'/'master' by guess."""
+    res = proc.run(
+        ["git", "-C", cwd, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        check=False,
+    )
+    if res.returncode != 0:
+        return None
+    ref = res.stdout.strip()  # e.g. "origin/main"
+    prefix = "origin/"
+    if ref.startswith(prefix):
+        return ref[len(prefix) :]
+    return ref or None
+
+
+def git_is_clean(*, cwd: str, except_paths: list[str] | None = None) -> bool:
+    """True iff `git status --porcelain` reports no changes other than the files
+    in ``except_paths`` (each compared against the porcelain path column).
+
+    The --push guard requires the working tree to be otherwise clean: we tolerate
+    only the managed paths init itself just wrote (passed as ``except_paths``)."""
+    res = proc.run(["git", "-C", cwd, "status", "--porcelain"], check=False)
+    if res.returncode != 0:
+        return False
+    allowed = set(except_paths or [])
+    for line in res.stdout.splitlines():
+        if not line.strip():
+            continue
+        # Porcelain v1: 2 status chars, a space, then the path (possibly
+        # "old -> new" for renames — managed config files are never renamed, so
+        # the simple split is sufficient for the paths we care about).
+        path = line[3:].strip()
+        if path not in allowed:
+            return False
+    return True
+
+
+def git_add(paths: list[str], *, cwd: str) -> None:
+    """`git -C <cwd> add -- <paths>` — stage ONLY the given pathspecs. Never -A.
+    Raises ProcError on failure."""
+    if not paths:
+        return
+    git(["-C", cwd, "add", "--", *paths])
+
+
+def git_commit_paths(paths: list[str], message: str, *, cwd: str) -> None:
+    """`git -C <cwd> commit -m <message> -- <paths>` — commit ONLY the given
+    pathspecs, leaving any other staged/unstaged changes untouched. Raises
+    ProcError on failure (no commit created)."""
+    git(["-C", cwd, "commit", "-m", message, "--", *paths])
+
+
+def git_push_ff(branch: str, *, cwd: str, remote: str = "origin") -> None:
+    """`git -C <cwd> push <remote> <branch>` — a plain (fast-forward-only) push.
+    Never --force. Raises ProcError on rejection (e.g. non-fast-forward)."""
+    git(["-C", cwd, "push", remote, branch])
 
 
 def git_show_bytes(rev_path: str, *, cwd: str) -> bytes:

@@ -1,0 +1,1 @@
+../../../.release/.claude/skills/improve-codebase-architecture/INTERFACE-DESIGN.md

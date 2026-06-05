@@ -17,7 +17,7 @@ Exit codes:
   2  — at least one repo has WARN (no FAILs)
   64 — bad usage
 
-Shell→Python migration (docs/proposals/shell-to-python.md): drops the
+Shell→Python migration: drops the
 fork-per-repo `audit-repo` subprocess + grep-counting of its rows; it imports
 the audit_repo verb and aggregates its in-memory results directly. The --json
 stream (one audit-repo object per line), the summary table, the per-repo

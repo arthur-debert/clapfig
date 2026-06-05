@@ -1,0 +1,161 @@
+{
+  "_source": "captured live from arthur-debert/release#342 (release#337)",
+  "meta": {
+    "number": 342,
+    "headRefOid": "cb17ff490e3af59cc26e7706e8caac04aed31a88",
+    "baseRefName": "main",
+    "isDraft": false,
+    "mergeable": "MERGEABLE",
+    "mergeStateStatus": "CLEAN",
+    "reviewRequests": [],
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "name": "ci / check",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "context": null,
+        "state": null
+      },
+      {
+        "__typename": "CheckRun",
+        "name": "ci / check",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "context": null,
+        "state": null
+      },
+      {
+        "__typename": "CheckRun",
+        "name": "request / request",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "context": null,
+        "state": null
+      },
+      {
+        "__typename": "CheckRun",
+        "name": "skill-lint",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "context": null,
+        "state": null
+      },
+      {
+        "__typename": "CheckRun",
+        "name": "skill-lint",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "context": null,
+        "state": null
+      },
+      {
+        "__typename": "CheckRun",
+        "name": "guards",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "context": null,
+        "state": null
+      },
+      {
+        "__typename": "CheckRun",
+        "name": "guards",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "context": null,
+        "state": null
+      }
+    ]
+  },
+  "reviews": [
+    {
+      "id": 4394219841,
+      "user": {
+        "login": "gemini-code-assist[bot]"
+      },
+      "state": "COMMENTED",
+      "commit_id": "cb17ff490e3af59cc26e7706e8caac04aed31a88",
+      "body": "## Code Review  This pull request introduces a throwaway sample file probe/sample.py containing a simple average functio"
+    },
+    {
+      "id": 4394220041,
+      "user": {
+        "login": "copilot-pull-request-reviewer[bot]"
+      },
+      "state": "COMMENTED",
+      "commit_id": "cb17ff490e3af59cc26e7706e8caac04aed31a88",
+      "body": "## Pull request overview  Tooling-test PR that adds a small Python file solely to generate real GitHub review/comment pa"
+    }
+  ],
+  "threads": [
+    {
+      "id": "PRRT_kwDOSRmzuc6F1cKr",
+      "isResolved": false,
+      "comments": {
+        "nodes": [
+          {
+            "databaseId": 3327945369,
+            "path": "probe/sample.py",
+            "line": 14,
+            "originalLine": 14,
+            "body": "![high](https://www.gstatic.com/codereviewagent/high-priority.svg)  The function `average` does not guard against `count",
+            "author": {
+              "login": "gemini-code-assist"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "PRRT_kwDOSRmzuc6F1cOD",
+      "isResolved": false,
+      "comments": {
+        "nodes": [
+          {
+            "databaseId": 3327945651,
+            "path": "probe/sample.py",
+            "line": 14,
+            "originalLine": 14,
+            "body": "`average()` divides by `count` without guarding against `0`, which will raise `ZeroDivisionError`. Add an explicit check",
+            "author": {
+              "login": "copilot-pull-request-reviewer"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "reactions": [
+    {
+      "content": "eyes",
+      "user": {
+        "login": "gemini-code-assist[bot]"
+      }
+    }
+  ],
+  "issue_comments": [],
+  "review_comments": [
+    {
+      "id": 3327945369,
+      "user": {
+        "login": "gemini-code-assist[bot]"
+      },
+      "path": "probe/sample.py",
+      "line": 14,
+      "original_line": 14,
+      "pull_request_review_id": 4394219841,
+      "body": "![high](https://www.gstatic.com/codereviewagent/high-priority.svg)  The function `average` does not guard against `count"
+    },
+    {
+      "id": 3327945651,
+      "user": {
+        "login": "Copilot"
+      },
+      "path": "probe/sample.py",
+      "line": 14,
+      "original_line": 14,
+      "pull_request_review_id": 4394220041,
+      "body": "`average()` divides by `count` without guarding against `0`, which will raise `ZeroDivisionError`. Add an explicit check"
+    }
+  ]
+}

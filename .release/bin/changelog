@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # changelog — orchestrator for the changelog-* family.
 #
-# Thin shim (shell→Python migration, docs/proposals/shell-to-python.md): put the
+# Thin shim (shell→Python migration): put the
 # stdlib-only release_core package on sys.path and dispatch. changelog is
 # distributed to consumers (real file here; bin/changelog is a symlink into
 # this dir), so realpath lands in templates/commons/bin/ and the package sits at

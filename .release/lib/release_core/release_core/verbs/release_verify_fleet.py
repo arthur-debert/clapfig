@@ -118,7 +118,7 @@ def main(argv: list[str]) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 — f
     os.environ["RELEASE_HOME"] = release_home
 
     # --- Dependency guard ------------------------------------------------
-    for tool in ("managed-repos", "release-sync", "detect-kind", "lefthook", "yq", "gh", "git"):
+    for tool in ("release-core", "release-sync", "detect-kind", "lefthook", "yq", "gh", "git"):
         if shutil.which(tool) is None:
             print(f"release-verify-fleet: {tool} not on PATH", file=sys.stderr)
             return 2
@@ -138,8 +138,13 @@ def main(argv: list[str]) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 — f
     )
 
     # An --only subset (comma-separated) becomes positional filter args shared
-    # by both managed-repos calls, so the clone is scoped too.
+    # by both `release-core admin repos list` calls, so the clone is scoped too.
     subset = [s for s in only.split(",") if s] if only else []
+
+    # The fleet accessor is now the hierarchical CLI verb (the flat
+    # `managed-repos` console-script was retired in the B2 cutover; #468). Argv
+    # passes through `release-core admin repos list` straight to the verb.
+    repos_list = ["release-core", "admin", "repos", "list"]
 
     # --- Phase 1: materialize the fleet (hermetic — into $root, never ~/h) ---
     print("==> cloning/refreshing fleet", file=sys.stderr)
@@ -147,7 +152,7 @@ def main(argv: list[str]) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 — f
     if refresh:
         clone_args.append("--refresh")
     clone = proc.run(
-        ["managed-repos", *clone_args, *subset],
+        [*repos_list, *clone_args, *subset],
         env={"REPOS_ROOT": root},
         check=False,
         capture_output=False,
@@ -164,7 +169,7 @@ def main(argv: list[str]) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 — f
     seen = 0
 
     paths = proc.run(
-        ["managed-repos", "--paths", *subset],
+        [*repos_list, "--paths", *subset],
         env={"REPOS_ROOT": root},
     )
     for line in paths.stdout.splitlines():

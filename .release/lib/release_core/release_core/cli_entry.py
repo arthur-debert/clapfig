@@ -1,60 +1,72 @@
-"""cli_entry — the top-level ``release-core`` CLI (pip-bootstrap PoC §2).
+"""cli_entry — the top-level ``release-core`` CLI, assembled from the click tree.
 
-`release-core` is the package's own command (entry `release_core.cli_entry:main`,
-wired in pyproject `[project.scripts]` by PR-B). Unlike the per-verb console
-scripts — each a thin wrapper around one verb's ``main(argv) -> int`` — this is a
-subcommand dispatcher: ``release-core <subcommand> [args...]``.
+``release-core`` is the package's own command (entry
+``release_core.cli_entry:main``, wired in pyproject ``[project.scripts]``). It is
+the ROOT of a hierarchical click command tree:
 
-PoC subcommands:
-  release-core init [--force] [--dry-run]   materialize per-repo committed config
-  release-core --help / release-core        print usage, exit 0
+    release-core <group> <command> [args...]
 
-The subcommand's own args are forwarded verbatim to its ``main(argv)`` so
-`release-core init --help` reaches the init verb's own --help, byte-identical to
-invoking the verb directly. Exit code is the subcommand's; an unknown subcommand
-is a usage error (exit 64), matching the cli harness convention.
+This module is a THIN ASSEMBLER: it builds the root ``click.Group`` and attaches
+each top-level group, which lives in its OWN module under ``release_core.cli`` —
+``toplevel`` (the per-project flat verbs), ``pr``, ``ci``, and the ``admin``
+subpackage. Adding or filling a group touches only that group's module, never
+this file — that is what lets parallel agents work without colliding. See
+``docs/dev/release-core-cli-pattern.md``.
+
+``main(argv) -> int`` is preserved as the entrypoint signature: it is what both
+the installed console-script and the local ``bin/release-core`` shim call. The
+click→int bridge lives in ``release_core.cli._helpers.run_root``.
 """
 
 from __future__ import annotations
 
-import sys
+import click
 
-from .cli import EXIT_OK, EXIT_USAGE
-from .verbs import init as init_verb
+from . import __version__
+from .cli import admin, ci, pr, toplevel
+from .cli._helpers import run_root
 
-# subcommand name -> its main(argv) -> int
-_SUBCOMMANDS = {
-    "init": init_verb.main,
-}
 
-USAGE = """\
-release-core — the release tooling CLI.
+@click.group(
+    help=(
+        "release-core — the release tooling CLI.\n\n"
+        "All infrastructure tasks go through this one tree; --help is the map. "
+        "Per-project commands live at the top level (init, cut, status, sync, "
+        "pr ...); fleet / meta-release ops live under `admin`."
+    ),
+    context_settings={"help_option_names": ["-h", "--help"]},
+    invoke_without_command=True,
+)
+@click.version_option(version=__version__, prog_name="release-core")
+@click.pass_context
+def root(ctx: click.Context) -> None:
+    """Root group. Subgroups/commands are attached below by the assembler.
 
-Usage:
-  release-core <subcommand> [args...]
-  release-core --help
+    Bare ``release-core`` (no subcommand) is a discovery entry point: it prints
+    the help (the map) and exits 0, rather than click's default usage error.
+    """
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+        ctx.exit(0)
 
-Subcommands:
-  init    Materialize the per-repo committed config (lefthook.yml + lint
-          configs) into the current repo. Idempotent, create-if-absent.
-          See `release-core init --help`.
-"""
+
+# Per-project flat verbs + small per-project groups (init/selfcheck folded in).
+toplevel.attach(root)
+
+# Top-level groups, one module each.
+root.add_command(pr.group)
+root.add_command(ci.group)
+root.add_command(admin.group)
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = list(sys.argv[1:] if argv is None else argv)
+    """Entry point: build-and-run the click root, returning an int exit code.
 
-    if not args or args[0] in ("-h", "--help"):
-        print(USAGE.rstrip("\n"))
-        return EXIT_OK
-
-    sub, rest = args[0], args[1:]
-    handler = _SUBCOMMANDS.get(sub)
-    if handler is None:
-        print(f"release-core: unknown subcommand {sub!r}", file=sys.stderr)
-        print(USAGE.rstrip("\n"), file=sys.stderr)
-        return EXIT_USAGE
-    return handler(rest)
+    Signature is preserved (``main(argv) -> int``) so the installed
+    console-script (``release_core.cli_entry:main``) and the local
+    ``bin/release-core`` shim both keep working unchanged.
+    """
+    return run_root(root, argv)
 
 
 if __name__ == "__main__":

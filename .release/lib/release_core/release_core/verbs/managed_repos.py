@@ -23,7 +23,7 @@ Exit codes:
   2  — manifest or dependency error
   64 — bad usage
 
-Shell→Python migration (docs/proposals/shell-to-python.md): the logic moved to
+Shell→Python migration: the logic moved to
 this verb; bin/managed-repos is a thin shim. Stdout (the <TAB>-joined --paths /
 --list lines) is preserved byte-for-byte — release-verify-fleet and
 audit-portfolio parse it with `IFS=$'\t' read`.

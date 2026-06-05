@@ -1,0 +1,1 @@
+../../../.release/.claude/skills/zoom-out/SKILL.md
