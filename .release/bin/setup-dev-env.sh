@@ -206,16 +206,22 @@ elif [ -x app-bin/pre-commit ]; then
 fi
 
 # --- 0.2. Pull-model: self-update release_core from the published wheel --
-# The north star (ADR-0003): repos AUTO-UPDATE on session start, retiring the
-# hand-run `orc propagate` treadmill. The boot resolver `install-release-core`
+# The north star (ADR-0003): repos AUTO-UPDATE on session start — this REPLACED
+# the hand-run push treadmill (`orc propagate`, since removed). The boot resolver
+# `install-release-core`
 # resolves the latest release wheel, pip-installs it (--force-reinstall — the
 # wheel version is static, so `-U` would skip it; deps resolve from PyPI), THEN runs `release-core
 # init` itself (it locates the just-installed console-script across venv/--user/
-# system layouts). One command does the whole boot. Runs in BOTH local and cloud
-# (above the cloud-only gate) — auto-update is the whole point.
+# system layouts). A bare `init` now materializes the WHOLE managed tree from the
+# wheel bundle (the .release/ build dir + every working-tree mirror — skills,
+# ORIENTATION, configs, the CLAUDE.md block) and auto-commits any managed change
+# (#476 cutover) — not just the config subset. So SessionStart self-syncs the full
+# tree from the pulled wheel: no push needed (no push mechanism exists). One
+# command does the whole boot. Runs in BOTH local and cloud (above the cloud-only
+# gate) — auto-update is the whole point.
 #
 # BEST-EFFORT, never aborts the session: every call is `|| warn`, and init
-# failure inside the resolver is itself best-effort. The committed config already
+# failure inside the resolver is itself best-effort. The committed tree already
 # in the repo degrades gracefully if the pull fails (a stale repo is
 # older-but-working, never broken).
 #
@@ -226,11 +232,11 @@ fi
 # If neither resolves (a consumer not yet seeded with the resolver), the block
 # no-ops — safe to land fleet-wide before the seeding propagate.
 #
-# Install target (so the console-scripts land on PATH): a repo `.venv` if one is
-# already present (its bin/ is symlinked onto PATH by §2 / dodot), else `--user`
-# → the user site (ensured on PATH below). `--break-system-packages` is tried
-# first for PEP-668 system pythons, with a plain `--user` fallback (older pip
-# rejects the flag), mirroring the ruff/yamllint blocks above.
+# Install target: the resolver self-isolates — it installs release_core into its
+# OWN dedicated venv (never the user pip / system site / a project venv) and
+# symlinks the console-scripts onto PATH (~/.local/bin). So there's nothing to
+# choose here: just invoke it. (It still tolerates a stale caller passing
+# --user/--break-system-packages, so an in-flight fleet migration can't break.)
 _resolver=""
 if [ -x "${REPO_ROOT}/bin/install-release-core" ]; then
   _resolver="${REPO_ROOT}/bin/install-release-core"
@@ -238,15 +244,8 @@ elif command -v install-release-core >/dev/null 2>&1; then
   _resolver="install-release-core"
 fi
 if [ -n "${_resolver}" ]; then
-  mkdir -p "${HOME}/.local/bin"
-  if [ -x .venv/bin/python ]; then
-    PYTHON="${REPO_ROOT}/.venv/bin/python" "${_resolver}" \
-      || echo "warning: install-release-core (.venv) failed — release_core not updated this session" >&2
-  else
-    "${_resolver}" --user --break-system-packages \
-      || "${_resolver}" --user \
-      || echo "warning: install-release-core (--user) failed — release_core not updated this session" >&2
-  fi
+  "${_resolver}" \
+    || echo "warning: install-release-core failed — release_core not updated this session" >&2
 fi
 
 # Cloud-only gate. Everything below is cloud-only — local sessions

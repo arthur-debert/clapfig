@@ -7,8 +7,15 @@ This note orients you: where you are, what is managed, and where problems go.
 
 ## What is managed (don't hand-edit)
 
-- **`.release/`** is the materialized managed tree. `release-core sync` regenerates
-  it wholesale from `release`; anything inside it is overwritten on the next sync.
+- **`.release/`** is the materialized managed tree. It is regenerated wholesale
+  from `release`; anything inside it is overwritten on the next refresh. You
+  rarely run this by hand: **`release-core init` materializes the full managed
+  tree** (this `.release/` build dir + every working-tree mirror — `bin/` tools,
+  the skills, `ORIENTATION.md`, the lint configs, the `CLAUDE.md` managed block)
+  **from the pulled release wheel and auto-commits any managed change.** This runs
+  automatically at SessionStart, so the repo self-updates to the latest `release`
+  with no manual step and no propagate PR. (`release-core init --config-only`
+  refreshes just the lint/gate config subset — the rare escape hatch.)
 - **`bin/`** holds release-provided tools, symlinked into `.release/`. The
   pre-commit gate (`lefthook.yml`), `.github/workflows/`, and the lint configs
   are managed too. Every managed task is run through the **`release-core`** CLI —
@@ -94,9 +101,10 @@ repo: the file is release's and your fix will not survive the next sync. Instead
 release-core issue file <component> "<one-line symptom>"
 ```
 
-The fix lands in `release`, is released, and propagates to every consumer when
-the floating major you pin (`@v2`) advances — you re-run `release-core sync` and
-pick it up. One fix, the whole fleet, nothing to hand-edit here.
+The fix lands in `release`, is released, and reaches every consumer when the
+floating major you pin (`@v2`) advances — your next SessionStart `release-core
+init` pulls the new wheel and self-syncs the whole managed tree (auto-committing
+the change). One fix, the whole fleet, nothing to hand-edit and no propagate PR.
 
 [release]: https://github.com/arthur-debert/release
 [issues]: https://github.com/arthur-debert/release/issues

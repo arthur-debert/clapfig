@@ -18,31 +18,32 @@ repo-root CHANGELOG.md is rendered from these fragments at RELEASE-CUT time
 hand-edit CHANGELOG.md either — your fragment here is the only thing a feature
 PR touches; the render is the release step's job.
 
-Tools (all in `bin/`, distributed via release-sync):
+Tools (the `changelog` console-script, installed via the release_core
+pip wheel — `install-release-core` at SessionStart):
 
-  bin/changelog add [--force] <slug> [body...]
+  changelog add [--force] <slug> [body...]
       Add an unreleased fragment. Body comes from stdin when no body args
       are given, otherwise from the joined args. Numeric slug → "pr-N".
       Fails if a fragment with the same slug exists; --force overwrites.
 
       Examples:
-        bin/changelog add 142 "- Fix tokenizer crash on empty input (#142)"
-        bin/changelog add fix-token-leak <<'EOF'
+        changelog add 142 "- Fix tokenizer crash on empty input (#142)"
+        changelog add fix-token-leak <<'EOF'
         - Fix token leak in retry path
         - Bonus: emit retry count in --json output
         EOF
 
-  bin/changelog cut <version>
+  changelog cut <version>
       Concat all CHANGELOG/unreleased-*.md into CHANGELOG/<version>.md
       with a "## <version> - YYYY-MM-DD" header, then delete the
       fragments. Typically invoked via `new-version` from a release hook.
 
-  bin/changelog render
+  changelog render
       Regenerate CHANGELOG.md from the directory contents. Idempotent.
       This is a RELEASE-TIME step (run by the release hook), not something to
       run or commit inside a feature PR.
 
-  bin/changelog new-version <version>
+  changelog new-version <version>
       Convenience: cut + render.
 
 Conventions:
