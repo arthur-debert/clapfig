@@ -1,1 +1,0 @@
-../../../.release/.claude/skills/teach/MISSION-FORMAT.md

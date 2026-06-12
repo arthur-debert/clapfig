@@ -1,1 +1,0 @@
-../../../.release/.claude/skills/release-issue-relay/SKILL.md

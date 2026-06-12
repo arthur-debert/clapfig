@@ -1,6 +1,0 @@
-# Managed by release-sync — do not edit. Regenerate via release-sync.
-# Keeps host/Python-version-specific bytecode out of the committed .release/
-# even if a local regeneration writes it on disk (release#450).
-__pycache__/
-*.pyc
-*.pyo

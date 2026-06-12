@@ -1,1 +1,0 @@
-../../../.release/.claude/skills/tdd/interface-design.md

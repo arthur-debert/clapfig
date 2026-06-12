@@ -1,1 +1,0 @@
-../../../.release/.claude/skills/padz-for-agents/SKILL.md

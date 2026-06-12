@@ -1,1 +1,0 @@
-../../../.release/.claude/skills/grill-with-docs/ADR-FORMAT.md

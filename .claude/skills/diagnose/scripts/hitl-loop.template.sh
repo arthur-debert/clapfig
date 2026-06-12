@@ -1,1 +1,0 @@
-../../../../.release/.claude/skills/diagnose/scripts/hitl-loop.template.sh

@@ -1,1 +1,0 @@
-../../../.release/.claude/skills/gh-pr-review-loop/SKILL.md

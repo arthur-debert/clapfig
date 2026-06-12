@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "Checking formatting..."
-cargo fmt --all -- --check
-echo "Formatting OK"

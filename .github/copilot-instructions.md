@@ -1,1 +1,0 @@
-../.release/.github/copilot-instructions.md

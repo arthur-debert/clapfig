@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""PreToolUse guard: a PR in an onboarded repo MUST be driven through the
+`gh-pr-review-loop` skill — not by hand-composing the individual helpers
+(release#495, epic #348).
+
+The skill is *capability*; the loop is *discipline* (request Copilot → wait →
+triage A/B/C → resolve threads as you go → stop at ready). The helpers are each
+independently on $PATH, so the orchestrator is bypassable by construction and
+optional discipline loses to task momentum. This hook is the forcing function:
+it gates `gh pr create` on a per-clone sentinel that the skill arms.
+
+Contract (Claude Code PreToolUse, matcher: Bash):
+  stdin  = JSON with tool_name + tool_input.command (+ cwd)
+  allow  = exit 0, no stdout
+  deny   = exit 0, stdout = {"hookSpecificOutput": {permissionDecision: "deny", ...}}
+
+Design guarantees:
+  * Self-service deny — the reason tells the agent how to arm manually, so a
+    consumer carrying a STALE skill copy (one without the arm step) can never
+    deadlock; it just reads the reason and arms.
+  * Fail-OPEN — any malformed stdin / non-git cwd / parse error allows the
+    command. The hand-rolling case is always well-formed, so failing open never
+    masks the thing we guard.
+  * One-shot — arming is consumed on allow, so the sentinel can't silently
+    whitelist every subsequent hand-rolled `gh pr create` in the clone.
+"""
+
+import contextlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+SENTINEL_NAME = "pr-loop-armed"
+
+
+def cd_targets(command):
+    """Leading ``cd <dir>`` targets in the command, so the guard can resolve the
+    repo the command actually operates IN — not just the hook payload's cwd.
+
+    Why this matters (release#507 dogfood, hit 5/5 by subagents): the PreToolUse
+    payload ``cwd`` is the session's working dir (e.g. the agent's home repo),
+    which the Bash tool resets to between calls. An agent opening a PR in another
+    repo runs ``cd <repo> && gh pr create``, so the sentinel it armed lives in
+    ``<repo>/.git`` — but the guard previously only checked the payload cwd, so
+    it kept denying. We collect every ``cd`` target token and check the sentinel
+    in each candidate repo too."""
+    try:
+        tokens = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        tokens = command.split()
+    targets = []
+    for i in range(len(tokens) - 1):
+        if tokens[i] == "cd":
+            tgt = tokens[i + 1]
+            # skip option-like tokens (`cd -`, `cd --`) — not a repo path
+            if tgt and not tgt.startswith("-"):
+                targets.append(tgt)
+    return targets
+
+
+def invokes_pr_create(command):
+    """True only when the command actually INVOKES `gh pr create` — not when it
+    merely mentions the phrase inside a quoted string (a grep pattern, an echo,
+    a heredoc body). Tokenize and look for `gh pr create` as three consecutive
+    bare tokens: a mention like `grep "gh pr create"` keeps the phrase inside a
+    single quoted token, so it never forms the bare sequence."""
+    try:
+        tokens = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        tokens = command.split()  # unbalanced quotes/heredoc — best-effort
+    for i in range(len(tokens) - 2):
+        if tokens[i] == "gh" and tokens[i + 1] == "pr" and tokens[i + 2] == "create":
+            return True
+    return False
+
+
+def allow():
+    sys.exit(0)
+
+
+def deny(reason):
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        )
+    )
+    sys.exit(0)
+
+
+def git_dir(cwd):
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    if not out:
+        return None
+    return out if os.path.isabs(out) else os.path.join(cwd, out)
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError, OSError):
+        allow()  # fail-open: malformed input is never the hand-rolling case
+
+    # Defensive type checks: a hand-rolling event is always well-formed, so any
+    # shape we don't recognise fails open rather than risking a crash (which
+    # would exit non-zero and violate the fail-OPEN contract).
+    if not isinstance(data, dict) or data.get("tool_name") != "Bash":
+        allow()
+
+    tool_input = data.get("tool_input")
+    command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+    if not isinstance(command, str) or not invokes_pr_create(command):
+        allow()
+
+    cwd = data.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        cwd = os.getcwd()
+
+    # Candidate repos: the payload cwd PLUS any `cd <dir>` the command changes
+    # into before `gh pr create` (resolved relative to the payload cwd, with ~
+    # expansion). The sentinel armed in ANY of them counts — so a subagent that
+    # armed the target repo's .git is honoured even though the payload cwd is the
+    # session root.
+    candidate_cwds = [cwd]
+    for tgt in cd_targets(command):
+        expanded = os.path.expanduser(tgt)
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(cwd, expanded)
+        candidate_cwds.append(expanded)
+
+    # Collect each candidate's sentinel path; allow (consuming) on the first that
+    # exists. The absolute paths feed the deny reason so the agent arms the right
+    # one instead of guessing under the cwd-reset model.
+    checked = []
+    for cand in candidate_cwds:
+        gd = git_dir(cand)
+        if gd is None:
+            continue
+        sentinel = os.path.join(gd, SENTINEL_NAME)
+        if sentinel in checked:
+            continue
+        checked.append(sentinel)
+        if os.path.exists(sentinel):
+            with contextlib.suppress(OSError):
+                os.unlink(sentinel)  # one-shot: consume the arm
+            allow()
+
+    if not checked:
+        allow()  # no git repo among the candidates — gh pr create wouldn't work
+
+    arm_lines = "\n".join(f"    touch {os.path.join(p)}" for p in checked)
+    deny(
+        "PRs in this repo are driven through the `gh-pr-review-loop` skill "
+        "(request the required reviews → wait → triage comments → resolve "
+        "threads as you go → stop at ready), NOT by hand-composing "
+        "`release-core pr review ...` / gh-pr-checks-wait. Invoke the "
+        "gh-pr-review-loop skill before opening the PR.\n\n"
+        "If you are ALREADY running the loop, arm it once (a SEPARATE step, "
+        "before the gh pr create call) and retry. Arm any of these exact paths "
+        "(the cwd is reset between calls, so don't rely on `git rev-parse` in the "
+        "same line):\n" + arm_lines
+    )
+
+
+if __name__ == "__main__":
+    # Last-resort fail-OPEN: any unexpected exception allows the command rather
+    # than crashing the hook. allow()/deny() raise SystemExit (not Exception),
+    # so normal control flow is never swallowed here.
+    try:
+        main()
+    except Exception:
+        allow()
