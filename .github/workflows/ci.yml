@@ -21,4 +21,4 @@ permissions:
 
 jobs:
   ci:
-    uses: arthur-debert/release/.github/workflows/rust-ci.yml@v2
+    uses: arthur-debert/release/.github/workflows/rust-ci.yml@v3
