@@ -1,6 +1,6 @@
 [package]
 name = "clapfig-derive"
-version = "0.21.6-release-rc"
+version = "0.21.5-rc.2"
 edition = "2024"
 description = "Procedural macro for deriving clapfig::Schema"
 license = "MIT"
