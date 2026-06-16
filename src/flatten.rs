@@ -697,4 +697,299 @@ mod tests {
         let pairs = flatten(&args).unwrap();
         assert_eq!(pairs, vec![("rate".into(), Some(Value::Float(1.5)))]);
     }
+
+    // --- Integer width coverage: all small int types widen to i64 ---
+
+    #[test]
+    fn small_int_widths_all_widen_to_i64() {
+        #[derive(Serialize)]
+        struct Args {
+            a: i8,
+            b: i16,
+            c: i32,
+            d: u8,
+            e: u16,
+            f: u32,
+            g: u64,
+        }
+        let args = Args {
+            a: -1,
+            b: -2,
+            c: -3,
+            d: 4,
+            e: 5,
+            f: 6,
+            g: 7,
+        };
+        let pairs = flatten(&args).unwrap();
+        assert_eq!(pairs.len(), 7);
+        assert!(pairs.contains(&("a".into(), Some(Value::Integer(-1)))));
+        assert!(pairs.contains(&("b".into(), Some(Value::Integer(-2)))));
+        assert!(pairs.contains(&("c".into(), Some(Value::Integer(-3)))));
+        assert!(pairs.contains(&("d".into(), Some(Value::Integer(4)))));
+        assert!(pairs.contains(&("e".into(), Some(Value::Integer(5)))));
+        assert!(pairs.contains(&("f".into(), Some(Value::Integer(6)))));
+        assert!(pairs.contains(&("g".into(), Some(Value::Integer(7)))));
+    }
+
+    #[test]
+    fn f32_widens_to_f64() {
+        #[derive(Serialize)]
+        struct Args {
+            rate: f32,
+        }
+        let args = Args { rate: 0.5 };
+        let pairs = flatten(&args).unwrap();
+        assert_eq!(pairs, vec![("rate".into(), Some(Value::Float(0.5)))]);
+    }
+
+    #[test]
+    fn char_serializes_as_string() {
+        #[derive(Serialize)]
+        struct Args {
+            sep: char,
+        }
+        let args = Args { sep: ',' };
+        let pairs = flatten(&args).unwrap();
+        assert_eq!(pairs, vec![("sep".into(), Some(Value::String(",".into())))]);
+    }
+
+    // --- Error paths ---
+
+    #[test]
+    fn bytes_field_is_rejected() {
+        // serde_bytes is the standard way to emit a byte buffer through the
+        // serialize_bytes hook; without it, Vec<u8> would go through serialize_seq.
+        struct Bytes(Vec<u8>);
+        impl Serialize for Bytes {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_bytes(&self.0)
+            }
+        }
+        #[derive(Serialize)]
+        struct Args {
+            blob: Bytes,
+        }
+        let err = flatten(&Args {
+            blob: Bytes(vec![1, 2, 3]),
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("bytes not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // --- Unit and newtype variants ---
+
+    #[test]
+    fn unit_field_emits_nothing() {
+        #[derive(Serialize)]
+        struct Args {
+            present: bool,
+            absent: (),
+        }
+        let args = Args {
+            present: true,
+            absent: (),
+        };
+        let pairs = flatten(&args).unwrap();
+        // `()` emits no pair; only `present` survives.
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "present");
+    }
+
+    #[test]
+    fn unit_struct_emits_nothing() {
+        #[derive(Serialize)]
+        struct Marker;
+        #[derive(Serialize)]
+        struct Args {
+            host: String,
+            marker: Marker,
+        }
+        let args = Args {
+            host: "x".into(),
+            marker: Marker,
+        };
+        let pairs = flatten(&args).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "host");
+    }
+
+    #[test]
+    fn newtype_struct_transparently_emits_inner() {
+        #[derive(Serialize)]
+        struct Port(u16);
+        #[derive(Serialize)]
+        struct Args {
+            port: Port,
+        }
+        let args = Args { port: Port(8080) };
+        let pairs = flatten(&args).unwrap();
+        assert_eq!(pairs, vec![("port".into(), Some(Value::Integer(8080)))]);
+    }
+
+    #[test]
+    fn newtype_variant_transparently_emits_inner() {
+        #[derive(Serialize)]
+        enum Limit {
+            Count(u32),
+        }
+        #[derive(Serialize)]
+        struct Args {
+            limit: Limit,
+        }
+        let args = Args {
+            limit: Limit::Count(5),
+        };
+        let pairs = flatten(&args).unwrap();
+        assert_eq!(pairs, vec![("limit".into(), Some(Value::Integer(5)))]);
+    }
+
+    // --- Tuple / tuple_struct / tuple_variant / seq lengths ---
+
+    #[test]
+    fn tuple_field_emits_array() {
+        #[derive(Serialize)]
+        struct Args {
+            point: (i32, i32),
+        }
+        let args = Args { point: (3, 4) };
+        let pairs = flatten(&args).unwrap();
+        assert_eq!(pairs.len(), 1);
+        let (k, v) = &pairs[0];
+        assert_eq!(k, "point");
+        match v {
+            Some(Value::Array(items)) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], Value::Integer(3));
+                assert_eq!(items[1], Value::Integer(4));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_struct_field_emits_array() {
+        #[derive(Serialize)]
+        struct Pair(i32, i32);
+        #[derive(Serialize)]
+        struct Args {
+            p: Pair,
+        }
+        let args = Args { p: Pair(1, 2) };
+        let pairs = flatten(&args).unwrap();
+        assert_eq!(pairs.len(), 1);
+        match &pairs[0].1 {
+            Some(Value::Array(items)) => assert_eq!(items.len(), 2),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_variant_field_emits_array() {
+        #[derive(Serialize)]
+        enum Shape {
+            Rect(i32, i32),
+        }
+        #[derive(Serialize)]
+        struct Args {
+            shape: Shape,
+        }
+        let args = Args {
+            shape: Shape::Rect(2, 3),
+        };
+        let pairs = flatten(&args).unwrap();
+        assert_eq!(pairs.len(), 1);
+        match &pairs[0].1 {
+            Some(Value::Array(items)) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], Value::Integer(2));
+                assert_eq!(items[1], Value::Integer(3));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vec_field_emits_array() {
+        #[derive(Serialize)]
+        struct Args {
+            tags: Vec<String>,
+        }
+        let args = Args {
+            tags: vec!["a".into(), "b".into(), "c".into()],
+        };
+        let pairs = flatten(&args).unwrap();
+        assert_eq!(pairs.len(), 1);
+        match &pairs[0].1 {
+            Some(Value::Array(items)) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], Value::String("a".into()));
+                assert_eq!(items[2], Value::String("c".into()));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn struct_variant_field_emits_dotted_keys() {
+        #[derive(Serialize)]
+        enum Conn {
+            Tcp { host: String, port: u16 },
+        }
+        #[derive(Serialize)]
+        struct Args {
+            conn: Conn,
+        }
+        let args = Args {
+            conn: Conn::Tcp {
+                host: "127.0.0.1".into(),
+                port: 5432,
+            },
+        };
+        let pairs = flatten(&args).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.contains(&("conn.host".into(), Some(Value::String("127.0.0.1".into())))));
+        assert!(pairs.contains(&("conn.port".into(), Some(Value::Integer(5432)))));
+    }
+
+    // --- KeySerializer: only string-shaped keys are accepted ---
+
+    #[test]
+    fn map_with_int_key_is_rejected() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(1u32, "v".to_string());
+        let err = flatten(&map).unwrap_err();
+        assert!(
+            err.to_string().contains("map keys must be strings"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn map_with_char_key_accepted() {
+        // char is string-like and KeySerializer accepts it.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert('x', 1i32);
+        let pairs = flatten(&map).unwrap();
+        assert_eq!(pairs, vec![("x".into(), Some(Value::Integer(1)))]);
+    }
+
+    #[test]
+    fn map_with_unit_variant_key_accepted() {
+        #[derive(Serialize, PartialEq, Eq, PartialOrd, Ord)]
+        enum K {
+            Alpha,
+            Beta,
+        }
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(K::Alpha, 1i32);
+        map.insert(K::Beta, 2i32);
+        let pairs = flatten(&map).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.contains(&("Alpha".into(), Some(Value::Integer(1)))));
+        assert!(pairs.contains(&("Beta".into(), Some(Value::Integer(2)))));
+    }
 }
