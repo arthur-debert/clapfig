@@ -133,16 +133,21 @@ def main():
         cwd = os.getcwd()
 
     # Candidate repos: the payload cwd PLUS any `cd <dir>` the command changes
-    # into before `gh pr create` (resolved relative to the payload cwd, with ~
-    # expansion). The sentinel armed in ANY of them counts — so a subagent that
-    # armed the target repo's .git is honoured even though the payload cwd is the
-    # session root.
-    candidate_cwds = [cwd]
+    # into before `gh pr create` (with ~ expansion). The sentinel armed in ANY
+    # of them counts — so a subagent that armed the target repo's .git is
+    # honoured even though the payload cwd is the session root. Sequential cds
+    # fold left: each relative target resolves against the previous resolved
+    # dir (`cd a && cd b` really lands in cwd/a/b), while an absolute or ~
+    # target resets the accumulator (release#632).
+    candidate_cwds = [os.path.normpath(cwd)]
+    acc = candidate_cwds[0]
     for tgt in cd_targets(command):
         expanded = os.path.expanduser(tgt)
         if not os.path.isabs(expanded):
-            expanded = os.path.join(cwd, expanded)
+            expanded = os.path.join(acc, expanded)
+        expanded = os.path.normpath(expanded)
         candidate_cwds.append(expanded)
+        acc = expanded
 
     # Collect each candidate's sentinel path; allow (consuming) on the first that
     # exists. The absolute paths feed the deny reason so the agent arms the right
