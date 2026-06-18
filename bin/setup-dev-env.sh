@@ -9,11 +9,11 @@
 # fetch, extra rustup targets, etc.) put them in app-bin/post-setup-hook.sh
 # — this script calls that hook at the end if it exists.
 #
-# Pre-commit hook wiring runs in BOTH local and cloud sessions (a fresh
-# clone has no `.git/hooks/pre-commit` wired regardless of where the dev
-# is). Everything else below the cloud-only gate is cloud-only —
-# submodules, project dep caches, NSS cert imports etc. are already in
-# place on a dev's local machine.
+# Pre-commit hook wiring AND git-submodule init run in BOTH local and cloud
+# sessions (a fresh clone has neither a wired `.git/hooks/pre-commit` nor
+# initialised submodules, regardless of where the dev is). Everything else
+# below the cloud-only gate is cloud-only — project dep caches, NSS cert
+# imports etc. are already in place on a dev's local machine.
 #
 # Detects stack by filesystem signals — handles rust, node, ruby, python,
 # and consumers with no project deps (just lefthook / hand-rolled hook
@@ -27,6 +27,29 @@ set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
+
+# --- 0.0. Git submodule content (BOTH local and cloud) ------------------
+# Runs in BOTH contexts, ABOVE the cloud-only gate, because a FRESH clone
+# has uninitialised submodules regardless of where it lands — the live-fire
+# round clones consumers fresh, and lex-fmt/lex carries a `comms/` submodule
+# (per .gitmodules) whose content the gate + tests need. The old §1
+# submodule step ran cloud-only on the (wrong) assumption that a local dev
+# always already has submodules in place; a fresh checkout doesn't, so the
+# gate/tests failed on missing submodule content (release#706, #728).
+#
+# Placed FIRST so submodule file content exists for everything downstream:
+# the §0.1 init/gate wiring, the gate itself, and the §2 dep installs / tests.
+# Guarded on .gitmodules so it's a no-op (the block is skipped entirely) when
+# the repo has no submodules. No-op-cheap when already in sync.
+#
+# Best-effort: a network hiccup fetching submodule content must NOT abort the
+# whole bootstrap (matches the script's continue-on-transient-errors stance) —
+# warn loudly so a genuinely-missing submodule surfaces rather than silently
+# failing a later gate/test step.
+if [ -f .gitmodules ]; then
+  git submodule update --init --recursive --quiet \
+    || echo "warning: git submodule update --init failed — submodule content may be missing (gate/tests that need it will fail)" >&2
+fi
 
 # --- 0. Arm the gate: ensure the lefthook toolset is installed ----------
 # THE gate (lefthook.yml) is HARD — a missing tool FAILS the commit, it does
@@ -43,7 +66,7 @@ _warn_unarmed() {
 
 # Pinned gate-toolset versions + the gate_version_matches reconcile helper —
 # single source of truth, shared with the CI provisioner
-# bin-internal/provision-gate-toolset.sh so the two can't drift (release#498,
+# bin-internal/provision-gate-toolset.sh so the two can't diverge (release#498,
 # release#531). Synced alongside this script (same managed sync) so it is
 # normally always present; the `:=` fallbacks + the gate_version_matches fallback
 # are a last-resort safety net so a (broken) missing-file state can't abort the
@@ -59,6 +82,7 @@ _warn_unarmed() {
 : "${MARKDOWNLINT_CLI_VERSION:=0.48.0}"
 : "${SHELLCHECK_VERSION:=0.11.0}"
 : "${SHELLCHECK_PY_VERSION:=0.11.0.1}"
+: "${YQ_VERSION:=4.44.3}"
 command -v gate_version_matches >/dev/null 2>&1 || gate_version_matches() {
   command -v "$1" >/dev/null 2>&1 || return 1
   _gvm_have="$("$1" --version 2>/dev/null \
@@ -120,10 +144,35 @@ if ! gate_version_matches actionlint "$ACTIONLINT_VERSION" && command -v curl >/
 fi
 gate_version_matches actionlint "$ACTIONLINT_VERSION" || _warn_unarmed "actionlint==${ACTIONLINT_VERSION}"
 
+# yq (mikefarah/Go): pinned GH-release binary → ~/.local/bin. release_core.yamlio
+# shells out to mikefarah's `yq -o=json` and `yq eval-all` (the gate reads + the
+# `release-core init` lefthook merge); a kislyuk python-yq (jq wrapper) squatting
+# /usr/bin/yq has neither and hard-fails the gate (release#755). Like actionlint,
+# install to ~/.local/bin (no sudo, first on PATH) so the pinned binary shadows
+# any python stub. mikefarah ships no installer script, so resolve OS/arch and
+# fetch the raw binary directly.
+if ! gate_version_matches yq "$YQ_VERSION" && command -v curl >/dev/null 2>&1; then
+  case "$(uname -s)" in Linux) _yq_os=linux ;; Darwin) _yq_os=darwin ;; *) _yq_os="" ;; esac
+  case "$(uname -m)" in x86_64|amd64) _yq_arch=amd64 ;; aarch64|arm64) _yq_arch=arm64 ;; *) _yq_arch="" ;; esac
+  if [ -n "${_yq_os}" ] && [ -n "${_yq_arch}" ]; then
+    mkdir -p "${HOME}/.local/bin"
+    # Download to a temp file (explicit template — BSD/macOS mktemp rejects a bare
+    # call) and install only if NON-EMPTY, so a failed download never leaves a
+    # truncated yq on PATH. Best-effort: a failure warns below, never aborts.
+    _yq_tmp="$(mktemp "${TMPDIR:-/tmp}/yq.XXXXXXXX")"
+    if curl -sSfL "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_${_yq_os}_${_yq_arch}" \
+         -o "${_yq_tmp}" >/dev/null 2>&1 && [ -s "${_yq_tmp}" ]; then
+      chmod +x "${_yq_tmp}" && mv "${_yq_tmp}" "${HOME}/.local/bin/yq"
+    fi
+    rm -f "${_yq_tmp}"
+  fi
+fi
+gate_version_matches yq "$YQ_VERSION" || _warn_unarmed "yq==${YQ_VERSION}"
+
 # golangci-lint — the go-quality gate's linter. Only Go repos run that hook, so
 # gate the install on a root go.mod existing (we cd'd to REPO_ROOT above; the
 # §2 `go mod download` block uses the same root check). brew on macOS; on Linux
-# the canonical install script drops the binary into the Go bin dir, with `go
+# the install script drops the binary into the Go bin dir, with `go
 # install` as the fallback when go is present but curl/sh isn't. Pinned to a
 # version (single source) for reproducibility. Install stderr stays visible —
 # matches the ruff/yamllint blocks; only stdout is muted.
@@ -156,20 +205,26 @@ fi
 # resolves the latest release wheel, pip-installs it (--force-reinstall — the
 # wheel version is static, so `-U` would skip it; deps resolve from PyPI), THEN runs `release-core
 # init` itself (it locates the just-installed console-script across venv/--user/
-# system layouts). A bare `init` now materializes the WHOLE managed tree from the
-# wheel bundle (the .release/ build dir + every working-tree mirror — skills,
-# ORIENTATION, configs, the CLAUDE.md block) and auto-commits any managed change
+# system layouts). A bare `init` now installs the WHOLE set of managed files from
+# the wheel bundle (the .release/ temp dir + every working-tree mirror — skills,
+# configs, the CLAUDE.md header block) and auto-commits any managed change
 # (#476 cutover) — not just the config subset. So SessionStart self-syncs the full
-# tree from the pulled wheel: no push needed (no push mechanism exists). One
+# set from the pulled wheel: no push needed (no push mechanism exists). One
 # command does the whole boot. Runs in BOTH local and cloud (above the cloud-only
 # gate) — auto-update is the whole point. Runs BEFORE the hook wiring (release#567):
-# init materializes the ephemeral .release/ (the gate config), so the very first
+# init installs the ephemeral .release/ (the gate config), so the very first
 # session of a fresh clone wires a hook that has a gate to run.
 #
-# BEST-EFFORT, never aborts the session: every call is `|| warn`, and init
-# failure inside the resolver is itself best-effort. The committed tree already
-# in the repo degrades gracefully if the pull fails (a stale repo is
-# older-but-working, never broken).
+# FAIL-LOUD on the load-bearing pull (WS6/F, release#763): the wheel pull is the
+# FOUNDATION — no wheel ⇒ no `release-core gate --hook` ⇒ no gate. So this no longer
+# `|| warn`s past a failed resolver: a genuine pull failure HALTS the session loudly
+# (the resolver already retries transient blips internally — 3 attempts with
+# backoff — and only a still-failing pull aborts, so a 1-second hiccup never
+# red-alerts). The DOWNSTREAM steps (init's managed-file refresh, gate wiring) stay
+# best-effort inside the resolver — the committed tree degrades gracefully there;
+# only the PULL itself is fail-loud. A consumer not yet seeded with the resolver
+# (no bin/install-release-core, not on PATH) still no-ops safely — there is nothing
+# to fail.
 #
 # The resolver is part of the committed bootstrap: it ships in the synced set
 # (templates/commons/bin/ → consumer bin/install-release-core), so it is found at
@@ -190,22 +245,28 @@ elif command -v install-release-core >/dev/null 2>&1; then
   _resolver="install-release-core"
 fi
 if [ -n "${_resolver}" ]; then
-  "${_resolver}" \
-    || echo "warning: install-release-core failed — release_core not updated this session" >&2
+  # FAIL-LOUD (WS6/F): no `|| warn` — a failed wheel pull HALTS the session loudly.
+  # The resolver retries transient blips internally and only aborts on a genuine
+  # failure (no wheel ⇒ no gate). Pass --cloud (WS5/E) so the resolver's
+  # `release-core init` runs the cloud-only provisioning steps (tag fetch, dep
+  # caches, NSS cert import) when in a cloud session; locally they are skipped.
+  if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
+    "${_resolver}" --cloud
+  else
+    "${_resolver}"
+  fi
 fi
 
 # --- 0.2. Pre-commit hook wiring (BOTH local and cloud) -----------------
 # Wiring `.git/hooks/pre-commit` is per-clone state — every fresh clone
 # (and cloud snapshot) starts without it, so we wire it on every session
 # and in both contexts. Runs ABOVE the cloud-only gate because skipping
-# it locally is what produces the "agents are still running husky"
-# symptom: lefthook never gets installed, husky's old wiring keeps
-# firing.
+# it locally leaves the session with no pre-commit hook wired at all.
 #
 # Runs AFTER the pull-model boot (§0.1) deliberately (release#567): on a
 # fresh clone/session the boot installs release-core and `release-core
-# init` materializes the ephemeral `.release/` (gitignored since WS4, so
-# EVERY session starts without it) — wiring first left the earliest
+# init` writes the ephemeral `.release/` temp dir (gitignored since WS4,
+# so EVERY session starts without it) — wiring first left the earliest
 # commits of a session without a hook at all, and a previously-wired hook
 # firing before init warn-and-passed on the missing config (the
 # first-commit-of-session boot hole; gate now fails loud on that too).
@@ -214,13 +275,6 @@ fi
 # brew/cargo/npm locally). Fallback for repos that ship a hand-rolled
 # app-bin/pre-commit instead (zed-lex, tree-sitter-lex pattern): symlink
 # it into .git/hooks/.
-#
-# Husky migration: if a previous `husky install` set
-# `core.hooksPath=.husky`, git routes hooks to `.husky/pre-commit` and
-# ignores `.git/hooks/pre-commit` entirely — so `lefthook install`
-# silently no-ops. Clear that config first when migrating a repo to
-# lefthook. We do NOT delete `.husky/` itself; that's a consumer-side
-# cleanup (committed file, belongs in a PR).
 
 # Resolve lefthook binary. npm/pnpm consumers commonly have lefthook
 # installed at `node_modules/.bin/lefthook` (via `prepare: lefthook install`
@@ -237,7 +291,7 @@ fi
 if command -v release-core >/dev/null 2>&1 \
    && { [ -f .release/lefthook.yml ] || [ ! -f lefthook.yml ]; }; then
   # WS3 (release#524): the gate definition lives ONLY in the ephemeral .release/
-  # build dir — there is no tracked root lefthook.yml for a stock `lefthook
+  # temp dir — there is no tracked root lefthook.yml for a stock `lefthook
   # install` shim to discover. Wire the git hook through the binary instead:
   # `release-core gate --install-hook` writes .git/hooks/pre-commit (→ `release-core
   # gate --hook`, which points lefthook at .release/lefthook.yml) and unsets any
@@ -248,30 +302,12 @@ if command -v release-core >/dev/null 2>&1 \
   # The no-root-lefthook.yml arm (release#567): a consumer whose §0.1 init failed
   # (network hiccup) has no .release/lefthook.yml YET — wire the binary hook
   # anyway, so its commits hit `release-core gate --hook`'s fail-loud
-  # unmaterialized-config error instead of running ungated with no hook at all.
+  # unbuilt-config error instead of running ungated with no hook at all.
   if ! release-core gate --install-hook >/dev/null; then
     echo "warning: release-core gate --install-hook failed — pre-commit hook NOT wired" >&2
   fi
 elif [ -f lefthook.yml ] && [ -n "${_lefthook}" ]; then
-  # `git config --get` returns 1 when unset. Command substitution exit
-  # codes don't propagate `set -e` from a conditional context, but the
-  # explicit `|| true` makes the empty-when-unset intent unambiguous.
-  _hooks_path="$(git config --get core.hooksPath 2>/dev/null || true)"
-  # Unset core.hooksPath if set to ANY value (not just .husky). Any
-  # custom hooksPath redirects git away from .git/hooks/, which is
-  # where `lefthook install` writes its pre-commit shim — so a leftover
-  # config from any prior hook manager (husky, pre-commit framework,
-  # custom) makes the install silently no-op.
-  if [ -n "${_hooks_path}" ]; then
-    # Don't suppress unset failures with `|| true` — if the unset
-    # fails (e.g. unwritable .git/config), the custom redirect stays
-    # in place and the subsequent `lefthook install` is effectively
-    # a no-op. The user needs to know that, not have it silently
-    # swallowed.
-    if ! git config --unset core.hooksPath; then
-      echo "warning: failed to unset core.hooksPath (=${_hooks_path}); custom redirect still active — lefthook install will not take effect" >&2
-    fi
-  fi
+  # Root-lefthook.yml branch — release's own repo (hand-authored root gate).
   if ! "${_lefthook}" install >/dev/null; then
     echo "warning: lefthook install failed — pre-commit hook NOT wired" >&2
   fi
@@ -306,12 +342,11 @@ fi
 [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] || exit 0
 
 # --- 1. Universal git hygiene --------------------------------------------
-# Cloud clones are shallow; restore submodule content and release tags.
-# Submodule update is a no-op when in sync; tag fetch is one round-trip.
+# Cloud clones are shallow; restore release tags. Tag fetch is one
+# round-trip. (Submodule content is restored in §0.0 above, which runs in
+# BOTH local and cloud — a fresh checkout has uninitialised submodules in
+# either context, so it can't be cloud-only.)
 
-if [ -f .gitmodules ]; then
-  git submodule update --init --recursive --quiet || true
-fi
 git fetch --tags --quiet origin || true
 
 # --- 2. Project dep cache ------------------------------------------------
@@ -334,7 +369,7 @@ fi
 # Node (npm/yarn/pnpm). We deliberately do NOT guard on `! -d node_modules`:
 # the env-snapshot caches a node_modules paired with a previous branch's
 # lockfile, and a feature branch that bumps the lockfile (Playwright is
-# the canonical case) drifts silently. Re-installing when already in sync
+# the case) diverges silently. Re-installing when already in sync
 # is ~2s; chasing a stale lockfile bug is hours. Pay the two seconds.
 if [ -f package.json ]; then
   if [ -f package-lock.json ] && command -v npm >/dev/null 2>&1; then
