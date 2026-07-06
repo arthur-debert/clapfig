@@ -47,8 +47,8 @@ cd "${REPO_ROOT}"
 # warn loudly so a genuinely-missing submodule surfaces rather than silently
 # failing a later gate/test step.
 if [ -f .gitmodules ]; then
-  git submodule update --init --recursive --quiet \
-    || echo "warning: git submodule update --init failed — submodule content may be missing (gate/tests that need it will fail)" >&2
+	git submodule update --init --recursive --quiet ||
+		echo "warning: git submodule update --init failed — submodule content may be missing (gate/tests that need it will fail)" >&2
 fi
 
 # --- 0. Arm the gate: ensure the lefthook toolset is installed ----------
@@ -61,7 +61,7 @@ fi
 # commit time. Best-effort installs — a transient failure shouldn't abort setup.
 
 _warn_unarmed() {
-  echo "warning: '$1' not installed and could not be auto-installed — the lefthook gate will FAIL until it is present. Install it, then re-run." >&2
+	echo "warning: '$1' not installed and could not be auto-installed — the lefthook gate will FAIL until it is present. Install it, then re-run." >&2
 }
 
 # Pinned gate-toolset versions + the gate_version_matches reconcile helper —
@@ -84,10 +84,10 @@ _warn_unarmed() {
 : "${SHELLCHECK_PY_VERSION:=0.11.0.1}"
 : "${YQ_VERSION:=4.44.3}"
 command -v gate_version_matches >/dev/null 2>&1 || gate_version_matches() {
-  command -v "$1" >/dev/null 2>&1 || return 1
-  _gvm_have="$("$1" --version 2>/dev/null \
-    | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)"
-  [ "$_gvm_have" = "$2" ]
+	command -v "$1" >/dev/null 2>&1 || return 1
+	_gvm_have="$("$1" --version 2>/dev/null |
+		grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)"
+	[ "$_gvm_have" = "$2" ]
 }
 
 # RECONCILE every tool to its pin (release#531), NOT install-if-missing: a
@@ -101,15 +101,15 @@ command -v gate_version_matches >/dev/null 2>&1 || gate_version_matches() {
 # before the hook wiring below so `lefthook install` finds the binary. The
 # markdownlint-cli package's binary is `markdownlint`.
 npm_pkgs=()
-gate_version_matches lefthook     "$LEFTHOOK_VERSION"          || npm_pkgs+=("lefthook@${LEFTHOOK_VERSION}")
-gate_version_matches prettier     "$PRETTIER_VERSION"          || npm_pkgs+=("prettier@${PRETTIER_VERSION}")
-gate_version_matches markdownlint "$MARKDOWNLINT_CLI_VERSION"  || npm_pkgs+=("markdownlint-cli@${MARKDOWNLINT_CLI_VERSION}")
+gate_version_matches lefthook "$LEFTHOOK_VERSION" || npm_pkgs+=("lefthook@${LEFTHOOK_VERSION}")
+gate_version_matches prettier "$PRETTIER_VERSION" || npm_pkgs+=("prettier@${PRETTIER_VERSION}")
+gate_version_matches markdownlint "$MARKDOWNLINT_CLI_VERSION" || npm_pkgs+=("markdownlint-cli@${MARKDOWNLINT_CLI_VERSION}")
 if [ "${#npm_pkgs[@]}" -gt 0 ] && command -v npm >/dev/null 2>&1; then
-  npm install -g "${npm_pkgs[@]}" >/dev/null 2>&1 || true
+	npm install -g "${npm_pkgs[@]}" >/dev/null 2>&1 || true
 fi
-gate_version_matches lefthook     "$LEFTHOOK_VERSION"          || _warn_unarmed "lefthook@${LEFTHOOK_VERSION}"
-gate_version_matches prettier     "$PRETTIER_VERSION"          || _warn_unarmed "prettier@${PRETTIER_VERSION}"
-gate_version_matches markdownlint "$MARKDOWNLINT_CLI_VERSION"  || _warn_unarmed "markdownlint@${MARKDOWNLINT_CLI_VERSION}"
+gate_version_matches lefthook "$LEFTHOOK_VERSION" || _warn_unarmed "lefthook@${LEFTHOOK_VERSION}"
+gate_version_matches prettier "$PRETTIER_VERSION" || _warn_unarmed "prettier@${PRETTIER_VERSION}"
+gate_version_matches markdownlint "$MARKDOWNLINT_CLI_VERSION" || _warn_unarmed "markdownlint@${MARKDOWNLINT_CLI_VERSION}"
 
 # pip tools: ruff + yamllint + shellcheck (via the shellcheck-py wheel — bundles
 # the binary, so shellcheck is pinned identically to ruff/yamllint with no
@@ -117,18 +117,18 @@ gate_version_matches markdownlint "$MARKDOWNLINT_CLI_VERSION"  || _warn_unarmed 
 # disagree on findings. Modern Debian/Ubuntu (PEP 668) reject a global pip
 # install without --break-system-packages; try that first, fall back to a plain
 # install (older distros / venvs reject the flag). Install stderr stays visible.
-if ! gate_version_matches ruff "$RUFF_VERSION" \
-  || ! gate_version_matches yamllint "$YAMLLINT_VERSION" \
-  || ! gate_version_matches shellcheck "$SHELLCHECK_VERSION"; then
-  if command -v pip3 >/dev/null 2>&1; then
-    pip3 install --quiet --break-system-packages \
-      "ruff==${RUFF_VERSION}" "yamllint==${YAMLLINT_VERSION}" "shellcheck-py==${SHELLCHECK_PY_VERSION}" >/dev/null \
-      || pip3 install --quiet \
-      "ruff==${RUFF_VERSION}" "yamllint==${YAMLLINT_VERSION}" "shellcheck-py==${SHELLCHECK_PY_VERSION}" >/dev/null || true
-  fi
+if ! gate_version_matches ruff "$RUFF_VERSION" ||
+	! gate_version_matches yamllint "$YAMLLINT_VERSION" ||
+	! gate_version_matches shellcheck "$SHELLCHECK_VERSION"; then
+	if command -v pip3 >/dev/null 2>&1; then
+		pip3 install --quiet --break-system-packages \
+			"ruff==${RUFF_VERSION}" "yamllint==${YAMLLINT_VERSION}" "shellcheck-py==${SHELLCHECK_PY_VERSION}" >/dev/null ||
+			pip3 install --quiet \
+				"ruff==${RUFF_VERSION}" "yamllint==${YAMLLINT_VERSION}" "shellcheck-py==${SHELLCHECK_PY_VERSION}" >/dev/null || true
+	fi
 fi
-gate_version_matches ruff       "$RUFF_VERSION"       || _warn_unarmed "ruff==${RUFF_VERSION}"
-gate_version_matches yamllint   "$YAMLLINT_VERSION"   || _warn_unarmed "yamllint==${YAMLLINT_VERSION}"
+gate_version_matches ruff "$RUFF_VERSION" || _warn_unarmed "ruff==${RUFF_VERSION}"
+gate_version_matches yamllint "$YAMLLINT_VERSION" || _warn_unarmed "yamllint==${YAMLLINT_VERSION}"
 gate_version_matches shellcheck "$SHELLCHECK_VERSION" || _warn_unarmed "shellcheck==${SHELLCHECK_VERSION}"
 
 # actionlint: pinned official downloader → ~/.local/bin. apt has no actionlint
@@ -137,10 +137,10 @@ gate_version_matches shellcheck "$SHELLCHECK_VERSION" || _warn_unarmed "shellche
 # pinned binary deterministically shadows any floating brew/apt actionlint — the
 # install-if-missing hole that let a brew-installed actionlint outvote the pin.
 if ! gate_version_matches actionlint "$ACTIONLINT_VERSION" && command -v curl >/dev/null 2>&1; then
-  mkdir -p "${HOME}/.local/bin"
-  _actionlint_url="https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash"
-  curl -sSfL "${_actionlint_url}" \
-    | bash -s -- "${ACTIONLINT_VERSION}" "${HOME}/.local/bin" >/dev/null || true
+	mkdir -p "${HOME}/.local/bin"
+	_actionlint_url="https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash"
+	curl -sSfL "${_actionlint_url}" |
+		bash -s -- "${ACTIONLINT_VERSION}" "${HOME}/.local/bin" >/dev/null || true
 fi
 gate_version_matches actionlint "$ACTIONLINT_VERSION" || _warn_unarmed "actionlint==${ACTIONLINT_VERSION}"
 
@@ -152,20 +152,20 @@ gate_version_matches actionlint "$ACTIONLINT_VERSION" || _warn_unarmed "actionli
 # any python stub. mikefarah ships no installer script, so resolve OS/arch and
 # fetch the raw binary directly.
 if ! gate_version_matches yq "$YQ_VERSION" && command -v curl >/dev/null 2>&1; then
-  case "$(uname -s)" in Linux) _yq_os=linux ;; Darwin) _yq_os=darwin ;; *) _yq_os="" ;; esac
-  case "$(uname -m)" in x86_64|amd64) _yq_arch=amd64 ;; aarch64|arm64) _yq_arch=arm64 ;; *) _yq_arch="" ;; esac
-  if [ -n "${_yq_os}" ] && [ -n "${_yq_arch}" ]; then
-    mkdir -p "${HOME}/.local/bin"
-    # Download to a temp file (explicit template — BSD/macOS mktemp rejects a bare
-    # call) and install only if NON-EMPTY, so a failed download never leaves a
-    # truncated yq on PATH. Best-effort: a failure warns below, never aborts.
-    _yq_tmp="$(mktemp "${TMPDIR:-/tmp}/yq.XXXXXXXX")"
-    if curl -sSfL "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_${_yq_os}_${_yq_arch}" \
-         -o "${_yq_tmp}" >/dev/null 2>&1 && [ -s "${_yq_tmp}" ]; then
-      chmod +x "${_yq_tmp}" && mv "${_yq_tmp}" "${HOME}/.local/bin/yq"
-    fi
-    rm -f "${_yq_tmp}"
-  fi
+	case "$(uname -s)" in Linux) _yq_os=linux ;; Darwin) _yq_os=darwin ;; *) _yq_os="" ;; esac
+	case "$(uname -m)" in x86_64 | amd64) _yq_arch=amd64 ;; aarch64 | arm64) _yq_arch=arm64 ;; *) _yq_arch="" ;; esac
+	if [ -n "${_yq_os}" ] && [ -n "${_yq_arch}" ]; then
+		mkdir -p "${HOME}/.local/bin"
+		# Download to a temp file (explicit template — BSD/macOS mktemp rejects a bare
+		# call) and install only if NON-EMPTY, so a failed download never leaves a
+		# truncated yq on PATH. Best-effort: a failure warns below, never aborts.
+		_yq_tmp="$(mktemp "${TMPDIR:-/tmp}/yq.XXXXXXXX")"
+		if curl -sSfL "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_${_yq_os}_${_yq_arch}" \
+			-o "${_yq_tmp}" >/dev/null 2>&1 && [ -s "${_yq_tmp}" ]; then
+			chmod +x "${_yq_tmp}" && mv "${_yq_tmp}" "${HOME}/.local/bin/yq"
+		fi
+		rm -f "${_yq_tmp}"
+	fi
 fi
 gate_version_matches yq "$YQ_VERSION" || _warn_unarmed "yq==${YQ_VERSION}"
 
@@ -178,24 +178,24 @@ gate_version_matches yq "$YQ_VERSION" || _warn_unarmed "yq==${YQ_VERSION}"
 # matches the ruff/yamllint blocks; only stdout is muted.
 _GOLANGCI_LINT_VERSION="v1.64.8"
 if [ -f go.mod ] && ! command -v golangci-lint >/dev/null 2>&1; then
-  if command -v brew >/dev/null 2>&1; then
-    brew install golangci-lint >/dev/null || true
-  elif command -v go >/dev/null 2>&1; then
-    # GOBIN wins if set; else the FIRST entry of a (possibly colon-separated)
-    # GOPATH — `$(go env GOPATH)/bin` would be a broken path on a multi-entry
-    # GOPATH. The install script and `go install` both land the binary here.
-    _go_bin="$(go env GOBIN)"
-    [ -n "${_go_bin}" ] || _go_bin="$(go env GOPATH | cut -d: -f1)/bin"
-    if command -v curl >/dev/null 2>&1; then
-      curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-        | sh -s -- -b "${_go_bin}" "${_GOLANGCI_LINT_VERSION}" >/dev/null \
-        || go install "github.com/golangci/golangci-lint/cmd/golangci-lint@${_GOLANGCI_LINT_VERSION}" >/dev/null \
-        || true
-    else
-      go install "github.com/golangci/golangci-lint/cmd/golangci-lint@${_GOLANGCI_LINT_VERSION}" >/dev/null || true
-    fi
-  fi
-  command -v golangci-lint >/dev/null 2>&1 || _warn_unarmed golangci-lint
+	if command -v brew >/dev/null 2>&1; then
+		brew install golangci-lint >/dev/null || true
+	elif command -v go >/dev/null 2>&1; then
+		# GOBIN wins if set; else the FIRST entry of a (possibly colon-separated)
+		# GOPATH — `$(go env GOPATH)/bin` would be a broken path on a multi-entry
+		# GOPATH. The install script and `go install` both land the binary here.
+		_go_bin="$(go env GOBIN)"
+		[ -n "${_go_bin}" ] || _go_bin="$(go env GOPATH | cut -d: -f1)/bin"
+		if command -v curl >/dev/null 2>&1; then
+			curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh |
+				sh -s -- -b "${_go_bin}" "${_GOLANGCI_LINT_VERSION}" >/dev/null ||
+				go install "github.com/golangci/golangci-lint/cmd/golangci-lint@${_GOLANGCI_LINT_VERSION}" >/dev/null ||
+				true
+		else
+			go install "github.com/golangci/golangci-lint/cmd/golangci-lint@${_GOLANGCI_LINT_VERSION}" >/dev/null || true
+		fi
+	fi
+	command -v golangci-lint >/dev/null 2>&1 || _warn_unarmed golangci-lint
 fi
 
 # --- 0.1. Pull-model: self-update release_core from the published wheel --
@@ -240,21 +240,21 @@ fi
 # --user/--break-system-packages, so an in-flight fleet migration can't break.)
 _resolver=""
 if [ -x "${REPO_ROOT}/bin/install-release-core" ]; then
-  _resolver="${REPO_ROOT}/bin/install-release-core"
+	_resolver="${REPO_ROOT}/bin/install-release-core"
 elif command -v install-release-core >/dev/null 2>&1; then
-  _resolver="install-release-core"
+	_resolver="install-release-core"
 fi
 if [ -n "${_resolver}" ]; then
-  # FAIL-LOUD (WS6/F): no `|| warn` — a failed wheel pull HALTS the session loudly.
-  # The resolver retries transient blips internally and only aborts on a genuine
-  # failure (no wheel ⇒ no gate). Pass --cloud (WS5/E) so the resolver's
-  # `release-core init` runs the cloud-only provisioning steps (tag fetch, dep
-  # caches, NSS cert import) when in a cloud session; locally they are skipped.
-  if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
-    "${_resolver}" --cloud
-  else
-    "${_resolver}"
-  fi
+	# FAIL-LOUD (WS6/F): no `|| warn` — a failed wheel pull HALTS the session loudly.
+	# The resolver retries transient blips internally and only aborts on a genuine
+	# failure (no wheel ⇒ no gate). Pass --cloud (WS5/E) so the resolver's
+	# `release-core init` runs the cloud-only provisioning steps (tag fetch, dep
+	# caches, NSS cert import) when in a cloud session; locally they are skipped.
+	if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
+		"${_resolver}" --cloud
+	else
+		"${_resolver}"
+	fi
 fi
 
 # --- 0.2. Pre-commit hook wiring (BOTH local and cloud) -----------------
@@ -283,57 +283,57 @@ fi
 # app-bin/pre-commit branch in cloud sessions for npm consumers.
 _lefthook=""
 if [ -x node_modules/.bin/lefthook ]; then
-  _lefthook="node_modules/.bin/lefthook"
+	_lefthook="node_modules/.bin/lefthook"
 elif command -v lefthook >/dev/null 2>&1; then
-  _lefthook="lefthook"
+	_lefthook="lefthook"
 fi
 
-if command -v release-core >/dev/null 2>&1 \
-   && { [ -f .release/lefthook.yml ] || [ ! -f lefthook.yml ]; }; then
-  # WS3 (release#524): the gate definition lives ONLY in the ephemeral .release/
-  # temp dir — there is no tracked root lefthook.yml for a stock `lefthook
-  # install` shim to discover. Wire the git hook through the binary instead:
-  # `release-core gate --install-hook` writes .git/hooks/pre-commit (→ `release-core
-  # gate --hook`, which points lefthook at .release/lefthook.yml) and unsets any
-  # stale core.hooksPath redirect itself. This is the path every migrated consumer
-  # takes; the root-lefthook.yml branch below is for release's own repo (which
-  # keeps a hand-authored root gate) and not-yet-migrated consumers.
-  #
-  # The no-root-lefthook.yml arm (release#567): a consumer whose §0.1 init failed
-  # (network hiccup) has no .release/lefthook.yml YET — wire the binary hook
-  # anyway, so its commits hit `release-core gate --hook`'s fail-loud
-  # unbuilt-config error instead of running ungated with no hook at all.
-  if ! release-core gate --install-hook >/dev/null; then
-    echo "warning: release-core gate --install-hook failed — pre-commit hook NOT wired" >&2
-  fi
+if command -v release-core >/dev/null 2>&1 &&
+	{ [ -f .release/lefthook.yml ] || [ ! -f lefthook.yml ]; }; then
+	# WS3 (release#524): the gate definition lives ONLY in the ephemeral .release/
+	# temp dir — there is no tracked root lefthook.yml for a stock `lefthook
+	# install` shim to discover. Wire the git hook through the binary instead:
+	# `release-core gate --install-hook` writes .git/hooks/pre-commit (→ `release-core
+	# gate --hook`, which points lefthook at .release/lefthook.yml) and unsets any
+	# stale core.hooksPath redirect itself. This is the path every migrated consumer
+	# takes; the root-lefthook.yml branch below is for release's own repo (which
+	# keeps a hand-authored root gate) and not-yet-migrated consumers.
+	#
+	# The no-root-lefthook.yml arm (release#567): a consumer whose §0.1 init failed
+	# (network hiccup) has no .release/lefthook.yml YET — wire the binary hook
+	# anyway, so its commits hit `release-core gate --hook`'s fail-loud
+	# unbuilt-config error instead of running ungated with no hook at all.
+	if ! release-core gate --install-hook >/dev/null; then
+		echo "warning: release-core gate --install-hook failed — pre-commit hook NOT wired" >&2
+	fi
 elif [ -f lefthook.yml ] && [ -n "${_lefthook}" ]; then
-  # Root-lefthook.yml branch — release's own repo (hand-authored root gate).
-  if ! "${_lefthook}" install >/dev/null; then
-    echo "warning: lefthook install failed — pre-commit hook NOT wired" >&2
-  fi
+	# Root-lefthook.yml branch — release's own repo (hand-authored root gate).
+	if ! "${_lefthook}" install >/dev/null; then
+		echo "warning: lefthook install failed — pre-commit hook NOT wired" >&2
+	fi
 elif [ -x app-bin/pre-commit ]; then
-  # Resolve the hooks dir via git plumbing rather than hardcoding
-  # `.git/hooks`. In a git-worktree the per-worktree hooks live under
-  # `.git/worktrees/<name>/hooks/`, and `.git` itself is a file (not
-  # a directory), so `mkdir -p .git/hooks` fails. `--git-path hooks`
-  # returns the right location in either layout. We also honor an
-  # already-set `core.hooksPath` if present — fallback consumers
-  # may have configured one deliberately. Use an absolute symlink
-  # target so it resolves correctly from any hooks-dir depth.
-  #
-  # Best-effort: warn-and-continue on failure (matches the rest of
-  # the script's continue-on-transient-errors stance — a failed
-  # mkdir/symlink on an unusual worktree layout shouldn't abort the
-  # entire dev-env setup).
-  _hooks_dir="$(git config --get core.hooksPath 2>/dev/null || git rev-parse --git-path hooks)"
-  # Best-effort with full diagnostics: don't suppress mkdir/ln stderr —
-  # if either fails, the user needs the underlying error to fix it
-  # (e.g. "Permission denied" pinpoints the actual issue).
-  if ! mkdir -p "${_hooks_dir}"; then
-    echo "warning: failed to mkdir -p \"${_hooks_dir}\" — pre-commit hook NOT wired" >&2
-  elif ! ln -sf "${REPO_ROOT}/app-bin/pre-commit" "${_hooks_dir}/pre-commit"; then
-    echo "warning: failed to symlink app-bin/pre-commit into \"${_hooks_dir}\" — pre-commit hook NOT wired" >&2
-  fi
+	# Resolve the hooks dir via git plumbing rather than hardcoding
+	# `.git/hooks`. In a git-worktree the per-worktree hooks live under
+	# `.git/worktrees/<name>/hooks/`, and `.git` itself is a file (not
+	# a directory), so `mkdir -p .git/hooks` fails. `--git-path hooks`
+	# returns the right location in either layout. We also honor an
+	# already-set `core.hooksPath` if present — fallback consumers
+	# may have configured one deliberately. Use an absolute symlink
+	# target so it resolves correctly from any hooks-dir depth.
+	#
+	# Best-effort: warn-and-continue on failure (matches the rest of
+	# the script's continue-on-transient-errors stance — a failed
+	# mkdir/symlink on an unusual worktree layout shouldn't abort the
+	# entire dev-env setup).
+	_hooks_dir="$(git config --get core.hooksPath 2>/dev/null || git rev-parse --git-path hooks)"
+	# Best-effort with full diagnostics: don't suppress mkdir/ln stderr —
+	# if either fails, the user needs the underlying error to fix it
+	# (e.g. "Permission denied" pinpoints the actual issue).
+	if ! mkdir -p "${_hooks_dir}"; then
+		echo "warning: failed to mkdir -p \"${_hooks_dir}\" — pre-commit hook NOT wired" >&2
+	elif ! ln -sf "${REPO_ROOT}/app-bin/pre-commit" "${_hooks_dir}/pre-commit"; then
+		echo "warning: failed to symlink app-bin/pre-commit into \"${_hooks_dir}\" — pre-commit hook NOT wired" >&2
+	fi
 fi
 
 # Cloud-only gate. Everything below is cloud-only — local sessions
@@ -354,7 +354,7 @@ git fetch --tags --quiet origin || true
 
 # Rust: cargo fetch with --locked so we don't silently mutate Cargo.lock.
 if [ -f Cargo.toml ] && command -v cargo >/dev/null 2>&1; then
-  cargo fetch --locked --quiet || true
+	cargo fetch --locked --quiet || true
 fi
 
 # Go: `go mod download` populates the module cache without building.
@@ -362,8 +362,8 @@ fi
 # stderr visible so module-resolution / auth failures surface during
 # debugging — `|| true` keeps us best-effort without silencing the why.
 if [ -f go.mod ] && command -v go >/dev/null 2>&1; then
-  go version
-  go mod download || true
+	go version
+	go mod download || true
 fi
 
 # Node (npm/yarn/pnpm). We deliberately do NOT guard on `! -d node_modules`:
@@ -372,30 +372,30 @@ fi
 # the case) diverges silently. Re-installing when already in sync
 # is ~2s; chasing a stale lockfile bug is hours. Pay the two seconds.
 if [ -f package.json ]; then
-  if [ -f package-lock.json ] && command -v npm >/dev/null 2>&1; then
-    npm ci 2>/dev/null || npm install
-  elif [ -f yarn.lock ] && command -v yarn >/dev/null 2>&1; then
-    yarn install --frozen-lockfile 2>/dev/null || yarn install
-  elif [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then
-    pnpm install --frozen-lockfile 2>/dev/null || pnpm install
-  elif command -v npm >/dev/null 2>&1; then
-    # No lockfile committed — repos like tree-sitter-lex deliberately
-    # gitignore package-lock.json because the npm deps are dev-only
-    # tooling (tree-sitter-cli, bats) and a committed lockfile would be
-    # noise to bump. Without this branch, node_modules never gets
-    # populated and any `npx <tool>` invocation fails.
-    #
-    # --no-package-lock matches the consumer's intent: they chose not
-    # to commit a lockfile, so we shouldn't generate one in their
-    # working tree just because we ran install.
-    npm install --no-audit --no-fund --no-package-lock 2>/dev/null \
-      || npm install --no-package-lock
-  fi
+	if [ -f package-lock.json ] && command -v npm >/dev/null 2>&1; then
+		npm ci 2>/dev/null || npm install
+	elif [ -f yarn.lock ] && command -v yarn >/dev/null 2>&1; then
+		yarn install --frozen-lockfile 2>/dev/null || yarn install
+	elif [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then
+		pnpm install --frozen-lockfile 2>/dev/null || pnpm install
+	elif command -v npm >/dev/null 2>&1; then
+		# No lockfile committed — repos like tree-sitter-lex deliberately
+		# gitignore package-lock.json because the npm deps are dev-only
+		# tooling (tree-sitter-cli, bats) and a committed lockfile would be
+		# noise to bump. Without this branch, node_modules never gets
+		# populated and any `npx <tool>` invocation fails.
+		#
+		# --no-package-lock matches the consumer's intent: they chose not
+		# to commit a lockfile, so we shouldn't generate one in their
+		# working tree just because we ran install.
+		npm install --no-audit --no-fund --no-package-lock 2>/dev/null ||
+			npm install --no-package-lock
+	fi
 fi
 
 # Ruby / Bundler.
 if [ -f Gemfile ] && command -v bundle >/dev/null 2>&1; then
-  bundle install --quiet || true
+	bundle install --quiet || true
 fi
 
 # Python / pip + venv. Triggered by any of the conventional manifests
@@ -414,89 +414,89 @@ fi
 # message is what made the partial-venv state silent in the first place.
 # A loud warning to stderr surfaces real installation problems instead
 # of papering over them.
-if { [ -f pyproject.toml ] || [ -f requirements.txt ] || [ -f setup.py ]; } \
-   && command -v python3 >/dev/null 2>&1; then
-  # Gate venv creation on `.venv/bin/pip` being executable, not just
-  # `.venv/` existing. A previous run can leave the directory in place
-  # with pip missing (interrupted mid-snapshot, broken extraction);
-  # checking pip directly recovers from that. Warn loudly when the
-  # creation itself fails — otherwise the next gate silently skips all
-  # pip work and the agent debugs a missing-module mystery.
-  if [ ! -x .venv/bin/pip ]; then
-    if ! python3 -m venv .venv; then
-      echo "warning: python3 -m venv .venv failed — pip installs will be skipped" >&2
-    fi
-  fi
-  if [ -x .venv/bin/pip ]; then
-    .venv/bin/pip install --upgrade pip --quiet || true
-    if [ -f pyproject.toml ]; then
-      # No fallback to plain `.` — modern pip treats `[dev]` against a
-      # pyproject without that extra as a warn-and-continue (still
-      # installs base, exits 0). A genuine failure means a real dep
-      # can't resolve, and falling back to `.` would silently leave
-      # the venv with base installed but dev-extras (pytest etc)
-      # missing. Surface the failure instead.
-      .venv/bin/pip install -e '.[dev]' --quiet \
-        || echo "warning: editable install failed — tests will not run (see pip output above)" >&2
-    elif [ -f requirements.txt ]; then
-      .venv/bin/pip install -r requirements.txt --quiet \
-        || echo "warning: requirements install failed — tests will not run" >&2
-    elif [ -f setup.py ]; then
-      .venv/bin/pip install -e . --quiet \
-        || echo "warning: editable install failed — tests will not run" >&2
-    fi
+if { [ -f pyproject.toml ] || [ -f requirements.txt ] || [ -f setup.py ]; } &&
+	command -v python3 >/dev/null 2>&1; then
+	# Gate venv creation on `.venv/bin/pip` being executable, not just
+	# `.venv/` existing. A previous run can leave the directory in place
+	# with pip missing (interrupted mid-snapshot, broken extraction);
+	# checking pip directly recovers from that. Warn loudly when the
+	# creation itself fails — otherwise the next gate silently skips all
+	# pip work and the agent debugs a missing-module mystery.
+	if [ ! -x .venv/bin/pip ]; then
+		if ! python3 -m venv .venv; then
+			echo "warning: python3 -m venv .venv failed — pip installs will be skipped" >&2
+		fi
+	fi
+	if [ -x .venv/bin/pip ]; then
+		.venv/bin/pip install --upgrade pip --quiet || true
+		if [ -f pyproject.toml ]; then
+			# No fallback to plain `.` — modern pip treats `[dev]` against a
+			# pyproject without that extra as a warn-and-continue (still
+			# installs base, exits 0). A genuine failure means a real dep
+			# can't resolve, and falling back to `.` would silently leave
+			# the venv with base installed but dev-extras (pytest etc)
+			# missing. Surface the failure instead.
+			.venv/bin/pip install -e '.[dev]' --quiet ||
+				echo "warning: editable install failed — tests will not run (see pip output above)" >&2
+		elif [ -f requirements.txt ]; then
+			.venv/bin/pip install -r requirements.txt --quiet ||
+				echo "warning: requirements install failed — tests will not run" >&2
+		elif [ -f setup.py ]; then
+			.venv/bin/pip install -e . --quiet ||
+				echo "warning: editable install failed — tests will not run" >&2
+		fi
 
-    # Expose venv-installed CLIs on the agent's bare PATH.
-    #
-    # The cloud Bash tool runs non-interactive shells whose PATH is
-    # fixed at session start and does NOT include
-    # ${REPO_ROOT}/.venv/bin. ~/.bashrc returns early for non-
-    # interactive shells (`[ -z "$PS1" ] && return`), so PATH fixes
-    # there are unreachable. The agent's `subprocess.run(['mkdocs',
-    # …])` (or any test that shells out to a venv CLI) resolves the
-    # command against the agent's PATH and gets FileNotFoundError.
-    #
-    # Symlink every executable in .venv/bin (except the
-    # python/pip/activate family — those would shadow system commands
-    # or break venv internals) into ${HOME}/.local/bin/, which IS on
-    # the agent's PATH (it's where uv / pipx / similar Python tooling
-    # already drops entry points). Idempotent — `ln -sf` overwrites
-    # stale symlinks pointing into a previous session's path.
-    #
-    # Consumers that install ADDITIONAL CLIs from project-local extras
-    # (pinned-binary downloads from GitHub releases, etc) should drop
-    # them directly into ${HOME}/.local/bin rather than .venv/bin, so
-    # they're discoverable on the same PATH without needing a second
-    # symlink pass.
-    if [ -d .venv/bin ]; then
-      # Create ~/.local/bin if missing — env/setup.sh doesn't and Ubuntu
-      # cloud images don't ship it by default in fresh users. The
-      # directory is on the default PATH for any login that picks up
-      # ~/.profile, but we still need it to exist before we ln into it.
-      mkdir -p "${HOME}/.local/bin"
-      for _venv_bin in .venv/bin/*; do
-        # Require both regular file (after symlink resolution) AND
-        # executable bit. `-x` alone matches directories, which would
-        # produce a useless dangling symlink if the glob ever did.
-        # Two separate guards, not `A && B || continue`: older shellcheck
-        # (Ubuntu's 0.9/0.10, which consumers run in CI) flags that form as
-        # SC2015. Equivalent behaviour, clean on every shellcheck version.
-        [ -f "${_venv_bin}" ] || continue
-        [ -x "${_venv_bin}" ] || continue
-        # Parameter expansion avoids forking basename per iteration.
-        _name="${_venv_bin##*/}"
-        case "${_name}" in
-          python|python[0-9]*|pip|pip[0-9]*|activate*|easy_install*|wheel|wheel[0-9]*)
-            continue
-            ;;
-        esac
-        # `--` defends against (pathological) filenames starting with -;
-        # `|| true` matches the script's best-effort policy — a single
-        # permission hiccup shouldn't abort the rest of session setup.
-        ln -sf -- "${REPO_ROOT}/.venv/bin/${_name}" "${HOME}/.local/bin/${_name}" || true
-      done
-    fi
-  fi
+		# Expose venv-installed CLIs on the agent's bare PATH.
+		#
+		# The cloud Bash tool runs non-interactive shells whose PATH is
+		# fixed at session start and does NOT include
+		# ${REPO_ROOT}/.venv/bin. ~/.bashrc returns early for non-
+		# interactive shells (`[ -z "$PS1" ] && return`), so PATH fixes
+		# there are unreachable. The agent's `subprocess.run(['mkdocs',
+		# …])` (or any test that shells out to a venv CLI) resolves the
+		# command against the agent's PATH and gets FileNotFoundError.
+		#
+		# Symlink every executable in .venv/bin (except the
+		# python/pip/activate family — those would shadow system commands
+		# or break venv internals) into ${HOME}/.local/bin/, which IS on
+		# the agent's PATH (it's where uv / pipx / similar Python tooling
+		# already drops entry points). Idempotent — `ln -sf` overwrites
+		# stale symlinks pointing into a previous session's path.
+		#
+		# Consumers that install ADDITIONAL CLIs from project-local extras
+		# (pinned-binary downloads from GitHub releases, etc) should drop
+		# them directly into ${HOME}/.local/bin rather than .venv/bin, so
+		# they're discoverable on the same PATH without needing a second
+		# symlink pass.
+		if [ -d .venv/bin ]; then
+			# Create ~/.local/bin if missing — env/setup.sh doesn't and Ubuntu
+			# cloud images don't ship it by default in fresh users. The
+			# directory is on the default PATH for any login that picks up
+			# ~/.profile, but we still need it to exist before we ln into it.
+			mkdir -p "${HOME}/.local/bin"
+			for _venv_bin in .venv/bin/*; do
+				# Require both regular file (after symlink resolution) AND
+				# executable bit. `-x` alone matches directories, which would
+				# produce a useless dangling symlink if the glob ever did.
+				# Two separate guards, not `A && B || continue`: older shellcheck
+				# (Ubuntu's 0.9/0.10, which consumers run in CI) flags that form as
+				# SC2015. Equivalent behaviour, clean on every shellcheck version.
+				[ -f "${_venv_bin}" ] || continue
+				[ -x "${_venv_bin}" ] || continue
+				# Parameter expansion avoids forking basename per iteration.
+				_name="${_venv_bin##*/}"
+				case "${_name}" in
+				python | python[0-9]* | pip | pip[0-9]* | activate* | easy_install* | wheel | wheel[0-9]*)
+					continue
+					;;
+				esac
+				# `--` defends against (pathological) filenames starting with -;
+				# `|| true` matches the script's best-effort policy — a single
+				# permission hiccup shouldn't abort the rest of session setup.
+				ln -sf -- "${REPO_ROOT}/.venv/bin/${_name}" "${HOME}/.local/bin/${_name}" || true
+			done
+		fi
+	fi
 fi
 
 # --- 2.5. Chromium NSS DB cert import ------------------------------------
@@ -528,72 +528,72 @@ fi
 # Gated on `certutil` AND `openssl` existing (the loop forks openssl
 # per cert to extract the subject); both are env-level state on cloud
 # sessions but may be absent locally.
-if [ "$(uname -s)" = "Linux" ] \
-   && command -v certutil >/dev/null 2>&1 \
-   && command -v openssl >/dev/null 2>&1; then
-  # Subshell scopes the EXIT trap so cleanup is reliable under `set -e`
-  # AND doesn't overwrite a process-wide EXIT trap. The subshell exits
-  # when this block finishes, the trap fires, the tmp dir is gone — no
-  # leak even if awk/cp/openssl error out below.
-  #
-  # The trailing `|| true` matches the script's stated philosophy
-  # (line ~19: errors are best-effort). A cert-import failure shouldn't
-  # abort the rest of the dev-env bootstrap.
-  (
-    _ca_tmp="$(mktemp -d)"
-    trap 'rm -rf "${_ca_tmp}"' EXIT
-    _found=0
+if [ "$(uname -s)" = "Linux" ] &&
+	command -v certutil >/dev/null 2>&1 &&
+	command -v openssl >/dev/null 2>&1; then
+	# Subshell scopes the EXIT trap so cleanup is reliable under `set -e`
+	# AND doesn't overwrite a process-wide EXIT trap. The subshell exits
+	# when this block finishes, the trap fires, the tmp dir is gone — no
+	# leak even if awk/cp/openssl error out below.
+	#
+	# The trailing `|| true` matches the script's stated philosophy
+	# (line ~19: errors are best-effort). A cert-import failure shouldn't
+	# abort the rest of the dev-env bootstrap.
+	(
+		_ca_tmp="$(mktemp -d)"
+		trap 'rm -rf "${_ca_tmp}"' EXIT
+		_found=0
 
-    # Layout A: split the system bundle into per-cert PEMs if it contains
-    # any Anthropic CA. Cheap grep gate avoids the awk fork on non-cloud
-    # Linux boxes (where the bundle has no matches).
-    if [ -f /etc/ssl/certs/ca-certificates.crt ] \
-       && grep -q 'Anthropic' /etc/ssl/certs/ca-certificates.crt 2>/dev/null; then
-      awk -v sandbox_dir="${_ca_tmp}" '
+		# Layout A: split the system bundle into per-cert PEMs if it contains
+		# any Anthropic CA. Cheap grep gate avoids the awk fork on non-cloud
+		# Linux boxes (where the bundle has no matches).
+		if [ -f /etc/ssl/certs/ca-certificates.crt ] &&
+			grep -q 'Anthropic' /etc/ssl/certs/ca-certificates.crt 2>/dev/null; then
+			awk -v sandbox_dir="${_ca_tmp}" '
         /-----BEGIN CERTIFICATE-----/ { n++; fn = sandbox_dir "/bundle_" n ".pem"; in_cert = 1 }
         in_cert                       { print > fn }
         /-----END CERTIFICATE-----/   { in_cert = 0; close(fn) }
       ' /etc/ssl/certs/ca-certificates.crt
-      _found=1
-    fi
+			_found=1
+		fi
 
-    # Layout B: copy standalone swp-ca-*.pem files into the scratch dir.
-    # The glob may be unexpanded if no file matches; guard with -f.
-    for _pem in /etc/ssl/certs/swp-ca-*.pem; do
-      [ -f "${_pem}" ] || continue
-      cp "${_pem}" "${_ca_tmp}/$(basename "${_pem}")"
-      _found=1
-    done
+		# Layout B: copy standalone swp-ca-*.pem files into the scratch dir.
+		# The glob may be unexpanded if no file matches; guard with -f.
+		for _pem in /etc/ssl/certs/swp-ca-*.pem; do
+			[ -f "${_pem}" ] || continue
+			cp "${_pem}" "${_ca_tmp}/$(basename "${_pem}")"
+			_found=1
+		done
 
-    if [ "${_found}" = "1" ]; then
-      _nssdb="${HOME}/.pki/nssdb"
-      mkdir -p "${_nssdb}"
-      if [ ! -f "${_nssdb}/cert9.db" ]; then
-        certutil -d "sql:${_nssdb}" -N --empty-password >/dev/null 2>&1 || true
-      fi
-      for _pem in "${_ca_tmp}"/*.pem; do
-        [ -f "${_pem}" ] || continue
-        _subject="$(openssl x509 -in "${_pem}" -noout -subject 2>/dev/null || true)"
-        case "${_subject}" in
-          *Anthropic*sandbox-egress*)
-            _nick="$(printf '%s' "${_subject}" | sed -nE 's/.*CN *= *([^,]+).*/\1/p')"
-            [ -n "${_nick}" ] || continue
-            if ! certutil -d "sql:${_nssdb}" -L -n "${_nick}" >/dev/null 2>&1; then
-              certutil -d "sql:${_nssdb}" -A -t "C,," -n "${_nick}" -i "${_pem}" >/dev/null 2>&1 || true
-            fi
-            ;;
-        esac
-      done
-    fi
-  ) || true
+		if [ "${_found}" = "1" ]; then
+			_nssdb="${HOME}/.pki/nssdb"
+			mkdir -p "${_nssdb}"
+			if [ ! -f "${_nssdb}/cert9.db" ]; then
+				certutil -d "sql:${_nssdb}" -N --empty-password >/dev/null 2>&1 || true
+			fi
+			for _pem in "${_ca_tmp}"/*.pem; do
+				[ -f "${_pem}" ] || continue
+				_subject="$(openssl x509 -in "${_pem}" -noout -subject 2>/dev/null || true)"
+				case "${_subject}" in
+				*Anthropic*sandbox-egress*)
+					_nick="$(printf '%s' "${_subject}" | sed -nE 's/.*CN *= *([^,]+).*/\1/p')"
+					[ -n "${_nick}" ] || continue
+					if ! certutil -d "sql:${_nssdb}" -L -n "${_nick}" >/dev/null 2>&1; then
+						certutil -d "sql:${_nssdb}" -A -t "C,," -n "${_nick}" -i "${_pem}" >/dev/null 2>&1 || true
+					fi
+					;;
+				esac
+			done
+		fi
+	) || true
 fi
 
 # --- 4. Per-repo hook -------------------------------------------------------
 _hook="${REPO_ROOT}/app-bin/post-setup-hook.sh"
 if [ -f "${_hook}" ]; then
-  if [ -x "${_hook}" ]; then
-    "${_hook}"
-  else
-    echo "warning: ${_hook} exists but is not executable; skipping" >&2
-  fi
+	if [ -x "${_hook}" ]; then
+		"${_hook}"
+	else
+		echo "warning: ${_hook} exists but is not executable; skipping" >&2
+	fi
 fi

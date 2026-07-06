@@ -3,7 +3,7 @@
 ## Issue Tracker
 
 | Category | # | Title | Fixed in commit |
-|----------|---|-------|-----------------|
+| ---------- | --- | ------- | ----------------- |
 | Correctness | 1 | `add_search_path` doesn't preserve default `Platform` path | db2e1ca |
 | Correctness | 2 | Silent data loss in `env.rs` when flat key conflicts with nested key | c124d9f |
 | Correctness | 3 | `find_key_line` fragile with duplicate leaf names across sections | a53620f |

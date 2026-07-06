@@ -45,7 +45,7 @@ default).
 order (last = highest priority):
 
 | Variant | Resolves to | Use case |
-|---------|-------------|----------|
+| --------- | ------------- | ---------- |
 | `Platform` | OS config dir (XDG, `~/Library/...`, AppData) | User-level settings |
 | `Home(".myapp")` | `$HOME/.myapp/` | Cross-platform dotfile convention |
 | `Cwd` | Working directory | Project-local config |

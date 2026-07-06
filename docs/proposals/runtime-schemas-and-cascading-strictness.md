@@ -441,7 +441,7 @@ gives them a domain-specific last word.
 The three knobs compose without leaking into each other:
 
 | Knob | Grain | Default |
-|------|-------|---------|
+| ------ | ------- | --------- |
 | `strict(bool)` | whole resolution | `true` |
 | `strict_at(path, bool)` / `Schema::strict(bool)` | per struct subtree | inherit |
 | `on_unknown_key(fn)` | per key | reject (no-op) |
