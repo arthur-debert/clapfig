@@ -1,0 +1,67 @@
+# [secrets] — repo Actions secrets. Each table key is the GitHub secret NAME; the
+# value names exactly one source ({ doppler = "KEY" } / { env = "VAR" } /
+# { prompt = true }). Seeded with shipit's local-reviewer (codex/agy) GitHub App
+# credentials, each sourced from Doppler github/prd. `shipit gh-setup` only pushes
+# a secret when its source resolves, so these are safe before the App is installed.
+[secrets]
+CODEX_REVIEW_APP_PRIVATE_KEY = { doppler = "CODEX_REVIEW_APP_PRIVATE_KEY" }
+CODEX_REVIEW_APP_ID          = { doppler = "CODEX_REVIEW_APP_ID" }
+AGY_REVIEW_APP_PRIVATE_KEY   = { doppler = "AGY_REVIEW_APP_PRIVATE_KEY" }
+AGY_REVIEW_APP_ID            = { doppler = "AGY_REVIEW_APP_ID" }
+
+# [reviewers] — the required-reviewer SET for this repo's PRs (the map KEYS are
+# required; ALL must be DONE to flip Ready). Seeded with shipit's shipped default
+# (Copilot, review-once), rendered from the single source in
+# `prstate.reviewers_config.DEFAULT_REVIEWERS`. codex/agy are NOT seeded by default —
+# their review GitHub Apps are not installed on an arbitrary repo, so requiring them
+# would park PRs at REVIEWS_PENDING; a repo that HAS the Apps opts them in here (e.g.
+# `codex = {}`). Review-once: `rerun` defaults OFF (token-billed; opt in per reviewer
+# with e.g. `copilot = { rerun = true }`).
+[reviewers]
+copilot = {}
+
+# [lint].ignore — paths the managed lint gate must SKIP. Seeded with common
+# generated/assembled files (a built CHANGELOG, package lockfiles) that are not
+# hand-written prose, so a freshly-onboarded repo does not take a latent gate
+# failure on them. Gitignore-style globs. You OWN this list and may extend it —
+# it is reconcile-safe: `shipit install` seeds [lint] only when absent and never
+# clobbers a table you have edited.
+[lint]
+ignore = [
+  "CHANGELOG.md",
+  "CHANGELOG/**",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+]
+
+[shipit]
+version = "4488d7a24b5d065f449e2a9cfada39d9f9d413b8"
+
+[managed]
+"skills/lex-primer/SKILL.md" = "sha256:ff616c1c447661298fb8e06a8a8a6ce60400d838c7c881b9e8bd526128e32901"
+"skills/shipit-grill-with-docs/ADR-FORMAT.md" = "sha256:f1f36cd3f8d3b6474ddd5855da4e233bfc4ae1a1c5024909ccf11871819a41b2"
+"skills/shipit-grill-with-docs/CONTEXT-FORMAT.md" = "sha256:886ce0e96fd0f76f4c72c337c049cf4655227c599862ce920a62297e0929beae"
+"skills/shipit-grill-with-docs/SKILL.md" = "sha256:47c25fe56510de6a63da1de9121ef9b6704808f3631d43c7f9ee745f2c32ff62"
+"skills/shipit-planning/SKILL.md" = "sha256:a16ac4744238b3a5b59da8a887bb6268742fd01a8a285797e0198aba49e44336"
+"skills/shipit-session-status/SKILL.md" = "sha256:4720ad9b381d57c32dfd2aca6cb2a4b338dfa69cac90eedd85a71f7f2f8db962"
+"skills/shipit-to-issues/SKILL.md" = "sha256:4df3706b12c89fb7d844521800addea1c9ab9f448cd7f926b993a5d92f46869b"
+"skills/shipit-to-prd/SKILL.md" = "sha256:0f13f20cad06161baff87628ea6b1cf5bac0cc7919beb6176535f9cdf9ae42d8"
+"AGENTS.md#shipit-block" = "sha256:3dbfc20b278929aaa6dfa0892d995967f6287f27203507e15291857786dda68a"
+"bin/shipit" = "sha256:317da6c4c43d10df6a54dcf4c3858379ac8569025969f98f12b9c42ad8e3820e"
+claude-start = "sha256:8a658d5d88269a0444e9843d5cddbf133e4ac9fb2e6862701980991bbd4d379c"
+"lefthook.yml" = "sha256:04485a9cec218f63549499cf76949f220e17b92c18fff4e67f2b85ccfff5c4ba"
+".markdownlint.yaml" = "sha256:b0834c9c810555866987cfec39862265322ef5048e92dac536563f6e21213553"
+".markdownlintignore" = "sha256:020113da3baf76d07c2785b8304c319fbafc1be2996ceaea9c18c5c7e482d6d6"
+".yamllint.yaml" = "sha256:d5c3b7b69d0bdd0ce25335e0db50cea2355b3c8ff62f4edbbf2a7d7909a2fd54"
+"pixi.toml#shipit-tasks" = "sha256:cd4a2539acc14e06db1875182eb4593ff302098856145f2c6c2ebc57c07361df"
+"pixi.toml#shipit-lint-deps" = "sha256:df44391ca8d72d123ddbb8139d92997e895ea52d4d1409d9b4a4dcd66ead5618"
+"pixi.toml#shipit-environments" = "sha256:c54b53e3bb55cd59aaabf9daea85c81cffe3cbae8978e41cbef5db0f16b3838b"
+".claude/agents/explorer.md" = "sha256:db4cc109e24df71c9062f31e55a92d1f0a9fdd25118649c729853195e6623657"
+".claude/agents/implementer.md" = "sha256:a5485f2a3d3317b5c3295ba471532f92fb2db0358cc79ce68951f93b495a08ee"
+".claude/agents/reviewer.md" = "sha256:71c08b63c3d1004fcb19855e5e2146fc519b65b658e50bb03af2208749f10f93"
+".claude/agents/shepherd.md" = "sha256:990face938a194c219cc370acd46a135e093d2d53ad1ab8e752fdd49056a10cc"
+".claude/settings.json#shipit-pretooluse-hook" = "sha256:596df072095077c26f1e7c5783768735aa8e088acc7656b911731e507b6de393"
+".claude/settings.json#shipit-stop-hook" = "sha256:bc9c571db686219e56a121a4618aa65359140abb3a21bdaade8cc26204af2e43"
+".claude/settings.json#shipit-subagentstop-hook" = "sha256:425d17986396cc441648e7dcc758f9c5c999760bb664b9bef27d0798bedfc053"
+".claude/settings.json#shipit-sessionstart-hook" = "sha256:b3f0ed85486752539925dddb7bdda5a960c116b103af4779aa483f6cf8b92230"
+".claude/settings.json#shipit-worktreecreate-hook" = "sha256:8373bbbb67e1b178d002d1246a0b81efea9f6d5547225efc845d0e992ad13a7f"

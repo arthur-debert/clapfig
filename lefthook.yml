@@ -1,0 +1,97 @@
+# Thin lefthook caller, managed by shipit (regenerate via `shipit install`) —
+# ALL lint-check logic lives in the `shipit lint` binary, invoked through the
+# managed `lint` pixi task (`pixi run -e lint lint`). lefthook is intentionally
+# dumb: one definition, run everywhere, so CI and the hooks cannot drift into
+# two transcriptions of the rules. Every task and environment invoked here is
+# satisfied by the shipit-managed pixi.toml blocks (the `[tasks]` line, the lint
+# feature/dependency block, the `[environments]` definition), so the hooks are
+# green on a stock consumer right after `shipit install`. The only repo-local
+# path referenced is the shipit-managed launcher `./bin/shipit` (covered next) —
+# itself part of the managed set, so a stock consumer has it too; no UNMANAGED
+# repo-local script or path is referenced.
+#
+# The pin, not PATH (ADR-0033): every shipit invocation below runs the repo's
+# pinned launcher `./bin/shipit`, NEVER a bare `shipit` resolved off PATH. A
+# bare PATH `shipit` is the machine-global (possibly auto-updating, possibly
+# stale) build — precisely the tool/managed-set drift the pin exists to kill,
+# and it would reappear at the highest-frequency surface (every commit, every
+# push). The managed `lint` task is `./bin/shipit lint`, so the `lint` legs
+# below ride the pin through that one indirection; the `classify-gate` and
+# `post-commit` legs call `./bin/shipit` directly. `bin/shipit` is a standalone
+# launcher (it reads `.shipit.toml`'s pin and execs that exact build) with NO
+# dependence on the pixi manifest, so the `-e lint` wrapper is preserved purely
+# for the lint TOOLCHAIN (ruff/shellcheck/…) — a separate concern from the
+# shipit build — and the manifest-ambiguity dodge below still holds.
+#
+# The `-e lint` is pinned (not bare `pixi run lint`): an inherited
+# `PIXI_PROJECT_MANIFEST` (a commit made from inside another pixi project's
+# activated environment) makes bare `pixi run lint` ambiguous across
+# environments and the hook dies. Pinning the environment removes the
+# ambiguity regardless of the inherited env.
+#
+# Fail-open when pixi is absent (#482): each leg is guarded by a `command -v
+# pixi` probe that skips (prints a note, `exit 0`) when pixi is not on PATH —
+# so a pixi-less environment (e.g. a consumer's legacy CI spine, `bin/check ->
+# lefthook run pre-commit`, which provisions no pixi) is not regressed to red
+# by the managed hook. Where pixi IS present (local dev, Trees, a pixi-aware
+# CI) the guard falls through and the FULL gate runs — the skip never weakens
+# the gate where the runtime exists. (The `run` scalars are folded YAML: the
+# line breaks fold to single spaces, so each is one shell one-liner.)
+#
+# Whole-tree (not staged-only): `pixi run -e lint lint` lints `git ls-files`,
+# so a green hook never lies about an unstaged edit.
+#
+# Repo-specific hook legs do NOT belong in this file — a local edit surfaces
+# as an OVERRIDE at the next `shipit install` reconcile, forever. Put them in
+# a committed `lefthook-local.yml`, which lefthook merges over this config
+# natively (shipit's own repo does exactly that for its .lex→.md mirror leg).
+# `piped: true` plus `priority: 2` on the lint command keep the slot open: a
+# local pre-commit leg with a lower priority runs first, and the pipe stops on
+# its failure before lint reads the tree.
+pre-commit:
+  piped: true
+  commands:
+    lint:
+      priority: 2
+      run: >-
+        command -v pixi >/dev/null 2>&1 || { echo "shipit: pixi not on PATH —
+        skipping this managed hook (pixi-less environment; the full gate runs
+        wherever pixi is provisioned)."; exit 0; };
+        pixi run -e lint lint
+
+pre-push:
+  commands:
+    lint:
+      run: >-
+        command -v pixi >/dev/null 2>&1 || { echo "shipit: pixi not on PATH —
+        skipping this managed hook (pixi-less environment; the full gate runs
+        wherever pixi is provisioned)."; exit 0; };
+        pixi run -e lint lint
+    # The classification tripwire (#423): block the push while the branch's
+    # PR has unclassified findings in its latest review round — the same
+    # CLASSIFY message the `pr next`/`pr status` gate reports (that gate is
+    # the arbiter; this is the fail-fast act-time seam). The verb fails OPEN
+    # on any inability to read the PR state, so a gh outage never blocks git.
+    # Runs the pinned build via `./bin/shipit` (ADR-0033), not a PATH `shipit`.
+    classify-gate:
+      run: >-
+        command -v pixi >/dev/null 2>&1 || { echo "shipit: pixi not on PATH —
+        skipping this managed hook (pixi-less environment; the full gate runs
+        wherever pixi is provisioned)."; exit 0; };
+        pixi run -e lint ./bin/shipit pr push-gate
+
+# Hook-witnessed dev-cycle tier (ADR-0032 / LOG04): POST-commit — the commit
+# exists and has a sha to record — emit `commit.created` into the durable
+# per-repo JSONL log via the constrained write verb. Registered names only;
+# domain keys (session from the env, epic/ws from the branch) are picked up by
+# the verb, not passed here. `--from-hook` makes the verb fail OPEN (exit 0,
+# WARNING) so a broken log path can never block git. Runs the pinned build via
+# `./bin/shipit` (ADR-0033) inside the same `-e lint` env as the lint caller.
+post-commit:
+  commands:
+    dev-cycle-event:
+      run: >-
+        command -v pixi >/dev/null 2>&1 || { echo "shipit: pixi not on PATH —
+        skipping this managed hook (pixi-less environment; the full gate runs
+        wherever pixi is provisioned)."; exit 0; };
+        pixi run -e lint ./bin/shipit log event commit.created --from-hook

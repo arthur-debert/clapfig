@@ -1,0 +1,21 @@
+# markdownlint config for the markdown leg of `shipit lint`, auto-discovered
+# from the repo root. Managed by shipit — a local edit surfaces as an OVERRIDE
+# at the next `shipit install` reconcile. Four rules are relaxed for the
+# markdown genre the managed set and its consumers ship; everything else stays
+# at markdownlint's defaults so real structural issues still fail the gate.
+#   - MD013 (line-length): prose and managed-block content where hard
+#     wrapping is churn, not signal.
+#   - MD041 (first-line-h1): the managed set ships fragment markdown (the
+#     AGENTS.md managed block is a `##` section, not a document), so "first
+#     line must be an h1" does not apply.
+#   - MD024 (no-duplicate-heading) -> siblings_only: Keep a Changelog files
+#     repeat `### Added` / `### Changed` under every version heading by design;
+#     only same-parent siblings colliding is a real duplicate.
+#   - MD033 (no-inline-html): changelog fragments and docs carry intentional
+#     inline tags (e.g. `<slug>` release metadata), not stray HTML.
+default: true
+MD013: false
+MD041: false
+MD024:
+  siblings_only: true
+MD033: false
