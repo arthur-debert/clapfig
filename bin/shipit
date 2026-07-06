@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# shipit pinned launcher — installed and managed by `shipit install` (ADR-0033).
+#
+# The repo pins its shipit: .shipit.toml's [shipit].version carries the FULL git
+# commit sha of the shipit build that wrote this repo's managed set, and this
+# launcher execs exactly that build via uv (cached after the first resolve), so
+# tool version and managed set travel as one versioned unit in the repo's
+# history. PATH is NEVER consulted — the old first-shipit-on-PATH walk silently
+# reintroduced the tool/managed-set drift the pin exists to kill.
+#
+# One sanctioned override exists for development: SHIPIT_EXEC=/path/to/build
+# execs that build instead — honored and ANNOUNCED (stderr here; the exec'd
+# shipit leaves the durable flow-log twin when it sees SHIPIT_EXEC set). The
+# self-exec guard survives in it: SHIPIT_EXEC pointing back at this launcher
+# would exec(2)-loop forever, so it is refused by inode comparison (`-ef`,
+# symlink- and relative-path-safe).
+#
+# A repo with no pin fails LOUD toward the bootstrap (exit 127): the external
+# `uv tool`-installed shipit's remaining role inside repos is exactly a virgin
+# repo's first `shipit install`, which stamps the pin this launcher needs.
+#
+# Do not edit — `shipit install` overwrites this file.
+set -euo pipefail
+
+SHIPIT_GIT_URL="git+https://github.com/arthur-debert/shipit"
+
+self="${BASH_SOURCE[0]:-$0}"
+repo_root="$(cd "$(dirname "$self")/.." && pwd)"
+manifest="$repo_root/.shipit.toml"
+
+# The development override (ADR-0033): honored and announced, never silent.
+if [ -n "${SHIPIT_EXEC:-}" ]; then
+	if [ -e "$SHIPIT_EXEC" ] && [ "$SHIPIT_EXEC" -ef "$self" ]; then
+		echo "shipit: SHIPIT_EXEC points at this launcher itself ($SHIPIT_EXEC); refusing the exec loop." >&2
+		exit 127
+	fi
+	echo "shipit: SHIPIT_EXEC override — exec'ing $SHIPIT_EXEC (the repo's pin is bypassed)." >&2
+	exec "$SHIPIT_EXEC" "$@"
+fi
+
+# Resolve the pin: the `version` key of .shipit.toml's [shipit] table (a full
+# git sha, stamped by `shipit install` from its own build identity). The file
+# is shipit-written flat TOML, so a table-scoped awk read is exact enough here;
+# the real parser lives on the Python side.
+pin=""
+if [ -f "$manifest" ]; then
+	pin="$(awk -F'"' '
+		/^\[/ { in_shipit = ($0 == "[shipit]") ? 1 : 0; next }
+		in_shipit && $1 ~ /^[[:space:]]*version[[:space:]]*=[[:space:]]*$/ { print $2; exit }
+	' "$manifest")"
+fi
+
+if [ -z "$pin" ]; then
+	echo "shipit: $manifest has no [shipit].version pin — this repo is not bootstrapped (ADR-0033)." >&2
+	echo "Bootstrap it: install shipit once (uv tool install --from $SHIPIT_GIT_URL shipit)," >&2
+	echo "then run \`shipit install --pr\` in this repo — the install stamps the pin this launcher execs." >&2
+	exit 127
+fi
+
+# The pin must be a FULL git object sha (40 hex for SHA-1, 64 for SHA-256) — the
+# same fail-closed check the Python side applies (config.shipit_pin / identity.Sha).
+# A non-sha value (the retired static `0.0.1`, a `seed` sentinel, an abbreviated
+# sha) is NOT a resolvable build: refuse toward the bootstrap rather than hand uv
+# a ref it would fail on with a murkier error.
+if ! printf '%s' "$pin" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$'; then
+	echo "shipit: $manifest [shipit].version is not a full git sha (40 or 64 hex chars) — this repo is not bootstrapped (ADR-0033)." >&2
+	echo "Re-bootstrap it: install shipit once (uv tool install --from $SHIPIT_GIT_URL shipit)," >&2
+	echo "then run \`shipit install --pr\` in this repo — the install stamps a valid pin this launcher execs." >&2
+	exit 127
+fi
+
+# Self-certification probe (ADR-0033): `shipit install` asserts this launcher
+# resolves the pin it just stamped. With SHIPIT_PIN_CHECK set, print the
+# resolved pin and stop — the real parse over the real manifest, with no uv
+# requirement and no network resolve in the postcondition.
+if [ -n "${SHIPIT_PIN_CHECK:-}" ]; then
+	printf '%s\n' "$pin"
+	exit 0
+fi
+
+command -v uv >/dev/null 2>&1 || {
+	echo "shipit: uv is not on PATH — the pinned launcher provisions the repo's shipit via uv (ADR-0033)." >&2
+	echo "Install uv (https://docs.astral.sh/uv/), then re-run." >&2
+	exit 127
+}
+
+# Exec the repo's pinned build via uv — cached after the first resolve; PATH
+# plays no part in choosing the build.
+exec uv tool run --from "$SHIPIT_GIT_URL@$pin" shipit "$@"

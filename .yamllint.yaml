@@ -1,0 +1,18 @@
+# yamllint config for the yaml leg of `shipit lint`, auto-discovered from the
+# repo root. Managed by shipit — a local edit surfaces as an OVERRIDE at the
+# next `shipit install` reconcile. Relaxes three rules that fight GitHub
+# Actions reality without adding signal:
+#   - document-start: workflows conventionally omit the `---` marker.
+#   - truthy check-keys: a workflow's `on:` key is not a boolean (the
+#     YAML 1.1 gotcha); only check values.
+#   - line-length: workflow lines routinely exceed 80; 120 is the cap.
+# Everything else is yamllint's default; the gate keeps --strict so any real
+# issue (not just these) fails hard.
+extends: default
+
+rules:
+  document-start: disable
+  truthy:
+    check-keys: false
+  line-length:
+    max: 120
