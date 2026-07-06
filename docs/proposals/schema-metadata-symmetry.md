@@ -131,26 +131,26 @@ handle, with the `LeafType` / `Field` / `Schema` output it produces.
 
 ### Type mapping rules
 
-| Rust field type                          | `LeafType` / `Field` emitted                  |
-|------------------------------------------|-----------------------------------------------|
-| `String`, `&'static str`                 | `LeafType::String`                            |
-| `i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`  | `LeafType::Integer`                           |
-| `u64`, `usize`, `isize`                  | `LeafType::Integer` (see TOML range note below) |
-| `f32`, `f64`                             | `LeafType::Float`                             |
-| `bool`                                   | `LeafType::Bool`                              |
-| `toml::value::Datetime`                  | `LeafType::DateTime`                          |
-| `chrono::DateTime<_>`, `chrono::NaiveDateTime` | `LeafType::DateTime` (feature-gated)    |
-| `Vec<T>` where `T → LeafType`            | `LeafType::Array(Box::new(T-as-LeafType))`    |
-| `BTreeMap<String, V>`, `HashMap<String, V>` where `V → LeafType` | `LeafType::Map(Box::new(V-as-LeafType))` |
-| `Option<T>` where `T → LeafType`         | `T-as-LeafType`, with `optional = true`       |
-| Unit-only enum `enum E { A, B, C }`      | `LeafType::Enum { values: [A, B, C] }` (variant names as strings, after `#[serde(rename_all)]`) |
-| Nested struct `S: Schema`                | `Field::Nested(S::schema())`                  |
-| `Vec<S>` where `S: Schema`               | `Field::ArrayOf(S::schema())`                 |
-| `#[serde(untagged)] enum`                | `LeafType::Value` (see issue #47)             |
-| `#[serde(tag = "...")] enum`             | `LeafType::Value` (clapfig doesn't validate variant shape) |
-| Tuple / struct-variant enum (non-`untagged`) | Compile error: ask the user to opt into `LeafType::Value` explicitly or restructure |
-| `toml::Value`                            | `LeafType::Value` (explicit untyped escape hatch) |
-| Any other type                           | Compile error pointing at `#[clapfig(value)]` |
+| Rust field type                                                  | `LeafType` / `Field` emitted                                                                    |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `String`, `&'static str`                                         | `LeafType::String`                                                                              |
+| `i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`                          | `LeafType::Integer`                                                                             |
+| `u64`, `usize`, `isize`                                          | `LeafType::Integer` (see TOML range note below)                                                 |
+| `f32`, `f64`                                                     | `LeafType::Float`                                                                               |
+| `bool`                                                           | `LeafType::Bool`                                                                                |
+| `toml::value::Datetime`                                          | `LeafType::DateTime`                                                                            |
+| `chrono::DateTime<_>`, `chrono::NaiveDateTime`                   | `LeafType::DateTime` (feature-gated)                                                            |
+| `Vec<T>` where `T → LeafType`                                    | `LeafType::Array(Box::new(T-as-LeafType))`                                                      |
+| `BTreeMap<String, V>`, `HashMap<String, V>` where `V → LeafType` | `LeafType::Map(Box::new(V-as-LeafType))`                                                        |
+| `Option<T>` where `T → LeafType`                                 | `T-as-LeafType`, with `optional = true`                                                         |
+| Unit-only enum `enum E { A, B, C }`                              | `LeafType::Enum { values: [A, B, C] }` (variant names as strings, after `#[serde(rename_all)]`) |
+| Nested struct `S: Schema`                                        | `Field::Nested(S::schema())`                                                                    |
+| `Vec<S>` where `S: Schema`                                       | `Field::ArrayOf(S::schema())`                                                                   |
+| `#[serde(untagged)] enum`                                        | `LeafType::Value` (see issue #47)                                                               |
+| `#[serde(tag = "...")] enum`                                     | `LeafType::Value` (clapfig doesn't validate variant shape)                                      |
+| Tuple / struct-variant enum (non-`untagged`)                     | Compile error: ask the user to opt into `LeafType::Value` explicitly or restructure             |
+| `toml::Value`                                                    | `LeafType::Value` (explicit untyped escape hatch)                                               |
+| Any other type                                                   | Compile error pointing at `#[clapfig(value)]`                                                   |
 
 `String` keys on maps are non-negotiable — TOML tables are string-keyed
 and clapfig's dotted-path machinery assumes it. Numeric or enum keys are
@@ -180,16 +180,16 @@ owned values.
 
 The macro reads the following attributes on each field:
 
-| Attribute                                | Effect                                       |
-|------------------------------------------|----------------------------------------------|
-| `///` doc comments                       | Populate `Leaf.doc` / `Schema.doc`           |
-| `#[clapfig(default = expr)]`             | `Leaf.default = Some(expr.into())`           |
-| `#[clapfig(env = "NAME")]`               | `Leaf.env = Some("NAME".into())`             |
-| `#[clapfig(optional)]`                   | Force `optional = true` on a non-`Option<T>` field. The macro **must** reject this attribute unless the field also carries `#[clapfig(default = ...)]`, since otherwise the typed `load()` would deserialize a missing field into a `T` that has no value — runtime panic territory. The intended spelling is `Option<T>`; this attribute is the rare opt-out for "I want `optional` semantics on a non-`Option<T>` field whose default makes the type recoverable." |
-| `#[clapfig(value)]`                      | Override type mapping with `LeafType::Value` |
-| `#[clapfig(rename = "name")]`            | Override field name in the schema and on deserialize |
-| `#[clapfig(skip)]`                       | Omit from schema and require a `Default` impl |
-| `#[clapfig(allowed = [...])]`            | Override enum variant collection (e.g. for `String` fields with a known value set, equivalent to runtime's `Field::enum_of([...])`) |
+| Attribute                     | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `///` doc comments            | Populate `Leaf.doc` / `Schema.doc`                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `#[clapfig(default = expr)]`  | `Leaf.default = Some(expr.into())`                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `#[clapfig(env = "NAME")]`    | `Leaf.env = Some("NAME".into())`                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `#[clapfig(optional)]`        | Force `optional = true` on a non-`Option<T>` field. The macro **must** reject this attribute unless the field also carries `#[clapfig(default = ...)]`, since otherwise the typed `load()` would deserialize a missing field into a `T` that has no value — runtime panic territory. The intended spelling is `Option<T>`; this attribute is the rare opt-out for "I want `optional` semantics on a non-`Option<T>` field whose default makes the type recoverable." |
+| `#[clapfig(value)]`           | Override type mapping with `LeafType::Value`                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `#[clapfig(rename = "name")]` | Override field name in the schema and on deserialize                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `#[clapfig(skip)]`            | Omit from schema and require a `Default` impl                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `#[clapfig(allowed = [...])]` | Override enum variant collection (e.g. for `String` fields with a known value set, equivalent to runtime's `Field::enum_of([...])`)                                                                                                                                                                                                                                                                                                                                  |
 
 The macro must also accept confique's existing `#[config(...)]` syntax
 during the migration window so users don't have to update every
@@ -198,12 +198,12 @@ commitment; the final state uses `#[clapfig(...)]` consistently.
 
 ### Struct-level attributes
 
-| Attribute                                | Effect                                       |
-|------------------------------------------|----------------------------------------------|
-| `///` doc comments                       | Populate `Schema.doc`                        |
-| `#[clapfig(name = "...")]`               | Override `Schema.name` (defaults to type name) |
-| `#[clapfig(strict = bool)]`              | Set `Schema.strict` for cascading strictness |
-| `#[clapfig(rename_all = "...")]`         | Apply confique/serde rename-all convention to all fields |
+| Attribute                        | Effect                                                   |
+| -------------------------------- | -------------------------------------------------------- |
+| `///` doc comments               | Populate `Schema.doc`                                    |
+| `#[clapfig(name = "...")]`       | Override `Schema.name` (defaults to type name)           |
+| `#[clapfig(strict = bool)]`      | Set `Schema.strict` for cascading strictness             |
+| `#[clapfig(rename_all = "...")]` | Apply confique/serde rename-all convention to all fields |
 
 ### Default-value expression handling
 
@@ -276,16 +276,16 @@ After this change:
 
 ## Downstream surfaces, before and after
 
-| Surface                          | Before                                       | After                                          |
-|----------------------------------|----------------------------------------------|------------------------------------------------|
-| JSON Schema `"type"`             | Sometimes missing on static                  | Always emitted                                 |
-| JSON Schema `"enum"`             | Never emitted on static                      | Emitted from unit-enum variant names           |
-| JSON Schema `"x-env"`            | Only when explicit `#[config(env)]` set      | Same — env-name derivation is still a layer concern, not a schema-time concern |
-| `config gen` template            | Confique's template; no enum hints, no type placeholders | Single emitter (`ops::emit_schema`) on both paths |
-| `config get`/`set` value validation | Serde round-trip on static, `LeafType::check` on runtime | `LeafType::check` on both                  |
-| `post_validate` argument         | `&C` on static, `&Table` on runtime          | Unchanged (irreducible)                        |
-| Strict-mode value context        | Same on both                                 | Same on both                                   |
-| `Field::ArrayOf` representation  | Static path goes through `Nested` (serde implicit) | Both paths emit `ArrayOf` explicitly       |
+| Surface                             | Before                                                   | After                                                                          |
+| ----------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| JSON Schema `"type"`                | Sometimes missing on static                              | Always emitted                                                                 |
+| JSON Schema `"enum"`                | Never emitted on static                                  | Emitted from unit-enum variant names                                           |
+| JSON Schema `"x-env"`               | Only when explicit `#[config(env)]` set                  | Same — env-name derivation is still a layer concern, not a schema-time concern |
+| `config gen` template               | Confique's template; no enum hints, no type placeholders | Single emitter (`ops::emit_schema`) on both paths                              |
+| `config get`/`set` value validation | Serde round-trip on static, `LeafType::check` on runtime | `LeafType::check` on both                                                      |
+| `post_validate` argument            | `&C` on static, `&Table` on runtime                      | Unchanged (irreducible)                                                        |
+| Strict-mode value context           | Same on both                                             | Same on both                                                                   |
+| `Field::ArrayOf` representation     | Static path goes through `Nested` (serde implicit)       | Both paths emit `ArrayOf` explicitly                                           |
 
 The "After" column is the new symmetric contract. The "Before" column
 is what review should weigh against — we are paying for symmetry with

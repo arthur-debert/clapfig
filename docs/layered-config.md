@@ -44,13 +44,13 @@ default).
 `search_paths()` accepts a list of `SearchPath` variants in priority-ascending
 order (last = highest priority):
 
-| Variant | Resolves to | Use case |
-| --------- | ------------- | ---------- |
-| `Platform` | OS config dir (XDG, `~/Library/...`, AppData) | User-level settings |
-| `Home(".myapp")` | `$HOME/.myapp/` | Cross-platform dotfile convention |
-| `Cwd` | Working directory | Project-local config |
-| `Path(path)` | Explicit directory | System defaults (`/etc/myapp/`), test fixtures |
-| `Ancestors(boundary)` | Walk up from CWD | `.editorconfig`-style per-directory config |
+| Variant               | Resolves to                                   | Use case                                       |
+| --------------------- | --------------------------------------------- | ---------------------------------------------- |
+| `Platform`            | OS config dir (XDG, `~/Library/...`, AppData) | User-level settings                            |
+| `Home(".myapp")`      | `$HOME/.myapp/`                               | Cross-platform dotfile convention              |
+| `Cwd`                 | Working directory                             | Project-local config                           |
+| `Path(path)`          | Explicit directory                            | System defaults (`/etc/myapp/`), test fixtures |
+| `Ancestors(boundary)` | Walk up from CWD                              | `.editorconfig`-style per-directory config     |
 
 Missing files are silently skipped — listing a search path is a suggestion,
 not a requirement.
@@ -104,9 +104,9 @@ requires reordering your search paths.
 
 With `env_prefix("MYAPP")` (or derived from `app_name("myapp")`):
 
-| Env var | Config key |
-|---------|------------|
-| `MYAPP__HOST` | `host` |
+| Env var                | Config key     |
+| ---------------------- | -------------- |
+| `MYAPP__HOST`          | `host`         |
 | `MYAPP__DATABASE__URL` | `database.url` |
 
 `__` (double underscore) separates nesting levels. Single `_` within a segment
