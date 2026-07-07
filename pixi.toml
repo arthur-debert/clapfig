@@ -18,7 +18,13 @@ provision-lexd = "./bin/shipit provision lexd"
 # the consumer environment). Canonical versions live HERE — a bump is one data
 # edit, rolled fleet-wide on each consumer's next `shipit install` reconcile.
 ruff = "0.15.*"
-shellcheck = "0.11.*"
+# shellcheck is PINNED DOWN to 0.10.* (not 0.11): shellcheck 0.11.0 has an SC2218
+# reaching-definitions false positive — a call to an EARLIER-defined function is
+# flagged "defined later" when a subshell (`$(...)`, a pipeline component, `<(...)`)
+# sits near the call, reddening the hermetic gate on CORRECT code across 5+ fleet
+# repos. 0.11.0 is the latest upstream (no fixed 0.11.x yet); restore 0.11+ when
+# upstream fixes it.
+shellcheck = "0.10.*"
 # conda-forge name for the `shfmt` binary
 go-shfmt = "3.*"
 yamllint = "1.38.*"

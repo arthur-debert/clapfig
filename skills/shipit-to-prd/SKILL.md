@@ -4,7 +4,7 @@ description: Turn the current conversation context into a PRD — the authoritat
 metadata:
     forked-from: https://github.com/mattpocock/skills (skills/engineering/to-prd)
 ---
-This skill takes the current conversation context and codebase understanding and produces a PRD. Do NOT interview the user — just synthesize what you already know. (The interview happens earlier, in `/shipit-grill-with-docs`.)
+This skill takes the current conversation context and codebase understanding and produces a PRD. Do NOT re-run the requirements interview — that happened earlier, in `/shipit-grill-with-docs`; synthesize the PRD from what you already know. This is not a fully AFK skill, though: step 2 still expects a short confirmation of the module boundaries and test scope with the user. That scoped confirmation is not a requirements interview.
 
 The issue tracker and triage label vocabulary should have been provided to you — run `/setup-matt-pocock-skills` if not.
 

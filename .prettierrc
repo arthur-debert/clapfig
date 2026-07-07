@@ -1,0 +1,43 @@
+# The canonical prettier config for the json/ts/svelte leg of `shipit lint`
+# (ADR-0037, the gate owns the config; LNT01-WS03 #516). shipit ships this ONE
+# body and injects it (`prettier --config <this>`) into every invocation, so no
+# ancestor/user `.prettierrc` is ever consulted. It resolves the fleet's only
+# genuine rule conflict — four TypeScript repos disagreed on `semi` /
+# `trailingComma` — to one set; WS04 (#517) unifies + reformats those repos to
+# it. YAML (not JSON) is the carrier so this documentation can live inline.
+singleQuote: true
+printWidth: 100
+tabWidth: 2
+semi: false
+trailingComma: none
+
+# The svelte + tailwindcss plugins are a CAPABILITY, not a rule, and are SCOPED to
+# `.svelte` via this `overrides` block rather than declared as a top-level
+# `plugins:` list. A top-level list is unconditional: prettier resolves every
+# plugin on load for EVERY invocation of this config, including the plain
+# json/TS leg, so on a tree that has not provisioned the plugins into
+# `node_modules` (a --depth-1 clone, shipit's own conda-forge lint env) prettier
+# would abort on load before ever parsing the JSON/TS file — which
+# `is_prettier_plugin_load_failure` (#498) then reads as an environment gap and
+# fails the leg OPEN (rc 0), silently passing a genuinely dirty JSON/TS file.
+# Scoping the plugins to an override keyed on `*.svelte` means prettier only
+# resolves them when it is actually asked to format a `.svelte` file — the
+# json/TS leg never touches them and cannot be masked by their absence
+# (verified: prettier 3.8.5 leaves an override's `plugins` unresolved for
+# non-matching files).
+#
+# Where the svelte leg's plugins COME FROM (LNT01-WS07 #520): they are npm
+# packages, NOT on conda-forge, so they cannot join the pixi lint-deps block the
+# way `prettier` itself does. They ride the consumer repo's OWN
+# `package.json` devDependencies + `npm ci` — which shipit Tree provisioning
+# already runs on any `package.json` (src/shipit/tree/create.py) — so prettier
+# (on PATH from conda-forge) resolves them from the repo's `./node_modules` when
+# it formats a `.svelte` file. Only the Svelte-bearing repos (they run their own
+# prettier via npm scripts) carry `.svelte` files AND those devDependencies;
+# shipit itself has neither, so its conda-forge lint env needs no plugin install.
+overrides:
+  - files: "*.svelte"
+    options:
+      plugins:
+        - prettier-plugin-svelte
+        - prettier-plugin-tailwindcss

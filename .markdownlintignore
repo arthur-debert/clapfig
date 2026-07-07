@@ -16,3 +16,16 @@
 # gates the source).
 skills/
 AGENTS.md
+# Test-data directories (issue #500): markdown fixtures / goldens / snapshots
+# are deliberately-malformed or byte-exact test inputs, not prose — flagging
+# them is noise about a test, not signal about a document. These are the same
+# conventions `shipit lint --fix` refuses to auto-rewrite
+# (lint.PROTECTED_TESTDATA_GLOBS); listing them here also spares check mode. A
+# directory pattern floats to any depth and drops its whole subtree.
+fixtures/
+__fixtures__/
+testdata/
+golden/
+goldens/
+snapshots/
+__snapshots__/

@@ -36,7 +36,7 @@ Then, for each epic, break its slice of the plan into **tracer bullet** Work Str
 - Favor making WS01 a **walking skeleton**: the thinnest end-to-end thread that proves the architecture is wired together
 </work-stream-rules>
 
-All Work Streams are AFK (implemented and merged by agents without mid-stream human interaction). The only human checkpoints are the upstream PRD approval and the final epic→main merge.
+Once the breakdown below is approved and published (step 4), Work Streams execute AFK — implemented and merged by agents without mid-stream human interaction. Across that execution phase the only human checkpoints are the upstream PRD approval and the final epic→main merge; the step-4 breakdown approval is the gate into that phase, not a checkpoint within it.
 
 ### 4. Quiz the user
 

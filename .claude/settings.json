@@ -13,7 +13,7 @@
       {
         "hooks": [
           {
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && pixi run ./bin/shipit hook sessionstart",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" || exit 0; test -x ./bin/shipit || { echo \"shipit: bin/shipit launcher not present or executable here \u2014 skipping this managed hook (run 'shipit install' to (re)provision it).\"; exit 0; }; ./bin/shipit hook sessionstart",
             "type": "command"
           }
         ]
@@ -32,7 +32,7 @@
       {
         "hooks": [
           {
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && pixi run ./bin/shipit hook pretooluse",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && pixi run --manifest-path \"$CLAUDE_PROJECT_DIR\"/pixi.toml -- ./bin/shipit hook pretooluse; rc=$?; if [ \"$rc\" -ne 0 ]; then echo \"shipit: PreToolUse guard could not run (rc=$rc) \u2014 refusing edit rather than allowing an unchecked coordinator edit. Likely causes: CLAUDE_PROJECT_DIR is unset or not a shipit checkout (the cd failed), pixi is not installed, or the pinned shipit environment could not be resolved. Install pixi (https://pixi.sh) if it is missing, then run this command from the project to see the underlying error: pixi run --manifest-path \\\"\\$CLAUDE_PROJECT_DIR\\\"/pixi.toml -- ./bin/shipit hook pretooluse\" >&2; exit 2; fi",
             "type": "command"
           }
         ],
@@ -43,7 +43,7 @@
       {
         "hooks": [
           {
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && pixi run ./bin/shipit hook stop",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" || exit 0; test -x ./bin/shipit || { echo \"shipit: bin/shipit launcher not present or executable here \u2014 skipping this managed hook (run 'shipit install' to (re)provision it).\"; exit 0; }; ./bin/shipit hook stop",
             "type": "command"
           }
         ]
@@ -53,7 +53,7 @@
       {
         "hooks": [
           {
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && pixi run ./bin/shipit hook subagent-stop",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" || exit 0; test -x ./bin/shipit || { echo \"shipit: bin/shipit launcher not present or executable here \u2014 skipping this managed hook (run 'shipit install' to (re)provision it).\"; exit 0; }; ./bin/shipit hook subagent-stop",
             "type": "command"
           }
         ]
@@ -63,7 +63,7 @@
       {
         "hooks": [
           {
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && pixi run ./bin/shipit hook worktreecreate",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" || exit 0; test -x ./bin/shipit || { echo \"shipit: bin/shipit launcher not present or executable here \u2014 skipping this managed hook (run 'shipit install' to (re)provision it).\"; exit 0; }; ./bin/shipit hook worktreecreate",
             "type": "command"
           }
         ]

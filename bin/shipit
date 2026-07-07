@@ -41,10 +41,17 @@ fi
 # Resolve the pin: the `version` key of .shipit.toml's [shipit] table (a full
 # git sha, stamped by `shipit install` from its own build identity). The file
 # is shipit-written flat TOML, so a table-scoped awk read is exact enough here;
-# the real parser lives on the Python side.
+# the real parser lives on the Python side. awk strips CR itself (gsub) and
+# reads the file directly — no `tr … | awk` pipe. That matters under `set -o
+# pipefail`: awk's early `exit` on the matched pin would close the pipe while
+# `tr` was still writing, so `tr` would take SIGPIPE, the pipeline would return
+# 141, and `set -e` would abort the launcher (#533). Reading the file directly
+# leaves no second process to SIGPIPE, while still defeating a CRLF checkout
+# (core.autocrlf=true / Windows) whose `[shipit]` header arrives as `[shipit]\r`.
 pin=""
 if [ -f "$manifest" ]; then
 	pin="$(awk -F'"' '
+		{ gsub(/\r/, "") }
 		/^\[/ { in_shipit = ($0 == "[shipit]") ? 1 : 0; next }
 		in_shipit && $1 ~ /^[[:space:]]*version[[:space:]]*=[[:space:]]*$/ { print $2; exit }
 	' "$manifest")"
