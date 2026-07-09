@@ -5,7 +5,7 @@ metadata:
     github-ref: refs/heads/main
     github-repo: https://github.com/mattpocock/skills
     github-tree-sha: 2c6aa7079cc705a6e0c319fcf23a0fa39968de29
-name: shipit-grill-with-docs
+name: grill-me-with-docs
 ---
 <what-to-do>
 

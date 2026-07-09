@@ -45,11 +45,22 @@
 # as an OVERRIDE at the next `shipit install` reconcile, forever. Put them in
 # a committed `lefthook-local.yml`, which lefthook merges over this config
 # natively (shipit's own repo does exactly that for its .lex→.md mirror leg).
-# `piped: true` plus `priority: 2` on the lint command keep the slot open: a
-# local pre-commit leg with a lower priority runs first, and the pipe stops on
-# its failure before lint reads the tree.
+# `priority: 2` on the lint command keeps the slot open: lefthook's default
+# sequential run orders commands by priority (0/unset sorts LAST), so a local
+# pre-commit leg with `priority: 1` still runs before lint reads the tree.
+#
+# NO hook-level execution-order option (`piped`/`parallel`) is set here —
+# deliberately (#544). lefthook refuses a merged hook where both are true
+# ("conflicting options 'piped' and 'parallel'"), crashing BEFORE any check
+# runs — so a hook-level option in this file collides with a consumer's own
+# `lefthook-local.yml` and bricks every commit in that repo. This file used
+# to set `piped: true` (stop the chain on a local leg's failure before lint
+# runs); the traded-away nicety is only that early stop — under the default
+# sequential run a failing local leg no longer skips lint, but the hook
+# still fails, so the gate is intact. `shipit install` also detects this
+# conflict class against the consumer's lefthook-local.yml at reconcile
+# time and refuses to publish a config that cannot run.
 pre-commit:
-  piped: true
   commands:
     lint:
       priority: 2
