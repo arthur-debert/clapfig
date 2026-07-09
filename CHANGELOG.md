@@ -1,10 +1,14 @@
-<!-- generated - do not edit. See CHANGELOG/README.txt -->
+<!-- generated - do not edit; fragments live in CHANGELOG/ (`shipit changelog render` regenerates this file) -->
 
 # Changelog
 
 ## Unreleased
 
+- Add tests for flatten.rs covering integer widths, tuples, enum variants, unit values, bytes error, and key serializer.
 Adopt fragment-directory changelog model ([#201](https://github.com/arthur-debert/release/issues/201)). Historical entries preserved verbatim in CHANGELOG/legacy.md; new entries land as files under CHANGELOG/unreleased/.
+- ci: migrate release reusable-workflow callers from @v2 to @v3
+- Revert the stray 0.21.6-release-rc version bump pushed to main by a release-tooling verification-cut bug; restore 0.21.5-rc.2.
+
 
 All notable changes to this project will be documented in this file.
 

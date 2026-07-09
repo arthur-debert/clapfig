@@ -1,599 +1,240 @@
 #!/usr/bin/env bash
-# bin/setup-dev-env.sh — per-session dev-environment setup, invoked by
-# the SessionStart hook in .claude/settings.json.
+# setup-dev-env.sh — Layer 0 bootstrap, installed and managed by `shipit install`.
 #
-# Source of truth: arthur-debert/release templates/commons/bin/setup-dev-env.sh.
-# Synced to consumers by release-sync (full file replace, no markers).
+# The managed set owns the consumer ENVIRONMENT (pixi envs, pinned linters,
+# issue #547), but everything above rides pixi — and the ADR-0033 pinned
+# `bin/shipit` launcher rides uv (`uv tool run` resolves the repo's pin). This
+# script provisions that base system: it reconciles pixi and uv TO THEIR PINS
+# (reconcile-to-pin, never install-if-missing — a drifted version is reconciled
+# exactly like an absent one) from sha256-verified GitHub release tarballs into
+# ~/.local/bin, then best-effort pre-solves the repo's pixi environments.
 #
-# Repos that need project-specific extras (Xvfb daemon, pinned-binary
-# fetch, extra rustup targets, etc.) put them in app-bin/post-setup-hook.sh
-# — this script calls that hook at the end if it exists.
+# Idempotent and cheap when converged: two version probes plus a locked solve
+# that no-ops. LOUD and fail-open on every miss (`setup-dev-env:` warnings on
+# stderr, exit 0): it runs from the managed SessionStart hook and must never
+# brick a session — a warned, degraded session beats no session. The one
+# hard-failing consumer of this script is docker/verify-self-provision.sh,
+# which asserts the pins landed.
 #
-# Pre-commit hook wiring AND git-submodule init run in BOTH local and cloud
-# sessions (a fresh clone has neither a wired `.git/hooks/pre-commit` nor
-# initialised submodules, regardless of where the dev is). Everything else
-# below the cloud-only gate is cloud-only — project dep caches, NSS cert
-# imports etc. are already in place on a dev's local machine.
+# Release tarballs, never `curl | sh` vendor installers: the Claude Code cloud
+# sandbox's default "Trusted" egress allowlist carries github.com and
+# release-assets.githubusercontent.com but NOT pixi.sh / astral.sh, so the
+# pinned, checksum-verified release asset is the one fetch path that works
+# identically on a laptop, in docker, and in a cloud session.
 #
-# Detects stack by filesystem signals — handles rust, node, ruby, python,
-# and consumers with no project deps (just lefthook / hand-rolled hook
-# wiring).
-#
-# Idempotent — safe to re-run. Errors are best-effort: a failure in one
-# step does not abort the rest (transient registry hiccups shouldn't
-# block the lefthook install).
-
+# Do not edit — `shipit install` overwrites this file.
 set -euo pipefail
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-cd "${REPO_ROOT}"
+# Keep PIXI_PIN in lockstep with `pixi-version` in the wf-checks workflow
+# block (.github/workflows/wf-checks.yml, setup-pixi in both its jobs — since
+# the TOL01-WS05 cutover ci.yml is a thin caller carrying no pin of its own):
+# CI and this bootstrap must provision the same pixi. A drift test
+# (tests/test_install.py) pins the two together.
+PIXI_PIN="0.71.0"
+# uv powers the managed `bin/shipit` launcher's pin resolve (ADR-0033) —
+# without it the pinned launcher cannot exec the repo's stamped build.
+UV_PIN="0.11.28"
 
-# --- 0.0. Git submodule content (BOTH local and cloud) ------------------
-# Runs in BOTH contexts, ABOVE the cloud-only gate, because a FRESH clone
-# has uninitialised submodules regardless of where it lands — the live-fire
-# round clones consumers fresh, and lex-fmt/lex carries a `comms/` submodule
-# (per .gitmodules) whose content the gate + tests need. The old §1
-# submodule step ran cloud-only on the (wrong) assumption that a local dev
-# always already has submodules in place; a fresh checkout doesn't, so the
-# gate/tests failed on missing submodule content (release#706, #728).
-#
-# Placed FIRST so submodule file content exists for everything downstream:
-# the §0.1 init/gate wiring, the gate itself, and the §2 dep installs / tests.
-# Guarded on .gitmodules so it's a no-op (the block is skipped entirely) when
-# the repo has no submodules. No-op-cheap when already in sync.
-#
-# Best-effort: a network hiccup fetching submodule content must NOT abort the
-# whole bootstrap (matches the script's continue-on-transient-errors stance) —
-# warn loudly so a genuinely-missing submodule surfaces rather than silently
-# failing a later gate/test step.
-if [ -f .gitmodules ]; then
-	git submodule update --init --recursive --quiet ||
-		echo "warning: git submodule update --init failed — submodule content may be missing (gate/tests that need it will fail)" >&2
-fi
+BIN_DIR="${HOME}/.local/bin"
 
-# --- 0. Arm the gate: ensure the lefthook toolset is installed ----------
-# THE gate (lefthook.yml) is HARD — a missing tool FAILS the commit, it does
-# not skip. So the bootstrap must guarantee the toolset in every environment
-# (the gate runs at session start, local pre-commit, and CI alike). Runs ABOVE
-# the cloud-only gate because the lint gate runs everywhere, not just in cloud.
-# Idempotent: each tool installs only when absent (no-op on a set-up machine);
-# a loud warning (never silent) surfaces an unarmed gate HERE rather than at
-# commit time. Best-effort installs — a transient failure shouldn't abort setup.
-
-_warn_unarmed() {
-	echo "warning: '$1' not installed and could not be auto-installed — the lefthook gate will FAIL until it is present. Install it, then re-run." >&2
+warn() {
+	echo "setup-dev-env: $*" >&2
 }
 
-# Pinned gate-toolset versions + the gate_version_matches reconcile helper —
-# single source of truth, shared with the CI provisioner
-# bin-internal/provision-gate-toolset.sh so the two can't diverge (release#498,
-# release#531). Synced alongside this script (same managed sync) so it is
-# normally always present; the `:=` fallbacks + the gate_version_matches fallback
-# are a last-resort safety net so a (broken) missing-file state can't abort the
-# SessionStart hook before install-release-core can self-heal. The `:=` fallbacks
-# are kept matching the shared file by tests/gate-tool-versions/.
-# shellcheck source=/dev/null
-[ -f "${REPO_ROOT}/bin/gate-tool-versions.sh" ] && . "${REPO_ROOT}/bin/gate-tool-versions.sh"
-: "${RUFF_VERSION:=0.15.12}"
-: "${ACTIONLINT_VERSION:=1.7.7}"
-: "${YAMLLINT_VERSION:=1.38.0}"
-: "${LEFTHOOK_VERSION:=2.1.9}"
-: "${PRETTIER_VERSION:=3.8.4}"
-: "${MARKDOWNLINT_CLI_VERSION:=0.48.0}"
-: "${SHELLCHECK_VERSION:=0.11.0}"
-: "${SHELLCHECK_PY_VERSION:=0.11.0.1}"
-: "${YQ_VERSION:=4.44.3}"
-command -v gate_version_matches >/dev/null 2>&1 || gate_version_matches() {
-	command -v "$1" >/dev/null 2>&1 || return 1
-	_gvm_have="$("$1" --version 2>/dev/null |
-		grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)"
-	[ "$_gvm_have" = "$2" ]
+# The supported platform triples mirror the fleet pixi platforms (Intel macs
+# unsupported, #540): anything else warns and skips — fail-open.
+resolve_triple() {
+	case "$(uname -s)/$(uname -m)" in
+	Linux/x86_64) echo "x86_64-unknown-linux-musl" ;;
+	Linux/aarch64) echo "aarch64-unknown-linux-musl" ;;
+	Darwin/arm64) echo "aarch64-apple-darwin" ;;
+	*) echo "" ;;
+	esac
 }
 
-# RECONCILE every tool to its pin (release#531), NOT install-if-missing: a
-# pre-existing floating brew/apt/npm binary reports a different version and gets
-# reinstalled at the pin instead of silently winning — the bug that let a dev box
-# run actionlint 1.7.12 while CI ran 1.7.7, so the same gate gave different
-# verdicts. Best-effort installs (a transient failure shouldn't abort the hook);
-# a loud re-check warning surfaces any still-unpinned tool HERE, not at commit.
-
-# npm globals: lefthook + prettier + markdownlint, each at its pin. Installed
-# before the hook wiring below so `lefthook install` finds the binary. The
-# markdownlint-cli package's binary is `markdownlint`.
-npm_pkgs=()
-gate_version_matches lefthook "$LEFTHOOK_VERSION" || npm_pkgs+=("lefthook@${LEFTHOOK_VERSION}")
-gate_version_matches prettier "$PRETTIER_VERSION" || npm_pkgs+=("prettier@${PRETTIER_VERSION}")
-gate_version_matches markdownlint "$MARKDOWNLINT_CLI_VERSION" || npm_pkgs+=("markdownlint-cli@${MARKDOWNLINT_CLI_VERSION}")
-if [ "${#npm_pkgs[@]}" -gt 0 ] && command -v npm >/dev/null 2>&1; then
-	npm install -g "${npm_pkgs[@]}" >/dev/null 2>&1 || true
-fi
-gate_version_matches lefthook "$LEFTHOOK_VERSION" || _warn_unarmed "lefthook@${LEFTHOOK_VERSION}"
-gate_version_matches prettier "$PRETTIER_VERSION" || _warn_unarmed "prettier@${PRETTIER_VERSION}"
-gate_version_matches markdownlint "$MARKDOWNLINT_CLI_VERSION" || _warn_unarmed "markdownlint@${MARKDOWNLINT_CLI_VERSION}"
-
-# pip tools: ruff + yamllint + shellcheck (via the shellcheck-py wheel — bundles
-# the binary, so shellcheck is pinned identically to ruff/yamllint with no
-# apt-0.9.0-vs-brew-0.11 split). Pinned to the CI versions so local and CI never
-# disagree on findings. Modern Debian/Ubuntu (PEP 668) reject a global pip
-# install without --break-system-packages; try that first, fall back to a plain
-# install (older distros / venvs reject the flag). Install stderr stays visible.
-if ! gate_version_matches ruff "$RUFF_VERSION" ||
-	! gate_version_matches yamllint "$YAMLLINT_VERSION" ||
-	! gate_version_matches shellcheck "$SHELLCHECK_VERSION"; then
-	if command -v pip3 >/dev/null 2>&1; then
-		pip3 install --quiet --break-system-packages \
-			"ruff==${RUFF_VERSION}" "yamllint==${YAMLLINT_VERSION}" "shellcheck-py==${SHELLCHECK_PY_VERSION}" >/dev/null ||
-			pip3 install --quiet \
-				"ruff==${RUFF_VERSION}" "yamllint==${YAMLLINT_VERSION}" "shellcheck-py==${SHELLCHECK_PY_VERSION}" >/dev/null || true
-	fi
-fi
-gate_version_matches ruff "$RUFF_VERSION" || _warn_unarmed "ruff==${RUFF_VERSION}"
-gate_version_matches yamllint "$YAMLLINT_VERSION" || _warn_unarmed "yamllint==${YAMLLINT_VERSION}"
-gate_version_matches shellcheck "$SHELLCHECK_VERSION" || _warn_unarmed "shellcheck==${SHELLCHECK_VERSION}"
-
-# actionlint: pinned official downloader → ~/.local/bin. apt has no actionlint
-# package and brew floats, so the downloader is the one cross-OS pinned source.
-# ~/.local/bin (not /usr/local/bin) needs no sudo and is first on PATH, so the
-# pinned binary deterministically shadows any floating brew/apt actionlint — the
-# install-if-missing hole that let a brew-installed actionlint outvote the pin.
-if ! gate_version_matches actionlint "$ACTIONLINT_VERSION" && command -v curl >/dev/null 2>&1; then
-	mkdir -p "${HOME}/.local/bin"
-	_actionlint_url="https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash"
-	curl -sSfL "${_actionlint_url}" |
-		bash -s -- "${ACTIONLINT_VERSION}" "${HOME}/.local/bin" >/dev/null || true
-fi
-gate_version_matches actionlint "$ACTIONLINT_VERSION" || _warn_unarmed "actionlint==${ACTIONLINT_VERSION}"
-
-# yq (mikefarah/Go): pinned GH-release binary → ~/.local/bin. release_core.yamlio
-# shells out to mikefarah's `yq -o=json` and `yq eval-all` (the gate reads + the
-# `release-core init` lefthook merge); a kislyuk python-yq (jq wrapper) squatting
-# /usr/bin/yq has neither and hard-fails the gate (release#755). Like actionlint,
-# install to ~/.local/bin (no sudo, first on PATH) so the pinned binary shadows
-# any python stub. mikefarah ships no installer script, so resolve OS/arch and
-# fetch the raw binary directly.
-if ! gate_version_matches yq "$YQ_VERSION" && command -v curl >/dev/null 2>&1; then
-	case "$(uname -s)" in Linux) _yq_os=linux ;; Darwin) _yq_os=darwin ;; *) _yq_os="" ;; esac
-	case "$(uname -m)" in x86_64 | amd64) _yq_arch=amd64 ;; aarch64 | arm64) _yq_arch=arm64 ;; *) _yq_arch="" ;; esac
-	if [ -n "${_yq_os}" ] && [ -n "${_yq_arch}" ]; then
-		mkdir -p "${HOME}/.local/bin"
-		# Download to a temp file (explicit template — BSD/macOS mktemp rejects a bare
-		# call) and install only if NON-EMPTY, so a failed download never leaves a
-		# truncated yq on PATH. Best-effort: a failure warns below, never aborts.
-		_yq_tmp="$(mktemp "${TMPDIR:-/tmp}/yq.XXXXXXXX")"
-		if curl -sSfL "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_${_yq_os}_${_yq_arch}" \
-			-o "${_yq_tmp}" >/dev/null 2>&1 && [ -s "${_yq_tmp}" ]; then
-			chmod +x "${_yq_tmp}" && mv "${_yq_tmp}" "${HOME}/.local/bin/yq"
-		fi
-		rm -f "${_yq_tmp}"
-	fi
-fi
-gate_version_matches yq "$YQ_VERSION" || _warn_unarmed "yq==${YQ_VERSION}"
-
-# golangci-lint — the go-quality gate's linter. Only Go repos run that hook, so
-# gate the install on a root go.mod existing (we cd'd to REPO_ROOT above; the
-# §2 `go mod download` block uses the same root check). brew on macOS; on Linux
-# the install script drops the binary into the Go bin dir, with `go
-# install` as the fallback when go is present but curl/sh isn't. Pinned to a
-# version (single source) for reproducibility. Install stderr stays visible —
-# matches the ruff/yamllint blocks; only stdout is muted.
-_GOLANGCI_LINT_VERSION="v1.64.8"
-if [ -f go.mod ] && ! command -v golangci-lint >/dev/null 2>&1; then
-	if command -v brew >/dev/null 2>&1; then
-		brew install golangci-lint >/dev/null || true
-	elif command -v go >/dev/null 2>&1; then
-		# GOBIN wins if set; else the FIRST entry of a (possibly colon-separated)
-		# GOPATH — `$(go env GOPATH)/bin` would be a broken path on a multi-entry
-		# GOPATH. The install script and `go install` both land the binary here.
-		_go_bin="$(go env GOBIN)"
-		[ -n "${_go_bin}" ] || _go_bin="$(go env GOPATH | cut -d: -f1)/bin"
-		if command -v curl >/dev/null 2>&1; then
-			curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh |
-				sh -s -- -b "${_go_bin}" "${_GOLANGCI_LINT_VERSION}" >/dev/null ||
-				go install "github.com/golangci/golangci-lint/cmd/golangci-lint@${_GOLANGCI_LINT_VERSION}" >/dev/null ||
-				true
-		else
-			go install "github.com/golangci/golangci-lint/cmd/golangci-lint@${_GOLANGCI_LINT_VERSION}" >/dev/null || true
-		fi
-	fi
-	command -v golangci-lint >/dev/null 2>&1 || _warn_unarmed golangci-lint
-fi
-
-# --- 0.1. Pull-model: self-update release_core from the published wheel --
-# The north star (ADR-0003): repos AUTO-UPDATE on session start — this REPLACED
-# the hand-run push treadmill (`orc propagate`, since removed). The boot resolver
-# `install-release-core`
-# resolves the latest release wheel, pip-installs it (--force-reinstall — the
-# wheel version is static, so `-U` would skip it; deps resolve from PyPI), THEN runs `release-core
-# init` itself (it locates the just-installed console-script across venv/--user/
-# system layouts). A bare `init` now installs the WHOLE set of managed files from
-# the wheel bundle (the .release/ temp dir + every working-tree mirror — skills,
-# configs, the CLAUDE.md header block) and auto-commits any managed change
-# (#476 cutover) — not just the config subset. So SessionStart self-syncs the full
-# set from the pulled wheel: no push needed (no push mechanism exists). One
-# command does the whole boot. Runs in BOTH local and cloud (above the cloud-only
-# gate) — auto-update is the whole point. Runs BEFORE the hook wiring (release#567):
-# init installs the ephemeral .release/ (the gate config), so the very first
-# session of a fresh clone wires a hook that has a gate to run.
-#
-# FAIL-LOUD on the load-bearing pull (WS6/F, release#763): the wheel pull is the
-# FOUNDATION — no wheel ⇒ no `release-core gate --hook` ⇒ no gate. So this no longer
-# `|| warn`s past a failed resolver: a genuine pull failure HALTS the session loudly
-# (the resolver already retries transient blips internally — 3 attempts with
-# backoff — and only a still-failing pull aborts, so a 1-second hiccup never
-# red-alerts). The DOWNSTREAM steps (init's managed-file refresh, gate wiring) stay
-# best-effort inside the resolver — the committed tree degrades gracefully there;
-# only the PULL itself is fail-loud. A consumer not yet seeded with the resolver
-# (no bin/install-release-core, not on PATH) still no-ops safely — there is nothing
-# to fail.
-#
-# The resolver is part of the committed bootstrap: it ships in the synced set
-# (templates/commons/bin/ → consumer bin/install-release-core), so it is found at
-# `$REPO_ROOT/bin/install-release-core` without needing the consumer's bin/ on
-# PATH. Fall back to a PATH lookup (release-dev, where dodot puts bin/ on PATH).
-# If neither resolves (a consumer not yet seeded with the resolver), the block
-# no-ops — safe to land fleet-wide before the seeding propagate.
-#
-# Install target: the resolver self-isolates — it installs release_core into its
-# OWN dedicated venv (never the user pip / system site / a project venv) and
-# symlinks the console-scripts onto PATH (~/.local/bin). So there's nothing to
-# choose here: just invoke it. (It still tolerates a stale caller passing
-# --user/--break-system-packages, so an in-flight fleet migration can't break.)
-_resolver=""
-if [ -x "${REPO_ROOT}/bin/install-release-core" ]; then
-	_resolver="${REPO_ROOT}/bin/install-release-core"
-elif command -v install-release-core >/dev/null 2>&1; then
-	_resolver="install-release-core"
-fi
-if [ -n "${_resolver}" ]; then
-	# FAIL-LOUD (WS6/F): no `|| warn` — a failed wheel pull HALTS the session loudly.
-	# The resolver retries transient blips internally and only aborts on a genuine
-	# failure (no wheel ⇒ no gate). Pass --cloud (WS5/E) so the resolver's
-	# `release-core init` runs the cloud-only provisioning steps (tag fetch, dep
-	# caches, NSS cert import) when in a cloud session; locally they are skipped.
-	if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
-		"${_resolver}" --cloud
+sha256_of() {
+	# GNU coreutils on Linux, shasum on macOS; "" when neither exists.
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | awk '{print $1}'
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$1" | awk '{print $1}'
 	else
-		"${_resolver}"
+		echo ""
 	fi
-fi
+}
 
-# --- 0.2. Pre-commit hook wiring (BOTH local and cloud) -----------------
-# Wiring `.git/hooks/pre-commit` is per-clone state — every fresh clone
-# (and cloud snapshot) starts without it, so we wire it on every session
-# and in both contexts. Runs ABOVE the cloud-only gate because skipping
-# it locally leaves the session with no pre-commit hook wired at all.
-#
-# Runs AFTER the pull-model boot (§0.1) deliberately (release#567): on a
-# fresh clone/session the boot installs release-core and `release-core
-# init` writes the ephemeral `.release/` temp dir (gitignored since WS4,
-# so EVERY session starts without it) — wiring first left the earliest
-# commits of a session without a hook at all, and a previously-wired hook
-# firing before init warn-and-passed on the missing config (the
-# first-commit-of-session boot hole; gate now fails loud on that too).
-#
-# Default: lefthook (binary installed at env-setup time in cloud, by
-# brew/cargo/npm locally). Fallback for repos that ship a hand-rolled
-# app-bin/pre-commit instead (zed-lex, tree-sitter-lex pattern): symlink
-# it into .git/hooks/.
+probe_version() {
+	# The first X.Y.Z token of `<tool> --version`, or "" (tool absent included).
+	"$1" --version 2>/dev/null | head -n 1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true
+}
 
-# Resolve lefthook binary. npm/pnpm consumers commonly have lefthook
-# installed at `node_modules/.bin/lefthook` (via `prepare: lefthook install`
-# in package.json) — `command -v lefthook` doesn't find that location, so
-# without this check the script silently falls through to the
-# app-bin/pre-commit branch in cloud sessions for npm consumers.
-_lefthook=""
-if [ -x node_modules/.bin/lefthook ]; then
-	_lefthook="node_modules/.bin/lefthook"
-elif command -v lefthook >/dev/null 2>&1; then
-	_lefthook="lefthook"
-fi
+place_binary() {
+	# $1 = source file, $2 = dest basename. Atomic within BIN_DIR: staged copy
+	# + same-dir `mv -f`, so a concurrent invocation never sees a torn binary.
+	local staged
+	staged="${BIN_DIR}/.${2}.setup-dev-env.$$"
+	cp "$1" "$staged" && chmod +x "$staged" && mv -f "$staged" "${BIN_DIR}/${2}"
+}
 
-if command -v release-core >/dev/null 2>&1 &&
-	{ [ -f .release/lefthook.yml ] || [ ! -f lefthook.yml ]; }; then
-	# WS3 (release#524): the gate definition lives ONLY in the ephemeral .release/
-	# temp dir — there is no tracked root lefthook.yml for a stock `lefthook
-	# install` shim to discover. Wire the git hook through the binary instead:
-	# `release-core gate --install-hook` writes .git/hooks/pre-commit (→ `release-core
-	# gate --hook`, which points lefthook at .release/lefthook.yml) and unsets any
-	# stale core.hooksPath redirect itself. This is the path every migrated consumer
-	# takes; the root-lefthook.yml branch below is for release's own repo (which
-	# keeps a hand-authored root gate) and not-yet-migrated consumers.
-	#
-	# The no-root-lefthook.yml arm (release#567): a consumer whose §0.1 init failed
-	# (network hiccup) has no .release/lefthook.yml YET — wire the binary hook
-	# anyway, so its commits hit `release-core gate --hook`'s fail-loud
-	# unbuilt-config error instead of running ungated with no hook at all.
-	if ! release-core gate --install-hook >/dev/null; then
-		echo "warning: release-core gate --install-hook failed — pre-commit hook NOT wired" >&2
+fetch_verified() {
+	# $1 = URL, $2 = expected sha256, $3 = dest file. The checksum is pinned in
+	# this script (verified from the published release assets), so a tampered or
+	# truncated download can never be installed.
+	local got
+	if ! command -v curl >/dev/null 2>&1; then
+		warn "curl is not available — cannot fetch $1"
+		return 1
 	fi
-elif [ -f lefthook.yml ] && [ -n "${_lefthook}" ]; then
-	# Root-lefthook.yml branch — release's own repo (hand-authored root gate).
-	if ! "${_lefthook}" install >/dev/null; then
-		echo "warning: lefthook install failed — pre-commit hook NOT wired" >&2
+	if ! curl -fsSL --retry 2 -o "$3" "$1"; then
+		warn "could not fetch $1"
+		return 1
 	fi
-elif [ -x app-bin/pre-commit ]; then
-	# Resolve the hooks dir via git plumbing rather than hardcoding
-	# `.git/hooks`. In a git-worktree the per-worktree hooks live under
-	# `.git/worktrees/<name>/hooks/`, and `.git` itself is a file (not
-	# a directory), so `mkdir -p .git/hooks` fails. `--git-path hooks`
-	# returns the right location in either layout. We also honor an
-	# already-set `core.hooksPath` if present — fallback consumers
-	# may have configured one deliberately. Use an absolute symlink
-	# target so it resolves correctly from any hooks-dir depth.
-	#
-	# Best-effort: warn-and-continue on failure (matches the rest of
-	# the script's continue-on-transient-errors stance — a failed
-	# mkdir/symlink on an unusual worktree layout shouldn't abort the
-	# entire dev-env setup).
-	_hooks_dir="$(git config --get core.hooksPath 2>/dev/null || git rev-parse --git-path hooks)"
-	# Best-effort with full diagnostics: don't suppress mkdir/ln stderr —
-	# if either fails, the user needs the underlying error to fix it
-	# (e.g. "Permission denied" pinpoints the actual issue).
-	if ! mkdir -p "${_hooks_dir}"; then
-		echo "warning: failed to mkdir -p \"${_hooks_dir}\" — pre-commit hook NOT wired" >&2
-	elif ! ln -sf "${REPO_ROOT}/app-bin/pre-commit" "${_hooks_dir}/pre-commit"; then
-		echo "warning: failed to symlink app-bin/pre-commit into \"${_hooks_dir}\" — pre-commit hook NOT wired" >&2
+	got="$(sha256_of "$3")"
+	if [ -z "$got" ]; then
+		warn "no sha256 tool (sha256sum/shasum) available — refusing the unverified $1"
+		return 1
 	fi
-fi
-
-# Cloud-only gate. Everything below is cloud-only — local sessions
-# already have submodules, project deps, the NSS cert DB, etc., set up
-# by the dev's machine.
-[ "${CLAUDE_CODE_REMOTE:-}" = "true" ] || exit 0
-
-# --- 1. Universal git hygiene --------------------------------------------
-# Cloud clones are shallow; restore release tags. Tag fetch is one
-# round-trip. (Submodule content is restored in §0.0 above, which runs in
-# BOTH local and cloud — a fresh checkout has uninitialised submodules in
-# either context, so it can't be cloud-only.)
-
-git fetch --tags --quiet origin || true
-
-# --- 2. Project dep cache ------------------------------------------------
-# Pick the right tool based on lockfile / manifest. Per stack, idempotent.
-
-# Rust: cargo fetch with --locked so we don't silently mutate Cargo.lock.
-if [ -f Cargo.toml ] && command -v cargo >/dev/null 2>&1; then
-	cargo fetch --locked --quiet || true
-fi
-
-# Go: `go mod download` populates the module cache without building.
-# Cheap when the cache is already warm; ~free in steady state. Keep
-# stderr visible so module-resolution / auth failures surface during
-# debugging — `|| true` keeps us best-effort without silencing the why.
-if [ -f go.mod ] && command -v go >/dev/null 2>&1; then
-	go version
-	go mod download || true
-fi
-
-# Node (npm/yarn/pnpm). We deliberately do NOT guard on `! -d node_modules`:
-# the env-snapshot caches a node_modules paired with a previous branch's
-# lockfile, and a feature branch that bumps the lockfile (Playwright is
-# the case) diverges silently. Re-installing when already in sync
-# is ~2s; chasing a stale lockfile bug is hours. Pay the two seconds.
-if [ -f package.json ]; then
-	if [ -f package-lock.json ] && command -v npm >/dev/null 2>&1; then
-		npm ci 2>/dev/null || npm install
-	elif [ -f yarn.lock ] && command -v yarn >/dev/null 2>&1; then
-		yarn install --frozen-lockfile 2>/dev/null || yarn install
-	elif [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then
-		pnpm install --frozen-lockfile 2>/dev/null || pnpm install
-	elif command -v npm >/dev/null 2>&1; then
-		# No lockfile committed — repos like tree-sitter-lex deliberately
-		# gitignore package-lock.json because the npm deps are dev-only
-		# tooling (tree-sitter-cli, bats) and a committed lockfile would be
-		# noise to bump. Without this branch, node_modules never gets
-		# populated and any `npx <tool>` invocation fails.
-		#
-		# --no-package-lock matches the consumer's intent: they chose not
-		# to commit a lockfile, so we shouldn't generate one in their
-		# working tree just because we ran install.
-		npm install --no-audit --no-fund --no-package-lock 2>/dev/null ||
-			npm install --no-package-lock
+	if [ "$got" != "$2" ]; then
+		warn "sha256 mismatch for $1 (got ${got}, want $2) — refusing to install"
+		return 1
 	fi
-fi
+}
 
-# Ruby / Bundler.
-if [ -f Gemfile ] && command -v bundle >/dev/null 2>&1; then
-	bundle install --quiet || true
-fi
-
-# Python / pip + venv. Triggered by any of the conventional manifests
-# (pyproject.toml, requirements.txt, setup.py) so legacy projects are
-# covered too.
-#
-# Run unconditionally on every session start — pip install is idempotent
-# (sub-second when the deps are already in place), and the alternative
-# (gating on `[ ! -d .venv ]`) means a half-installed .venv from a
-# previous run persists across sessions, and re-running the script can
-# never recover. mkdocs-lex's snapshot left .venv with only pip +
-# setuptools and tests then failed with ModuleNotFoundError — the guard
-# saw the directory, skipped reinstall, and nothing ever fixed it.
-#
-# Also: do NOT redirect install stderr to /dev/null. Swallowing the
-# message is what made the partial-venv state silent in the first place.
-# A loud warning to stderr surfaces real installation problems instead
-# of papering over them.
-if { [ -f pyproject.toml ] || [ -f requirements.txt ] || [ -f setup.py ]; } &&
-	command -v python3 >/dev/null 2>&1; then
-	# Gate venv creation on `.venv/bin/pip` being executable, not just
-	# `.venv/` existing. A previous run can leave the directory in place
-	# with pip missing (interrupted mid-snapshot, broken extraction);
-	# checking pip directly recovers from that. Warn loudly when the
-	# creation itself fails — otherwise the next gate silently skips all
-	# pip work and the agent debugs a missing-module mystery.
-	if [ ! -x .venv/bin/pip ]; then
-		if ! python3 -m venv .venv; then
-			echo "warning: python3 -m venv .venv failed — pip installs will be skipped" >&2
-		fi
+provision_pixi() {
+	local url sum tmp
+	url="https://github.com/prefix-dev/pixi/releases/download/v${PIXI_PIN}/pixi-${TRIPLE}.tar.gz"
+	case "$TRIPLE" in
+	x86_64-unknown-linux-musl) sum="2f30a2434b3786c860d11494f4dc6c1f3437fb47366d948e398409cae84e0a6c" ;;
+	aarch64-unknown-linux-musl) sum="568696c74bd734becf8c7bb84b7d5ea9beda58031f66a6288a8dbc47131dfbf9" ;;
+	aarch64-apple-darwin) sum="b3c7e0470a89f63db5b962a72141813e643752825ee8fd950f169ddb4a3d2a44" ;;
+	*) return 1 ;;
+	esac
+	tmp="$(mktemp -d)" || return 1
+	if ! fetch_verified "$url" "$sum" "${tmp}/pixi.tar.gz" ||
+		! tar -xzf "${tmp}/pixi.tar.gz" -C "$tmp" pixi ||
+		! place_binary "${tmp}/pixi" pixi; then
+		rm -rf "$tmp"
+		return 1
 	fi
-	if [ -x .venv/bin/pip ]; then
-		.venv/bin/pip install --upgrade pip --quiet || true
-		if [ -f pyproject.toml ]; then
-			# No fallback to plain `.` — modern pip treats `[dev]` against a
-			# pyproject without that extra as a warn-and-continue (still
-			# installs base, exits 0). A genuine failure means a real dep
-			# can't resolve, and falling back to `.` would silently leave
-			# the venv with base installed but dev-extras (pytest etc)
-			# missing. Surface the failure instead.
-			.venv/bin/pip install -e '.[dev]' --quiet ||
-				echo "warning: editable install failed — tests will not run (see pip output above)" >&2
-		elif [ -f requirements.txt ]; then
-			.venv/bin/pip install -r requirements.txt --quiet ||
-				echo "warning: requirements install failed — tests will not run" >&2
-		elif [ -f setup.py ]; then
-			.venv/bin/pip install -e . --quiet ||
-				echo "warning: editable install failed — tests will not run" >&2
-		fi
+	rm -rf "$tmp"
+}
 
-		# Expose venv-installed CLIs on the agent's bare PATH.
-		#
-		# The cloud Bash tool runs non-interactive shells whose PATH is
-		# fixed at session start and does NOT include
-		# ${REPO_ROOT}/.venv/bin. ~/.bashrc returns early for non-
-		# interactive shells (`[ -z "$PS1" ] && return`), so PATH fixes
-		# there are unreachable. The agent's `subprocess.run(['mkdocs',
-		# …])` (or any test that shells out to a venv CLI) resolves the
-		# command against the agent's PATH and gets FileNotFoundError.
-		#
-		# Symlink every executable in .venv/bin (except the
-		# python/pip/activate family — those would shadow system commands
-		# or break venv internals) into ${HOME}/.local/bin/, which IS on
-		# the agent's PATH (it's where uv / pipx / similar Python tooling
-		# already drops entry points). Idempotent — `ln -sf` overwrites
-		# stale symlinks pointing into a previous session's path.
-		#
-		# Consumers that install ADDITIONAL CLIs from project-local extras
-		# (pinned-binary downloads from GitHub releases, etc) should drop
-		# them directly into ${HOME}/.local/bin rather than .venv/bin, so
-		# they're discoverable on the same PATH without needing a second
-		# symlink pass.
-		if [ -d .venv/bin ]; then
-			# Create ~/.local/bin if missing — env/setup.sh doesn't and Ubuntu
-			# cloud images don't ship it by default in fresh users. The
-			# directory is on the default PATH for any login that picks up
-			# ~/.profile, but we still need it to exist before we ln into it.
-			mkdir -p "${HOME}/.local/bin"
-			for _venv_bin in .venv/bin/*; do
-				# Require both regular file (after symlink resolution) AND
-				# executable bit. `-x` alone matches directories, which would
-				# produce a useless dangling symlink if the glob ever did.
-				# Two separate guards, not `A && B || continue`: older shellcheck
-				# (Ubuntu's 0.9/0.10, which consumers run in CI) flags that form as
-				# SC2015. Equivalent behaviour, clean on every shellcheck version.
-				[ -f "${_venv_bin}" ] || continue
-				[ -x "${_venv_bin}" ] || continue
-				# Parameter expansion avoids forking basename per iteration.
-				_name="${_venv_bin##*/}"
-				case "${_name}" in
-				python | python[0-9]* | pip | pip[0-9]* | activate* | easy_install* | wheel | wheel[0-9]*)
-					continue
-					;;
-				esac
-				# `--` defends against (pathological) filenames starting with -;
-				# `|| true` matches the script's best-effort policy — a single
-				# permission hiccup shouldn't abort the rest of session setup.
-				ln -sf -- "${REPO_ROOT}/.venv/bin/${_name}" "${HOME}/.local/bin/${_name}" || true
-			done
+provision_uv() {
+	# The uv tarball nests its binaries under uv-<triple>/; install uv AND uvx
+	# (both ship in the asset, and uvx is the sibling entry point).
+	local url sum tmp
+	url="https://github.com/astral-sh/uv/releases/download/${UV_PIN}/uv-${TRIPLE}.tar.gz"
+	case "$TRIPLE" in
+	x86_64-unknown-linux-musl) sum="f02146b371c35c287d860f003ece7345c86e358a3fd70a9b63700cd141ee7fb4" ;;
+	aarch64-unknown-linux-musl) sum="da10cdfa7d92212b7acb62021a0fd61bcf8580c58c3632ec915d10c3a1a7906b" ;;
+	aarch64-apple-darwin) sum="33540eb7c883ab857eff79bd5ac2aa31fe27b595abecb4a9c003a2c998447232" ;;
+	*) return 1 ;;
+	esac
+	tmp="$(mktemp -d)" || return 1
+	if ! fetch_verified "$url" "$sum" "${tmp}/uv.tar.gz" ||
+		! tar -xzf "${tmp}/uv.tar.gz" -C "$tmp" ||
+		! place_binary "${tmp}/uv-${TRIPLE}/uv" uv ||
+		! place_binary "${tmp}/uv-${TRIPLE}/uvx" uvx; then
+		rm -rf "$tmp"
+		return 1
+	fi
+	rm -rf "$tmp"
+}
+
+provision_tool() {
+	# Direct dispatch (no `"$fn"` indirection — shellcheck 0.10's reachability
+	# analysis cannot follow an indirect call and would flag the provisioners
+	# as unreachable, SC2317).
+	case "$1" in
+	pixi) provision_pixi ;;
+	uv) provision_uv ;;
+	*) return 1 ;;
+	esac
+}
+
+reconcile_tool() {
+	# $1 = tool, $2 = pin. Exact pin match → no-op; anything else (absent OR
+	# drifted) → fetch + install, then re-probe and warn LOUDLY when the
+	# resolved version still mismatches (a PATH shadow is hiding the pinned
+	# binary). Always returns 0 — fail-open.
+	local have
+	have="$(probe_version "$1")"
+	if [ "$have" = "$2" ]; then
+		return 0
+	fi
+	if [ -z "$TRIPLE" ]; then
+		warn "unsupported platform $(uname -s)/$(uname -m) — cannot provision $1 $2 (found: ${have:-none})"
+		return 0
+	fi
+	warn "reconciling $1 to $2 (found: ${have:-none})"
+	if ! provision_tool "$1"; then
+		warn "$1 $2 was NOT provisioned — later steps that need it will degrade"
+		return 0
+	fi
+	have="$(probe_version "$1")"
+	if [ "$have" != "$2" ]; then
+		warn "installed $1 $2 into ${BIN_DIR}, but '$1 --version' resolves ${have:-nothing} — a PATH entry is shadowing the pinned binary (check 'command -v $1')"
+	fi
+}
+
+manifest_defines_lint_env() {
+	# Does pixi.toml's [environments] table define a `lint` env (the managed env
+	# block)? Table-scoped awk read, same pattern as the bin/shipit launcher's
+	# pin read — a flat grep would false-positive on the managed `[tasks]`
+	# `lint = "./bin/shipit lint"` line.
+	awk '
+		{ gsub(/\r/, "") }
+		/^\[/ { in_envs = ($0 == "[environments]") ? 1 : 0; next }
+		in_envs && $0 ~ /^[[:space:]]*lint[[:space:]]*=/ { found = 1; exit }
+		END { exit !found }
+	' "${REPO_ROOT}/pixi.toml"
+}
+
+TRIPLE="$(resolve_triple)"
+SELF="${BASH_SOURCE[0]:-$0}"
+REPO_ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+if ! mkdir -p "$BIN_DIR"; then
+	warn "could not create ${BIN_DIR} — nothing can be provisioned"
+	exit 0
+fi
+
+# ~/.local/bin must LEAD PATH for this run so the freshly placed pins win the
+# re-probe (and the pixi solve below) over any stale system copy.
+PATH="${BIN_DIR}:${PATH}"
+export PATH
+
+# When Claude Code hands us a session env file (cloud + SES01 sessions),
+# idempotently append a guarded PATH line so every LATER Bash call in the
+# session resolves the pins too — the marker comment keys the idempotence.
+if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
+	if ! grep -Fqs "setup-dev-env: pinned base-system PATH" "$CLAUDE_ENV_FILE"; then
+		if ! printf '%s\n' "case \":\$PATH:\" in *\":\$HOME/.local/bin:\"*) ;; *) export PATH=\"\$HOME/.local/bin:\$PATH\" ;; esac # setup-dev-env: pinned base-system PATH" >>"$CLAUDE_ENV_FILE"; then
+			warn "could not append the PATH line to CLAUDE_ENV_FILE (${CLAUDE_ENV_FILE})"
 		fi
 	fi
 fi
 
-# --- 2.5. Chromium NSS DB cert import ------------------------------------
-# Cloud sessions route HTTPS through an "Anthropic sandbox-egress…CA"
-# proxy that re-signs every leaf cert. Chromium on Linux ignores the
-# OpenSSL bundle and reads its own NSS DB at ~/.pki/nssdb — without
-# the CA imported there, every HTTPS resource an Electron / Playwright
-# test loads is rejected with ERR_CERT_AUTHORITY_INVALID. The e2e
-# harness's runtime-error fixture surfaces that as a `console.error`
-# and the test auto-fails.
-#
-# Cert layouts seen in the cloud env (probe both):
-#   (A) Historical (~pre-2026-05): the sandbox-egress CA was
-#       concatenated into the system bundle
-#       /etc/ssl/certs/ca-certificates.crt alongside public roots.
-#   (B) Current (2026-05+): the CA ships as standalone PEMs at
-#       /etc/ssl/certs/swp-ca-{production,staging}.pem; it is NOT
-#       written into the system bundle, so the old layout-A grep gate
-#       silently misses it and the NSS DB is never populated. `curl`
-#       and Node still work because they read the bundle directly via
-#       their own paths — only Chromium / Electron is affected.
-#
-# Strategy: collect candidate PEMs from both layouts into a scratch
-# dir, then run the subject-match-and-import loop over the union.
-# Fast-path: skip everything if neither layout has any matching cert
-# (non-cloud Linux box). Idempotent — `certutil -L -n <nick>` short-
-# circuits the `-A` import once a cert is present.
-#
-# Gated on `certutil` AND `openssl` existing (the loop forks openssl
-# per cert to extract the subject); both are env-level state on cloud
-# sessions but may be absent locally.
-if [ "$(uname -s)" = "Linux" ] &&
-	command -v certutil >/dev/null 2>&1 &&
-	command -v openssl >/dev/null 2>&1; then
-	# Subshell scopes the EXIT trap so cleanup is reliable under `set -e`
-	# AND doesn't overwrite a process-wide EXIT trap. The subshell exits
-	# when this block finishes, the trap fires, the tmp dir is gone — no
-	# leak even if awk/cp/openssl error out below.
-	#
-	# The trailing `|| true` matches the script's stated philosophy
-	# (line ~19: errors are best-effort). A cert-import failure shouldn't
-	# abort the rest of the dev-env bootstrap.
-	(
-		_ca_tmp="$(mktemp -d)"
-		trap 'rm -rf "${_ca_tmp}"' EXIT
-		_found=0
+reconcile_tool pixi "$PIXI_PIN"
+reconcile_tool uv "$UV_PIN"
 
-		# Layout A: split the system bundle into per-cert PEMs if it contains
-		# any Anthropic CA. Cheap grep gate avoids the awk fork on non-cloud
-		# Linux boxes (where the bundle has no matches).
-		if [ -f /etc/ssl/certs/ca-certificates.crt ] &&
-			grep -q 'Anthropic' /etc/ssl/certs/ca-certificates.crt 2>/dev/null; then
-			awk -v sandbox_dir="${_ca_tmp}" '
-        /-----BEGIN CERTIFICATE-----/ { n++; fn = sandbox_dir "/bundle_" n ".pem"; in_cert = 1 }
-        in_cert                       { print > fn }
-        /-----END CERTIFICATE-----/   { in_cert = 0; close(fn) }
-      ' /etc/ssl/certs/ca-certificates.crt
-			_found=1
+# Best-effort environment pre-solve. `--locked` ONLY: provisioning must never
+# mutate pixi.lock (ADR-0033 — provisioning mutates nothing managed); a lock
+# drift fails the solve loudly here and stays the repo's own problem. Fast
+# no-op when the envs are already solved against the lockfile.
+if [ -f "${REPO_ROOT}/pixi.toml" ]; then
+	if ! command -v pixi >/dev/null 2>&1; then
+		warn "pixi is unavailable — skipping the environment solve"
+	else
+		if ! (cd "$REPO_ROOT" && pixi install --locked); then
+			warn "pixi install --locked failed (default env) — the next pixi run will surface the error"
 		fi
-
-		# Layout B: copy standalone swp-ca-*.pem files into the scratch dir.
-		# The glob may be unexpanded if no file matches; guard with -f.
-		for _pem in /etc/ssl/certs/swp-ca-*.pem; do
-			[ -f "${_pem}" ] || continue
-			cp "${_pem}" "${_ca_tmp}/$(basename "${_pem}")"
-			_found=1
-		done
-
-		if [ "${_found}" = "1" ]; then
-			_nssdb="${HOME}/.pki/nssdb"
-			mkdir -p "${_nssdb}"
-			if [ ! -f "${_nssdb}/cert9.db" ]; then
-				certutil -d "sql:${_nssdb}" -N --empty-password >/dev/null 2>&1 || true
+		if manifest_defines_lint_env; then
+			if ! (cd "$REPO_ROOT" && pixi install --locked --environment lint); then
+				warn "pixi install --locked -e lint failed — the next lint run will surface the error"
 			fi
-			for _pem in "${_ca_tmp}"/*.pem; do
-				[ -f "${_pem}" ] || continue
-				_subject="$(openssl x509 -in "${_pem}" -noout -subject 2>/dev/null || true)"
-				case "${_subject}" in
-				*Anthropic*sandbox-egress*)
-					_nick="$(printf '%s' "${_subject}" | sed -nE 's/.*CN *= *([^,]+).*/\1/p')"
-					[ -n "${_nick}" ] || continue
-					if ! certutil -d "sql:${_nssdb}" -L -n "${_nick}" >/dev/null 2>&1; then
-						certutil -d "sql:${_nssdb}" -A -t "C,," -n "${_nick}" -i "${_pem}" >/dev/null 2>&1 || true
-					fi
-					;;
-				esac
-			done
 		fi
-	) || true
-fi
-
-# --- 4. Per-repo hook -------------------------------------------------------
-_hook="${REPO_ROOT}/app-bin/post-setup-hook.sh"
-if [ -f "${_hook}" ]; then
-	if [ -x "${_hook}" ]; then
-		"${_hook}"
-	else
-		echo "warning: ${_hook} exists but is not executable; skipping" >&2
 	fi
 fi
+
+exit 0

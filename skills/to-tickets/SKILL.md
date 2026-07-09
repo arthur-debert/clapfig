@@ -1,10 +1,10 @@
 ---
-name: shipit-to-issues
+name: to-tickets
 description: Break a PRD into one or more epic tracker issues plus independently-grabbable Work Stream sub-issues on the project issue tracker, using tracer-bullet vertical slices. Use when user wants to convert a plan/PRD into epics and work streams, create implementation tickets, or break down work.
 metadata:
     forked-from: https://github.com/mattpocock/skills (skills/engineering/to-issues)
 ---
-# To Issues
+# To Tickets
 
 Break a plan into independently-grabbable **Work Streams (WS)** using vertical slices (tracer bullets). Each Work Stream ships as one PR.
 
@@ -14,9 +14,9 @@ The issue tracker and triage label vocabulary should have been provided to you �
 
 ### 1. Gather context
 
-Work from whatever is already in the conversation context. The authoritative source is the **PRD file in `docs/prd/`** (the feature spec — the *what & why*), produced by `/shipit-to-prd`. Read it in full, along with the ADRs it references. If the user passes a reference (PRD path, issue number, or URL) as an argument, fetch it and read it fully.
+Work from whatever is already in the conversation context. The authoritative source is the **PRD file in `docs/prd/`** (the feature spec — the *what & why*), produced by `/to-prd`. Read it in full, along with the ADRs it references. If the user passes a reference (PRD path, issue number, or URL) as an argument, fetch it and read it fully.
 
-This skill **creates the epic umbrella issue(s)** — do not assume one already exists. The epic issue is an **execution tracker** (PRD summary + pointers to the PRD/ADRs + the WS topology), not the spec; the PRD file stays authoritative. (`/shipit-to-prd` writes the PRD only; epic-issue creation lives here.)
+This skill **creates the epic umbrella issue(s)** — do not assume one already exists. The epic issue is an **execution tracker** (PRD summary + pointers to the PRD/ADRs + the WS topology), not the spec; the PRD file stays authoritative. (`/to-prd` writes the PRD only; epic-issue creation lives here.)
 
 ### 2. Explore the codebase (optional)
 
