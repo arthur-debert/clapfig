@@ -1,0 +1,61 @@
+name: Checks
+
+# Thin caller of shipit's wf-checks quality-checks block (ADP02-WS05, #85;
+# ADR-0010/0039/0040: consumer CI is routing-only YAML over shipit-published
+# reusable workflows). Replaces the legacy caller of
+# arthur-debert/release/.github/workflows/rust-ci.yml@v3: the lane planner
+# (`shipit ci plan`) reads .shipit.toml [lanes] and emits the lint + test
+# matrix, and each job runs `pixi run --locked <run>` — the same
+# implementation a laptop runs. The block is consumed by the floating major
+# ref @v1, per the ADR-0010 publishing convention.
+#
+# The legacy caller passed NO inputs (clapfig is a rust-lib: no binary, no
+# bats e2e, no wasm, no submodules), so its whole surface was the check job's
+# fmt + clippy + nextest umbrella — fully relocated into the lint + test
+# lanes. Release workflows (release.yml) stay on the legacy release path.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# Superseded-run hygiene (shipit#645): a branch with an open PR gets BOTH a
+# push run and a pull_request run per push. The group is scoped per EVENT and
+# per ref/PR: `github.event_name` keeps the push run and the PR run of the
+# same head in separate groups (both verdicts are legit), while within one
+# event a new push cancels the now-superseded in-flight run for the same
+# branch (push: github.ref) or the same PR (pull_request: PR number). A
+# cancelled-because-superseded run belongs to an old head, and the `check`
+# job below turns cancellation into a SKIP, so it is never the surviving
+# verdict on the current head.
+concurrency:
+  group: checks-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: arthur-debert/shipit/.github/workflows/wf-checks.yml@v1
+  # The merge-blocking verdict under ONE stable name: branch protection
+  # requires `check`, and a called workflow's jobs report as
+  # "checks / <lane>" — so this aggregator keeps the exact `check` name
+  # alive, succeeding iff the block succeeded. Result propagation with one
+  # deliberate hole (shipit#645): a CANCELLED block means the run was
+  # superseded (the concurrency group above cancelled it for a newer head),
+  # and the new head's run carries the verdict — so cancellation SKIPS this
+  # job (a skipped required check counts as satisfied, i.e. neutral) instead
+  # of failing it. Every completed result stays explicit via `if: always()`:
+  # success passes, anything else — including a skipped block — fails.
+  check:
+    needs: checks
+    if: always() && needs.checks.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verdict
+        env:
+          RESULT: ${{ needs.checks.result }}
+        run: |
+          echo "wf-checks: $RESULT"
+          test "$RESULT" = "success"

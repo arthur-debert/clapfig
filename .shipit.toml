@@ -34,6 +34,33 @@ ignore = [
   "pnpm-lock.yaml",
 ]
 
+# [lanes] — the declared PR-time check units (ADP02-WS05, #85). The lane
+# planner (`shipit ci plan`) maps these + the CI event + a path-diff to the job
+# matrix the wf-checks workflow block runs (`pixi run --locked <run>` per job).
+# Modeled on lex-fmt/lex#829 (first-consumer cutover). Lane tasks
+# SELF-PROVISION — on a hosted runner nothing outside pixi exists:
+#   - `lint-full` (NOT the managed bare `lint` task, which runs in the default
+#     env where no lint tool exists on a runner) resolves into the pixi lint
+#     env, where the managed toolchain (ruff/shfmt/prettier/markdownlint/
+#     actionlint/rust 1.96) lives — see [feature.lint.tasks] in pixi.toml.
+#     No lexd provisioning: this repo tracks zero .lex files, so the lex Lang
+#     of `shipit lint` never runs.
+#   - `test` is the managed pixi task (`./bin/shipit test` → cargo nextest per
+#     the rust toolchain; a REAL task, so the #444 POSIX-`test` trap does not
+#     apply). No inline provisioning needed — no submodules, no assets — so
+#     the lane routes to the managed task directly; its full `cargo nextest`
+#     stack (rust, cargo-nextest) and the launcher's uv ride pixi's default
+#     env ([dependencies] in pixi.toml).
+[lanes.lint]
+run = "lint-full"
+required = true
+local = true
+
+[lanes.test]
+run = "test"
+required = true
+local = true
+
 [toolchains]
 "." = "rust"
 
