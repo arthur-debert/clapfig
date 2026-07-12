@@ -51,6 +51,38 @@ actionlint = "1.7.*"
 lefthook = "2.1.*"
 # <<< shipit-managed lint deps <<<
 
+[feature.lint.tasks]
+# The wf-checks LINT LANE's run (ADP02-WS05, #85), byte-modeled on lex#829 /
+# shipit's own: the lint toolchain (ruff/shfmt/prettier/markdownlint/
+# actionlint/rust 1.96) lives in THIS feature's env, so the lane task must
+# resolve into the lint env — the managed bare `lint` task is a fixed plain
+# string that runs in the default env, where none of those tools exist on a
+# hosted runner. No `provision lexd` step (unlike lex/lexed): this repo tracks
+# zero .lex files, so the lex Lang of `shipit lint` never runs. Defined ONLY
+# in this feature, so it exists in EXACTLY ONE env (lint) and bare
+# `pixi run lint-full` resolves unambiguously — the wf-checks matrix job's
+# `pixi run --locked lint-full` and a laptop run are identical.
+lint-full = { cmd = "./bin/shipit lint" }
+
+# Consumer-owned dependencies (outside the shipit-managed blocks above),
+# added for the wf-checks TEST LANE (ADP02-WS05, #85): the lane runs
+# `pixi run --locked test` (→ `./bin/shipit test` → `cargo nextest run`) on a
+# hosted runner where nothing outside pixi is provisioned (hosted images no
+# longer carry Rust, and the pinned planner emits no env/cache descriptors
+# that would put a toolchain on PATH), so the default env must carry the full
+# `cargo nextest` stack itself. Same conda-forge rust pin as the managed
+# [feature.lint.dependencies] block.
+[dependencies]
+rust = "1.96.*"
+cargo-nextest = ">=0.9.138,<0.10"
+# uv backs the pinned bin/shipit launcher (ADR-0033: it provisions the repo's
+# pinned shipit via uv, PATH-independent). Both wf-checks lanes run
+# `pixi run --locked <task>` -> ./bin/shipit on a hosted runner where uv is
+# not otherwise present, so the launcher's one prerequisite must ride the env
+# too. (Known upstream gap: the block/managed set should own this —
+# shipit#758, first flagged by lex#828/#829.)
+uv = ">=0.5"
+
 [environments]
 # >>> shipit-managed environments (do not edit; regenerate via `shipit install`) >>>
 lint = ["lint"]
