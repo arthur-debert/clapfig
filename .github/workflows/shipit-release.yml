@@ -28,17 +28,23 @@ name: shipit-release
 # nothing, and skips. The choices stay offered because this caller rides
 # the blessed shape, never a trimmed variant.
 #
-# Secrets — exactly the plan-required set for clapfig's plan:
+# Secrets — the plan-required set (shipit#896): preflight re-validates
+# the WHOLE release plan at every stage entry, so each stage job
+# forwards EVERY plan-required secret its called block declares — never
+# a hand-picked subset of the declared set; which secrets a stage
+# actually spends is the plan's call, not this caller's. For clapfig:
+# `prepare` forwards the full set (same as `full`); `publish` forwards
+# the registry set its block declares; `build` and `sign` declare no
+# secrets, so they forward none (adding undeclared secrets to a `uses:`
+# job is an error).
 #   RELEASE_TOKEN         prepare's tag+branch push through the ruleset
 #                         (a GITHUB_TOKEN push would not re-trigger
 #                         workflows).
 #   CARGO_REGISTRY_TOKEN  the crates endpoint's registry token, mapped
 #                         from this repo's legacy-named CRATES_IO_KEY
-#                         secret (NOT renamed: the legacy release.yml
-#                         still consumes it under that name until the
-#                         post-rc-proof step retires it). Forwarded to
-#                         the stages that can publish crates (`full`,
-#                         `publish`); the RC guard drops the crates
+#                         secret (the repo secret keeps its legacy name;
+#                         renaming it is a repo settings change, not
+#                         this caller's). The RC guard drops the crates
 #                         endpoint on an -release-rc version centrally.
 # gh-release rides the workflow's own GITHUB_TOKEN (no registry entry).
 # The Apple signing set is not forwarded: clapfig has never signed mac
@@ -123,6 +129,7 @@ jobs:
       unsigned: ${{ inputs.unsigned }}
     secrets:
       RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_KEY }}
 
   build:
     if: inputs.stage == 'build'
