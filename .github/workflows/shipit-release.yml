@@ -28,14 +28,15 @@ name: shipit-release
 # nothing, and skips. The choices stay offered because this caller rides
 # the blessed shape, never a trimmed variant.
 #
-# Secrets — the UNIFORM plan-required set (shipit#896): preflight
-# re-validates the WHOLE release plan at every stage entry, so every
-# stage job forwards the SAME secret set as `full` — no per-stage
-# subsetting; which secrets a stage actually spends is the plan's call,
-# not this caller's. For clapfig that means `prepare` forwards the full
-# set; `publish` keeps the registry set its block declares; `build`
-# declares no secrets, so it forwards none (adding undeclared secrets
-# to a `uses:` job is an error).
+# Secrets — the plan-required set (shipit#896): preflight re-validates
+# the WHOLE release plan at every stage entry, so each stage job
+# forwards EVERY plan-required secret its called block declares — never
+# a hand-picked subset of the declared set; which secrets a stage
+# actually spends is the plan's call, not this caller's. For clapfig:
+# `prepare` forwards the full set (same as `full`); `publish` forwards
+# the registry set its block declares; `build` and `sign` declare no
+# secrets, so they forward none (adding undeclared secrets to a `uses:`
+# job is an error).
 #   RELEASE_TOKEN         prepare's tag+branch push through the ruleset
 #                         (a GITHUB_TOKEN push would not re-trigger
 #                         workflows).
