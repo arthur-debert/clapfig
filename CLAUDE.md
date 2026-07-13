@@ -1,1 +1,1 @@
-@.claude/IMPORTANT-RELEASE.md
+@AGENTS.md
