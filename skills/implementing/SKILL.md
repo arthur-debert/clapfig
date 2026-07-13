@@ -17,7 +17,7 @@ Your brief should name:
 
 - the issue this Run implements;
 - exact verify commands;
-- governing PRD, ADR, or docs to self-check against;
+- governing Spec, ADR, or docs to self-check against;
 - decision boundaries and out-of-scope items.
 
 If a mandatory slot is missing, flag it in your handoff and in the PR `## Context` note instead of guessing. Work inside the Tree and branch you were given. A standalone issue branch is `issues/<id>/<session>` from `origin/main`; an epic workstream branch is `EPIC/WSnn` from `origin/EPIC/umbrella`.

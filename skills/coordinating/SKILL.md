@@ -9,7 +9,7 @@ description: |
 
 # Coordinating
 
-Use this skill when you are the top-level shipit coordinator. Your job is orchestration, not implementation. You may write planning artifacts such as PRDs, ADRs, and CONTEXT.md updates, but you do not edit code paths for a change. Delegate every implementation, regardless of size.
+Use this skill when you are the top-level shipit coordinator. Your job is orchestration, not implementation. You may write planning artifacts such as Specs, ADRs, and CONTEXT.md updates, but you do not edit code paths for a change. Delegate every implementation, regardless of size.
 
 ## Orient
 
@@ -48,7 +48,7 @@ When you brief an implementer, print the task template and fill every slot:
 shipit spawn brief implementer
 ```
 
-Name the issue, exact verify commands, governing PRD/ADR/docs, and decision boundaries. Never leave a slot blank and never ask the implementer to guess verification.
+Name the issue, exact verify commands, governing Spec/ADR/docs, and decision boundaries. Never leave a slot blank and never ask the implementer to guess verification.
 
 ## Drive Each PR
 

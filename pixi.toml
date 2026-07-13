@@ -30,7 +30,7 @@ provision-lexd = "./bin/shipit provision lexd"
 rust = "1.96.*"
 # <<< shipit-managed rust lint toolchain <<<
 # >>> shipit-managed lint deps (do not edit; regenerate via `shipit install`) >>>
-# The fleet-pinned lint toolchain (docs/prd/adoption.md: the managed set owns
+# The fleet-pinned lint toolchain (arthur-debert/shipit docs/legacy-prd/adoption.md: the managed set owns
 # the consumer environment). Canonical versions live HERE — a bump is one data
 # edit, rolled fleet-wide on each consumer's next `shipit install` reconcile.
 ruff = "0.15.*"
@@ -73,6 +73,38 @@ lint-full = { cmd = "./bin/shipit lint" }
 # `cargo nextest` stack itself. Same conda-forge rust pin as the managed
 # [feature.lint.dependencies] block.
 [dependencies]
+# >>> shipit-managed rust release deps (do not edit; regenerate via `shipit install`) >>>
+# The rust RELEASE-side bump tool (#793, the #784-F2 failure class): `shipit
+# release prepare`'s rust bump adapter runs `cargo set-version --workspace`
+# (a cargo-edit subcommand), and wf-prepare executes shipit in the DEFAULT
+# pixi env (`pixi run --locked ./bin/shipit`), so cargo-edit anchors HERE —
+# [dependencies], not a feature — where that run's PATH resolves it (cargo
+# finds subcommands via $CARGO_HOME/bin then PATH, the #785 finding).
+# Provisioned from conda-forge under setup-pixi's lockfile-keyed cache (the
+# #582 doctrine: the release run NEVER `cargo install`s). Pinned to the patch
+# line (`0.13.11.*` — conda match-spec, so any 0.13.11.x build resolves); a
+# bump is one data edit, rolled out on each consumer's next `shipit install`
+# reconcile. If this repo no longer ships rust (the last Cargo.toml is gone),
+# delete this block and its `pixi.toml#shipit-rust-release-deps` entry in
+# .shipit.toml's [managed] table — a reconcile only ADDS toolchain blocks, it
+# never retires one.
+cargo-edit = "0.13.11.*"
+# The wasm/npm bundle composition's builder (TOL02-WS12 #788, WS10 DECIDED
+# #798): `shipit release bundle`'s wasm-pack composition runs `wasm-pack build`
+# to turn a rust crate into an npm package tree, then `npm pack`s the tarball
+# — the artifact. wasm-pack is on conda-forge, so it anchors HERE (the rust
+# release-deps block, rust signal) beside cargo-edit rather than
+# self-provisioning (the cargo-deb #785 exception is for tools conda-forge does
+# NOT carry). conda-forge's wasm-pack pulls the wasm32-unknown-unknown target
+# std it needs, so pixi provisions BOTH under setup-pixi's lockfile-keyed cache
+# (the #582 doctrine: the release run NEVER installs at run time). Pinned to the
+# minor line (`0.15.*` — conda match-spec); a bump is one data edit, rolled out
+# on each consumer's next `shipit install` reconcile. 0.15.* per #846: the
+# original 0.13.* pin was never solvable — conda-forge never published any
+# 0.13.x wasm-pack build (verified on osx-arm64 + linux-64) — so every
+# consumer's default env died at solve.
+wasm-pack = "0.15.*"
+# <<< shipit-managed rust release deps <<<
 rust = "1.96.*"
 cargo-nextest = ">=0.9.138,<0.10"
 # uv backs the pinned bin/shipit launcher (ADR-0033: it provisions the repo's

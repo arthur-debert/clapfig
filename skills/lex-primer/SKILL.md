@@ -178,7 +178,7 @@ Escape with backslash: `\*not bold\*`, `\[not a link\]`
 ## Common Mistakes (Lex ≠ Markdown)
 
 | Wrong (Markdown) | Right (Lex) |
-|---|---|
+| --- | --- |
 | `# Heading` | `1. Heading` + blank line + indented content |
 | `**bold**` | `*bold*` |
 | `*italic*` | `_italic_` |
