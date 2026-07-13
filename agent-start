@@ -35,7 +35,14 @@
 # Do not edit — `shipit install` overwrites this file.
 set -euo pipefail
 
-repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# Launch FROM the repo root (#848): the launcher may be invoked from any cwd,
+# but the coordinator session it starts must be rooted in the checkout this
+# launcher belongs to — claude roots its session (and the WorktreeCreate seam)
+# in the cwd, and codex resolves the project from it. Under `set -e` a failed
+# cd aborts the launch instead of dispatching from the wrong directory.
+cd -- "$repo"
 
 # Launch-seam agent-identity scrub (see header): the session being started is a
 # coordinator, whatever shell it was started from — a worker Run's exported

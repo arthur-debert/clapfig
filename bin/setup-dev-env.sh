@@ -195,7 +195,7 @@ manifest_defines_lint_env() {
 
 TRIPLE="$(resolve_triple)"
 SELF="${BASH_SOURCE[0]:-$0}"
-REPO_ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+REPO_ROOT="$(cd -P -- "$(dirname -- "$SELF")/.." && pwd)"
 
 if ! mkdir -p "$BIN_DIR"; then
 	warn "could not create ${BIN_DIR} — nothing can be provisioned"
