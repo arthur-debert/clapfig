@@ -16,8 +16,8 @@
 # stale) build — precisely the tool/managed-set drift the pin exists to kill,
 # and it would reappear at the highest-frequency surface (every commit, every
 # push). The managed `lint` task is `./bin/shipit lint`, so the `lint` legs
-# below ride the pin through that one indirection; the `classify-gate` and
-# `post-commit` legs call `./bin/shipit` directly. `bin/shipit` is a standalone
+# below ride the pin through that one indirection; the
+# `post-commit` leg calls `./bin/shipit` directly. `bin/shipit` is a standalone
 # launcher (it reads `.shipit.toml`'s pin and execs that exact build) with NO
 # dependence on the pixi manifest, so the `-e lint` wrapper is preserved purely
 # for the lint TOOLCHAIN (ruff/shellcheck/…) — a separate concern from the
@@ -78,18 +78,6 @@ pre-push:
         skipping this managed hook (pixi-less environment; the full gate runs
         wherever pixi is provisioned)."; exit 0; };
         pixi run -e lint lint
-    # The classification tripwire (#423): block the push while the branch's
-    # PR has unclassified findings in its latest review round — the same
-    # CLASSIFY message the `pr next`/`pr status` gate reports (that gate is
-    # the arbiter; this is the fail-fast act-time seam). The verb fails OPEN
-    # on any inability to read the PR state, so a gh outage never blocks git.
-    # Runs the pinned build via `./bin/shipit` (ADR-0033), not a PATH `shipit`.
-    classify-gate:
-      run: >-
-        command -v pixi >/dev/null 2>&1 || { echo "shipit: pixi not on PATH —
-        skipping this managed hook (pixi-less environment; the full gate runs
-        wherever pixi is provisioned)."; exit 0; };
-        pixi run -e lint ./bin/shipit pr push-gate
 
 # Hook-witnessed dev-cycle tier (ADR-0032 / LOG04): POST-commit — the commit
 # exists and has a sha to record — emit `commit.created` into the durable

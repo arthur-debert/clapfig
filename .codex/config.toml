@@ -1,0 +1,18 @@
+# Codex project layer — managed by shipit; do not edit (regenerate via
+# `shipit install`). Personal/machine Codex config belongs in
+# ~/.codex/config.toml ($CODEX_HOME), which codex layers over this repo-local
+# file — this thin layer stays shipit-owned so the managed reconcile can keep
+# it current fleet-wide (a local edit surfaces as an OVERRIDE at the next
+# reconcile, for a human to decide).
+#
+# The dev-cycle policy is NOT duplicated here (CDX01: no Codex-only fork of
+# the policy docs): codex reads AGENTS.md natively — the shipit-managed block
+# there is the policy — and the lifecycle hooks in .codex/hooks.json route to
+# the shared `./bin/shipit hook ...` verbs. Repo-local .codex/ requires
+# project trust (codex 0.139+): codex loads this layer only after the
+# operator trusts the checkout, so nothing here grants itself anything.
+
+# AGENTS.md carries the full shipit dev-cycle block and grows with the managed
+# set; raise the project-doc budget above codex's default so the policy doc is
+# never silently truncated mid-file.
+project_doc_max_bytes = 65536

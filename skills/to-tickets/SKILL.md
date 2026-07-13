@@ -1,6 +1,6 @@
 ---
 name: to-tickets
-description: Break a PRD into one or more epic tracker issues plus independently-grabbable Work Stream sub-issues on the project issue tracker, using tracer-bullet vertical slices. Use when user wants to convert a plan/PRD into epics and work streams, create implementation tickets, or break down work.
+description: Break a Spec into one or more epic tracker issues plus independently-grabbable Work Stream sub-issues on the project issue tracker, using tracer-bullet vertical slices. Use when user wants to convert a plan/Spec into epics and work streams, create implementation tickets, or break down work.
 metadata:
     forked-from: https://github.com/mattpocock/skills (skills/engineering/to-issues)
 ---
@@ -14,9 +14,9 @@ The issue tracker and triage label vocabulary should have been provided to you �
 
 ### 1. Gather context
 
-Work from whatever is already in the conversation context. The authoritative source is the **PRD file in `docs/prd/`** (the feature spec — the *what & why*), produced by `/to-prd`. Read it in full, along with the ADRs it references. If the user passes a reference (PRD path, issue number, or URL) as an argument, fetch it and read it fully.
+Work from whatever is already in the conversation context. The authoritative source is the **Spec file in `docs/spec/`** (the feature spec — the *what & why*), produced by `/to-spec`. Read it in full, along with the ADRs it references. If the user passes a reference (Spec path, issue number, or URL) as an argument, fetch it and read it fully.
 
-This skill **creates the epic umbrella issue(s)** — do not assume one already exists. The epic issue is an **execution tracker** (PRD summary + pointers to the PRD/ADRs + the WS topology), not the spec; the PRD file stays authoritative. (`/to-prd` writes the PRD only; epic-issue creation lives here.)
+This skill **creates the epic umbrella issue(s)** — do not assume one already exists. The epic issue is an **execution tracker** (Spec summary + pointers to the Spec/ADRs + the WS topology), not the spec; the Spec file stays authoritative. (`/to-spec` writes the Spec only; epic-issue creation lives here.)
 
 ### 2. Explore the codebase (optional)
 
@@ -36,7 +36,7 @@ Then, for each epic, break its slice of the plan into **tracer bullet** Work Str
 - Favor making WS01 a **walking skeleton**: the thinnest end-to-end thread that proves the architecture is wired together
 </work-stream-rules>
 
-Once the breakdown below is approved and published (step 4), Work Streams execute AFK — implemented and merged by agents without mid-stream human interaction. Across that execution phase the only human checkpoints are the upstream PRD approval and the final epic→main merge; the step-4 breakdown approval is the gate into that phase, not a checkpoint within it.
+Once the breakdown below is approved and published (step 4), Work Streams execute AFK — implemented and merged by agents without mid-stream human interaction. Across that execution phase the only human checkpoints are the upstream Spec approval and the final epic→main merge; the step-4 breakdown approval is the gate into that phase, not a checkpoint within it.
 
 ### 4. Quiz the user
 
@@ -59,7 +59,7 @@ Iterate until the user approves the breakdown. Before publishing, confirm the hu
 
 Work one epic at a time. For each approved epic:
 
-**a. Create the epic umbrella issue first.** This is the **execution tracker**, not the spec — use the epic template below. Title: `<REPO>-<EPIC>: Epic: <Epic Name>`. It carries a summary of the PRD, pointers to the authoritative PRD (`docs/prd/…`) and the relevant ADRs, and the WS list/topology. Apply the correct triage label unless instructed otherwise. Once the umbrella issue exists, record it in the dev-cycle log (best-effort — ADR-0032; continue on error):
+**a. Create the epic umbrella issue first.** This is the **execution tracker**, not the spec — use the epic template below. Title: `<REPO>-<EPIC>: Epic: <Epic Name>`. It carries a summary of the Spec, pointers to the authoritative Spec (`docs/spec/<feature-slug>.md`) and the relevant ADRs, and the WS list/topology. Apply the correct triage label unless instructed otherwise. Once the umbrella issue exists, record it in the dev-cycle log (best-effort — ADR-0032; continue on error):
 
 ```sh
 shipit log event planning.epic.minted --about "<EPIC>: <Epic Name> (#<issue>)"
@@ -78,11 +78,11 @@ If the decomposition produced **multiple epics**, repeat (a)+(b) for each — on
 <epic-template>
 ## Summary
 
-A short summary of the PRD — the *what & why*, enough to orient without opening the spec. This issue is an execution tracker, NOT the authoritative spec.
+A short summary of the Spec — the *what & why*, enough to orient without opening the spec. This issue is an execution tracker, NOT the authoritative spec.
 
 ## Spec
 
-- **PRD**: a reference to the authoritative feature PRD file read in step 1 (`docs/prd/<feature-slug>.md`). When one feature splits into several epics, every epic points at the same feature PRD.
+- **Spec**: a reference to the authoritative feature Spec file read in step 1 (`docs/spec/<feature-slug>.md`). When one feature splits into several epics, every epic points at the same feature Spec.
 - **ADRs**: references to the relevant ADRs.
 
 ## Work Streams

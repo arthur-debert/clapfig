@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# agent-start — launch an isolated coordinator session for a named agent host.
+# Installed and managed by `shipit install`.
+#
+# ONE generic entry point (`./agent-start <agent> [args...]`, CDX01 #627): the
+# common start path — usage, the host dispatch, the CLI presence check, arg
+# forwarding — is written once here, so changing it cannot be forgotten for
+# one agent. Host-specific launch mechanics stay behind the narrow per-host
+# launch functions the strategy table below dispatches to
+# (docs/dev/agent-host-seams.md):
+#
+# - claude: mint a per-launch `sess-<utc>-<pid>` session id and exec
+#   `claude --worktree <id>` — the WorktreeCreate pre-launch seam provisions
+#   the isolated session Tree (ADR-0027), with the SessionStart activation
+#   (CLAUDE_ENV_FILE) live in the session.
+# - codex: exec the pinned `./bin/shipit session codex` (ADR-0033) — Codex has
+#   no WorktreeCreate-style pre-launch seam, so shipit provisions the
+#   ephemeral session Tree explicitly and then execs codex rooted in it.
+#
+# Convenience only, never a requirement: `claude -w <name>` and
+# `./bin/shipit session codex` work identically without this file. Extra args
+# are forwarded to the agent CLI verbatim.
+#
+# The common path scrubs the worker's agent-identity log-context keys before
+# dispatch — SHIPIT_LOG_CTX_ROLE, plus the paired AGENT and RUN spawn ids: a
+# coordinator launched from inside a spawned worker Run's shell would otherwise
+# inherit ROLE and silently disarm the coordinator edit guard (the pretooluse
+# fallback consults that var exactly when the payload names no agent), and
+# inherit AGENT/RUN and mis-tag its own log records with the worker's identity.
+# Task-correlation keys (PR, EPIC, …) may still inherit — they describe the
+# work, not who is doing it. Known accepted boundary: a bare `claude -w` run
+# manually from inside a worker shell bypasses this launcher and still inherits
+# these vars.
+#
+# Do not edit — `shipit install` overwrites this file.
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Launch-seam agent-identity scrub (see header): the session being started is a
+# coordinator, whatever shell it was started from — a worker Run's exported
+# agent-identity keys (role, plus the paired agent/run spawn ids) must not ride
+# into it. Common path, so no host can forget it.
+unset SHIPIT_LOG_CTX_ROLE SHIPIT_LOG_CTX_AGENT SHIPIT_LOG_CTX_RUN
+
+usage() {
+	echo "usage: agent-start <agent> [args...]   (agents: claude, codex)" >&2
+	exit 64
+}
+
+launch_claude() {
+	# Session id: sortable UTC launch stamp + this launcher's PID — unique
+	# across concurrent launches on one host, no extra tooling needed. The
+	# `sess-` prefix makes the session recognizable on disk; the hook
+	# discriminates coordinator vs helper spawn on the payload's `prompt_id`
+	# (ADR-0027), not on this prefix.
+	exec claude --worktree "sess-$(date -u +%Y%m%d-%H%M%S)-$$" "$@"
+}
+
+launch_codex() {
+	if [ ! -x "$repo/bin/shipit" ]; then
+		echo "agent-start: $repo/bin/shipit is missing or not executable — run 'shipit install' to (re)provision the pinned launcher." >&2
+		exit 127
+	fi
+	exec "$repo/bin/shipit" session codex "$@"
+}
+
+[ "$#" -ge 1 ] || usage
+agent="$1"
+shift
+
+# The host strategy table: agent name -> (CLI binary to require, product name
+# for the missing-CLI hint, launch function). Adding a host is one row here
+# plus its narrow launch function above — never a conditional scattered
+# through the common path.
+case "$agent" in
+claude) cli="claude" product="Claude Code" launch="launch_claude" ;;
+codex) cli="codex" product="Codex" launch="launch_codex" ;;
+*)
+	echo "agent-start: unknown agent '$agent' (supported: claude, codex)" >&2
+	exit 64
+	;;
+esac
+
+if ! command -v "$cli" >/dev/null 2>&1; then
+	echo "agent-start: the $cli CLI is not on PATH — install $product first." >&2
+	exit 127
+fi
+
+"$launch" "$@"

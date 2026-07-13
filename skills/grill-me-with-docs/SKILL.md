@@ -34,7 +34,7 @@ During codebase exploration, also look for existing documentation:
 
 Most repos have a single context:
 
-```
+```text
 /
 ├── CONTEXT.md
 ├── docs/
@@ -46,7 +46,7 @@ Most repos have a single context:
 
 If a `CONTEXT-MAP.md` exists at the root, the repo has multiple contexts. The map points to where each one lives:
 
-```
+```text
 /
 ├── CONTEXT-MAP.md
 ├── docs/
@@ -60,7 +60,7 @@ If a `CONTEXT-MAP.md` exists at the root, the repo has multiple contexts. The ma
 │       └── docs/adr/
 ```
 
-Create files lazily — only when you have something to write. If no `CONTEXT.md` exists, create one when the first term is resolved. If no `docs/adr/` exists, create it when the first ADR is needed.
+Create files lazily — only when you have something to write. If no `CONTEXT.md` exists, create one only when the first term qualifies for the curated glossary. If no `docs/adr/` exists, create it when the first ADR is needed.
 
 ## During the session
 
@@ -80,11 +80,13 @@ When domain relationships are being discussed, stress-test them with specific sc
 
 When the user states how something works, check whether the code agrees. If you find a contradiction, surface it: "Your code cancels entire Orders, but you just said partial cancellation is possible — which is right?"
 
-### Update CONTEXT.md inline
+### Capture glossary terms selectively
 
-When a term is resolved, update `CONTEXT.md` right there. Don't batch these up — capture them as they happen. Use the format in [CONTEXT-FORMAT.md](./CONTEXT-FORMAT.md).
+When a high-value domain term is resolved and it belongs in the shared glossary, update `CONTEXT.md` right there. Don't batch up qualifying glossary updates — capture them while the distinction is fresh. Use the format in [CONTEXT-FORMAT.md](./CONTEXT-FORMAT.md).
 
-`CONTEXT.md` should be totally devoid of implementation details. Do not treat `CONTEXT.md` as a spec, a scratch pad, or a repository for implementation decisions. It is a glossary and nothing else.
+Updating `CONTEXT.md` is not the goal of the grill. The goal is sharper shared language and better decisions. Most resolved details should stay in the conversation, code, ADRs, Specs, or focused docs; only terms that are project-specific, repeatedly useful, and likely to be misunderstood without a glossary entry belong in `CONTEXT.md`.
+
+`CONTEXT.md` should be totally devoid of implementation details. Do not treat `CONTEXT.md` as a spec, a scratch pad, a transcript, or a repository for implementation decisions. It is a curated glossary and nothing else. Do not add general computing terms, one-off labels, workflow status words, or every term mentioned during the grill.
 
 ### Offer ADRs sparingly
 

@@ -4,7 +4,7 @@
       {
         "hooks": [
           {
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" || exit 0; if [ -x ./bin/setup-dev-env.sh ]; then ./bin/setup-dev-env.sh || echo \"shipit: setup-dev-env.sh reported a problem \u2014 continuing (base-system provisioning is best-effort).\" >&2; fi; test -x ./bin/shipit || { echo \"shipit: bin/shipit launcher not present or executable here \u2014 skipping this managed hook (run 'shipit install' to (re)provision it).\"; exit 0; }; ./bin/shipit hook sessionstart",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" || exit 0; if [ -x ./bin/setup-dev-env.sh ]; then ./bin/setup-dev-env.sh || echo \"shipit: setup-dev-env.sh reported a problem \u2014 continuing (base-system provisioning is best-effort).\" >&2; fi; case \":$PATH:\" in *\":$HOME/.local/bin:\"*) ;; *) export PATH=\"$HOME/.local/bin:$PATH\" ;; esac; test -x ./bin/shipit || { echo \"shipit: bin/shipit launcher not present or executable here \u2014 skipping this managed hook (run 'shipit install' to (re)provision it).\"; exit 0; }; ./bin/shipit hook sessionstart",
             "type": "command"
           }
         ]

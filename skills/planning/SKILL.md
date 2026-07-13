@@ -1,17 +1,17 @@
 ---
 name: planning
-description: Plan a new feature or epic from loose ideas through to issues. Drives ideation → overview checkpoint → ADRs → PRD → docs PR (Leg A), then epic decomposition → issues (Leg B). Use at the START of a feature/epic, before any code. NOT for single fixes — the simpler-issue path skips planning.
+description: Plan a new feature or epic from loose ideas through to issues. Drives ideation → overview checkpoint → ADRs → Spec → docs PR (Leg A), then epic decomposition → issues (Leg B). Use at the START of a feature/epic, before any code. NOT for single fixes — the simpler-issue path skips planning.
 ---
 # Planning
 
 Conduct a planning session for a **new feature or epic**. This is the orchestrator: it drives the other planning skills in order and keeps the human in the loop at the two checkpoints that matter.
 
-**Two legs, often two sessions.** Leg A turns loose ideas into the **spec** (ADRs + a PRD), locked by a merged docs PR. Leg B turns that spec into **execution tracking** (epic issue(s) + Work Stream sub-issues). Leg B is independently invocable — it is frequently a separate, later session run directly once the PRD is merged. Run Leg A end-to-end first; only continue into Leg B when asked, or note it as the next session.
+**Two legs, often two sessions.** Leg A turns loose ideas into the **Spec** (ADRs + `docs/spec/<slug>.md`), locked by a merged docs PR. Leg B turns that Spec into **execution tracking** (epic issue(s) + Work Stream sub-issues). Leg B is independently invocable — it is frequently a separate, later session run directly once the Spec is merged. Run Leg A end-to-end first; only continue into Leg B when asked, or note it as the next session.
 
 **Spec vs tracker — keep these distinct:**
 
-- **PRD** = the feature definition — the authoritative file in `docs/prd/`. The *what & why*.
-- **Epic issue** = an execution tracker — a GitHub issue that points to the PRD + ADRs and carries a PRD summary plus the WS topology and progress. It is **not** the spec.
+- **Spec** = the feature definition — the authoritative file in `docs/spec/`. The *what & why*.
+- **Epic issue** = an execution tracker — a GitHub issue that points to the Spec + ADRs and carries a Spec summary plus the WS topology and progress. It is **not** the spec.
 
 **Bail early on small work.** Planning is for features and epics. If this is a single fix or a small change, stop and say so — skip straight to implementation. Don't manufacture an epic for a one-PR change.
 
@@ -28,7 +28,7 @@ Open discussion. Move from loose ideas to a structured, shared understanding of 
 - **Outside research** is blessed — look things up when a decision turns on facts you don't have.
 - **Codebase exploration** is blessed — delegate **Explore** agents to find how the relevant area works today, what's already there, and what would have to change.
 
-**Name the feature here** — agree a short, memorable name; everything downstream (PRD slug, ADRs, later the epic) hangs off it.
+**Name the feature here** — agree a short, memorable name; everything downstream (Spec slug, ADRs, later the epic) hangs off it.
 
 ### 2. Overview checkpoint (user checkpoint)
 
@@ -46,19 +46,19 @@ If the command errors, continue — a skipped emission is a missing event, never
 
 Run `/grill-me-with-docs`: relentless one-question-at-a-time Q&A on the important decisions, challenged against `CONTEXT.md` and the existing domain model. It sharpens terminology and writes **ADRs** for the decisions that warrant them.
 
-### 4. PRD — `/to-prd`
+### 4. Spec — `/to-spec`
 
-Run `/to-prd`. It synthesizes the conversation into the **PRD file only** — `docs/prd/<slug>.md`, the authoritative feature spec. No interview (that already happened in the grill); no epic issue (that's Leg B).
+Run `/to-spec`. It synthesizes the conversation into the **Spec file only** — `docs/spec/<slug>.md`, the authoritative feature spec. No interview (that already happened in the grill); no epic issue (that's Leg B).
 
 ### 5. Docs PR (user checkpoint at merge)
 
-Push the ADR + PRD changes as a DRAFT PR and run it through the **full required-reviewer cycle, exactly like code** — architectural oversights surface in review. The agent addresses review threads itself, **surfacing to the user only when a real call is needed**, flips the PR to **READY** when reviews are settled and CI is green, then stops. **The user merges.** The merged PR is what locks the spec.
+Push the ADR + Spec changes as a DRAFT PR and run it through the **full required-reviewer cycle, exactly like code** — architectural oversights surface in review. The agent addresses review threads itself, **surfacing to the user only when a real call is needed**, flips the PR to **READY** when reviews are settled and CI is green, then stops. **The user merges.** The merged PR is what locks the spec.
 
 ---
 
 ## Leg B — Issue planning (independently invocable)
 
-Run this once the PRD is merged — usually a fresh session. If invoked directly, read the merged PRD in `docs/prd/` first for context.
+Run this once the Spec is merged — usually a fresh session. If invoked directly, read the merged Spec in `docs/spec/` first for context.
 
 ### 6. Epic naming + decomposition (user checkpoint)
 
@@ -70,8 +70,8 @@ One feature **may span several epics** (e.g. `OBS01`→`OBS04`: one feature, sev
 
 Run `/to-tickets`, **per epic**. It creates:
 
-- the **epic umbrella issue** — the execution tracker: PRD summary, pointers to the PRD + relevant ADRs, the WS list/topology, progress;
-- the **WS sub-issues** — high detail (risks, where/how in the code, testing, links to the PRD/ADRs), formally linked as sub-issues for GitHub progress tracking.
+- the **epic umbrella issue** — the execution tracker: Spec summary, pointers to the Spec + relevant ADRs, the WS list/topology, progress;
+- the **WS sub-issues** — high detail (risks, where/how in the code, testing, links to the Spec/ADRs), formally linked as sub-issues for GitHub progress tracking.
 
 ---
 

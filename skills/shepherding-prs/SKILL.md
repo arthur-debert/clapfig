@@ -2,9 +2,9 @@
 name: shepherding-prs
 description: |
   Shepherd one shipit draft PR through review-addressing rounds. Use when an
-  agent is assigned to a PR after it is open: read current review threads, classify
-  findings, fix or reply, resolve threads, verify, push the round, and park
-  without waiting or flipping ready.
+  agent is assigned to a PR after it is open: read current review threads,
+  address findings in severity order, fix or reply, resolve threads, verify,
+  push the round, and park without waiting or flipping ready.
 ---
 
 # Shepherding PRs
@@ -20,7 +20,7 @@ Your round-1 brief should name:
 - the PR and its `## Context` note;
 - the issue the PR implements;
 - exact verify commands for review fixes;
-- governing PRD, ADR, or docs;
+- governing Spec, ADR, or docs;
 - decision boundaries that review comments cannot re-open.
 
 If a mandatory slot is missing, flag it to the coordinator instead of guessing.
@@ -29,31 +29,20 @@ If a mandatory slot is missing, flag it to the coordinator instead of guessing.
 
 On every resume, re-read the current PR state, diff, and open review threads. Held context is only a head start; the PR is the source of truth for the round.
 
-For every open thread:
+Every finding arrives pre-classified on the 4-tier severity ladder (critical | major | minor | nit) — its comment carries the severity as a Conventional Comments label plus a machine marker the engine reads. You never classify anything.
+
+Address findings in severity order — every critical, then major, then minor, then nit. For every open thread:
 
 - fix it, or reply with a clear rationale;
-- classify the finding before pushing;
 - resolve the thread.
 
-Classify with:
-
-```sh
-shipit pr classify <pr> --comment <id> nitpick|substantive [--reason "<reason>"]
-```
-
-List unclassified findings with:
-
-```sh
-shipit pr classify <pr>
-```
-
-Use `nitpick` only for cosmetic wording, naming, or style that does not affect correctness, behavior, security, or maintainability. A reviewer's own `nit:` label is input, not a binding verdict.
+Severity orders the work; it never waives any of it: minor and nit threads still end resolved before you hand back.
 
 ## Sweep The Finding Class
 
 A useful review finding is usually an instance of a broader class. Before pushing, scan the whole PR diff for other instances of the same class: the same stale reference, missing convention, escaping bug, incomplete rename, or repeated edge case. Fix the class in the same round when it is in scope.
 
-If a thread tries to re-open a settled decision or asks for out-of-scope work, reply with the rationale, classify it, and resolve it. Do not unwind governing decisions unless the coordinator changes the boundary.
+If a thread tries to re-open a settled decision or asks for out-of-scope work, reply with the rationale and resolve it. Do not unwind governing decisions unless the coordinator changes the boundary.
 
 ## Verify And Park
 

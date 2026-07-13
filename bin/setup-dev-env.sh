@@ -53,11 +53,14 @@ resolve_triple() {
 }
 
 sha256_of() {
-	# GNU coreutils on Linux, shasum on macOS; "" when neither exists.
+	# GNU coreutils on Linux, shasum on macOS; "" when neither exists OR the
+	# tool errors on the file (#598) — under this script's `set -euo pipefail`
+	# an unguarded pipeline would abort the whole run, and "" is what routes a
+	# hashing failure into fetch_verified's `[ -z "$got" ]` fail-open path.
 	if command -v sha256sum >/dev/null 2>&1; then
-		sha256sum "$1" | awk '{print $1}'
+		sha256sum "$1" 2>/dev/null | awk '{print $1}' || echo ""
 	elif command -v shasum >/dev/null 2>&1; then
-		shasum -a 256 "$1" | awk '{print $1}'
+		shasum -a 256 "$1" 2>/dev/null | awk '{print $1}' || echo ""
 	else
 		echo ""
 	fi
@@ -91,7 +94,7 @@ fetch_verified() {
 	fi
 	got="$(sha256_of "$3")"
 	if [ -z "$got" ]; then
-		warn "no sha256 tool (sha256sum/shasum) available — refusing the unverified $1"
+		warn "could not hash $3 (no sha256sum/shasum, or the tool errored) — refusing the unverified $1"
 		return 1
 	fi
 	if [ "$got" != "$2" ]; then
