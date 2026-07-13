@@ -25,7 +25,7 @@ set -euo pipefail
 SHIPIT_GIT_URL="git+https://github.com/arthur-debert/shipit"
 
 self="${BASH_SOURCE[0]:-$0}"
-repo_root="$(cd "$(dirname "$self")/.." && pwd)"
+repo_root="$(cd -P -- "$(dirname -- "$self")/.." && pwd)"
 manifest="$repo_root/.shipit.toml"
 
 # The development override (ADR-0033): honored and announced, never silent.
