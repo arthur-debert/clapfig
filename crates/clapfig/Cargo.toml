@@ -1,6 +1,6 @@
 [package]
 name = "clapfig"
-version = "0.21.5-rc.2"
+version = "0.21.5-release-rc"
 edition = "2024"
 description = "Rich, layered configuration for Rust CLI apps"
 license = "MIT"
@@ -20,7 +20,7 @@ derive = ["dep:clapfig-derive"]
 [dependencies]
 confique = { version = "0.4", features = ["toml"] }
 clap = { version = "4", features = ["derive", "string"], optional = true }
-clapfig-derive = { path = "../clapfig-derive", version = "0.21.5-rc.2", optional = true }
+clapfig-derive = { path = "../clapfig-derive", version = "0.21.5-release-rc", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = "1"
