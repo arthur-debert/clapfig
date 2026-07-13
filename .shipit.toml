@@ -64,6 +64,29 @@ local = true
 [toolchains]
 "." = "rust"
 
+# [artifacts] — clapfig's declared release surface for the shipit release
+# pipeline (ADP02-WS08, arthur-debert/shipit#841; modeled on
+# arthur-debert/standout's #187 no-build artifact — the pathfinder shape
+# this repo matches almost verbatim). clapfig is a crates-only rust
+# workspace: 2 library crates published to crates.io in dependency order
+# (clapfig-derive, then clapfig — the lockstep serde/serde_derive
+# convention: clapfig's `derive` feature pins clapfig-derive as a
+# registry dep, so the derive crate must exist on crates.io first), plus
+# a notes-only GitHub release — the legacy surface (release.yml →
+# rust-lib.yml@v3) published the same 2 crates and cut a GH release with
+# ZERO assets (verified against v0.21.4). The honest declaration is
+# therefore a NO-BUILD artifact: no binary, no bundle, no platforms —
+# preflight plans an EMPTY matrix (build/sign are plan-proven no-op
+# stages that skip) and publish fans over the two endpoints. The crates
+# endpoint rides the [toolchains] rust leg above and DERIVES the publish
+# order from `cargo metadata` at publish time (topological, alphabetical
+# ties; shipit#850 filters `publish = false` members — moot here, both
+# workspace members are publishable) — the legacy caller's hand-copied
+# `crates: clapfig-derive,clapfig` list is deliberately NOT repeated
+# here: topo order gives the same sequence.
+[artifacts.clapfig]
+endpoints = ["gh-release", "crates"]
+
 [shipit]
 version = "68747540c4a14771a03986ebd0e89ab951815fbf"
 

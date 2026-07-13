@@ -1,0 +1,148 @@
+name: shipit-release
+
+# clapfig's shipit release caller (ADP02-WS08, the rust fleet cutover —
+# arthur-debert/shipit#841) — the WS09 BLESSED per-stage dispatch shape
+# (ADR-0054, workflows.lex §8), copied from arthur-debert/standout's
+# shipit-release.yml (#187, the pathfinder proven on the 7.6.4-release-rc
+# run): one workflow_dispatch caller with a `stage` choice
+# (full | prepare | build | sign | publish), one job per stage, each a
+# single `uses:` line against the matching block, gated
+# `if: inputs.stage == '...'`, forwarding
+# `version`/`tag`/`run-id`/`unsigned` verbatim. Routing ONLY (ADR-0040):
+# the release plan — matrix, live stages, the post-RC-guard endpoint set,
+# required secrets — is preflight's, computed inside the blocks; nothing
+# is re-derived or wired stage-to-stage here.
+#
+# Every ref is the FULL remote `arthur-debert/shipit/...@v1` form — never
+# `./` relative (which would resolve against THIS repo, where no blocks
+# live), never SHA-pinned (the fleet rides the advance-major-moved `v1`,
+# ADR-0010).
+#
+# clapfig's release surface is crates-only (.shipit.toml
+# [artifacts.clapfig]: a no-build artifact, endpoints gh-release +
+# crates — the workspace's 2 publishable library crates in derived
+# dependency order, clapfig-derive then clapfig, plus the notes-only GH
+# release the legacy surface cut; v0.21.4 has zero assets), so the plan's
+# matrix is EMPTY and the build/sign stages are plan-proven no-ops: a
+# `build` or `sign` dispatch re-derives the plan at the tag, fans over
+# nothing, and skips. The choices stay offered because this caller rides
+# the blessed shape, never a trimmed variant.
+#
+# Secrets — exactly the plan-required set for clapfig's plan:
+#   RELEASE_TOKEN         prepare's tag+branch push through the ruleset
+#                         (a GITHUB_TOKEN push would not re-trigger
+#                         workflows).
+#   CARGO_REGISTRY_TOKEN  the crates endpoint's registry token, mapped
+#                         from this repo's legacy-named CRATES_IO_KEY
+#                         secret (NOT renamed: the legacy release.yml
+#                         still consumes it under that name until the
+#                         post-rc-proof step retires it). Forwarded to
+#                         the stages that can publish crates (`full`,
+#                         `publish`); the RC guard drops the crates
+#                         endpoint on an -release-rc version centrally.
+# gh-release rides the workflow's own GITHUB_TOKEN (no registry entry).
+# The Apple signing set is not forwarded: clapfig has never signed mac
+# (no darwin lane, no sign stage in the plan), and preflight refuses a
+# break-glass `--unsigned` on a plan with no sign stage.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          The release version, consumed by `full`/`prepare`: a bare semver
+          (1.0.0, 1.0.0-release-rc) or a bump word (major|minor|patch).
+          Ignored by the tag-dispatched stages.
+        required: false
+        type: string
+      stage:
+        description: >-
+          What to dispatch: the full composed chain (default) or ONE
+          independently re-runnable stage block (per-stage dispatch,
+          ADR-0054). `prepare` dispatches on `version`; `build`, `sign`
+          and `publish` on `tag` (+ `run-id` for the artifact-consuming
+          stages).
+        required: false
+        type: choice
+        default: full
+        options:
+          - full
+          - prepare
+          - build
+          - sign
+          - publish
+      tag:
+        description: >-
+          The release tag (v<version>), consumed by the `build`/`sign`/
+          `publish` stage dispatches (ADR-0041: the version is read off
+          the tag). Ignored by `full`/`prepare`.
+        required: false
+        type: string
+      run-id:
+        description: >-
+          The SOURCE run id whose artifacts feed an artifact-consuming
+          stage dispatch (`sign`, `publish`) — one source run per dispatch
+          (workflows.lex §8). Ignored by the other stages.
+        required: false
+        type: string
+      unsigned:
+        description: >-
+          Break-glass: flip a signing plan to the unsigned path. Forwarded
+          verbatim; clapfig's plan has no sign stage, so preflight
+          refuses it here — offered because this caller rides the blessed
+          shape.
+        required: false
+        type: boolean
+        default: false
+
+# The standalone dispatch caller's grant (workflows.lex §8): `contents:
+# write` for prepare's push and publish's gh-release, `actions: read` for
+# the cross-run artifact downloads (`run-id` flips download-artifact onto
+# the REST API). The downloading blocks deliberately declare NO
+# `permissions:` key — a called workflow can only downgrade this token.
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    if: inputs.stage == 'full'
+    uses: arthur-debert/shipit/.github/workflows/wf-release.yml@v1
+    with:
+      version: ${{ inputs.version }}
+      unsigned: ${{ inputs.unsigned }}
+    secrets:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_KEY }}
+
+  prepare:
+    if: inputs.stage == 'prepare'
+    uses: arthur-debert/shipit/.github/workflows/wf-prepare.yml@v1
+    with:
+      version: ${{ inputs.version }}
+      unsigned: ${{ inputs.unsigned }}
+    secrets:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+  build:
+    if: inputs.stage == 'build'
+    uses: arthur-debert/shipit/.github/workflows/wf-build.yml@v1
+    with:
+      tag: ${{ inputs.tag }}
+
+  sign:
+    if: inputs.stage == 'sign'
+    uses: arthur-debert/shipit/.github/workflows/wf-sign-mac.yml@v1
+    with:
+      tag: ${{ inputs.tag }}
+      run-id: ${{ inputs.run-id }}
+
+  publish:
+    if: inputs.stage == 'publish'
+    uses: arthur-debert/shipit/.github/workflows/wf-publish.yml@v1
+    with:
+      tag: ${{ inputs.tag }}
+      run-id: ${{ inputs.run-id }}
+      unsigned: ${{ inputs.unsigned }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_KEY }}
