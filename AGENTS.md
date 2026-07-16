@@ -7,7 +7,7 @@ Every change ships as an agent-driven PR. The shipit **PR engine is authoritativ
 it reads where a PR stands and emits the **single next action**. Don't carry the policy
 (reviewers, waits, breakers) in your head — run the tool and do what it returns.
 
-**Planning a new feature/epic?** Run `/planning` first — it walks overview → ADRs → Spec → issues, checking in with you at the overview and the docs PR.
+**Planning a new feature/epic?** Run `/planning` first — it walks overview → Spec → ADRs → issues, checking in with you at the overview and the docs PR.
 
 ### Commands
 
