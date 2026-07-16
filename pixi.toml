@@ -30,8 +30,8 @@ provision-lexd = "./bin/shipit provision lexd"
 rust = "1.96.*"
 # <<< shipit-managed rust lint toolchain <<<
 # >>> shipit-managed lint deps (do not edit; regenerate via `shipit install`) >>>
-# The fleet-pinned lint toolchain (docs/legacy-prd/adoption.md in the
-# arthur-debert/shipit repo: the managed set owns the consumer environment).
+# The fleet-pinned lint toolchain (https://github.com/arthur-debert/shipit/blob/main/docs/legacy-prd/adoption.md:
+# the managed set owns the consumer environment).
 # Canonical versions live HERE — a bump is one data edit, rolled fleet-wide on
 # each consumer's next `shipit install` reconcile.
 ruff = "0.15.*"
@@ -110,6 +110,20 @@ wasm-pack = "0.15.*"
 # rust-release-toolchain block beside `rust`, NOT here: it must be delivered
 # (and skipped, when a consumer owns its `rust` pin) with the sysroot it
 # belongs to, while this block delivers unconditionally on the rust signal.
+# The Artifact channel's conda-endpoint packager (ARF01-WS01 #950, ADR-0064):
+# `shipit release publish`'s conda endpoint runs `rattler-build build` to
+# repackage a final release binary into a `.conda` and `rattler-build publish`
+# to push+reindex the producing repo's per-repo channel. rattler-build is on
+# conda-forge, so it anchors HERE (the rust release-deps block, rust signal)
+# beside wasm-pack — the walking-skeleton producer (lex-fmt/lex → lexd) is a
+# rust artifact, so the rust signal delivers it; a language-agnostic
+# endpoint-gated home is future work. Provisioned under setup-pixi's
+# lockfile-keyed cache (the #582 doctrine: the release run NEVER installs at run
+# time — publish fails loudly naming this reconcile instead). Pinned to the
+# minor line (`0.68.*` — conda match-spec); spike-validated at 0.68.0
+# (ADR-0064). A bump is one data edit, rolled out on each consumer's next
+# `shipit install` reconcile.
+rattler-build = "0.68.*"
 # <<< shipit-managed rust release deps <<<
 rust = "1.96.*"
 cargo-nextest = ">=0.9.138,<0.10"

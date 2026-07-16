@@ -14,7 +14,7 @@ The issue tracker and triage label vocabulary should have been provided to you �
 
 ### 1. Gather context
 
-Work from whatever is already in the conversation context. The authoritative source is the **Spec file in `docs/spec/`** (the feature spec — the *what & why*), produced by `/to-spec`. Read it in full, along with the ADRs it references. If the user passes a reference (Spec path, issue number, or URL) as an argument, fetch it and read it fully.
+Work from whatever is already in the conversation context. The authoritative source is the **Spec + the ADRs it references, read together as a pair**: the **Spec file in `docs/spec/`** (the feature spec — the *why & general-what*, produced by `/to-spec`) states what we're building; the **ADRs** (produced by the grill that followed the Spec, and linked back into the Spec's Further Notes by that grill) carry the specific durable decisions. Read the Spec in full AND every ADR it references — the slicing must honor both. If the Spec references no ADRs but you have reason to believe the grill produced some (e.g. the docs PR or session log mentions them), track them down rather than slicing blind. If the user passes a reference (Spec path, issue number, or URL) as an argument, fetch it and read it fully.
 
 This skill **creates the epic umbrella issue(s)** — do not assume one already exists. The epic issue is an **execution tracker** (Spec summary + pointers to the Spec/ADRs + the WS topology), not the spec; the Spec file stays authoritative. (`/to-spec` writes the Spec only; epic-issue creation lives here.)
 
@@ -59,7 +59,7 @@ Iterate until the user approves the breakdown. Before publishing, confirm the hu
 
 Work one epic at a time. For each approved epic:
 
-**a. Create the epic umbrella issue first.** This is the **execution tracker**, not the spec — use the epic template below. Title: `<REPO>-<EPIC>: Epic: <Epic Name>`. It carries a summary of the Spec, pointers to the authoritative Spec (`docs/spec/<feature-slug>.md`) and the relevant ADRs, and the WS list/topology. Apply the correct triage label unless instructed otherwise. Once the umbrella issue exists, record it in the dev-cycle log (best-effort — ADR-0032; continue on error):
+**a. Create the epic umbrella issue first.** This is the **execution tracker**, not the spec — use the epic template below. Title: `<REPO>-<EPIC>: Epic: <Epic Name>`. It carries a summary of the Spec, pointers to the authoritative Spec (`docs/spec/<slug>.md`) and the relevant ADRs, and the WS list/topology. Apply the correct triage label unless instructed otherwise. Once the umbrella issue exists, record it in the dev-cycle log (best-effort — ADR-0032; continue on error):
 
 ```sh
 shipit log event planning.epic.minted --about "<EPIC>: <Epic Name> (#<issue>)"
@@ -82,7 +82,7 @@ A short summary of the Spec — the *what & why*, enough to orient without openi
 
 ## Spec
 
-- **Spec**: a reference to the authoritative feature Spec file read in step 1 (`docs/spec/<feature-slug>.md`). When one feature splits into several epics, every epic points at the same feature Spec.
+- **Spec**: a reference to the authoritative feature Spec file read in step 1 (`docs/spec/<slug>.md`). When one feature splits into several epics, every epic points at the same feature Spec.
 - **ADRs**: references to the relevant ADRs.
 
 ## Work Streams

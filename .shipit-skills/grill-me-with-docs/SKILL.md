@@ -9,6 +9,8 @@ name: grill-me-with-docs
 ---
 <what-to-do>
 
+**Read the Spec first.** In the planning cycle the grill runs **after** `/to-spec` — the Spec (`docs/spec/<slug>.md`) already pins the *why and general-what* of the feature. Your job here is the next altitude down: crystallize the **specific, durable architectural decisions the Spec implies** and write the **ADRs** for them — not to discover the feature from scratch. Grill against the **Spec + `CONTEXT.md` + the existing ADRs**. (If no Spec exists yet — the grill invoked standalone, outside a planning cycle — grill against `CONTEXT.md` and the existing domain model as before.)
+
 Before the first question, record the grill in the dev-cycle log (best-effort — ADR-0032; on any error continue silently, a skipped emission is a missing event, never a broken step):
 
 ```sh
@@ -103,5 +105,7 @@ Each time an ADR file is written, record it in the dev-cycle log (best-effort; c
 ```sh
 shipit log event planning.adr.written --about "ADR-NNNN: <title>"
 ```
+
+**Link every new ADR back into the Spec.** In the planning cycle the Spec was written *before* these ADRs, so it cannot reference them yet — and `/to-tickets` discovers the durable decisions by reading the Spec **plus the ADRs it references**. So each time you write an ADR here, immediately add a link to it in the Spec's **Further Notes** section (`docs/spec/<slug>.md`). Do this before the docs PR is locked; without it the ADRs are orphaned and a later ticketing session reads the authoritative Spec and misses them. (Standalone grill, no Spec — skip this; there is no Spec to update.)
 
 </supporting-info>

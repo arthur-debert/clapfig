@@ -18,3 +18,18 @@ local
 
 #/target
 tmp
+
+# >>> shipit-managed release-output ignores (do not edit; regenerate via `shipit install`) >>>
+# shipit release-stage outputs — transient artifacts the release verbs write at
+# the repo ROOT: `shipit release notes` writes RELEASE_NOTES.md, the sign stage
+# stages dist-signed/, and compositions write dist/. Ignoring them keeps a
+# root-level single-crate `cargo publish` VCS-dirty check clean (#906 — cargo
+# inspects the crate root, so unignored root-level artifacts abort the publish).
+# The leading slash ROOT-ANCHORS each pattern so it matches only these repo-root
+# artifacts, never a same-named nested path (e.g. crates/foo/dist/). Managed by
+# shipit — a local edit surfaces as an OVERRIDE at the next `shipit install`
+# reconcile; add your OWN ignores outside this block.
+/RELEASE_NOTES.md
+/dist/
+/dist-signed/
+# <<< shipit-managed release-output ignores <<<
