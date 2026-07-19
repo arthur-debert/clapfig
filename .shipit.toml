@@ -88,7 +88,7 @@ local = true
 endpoints = ["gh-release", "crates"]
 
 [shipit]
-version = "afedd13dfd9f27ed1c5d7d61294a01ba3446bf1d"
+version = "57d9d16b1a8d374e1558912376c4f10d70beae1d"
 
 [managed]
 ".shipit-skills/coordinating/SKILL.md" = "sha256:065a793b117dcfbb1e97fea0a80b405c69995850af9a350061dbcc1f4ea4976a"
@@ -105,8 +105,8 @@ version = "afedd13dfd9f27ed1c5d7d61294a01ba3446bf1d"
 "AGENTS.md#shipit-block" = "sha256:570976e63c75768cd51114f0d3ac5b35757b11abd3405eac400aea034ca5ceb5"
 ".gitignore#shipit-release-outputs" = "sha256:4a9beb3dea542cd0f1426a298069a506c6ea1fdfb3e852a9d2032dd475dfe143"
 "bin/shipit" = "sha256:c1c8d6653ce37ada6b6dbad1866148bc1e54a8951384ebc07df01abd86d084a3"
-"bin/setup-dev-env.sh" = "sha256:0558c0ba79c3569f55683f4fe80098565b5ffae03a11f14beb279ff29a1be8a7"
-agent-start = "sha256:3f8b7d1d6e1d51f9a714e4781f8be89a60e3da26f33f55715c3a67f4ae2c43fd"
+"bin/setup-dev-env.sh" = "sha256:614aafa3d2c8c2b0a01efb6b4420edf5643372339880f6edfe3f23e86d7d39bd"
+agent-start = "sha256:70a2f96788eecbd689412d428a3615193edcd1deaccc730e6976332c612176a6"
 "lefthook.yml" = "sha256:018da1c47329a4731e1f1c9345164f11fdf98771e1ddd57633cc0849286d7c74"
 ".markdownlint.yaml" = "sha256:b0834c9c810555866987cfec39862265322ef5048e92dac536563f6e21213553"
 ".markdownlintignore" = "sha256:05b151b2b20689c8c8e5e488ac8c5131f62b273101fb60395eb7be1c5d79d101"
@@ -117,11 +117,11 @@ agent-start = "sha256:3f8b7d1d6e1d51f9a714e4781f8be89a60e3da26f33f55715c3a67f4ae
 "pixi.toml#shipit-lint-deps" = "sha256:c75669f6e5fe369c0a6a2d5bbcceb59f0c8a0c9a1eba163f00d1081048067224"
 "pixi.toml#shipit-environments" = "sha256:c54b53e3bb55cd59aaabf9daea85c81cffe3cbae8978e41cbef5db0f16b3838b"
 "pixi.toml#shipit-rust-lint-toolchain" = "sha256:e5105bbd8feb8a1d5bde16dd427028303d1f0b3b4c43d7b85689de95c1200285"
-"pixi.toml#shipit-rust-release-deps" = "sha256:0f4fa11a3baa8d38a52db7649a938c8366b01fa60d3193aa17a1754bd72db2b1"
-".claude/agents/explorer.md" = "sha256:cef84756bfe22e1b73cae1d03bf062dd945453a96db22e0b17e5471524ff6112"
-".claude/agents/implementer.md" = "sha256:29a0e850f6a50f9f0e74f4bbaf52932b27231f6f2ab489aebeba895f5afdcc6c"
-".claude/agents/reviewer.md" = "sha256:1c1eeba06829be68c7190f61216bc8fe0a20c6413f71ca1b4898cd60eb2a060d"
-".claude/agents/shepherd.md" = "sha256:59c5ab182a25c616f826af9dc9427e11cddf0b6698ba586e0286f778f172dff3"
+"pixi.toml#shipit-rust-release-deps" = "sha256:e644207b819072fedeb26ab033ee695679b89df3403dedd190ed6f400e58fbc0"
+".claude/agents/explorer.md" = "sha256:278acf5f455c4a819f04d4686857854838faeb43c51a01f78cfdc171507081ee"
+".claude/agents/implementer.md" = "sha256:6dd3a1edfda6fe025119a79b865a620081cfecdd7bf29431223f65e2caf2c801"
+".claude/agents/reviewer.md" = "sha256:addadec3894e260d5abb2bb32684b445a2aa03a61d7bb2ef81fd1caa61153a38"
+".claude/agents/shepherd.md" = "sha256:8ea77a78dae1497a692c7ec9619dfefcc23137dd3c013b3259dd4a7e595714bf"
 ".agents/agents/reviewer/agent.md" = "sha256:38d3d1265d8cf912652570932d0e59f867c71ad80b7c7e0a9fbbb55316c6cca5"
 ".claude/settings.json#shipit-pretooluse-hook" = "sha256:329d1ef1631ac5217473702961c4213a36f6de10873e2a2500731ff003f58c9a"
 ".claude/settings.json#shipit-stop-hook" = "sha256:f01a445a58731cca9cfa67032780749aed3ece69afa0cec813c1a522cf25ce8f"
