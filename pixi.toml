@@ -120,10 +120,12 @@ wasm-pack = "0.15.*"
 # endpoint-gated home is future work. Provisioned under setup-pixi's
 # lockfile-keyed cache (the #582 doctrine: the release run NEVER installs at run
 # time — publish fails loudly naming this reconcile instead). Pinned to the
-# minor line (`0.68.*` — conda match-spec); spike-validated at 0.68.0
-# (ADR-0064). A bump is one data edit, rolled out on each consumer's next
+# minor line (`0.69.*` — conda match-spec); seed-validated at 0.69 against the
+# live channel (#1049 — 0.68.* panicked during the S3 upload: `opendal-core
+# 0.57.0 … concurrent tasks executed with no executor`, even with correct
+# AWS_* creds). A bump is one data edit, rolled out on each consumer's next
 # `shipit install` reconcile.
-rattler-build = "0.68.*"
+rattler-build = "0.69.*"
 # <<< shipit-managed rust release deps <<<
 rust = "1.96.*"
 cargo-nextest = ">=0.9.138,<0.10"

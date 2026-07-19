@@ -35,7 +35,64 @@
 # Do not edit — `shipit install` overwrites this file.
 set -euo pipefail
 
-repo="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# The directory this launcher lives in, symlink-safe (#994). `cd -P` on the
+# raw `$(dirname)` looks equivalent but is not: it never follows the SCRIPT's
+# own link chain, so a symlinked launcher path (`~/bin/agent-start ->
+# <checkout>/agent-start`) resolved `repo` to the LINK's directory and rooted
+# the coordinator session in the wrong checkout. Follow the link chain to the
+# real launcher first, then take its directory.
+#
+# The two `cd`s below differ deliberately, and swapping either breaks a case:
+#
+# - PHYSICAL (`-P`) inside the loop, to join a RELATIVE link target: the kernel
+#   interprets a link's relative target against the directory PHYSICALLY
+#   holding the link, not the logical path we reached it through. Joining onto
+#   the logical dir instead re-resolved `..` against the wrong parent — with
+#   `~/bin -> /tools` and `/tools/agent-start -> ../repo/agent-start` it
+#   silently rooted the session in `~/repo` (a real, WRONG checkout) instead of
+#   `/repo`. `-P` makes the joined path fully physical, so its `..` is exact.
+# - LOGICAL (no `-P`) for the final directory, whose last component is by then
+#   never a link: this is what keeps the symlinked-`bin` case working, where
+#   the caller's path IS the checkout we must resolve back to.
+#
+# Every resolution step degrades to "use the path as-is" rather than aborting:
+# under `set -e` a bare `readlink`/`cd` failure would kill the launch outright.
+resolve_script_dir() {
+	local path="$1" link dir dirpath hops=0
+	while [ -L "$path" ]; do
+		hops=$((hops + 1))
+		if [ "$hops" -gt 40 ]; then
+			echo "agent-start: symlink loop resolving $1 — using it as-is" >&2
+			break
+		fi
+		if ! dir="$(cd -P -- "$(dirname -- "$path")" && pwd)"; then
+			echo "agent-start: could not resolve the directory holding $path — using it as-is" >&2
+			break
+		fi
+		if ! link="$(readlink -- "$path")"; then
+			echo "agent-start: could not read the symlink $path — using it as-is" >&2
+			break
+		fi
+		case "$link" in
+		/*) path="$link" ;;
+		*) path="${dir}/${link}" ;;
+		esac
+	done
+	# The final step is guarded like every step above, and for the same reason:
+	# an unguarded `cd` (a link into a removed directory) aborted the launch
+	# outright under `set -e` — the exact hard-fail the degrade-to-as-is
+	# contract above rules out. Warn and degrade to the directory as-is; the
+	# `cd -- "$repo"` below still fails LOUDLY if that root is unusable.
+	dirpath="$(dirname -- "$path")" || dirpath="$path"
+	if ! dir="$(cd -- "$dirpath" && pwd)"; then
+		echo "agent-start: could not resolve the directory holding $path — using it as-is" >&2
+		printf '%s\n' "$dirpath"
+		return 0
+	fi
+	printf '%s\n' "$dir"
+}
+
+repo="$(resolve_script_dir "${BASH_SOURCE[0]}")"
 
 # Launch FROM the repo root (#848): the launcher may be invoked from any cwd,
 # but the coordinator session it starts must be rooted in the checkout this
