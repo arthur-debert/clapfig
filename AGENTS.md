@@ -13,6 +13,7 @@ it reads where a PR stands and emits the **single next action**. Don't carry the
 
 ```text
 pixi run lint     # the commit/push checks — multi-language, hard fail, never skips (CI runs the same)
+pixi run lint --fix  # the same gate, same pinned toolchain, formatting what it can
 pixi run test     # the test suite (a commit/push check)
 shipit pr status  # where the PR stands + the next action (read-only)
 shipit pr next    # DO the next action, then report — the verb you loop on

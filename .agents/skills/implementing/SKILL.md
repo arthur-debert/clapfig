@@ -39,7 +39,7 @@ pixi run test
 The commit and push hooks run the lint gate. Do not run a separate lint check unless the brief asks for it or you expect formatting damage. If formatting is likely, run:
 
 ```sh
-shipit lint --fix
+pixi run lint --fix
 ```
 
 Then commit and let the hook be the check.

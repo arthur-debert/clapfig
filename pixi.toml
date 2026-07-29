@@ -11,9 +11,7 @@ test = "./bin/shipit test"
 # <<< shipit-managed test task <<<
 # >>> shipit-managed tasks (do not edit; regenerate via `shipit install`) >>>
 changelog = "./bin/shipit changelog"
-lint = "./bin/shipit lint"
 logs = "./bin/shipit logs"
-provision-lexd = "./bin/shipit provision lexd"
 # <<< shipit-managed tasks <<<
 
 [feature.lint.dependencies]
@@ -53,6 +51,9 @@ lefthook = "2.1.*"
 # <<< shipit-managed lint deps <<<
 
 [feature.lint.tasks]
+# >>> shipit-managed lint task (do not edit; regenerate via `shipit install`) >>>
+lint = "./bin/shipit lint"
+# <<< shipit-managed lint task <<<
 # The wf-checks LINT LANE's run (ADP02-WS05, #85), byte-modeled on lex#829 /
 # shipit's own: the lint toolchain (ruff/shfmt/prettier/markdownlint/
 # actionlint/rust 1.96) lives in THIS feature's env, so the lane task must
@@ -74,6 +75,60 @@ lint-full = { cmd = "./bin/shipit lint" }
 # `cargo nextest` stack itself. Same conda-forge rust pin as the managed
 # [feature.lint.dependencies] block.
 [dependencies]
+# >>> shipit-managed rust release toolchain (do not edit; regenerate via `shipit install`) >>>
+# The rust RELEASE toolchain (#801, closing open hole 1 of the TOL02-WS17
+# inventory): hosted runner images no longer carry Rust, and the managed rust
+# LINT block anchors in the lint feature — an env the release runs' bare
+# `pixi run --locked ./bin/shipit` never resolves. So `cargo` itself (prepare's
+# subcommand dispatch, `cargo build`, `cargo publish`/`cargo metadata`)
+# anchors HERE, in the DEFAULT env's [dependencies], exactly the PATH every
+# wf-release stage executes with. conda-forge's `rust` is the official
+# toolchain (cargo included), provisioned under setup-pixi's lockfile-keyed
+# cache (the #582 doctrine: the release run NEVER installs at run time).
+# Deliberately the SYSROOT-ONLY block, SEPARATE from the cargo-edit
+# release-deps block: a consumer already pinning `rust` in its own
+# [dependencies] (the pre-#801 consumer-side workaround) keeps its pin via
+# the PixiKeyConflict first-splice guard WITHOUT losing cargo-edit delivery
+# — a block shared with the release deps would be skipped whole. Pinned in
+# lockstep with the rust lint block (drift-tested); a bump is one data edit
+# per block, same diff. If this repo no longer ships rust (the last
+# Cargo.toml is gone), delete this block and its
+# `pixi.toml#shipit-rust-release-toolchain` entry in .shipit.toml's
+# [managed] table — a reconcile only ADDS toolchain blocks, never retires one.
+rust = "1.96.*"
+# The wasm32 target std for this managed sysroot (#853): conda-forge's
+# wasm-pack does NOT pull it — its only deps are __glibc/libgcc (osx: __osx),
+# so the WS12 record's "wasm-pack pulls the wasm32 std" claim was false and
+# every wasm build against the managed `rust` toolchain died with
+# "wasm32-unknown-unknown target not found in sysroot" (found live in the
+# ADP02 rust reconcile wave). Anchors HERE, beside the `rust` line it is a
+# component of — NOT in the release-deps block — so a consumer that owns its
+# `rust` pin skips the std WITH the toolchain (one sysroot, one owner: that
+# consumer self-provisions the matching std, the sanctioned #759 rule)
+# instead of receiving a std that misses its own rust version. Still no
+# wasm-gated block (the WS12 record); accepted residue: ~20MB in every rust
+# consumer's default env, wasm or not. Pinned in LOCKSTEP with the `rust`
+# line above (drift-tested, `test_pins_agree_with_their_one_authority`) —
+# bump both keys in the same diff, or the std misses the sysroot version.
+rust-std-wasm32-unknown-unknown = "1.96.*"
+# <<< shipit-managed rust release toolchain <<<
+# >>> shipit-managed launcher deps (do not edit; regenerate via `shipit install`) >>>
+# The pinned `bin/shipit` launcher's one prerequisite (#758, TOL02-WS17
+# #794): every workflow block (wf-checks and the whole wf-release family)
+# runs `pixi run --locked ./bin/shipit ...`, and the ADR-0033 launcher
+# resolves the repo's shipit pin via `uv tool run` — but hosted runners do
+# not carry uv, so without this block the very first `./bin/shipit` dies 127
+# before any verb runs. Provisioned from conda-forge under setup-pixi's
+# lockfile-keyed cache (the #582 doctrine; the spike measured the launcher's
+# uv resolve at 5s cold / 0-3s warm riding this env — no extra cache step).
+# Anchored under [dependencies] — the DEFAULT env — because that is exactly
+# the PATH a bare `pixi run --locked <task>` resolves. Pinned to the minor
+# line of Layer 0's UV_PIN (bin/setup-dev-env.sh), so dev machines and CI
+# provision the same uv; a lockstep drift test (tests/test_install.py) fails
+# when the two move apart. `uv build` (the python bundle composition) rides
+# this same entry.
+uv = "0.11.*"
+# <<< shipit-managed launcher deps <<<
 # >>> shipit-managed rust release deps (do not edit; regenerate via `shipit install`) >>>
 # The rust RELEASE-side bump tool (#793, the #784-F2 failure class): `shipit
 # release prepare`'s rust bump adapter runs `cargo set-version --workspace`
@@ -110,34 +165,75 @@ wasm-pack = "0.15.*"
 # rust-release-toolchain block beside `rust`, NOT here: it must be delivered
 # (and skipped, when a consumer owns its `rust` pin) with the sysroot it
 # belongs to, while this block delivers unconditionally on the rust signal.
-# The Artifact channel's conda-endpoint packager (ARF01-WS01 #950, ADR-0064):
-# `shipit release publish`'s conda endpoint runs `rattler-build build` to
-# repackage a final release binary into a `.conda` and `rattler-build publish`
-# to push+reindex the producing repo's per-repo channel. rattler-build is on
-# conda-forge, so it anchors HERE (the rust release-deps block, rust signal)
-# beside wasm-pack — the walking-skeleton producer (lex-fmt/lex → lexd) is a
-# rust artifact, so the rust signal delivers it; a language-agnostic
-# endpoint-gated home is future work. Provisioned under setup-pixi's
-# lockfile-keyed cache (the #582 doctrine: the release run NEVER installs at run
-# time — publish fails loudly naming this reconcile instead). Pinned to the
-# minor line (`0.69.*` — conda match-spec); seed-validated at 0.69 against the
-# live channel (#1049 — 0.68.* panicked during the S3 upload: `opendal-core
-# 0.57.0 … concurrent tasks executed with no executor`, even with correct
-# AWS_* creds). A bump is one data edit, rolled out on each consumer's next
-# `shipit install` reconcile.
-rattler-build = "0.69.*"
+# NOTE: rattler-build (the conda endpoint's packager) used to ride HERE too
+# (ARF01-WS01 #950) — but it is the ENDPOINT's tool, not a rust tool, and
+# gating it on the rust signal starved a NON-rust conda producer (tree-sitter's
+# `tarball` grammar) of its packager (the #1071 seed failure). It now rides the
+# conda-endpoint-gated `pixi.toml#shipit-conda-packager` block
+# (src/shipit/data/pixi-conda-packager-block.toml), delivered iff the repo
+# declares a `conda` endpoint — so a rust+conda repo gets it EXACTLY once and a
+# rust-without-conda repo (which publishes no `.conda`) no longer carries it.
 # <<< shipit-managed rust release deps <<<
-rust = "1.96.*"
 cargo-nextest = ">=0.9.138,<0.10"
-# uv backs the pinned bin/shipit launcher (ADR-0033: it provisions the repo's
-# pinned shipit via uv, PATH-independent). Both wf-checks lanes run
-# `pixi run --locked <task>` -> ./bin/shipit on a hosted runner where uv is
-# not otherwise present, so the launcher's one prerequisite must ride the env
-# too. (Known upstream gap: the block/managed set should own this —
-# shipit#758, first flagged by lex#828/#829.)
-uv = ">=0.5"
+# `rust` and `uv` used to be declared here as consumer keys; both are now
+# shipit-managed and MUST NOT come back. `uv` (the pinned bin/shipit launcher's
+# one prerequisite, ADR-0033) rides `pixi.toml#shipit-launcher-deps` — the
+# upstream gap this repo worked around (shipit#758, first flagged by
+# lex#828/#829) is closed. `rust` rides
+# `pixi.toml#shipit-rust-release-toolchain`, which delivers the same pin PLUS
+# `rust-std-wasm32-unknown-unknown`; a consumer-owned `rust` key made that whole
+# block skip, so the shadow copy silently cost this repo the wasm32 sysroot.
 
 [environments]
 # >>> shipit-managed environments (do not edit; regenerate via `shipit install`) >>>
-lint = ["lint"]
+lint = ["lint", "shipit-lexd"]
 # <<< shipit-managed environments <<<
+
+# >>> shipit-managed lexd feature (do not edit; regenerate via `shipit install`) >>>
+[feature.shipit-lexd]
+# lexd — the lex Lang's lint-gate tool — resolved as an ordinary conda package
+# from the public Artifact channel (ADR-0066: `provision lexd` retired). The
+# channel is scoped to THIS reserved feature (a sibling of conda-forge, added to
+# whatever env `shipit-lexd` is wired into — the lint env), so lexd rides
+# pixi.lock and pixi's sha256 like every other linter, and `shipit install`
+# keeps the whole fleet on ONE lexd version — uniformity moved from a compiled
+# binary constant to this managed block (ADR-0047: not consumer config).
+channels = ["https://storage.googleapis.com/shipit-artifacts-public/lex-fmt/lex"]
+
+# The fleet-pinned lexd, PLATFORM-SCOPED via pixi `[target]` tables. This file is
+# the block HEADER; `shipit install` GENERATES one
+# `[feature.shipit-lexd.target.<plat>.dependencies]` table below per platform in
+# (this repo's declared `[workspace].platforms` ∩ the channel's CLOSED SERVED SET
+# — `SERVED_SUBDIRS`, `src/shipit/channel/buckets.py`:
+# osx-arm64/linux-64/linux-aarch64 AND win-64), pinned to `LEXD_PIN`
+# (`src/shipit/install/units.py`, the single pin edit) — NEVER a blanket
+# `[feature.shipit-lexd.dependencies]`. See `units.lexd_block`; a bump is one edit
+# to `LEXD_PIN`, rolled fleet-wide on each consumer's next reconcile.
+#
+# Why intersect with the repo's OWN declared platforms (#1072): a `[target]`
+# selector for a platform the workspace does NOT declare makes pixi warn on EVERY
+# invocation (`target selector 'win-64' does not match any of the platforms
+# supported by the workspace`) — fleet-wide noise (hit on shipit's own `main`
+# after #1068 emitted a fixed all-of-served target set). A repo emits a target
+# only for a platform it actually declares.
+#
+# Why intersect with the served set (#1068) — load-bearing AND fail-closed:
+#  - A BLANKET `[feature.shipit-lexd.dependencies]` applied lexd to EVERY platform
+#    a composing env declares, so a consumer declaring a platform OUTSIDE the
+#    served set (e.g. osx-64, Intel Mac) had no channel candidate and got an
+#    unsatisfiable lint-env solve — `shipit install` then failed closed with no
+#    commit and no reconcile (#1068). Platforms NOT in the served set carry NO
+#    lexd dep, so their lint env SOLVES and install/reconcile no longer breaks.
+#  - win-64 IS in the served set (served, merely owner-PAUSED under the Windows
+#    build pause #895, ADR-0071). A repo that DECLARES win-64 keeps a win-64
+#    target and FAILS CLOSED at solve (the channel serves no win-64 lexd while the
+#    pause holds — ADR-0071's "Windows consumers fail closed, loudly"); a repo
+#    that does NOT declare win-64 emits no win-64 target (and no dangling-selector
+#    warning). It re-resolves automatically when #895 lifts — no edit here.
+[feature.shipit-lexd.target.osx-arm64.dependencies]
+lexd = "==0.19.10"
+[feature.shipit-lexd.target.linux-64.dependencies]
+lexd = "==0.19.10"
+[feature.shipit-lexd.target.linux-aarch64.dependencies]
+lexd = "==0.19.10"
+# <<< shipit-managed lexd feature <<<

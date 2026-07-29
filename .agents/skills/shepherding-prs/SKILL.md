@@ -52,6 +52,6 @@ Run the exact verify commands from the brief after your fixes. In shipit, this i
 pixi run test
 ```
 
-The commit and push hooks run the lint gate. Use `shipit lint --fix` only when formatting damage is expected, then commit and let the hook check it.
+The commit and push hooks run the lint gate. Use `pixi run lint --fix` only when formatting damage is expected, then commit and let the hook check it.
 
 Push the round's commits together. Then hand back to the coordinator and park. Trust `shipit pr status` or `shipit pr next` for the next action; do not re-request reviews manually.

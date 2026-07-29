@@ -3,9 +3,9 @@
 # managed `lint` pixi task (`pixi run -e lint lint`). lefthook is intentionally
 # dumb: one definition, run everywhere, so CI and the hooks cannot drift into
 # two transcriptions of the rules. Every task and environment invoked here is
-# satisfied by the shipit-managed pixi.toml blocks (the `[tasks]` line, the lint
-# feature/dependency block, the `[environments]` definition), so the hooks are
-# green on a stock consumer right after `shipit install`. The only repo-local
+# satisfied by the shipit-managed pixi.toml blocks (the `[feature.lint.tasks]`
+# line, the lint feature/dependency block, the `[environments]` definition), so
+# the hooks are green on a stock consumer right after `shipit install`. The only repo-local
 # path referenced is the shipit-managed launcher `./bin/shipit` (covered next) —
 # itself part of the managed set, so a stock consumer has it too; no UNMANAGED
 # repo-local script or path is referenced.
@@ -21,13 +21,26 @@
 # launcher (it reads `.shipit.toml`'s pin and execs that exact build) with NO
 # dependence on the pixi manifest, so the `-e lint` wrapper is preserved purely
 # for the lint TOOLCHAIN (ruff/shellcheck/…) — a separate concern from the
-# shipit build — and the manifest-ambiguity dodge below still holds.
+# shipit build — and the environment pin below still holds.
 #
-# The `-e lint` is pinned (not bare `pixi run lint`): an inherited
+# The `-e lint` is EXPLICIT, not different: since #1066 the managed `lint` task
+# lives in `[feature.lint.tasks]` and the managed `[environments]` composes that
+# feature into exactly one env, so a bare `pixi run lint` already resolves there
+# — the hook and the public command are the same task in the same env. The flag
+# stays as a LOUD, self-documenting pin of the environment this gate runs in,
+# and it keeps working if a repo ever composes the lint feature into a SECOND
+# environment: the bare form would go ambiguous there, and a hook that dies at
+# commit time is the worst place to discover it.
+#
+# What `-e` does NOT do is pin the MANIFEST. It selects an environment WITHIN
+# whichever pixi.toml pixi already resolved, and resolving that manifest is a
+# SEPARATE mechanism: pixi's root-walk from cwd, an inherited
 # `PIXI_PROJECT_MANIFEST` (a commit made from inside another pixi project's
-# activated environment) makes bare `pixi run lint` ambiguous across
-# environments and the hook dies. Pinning the environment removes the
-# ambiguity regardless of the inherited env.
+# activated environment), or an explicit `--manifest-path` — the only one that
+# actually pins it (docs/dev/pixi.lex). The hook passes no `--manifest-path`: it
+# fires at the checkout's root and lints the tree pixi's root-walk finds there.
+# So read `-e lint` as "this gate runs in the lint env", never as a shield
+# against a hostile ambient manifest.
 #
 # Fail-open when pixi is absent (#482): each leg is guarded by a `command -v
 # pixi` probe that skips (prints a note, `exit 0`) when pixi is not on PATH —
