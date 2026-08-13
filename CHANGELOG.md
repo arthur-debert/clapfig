@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.22.1 - 2026-08-13
+
+Republish the 0.22.0 release surface to crates.io: the v0.22.0 tag was cut locally, so the dispatch-only release workflow never ran and the crates never published.
+
 ## 0.22.0 - 2026-08-13
 
 - Add tests for flatten.rs covering integer widths, tuples, enum variants, unit values, bytes error, and key serializer.
