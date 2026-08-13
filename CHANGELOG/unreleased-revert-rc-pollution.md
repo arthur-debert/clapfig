@@ -1,1 +1,0 @@
-- Revert the stray 0.21.6-release-rc version bump pushed to main by a release-tooling verification-cut bug; restore 0.21.5-rc.2.

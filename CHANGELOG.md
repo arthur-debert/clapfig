@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+## 0.22.0 - 2026-08-13
+
 - Add tests for flatten.rs covering integer widths, tuples, enum variants, unit values, bytes error, and key serializer.
 Adopt fragment-directory changelog model ([#201](https://github.com/arthur-debert/release/issues/201)). Historical entries preserved verbatim in CHANGELOG/legacy.md; new entries land as files under CHANGELOG/unreleased/.
 - ci: migrate release reusable-workflow callers from @v2 to @v3

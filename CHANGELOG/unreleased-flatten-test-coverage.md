@@ -1,1 +1,0 @@
-- Add tests for flatten.rs covering integer widths, tuples, enum variants, unit values, bytes error, and key serializer.
