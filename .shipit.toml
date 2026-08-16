@@ -18,7 +18,9 @@ AGY_REVIEW_APP_ID            = { doppler = "AGY_REVIEW_APP_ID" }
 # `codex = {}`). Review-once: `rerun` defaults OFF (token-billed; opt in per reviewer
 # with e.g. `copilot = { rerun = true }`).
 [reviewers]
-copilot = {}
+copilot = { rerun = true }
+codex = { window = 2700, model = "gpt-5.6-sol" }
+agy = { window = 2700, model = "pro" }
 
 # [lint].ignore — paths the managed lint gate must SKIP. Seeded with common
 # generated/assembled files (a built CHANGELOG, package lockfiles) that are not
