@@ -21,9 +21,10 @@ produces carries a dotted key and nothing else: no file, no line, not even which
 CLI overrides, `invalid value for key 'database.pool_size'` leaves the user to
 search every source by hand.
 
-The only located errors today are unknown-key errors, and their line numbers come
-from `find_key_line` — a text-scan heuristic that cannot handle arrays-of-tables or
-inline tables and silently degrades to "line 0" (no snippet) when it fails.
+The only located *post-merge validation* errors today are unknown-key errors, and
+their line numbers come from `find_key_line` — a text-scan heuristic that cannot
+handle arrays-of-tables or inline tables and silently degrades to "line 0" (no
+snippet) when it fails. (Parse errors are already located: they carry parser spans.)
 
 This is the gap recorded as a qualification on #100, #101, and #102: those features
 are not honestly complete while the errors they produce cannot name their source.
@@ -57,14 +58,23 @@ truth" and "errors are data":
 subscriber is installed, and gating it behind a feature would remove the narration
 exactly when it is needed. Level discipline:
 
-- `trace` — the full story: every candidate value per key, every win/loss decision
-  with its reason (layer precedence), every path probed during discovery including
+- `trace` — the full story: every candidate per key, every win/loss decision with
+  its reason (layer precedence), every path probed during discovery including
   misses, per-key origin assignments, defaults filled.
 - `debug` — per-stage summaries: files discovered and parsed (with key counts),
   layers constructed, merge completed, validation passes and their outcomes.
 - `info` and above — nothing during healthy resolution. A library is quiet at info.
   `warn` is reserved for legal-but-suspicious situations if any are identified
   later; none are proposed now.
+
+**Values are never logged.** Config values routinely include tokens, passwords, and
+credentials, and clapfig has no sensitivity metadata to tell them from benign
+values — so the safe-by-default contract is: logs carry key paths, origins, value
+*types*, and precedence decisions, never raw values, at every level. This is
+sufficient for the narration stories below (the diagnostic is *which source won*,
+not what it said). If raw-value logging is ever wanted for local debugging, it
+requires an explicit opt-in and a sensitivity/redaction design first; neither is
+part of this proposal.
 
 ## User experience
 
@@ -93,15 +103,18 @@ error: invalid value for `block.core.kind`: "rus" is not in allowed set: rust | 
 
 When the offending value did not come from a file, the error names its actual
 source instead: `set by environment variable EDWARD__BLOCK__CORE__KIND` or
-`set by --set block.core.kind=rus`.
+`set by a programmatic override for key block.core.kind` (clapfig's override
+layers receive `(key, value)` pairs and cannot see whether a CLI flag, GUI field,
+or HTTP header produced them — see Origin below).
 
 ### Story 2 — end user: a missing required key names where clapfig looked
 
 A required key is set in no layer. An absent key has no origin, so the error cannot
-point at a line — instead it names the search: the files that were loaded and the
-non-file layers that were consulted. "It's not set" becomes "it's not set in
-`~/.config/edward/config.toml`, `./.edward/blocks.toml`, or the `EDWARD__` env" —
-which tells the user exactly where to add it.
+point at a line — instead it names the search: every file path *probed* (found or
+missing) and the non-file layers consulted. "It's not set" becomes "it's not set in
+`~/.config/edward/config.toml` (not found), `./.edward/blocks.toml`, or the
+`EDWARD__` env" — which tells the user exactly where to add it, including the case
+where the file they thought they wrote was never discovered at all.
 
 ### Story 3 — developer: the silent wrong merge
 
@@ -117,16 +130,17 @@ TRACE clapfig::file    probing ./myapp.toml — found
 TRACE clapfig::file    probing ~/.config/myapp/config.toml — not found
 DEBUG clapfig::resolve layer Files: 1 file, 14 keys
 DEBUG clapfig::resolve layer Env (MYAPP__): 1 key
-TRACE clapfig::merge   database.pool_size: Files(./myapp.toml:8) = 10 loses to Env(MYAPP__DATABASE__POOL_SIZE) = 5
+TRACE clapfig::merge   database.pool_size: File(./myapp.toml:8, integer) loses to Env(MYAPP__DATABASE__POOL_SIZE, integer)
 DEBUG clapfig::resolve merge complete: 15 keys, 1 override across layers
 ```
 
-The forgotten env var is named in one line, with both candidates and the reason the
-winner won. No code changes, no fork.
+The forgotten env var is named in one line, with both candidates' sources and the
+reason the winner won — note the log names sources and types, never the values
+themselves (see the no-values contract above). No code changes, no fork.
 
 ### Story 4 — developer: locating errors in shapes the heuristic can't parse
 
-Unknown keys inside `[[array-of-table]]` entries and inline tables currently render
+Unknown keys inside arrays-of-tables (`[[...]]`) entries and inline tables currently render
 with `path:0` and no snippet. Real span data closes this: every located error gets a
 correct line regardless of TOML syntax shape. This is also what makes the
 diagnostics demanded by #101/#102 (arrays of structs, enum lists) — and eventually
@@ -143,31 +157,62 @@ but is **not part of this work** — noted here so the map's shape anticipates i
 
 ### The origin map
 
-A per-resolution map from dotted key path to the winning value's origin:
+A per-resolution map from key path to the winning value's origin:
 
 ```rust
-Origin {
-    layer: Layer,                  // Files | Env | Url | Cli | Default
-    file:  Option<PathBuf>,        // Files layer only
-    span:  Option<(line, column)>, // where parser span data exists
-    detail: Option<String>,        // e.g. the env var name, the CLI flag text
+struct Origin {
+    layer: OriginLayer,          // File | Env | Url | Override | Default
+    file: Option<PathBuf>,       // File layer only
+    span: Option<Range<usize>>,  // byte range in the source, where parser data exists
+    detail: Option<String>,      // e.g. the env var name
 }
 ```
 
+- **Keyed by structured paths, not dotted strings.** A dotted string is not a
+  lossless node identity in TOML: a quoted literal key `"a.b"` collides with the
+  nested path `[a] b`, and array entries need index segments. The map is keyed by
+  `Vec<PathSegment>` with distinct `Key(String)` and `Index(usize)` segments;
+  dotted/indexed strings are produced only for display, with defined escaping.
+  Regression coverage includes quoted dotted keys vs. their nested lookalikes,
+  inline tables, and arrays of tables.
+- **`OriginLayer` is a new enum, not the public `Layer`.** The existing `Layer`
+  enum is the input to `layer_order` (a merge-order vocabulary: Files/Env/Url/Cli)
+  and must not grow a `Default` variant that would be meaningless as a merge
+  source. `OriginLayer` is provenance vocabulary: `File`, `Env`, `Url`,
+  `Override` (the programmatic override layer — clapfig receives `(key, value)`
+  pairs there and guarantees only the key; it cannot know whether a CLI flag, GUI
+  field, or HTTP header produced them, and no caller-supplied origin-label API is
+  proposed now), and `Default` (schema-filled).
+- **Spans are byte ranges plus shared source.** `(line, column)` alone cannot
+  render the caret or the snippet. An origin retains the parser's byte
+  `Range<usize>` over the *value* of the assignment (unknown-key diagnostics use
+  the key's range from the span index), alongside the file's source text shared as
+  `Arc<str>` — the same pattern `UnknownKeyInfo` uses today. Line/column are
+  derived at render time.
 - **Built at parse time.** Each file parse also produces a path → span index from
   real parser span data (`toml_edit` retains spans). The `find_key_line` text
   heuristic is deleted outright — which also fixes its array-of-tables and
-  inline-table blind spots. Env/CLI/URL layers get synthetic origins carrying the
-  variable or flag name. Defaults filled from the schema get `layer: Default`.
+  inline-table blind spots. Env/URL/override layers get synthetic origins carrying
+  what they know (the env var name, the override key). Defaults filled from the
+  schema get `OriginLayer::Default`.
+- **Normalization-aware identity.** With `normalize_keys(true)`, provenance paths
+  undergo the same key normalization as value paths (a source `pool-size` span is
+  reachable from the merged `pool_size` identity), while the original spelling and
+  span are retained for rendering. Acceptance covers normalized top-level, nested,
+  inline-table, and array-of-tables keys.
 - **Carried through the merge.** `deep_merge` merges origin tables alongside value
   tables under the same override rules: when a value wins, its origin wins. The
-  losing candidate is emitted to `trace` at the decision point (story 3) and then
-  dropped.
+  losing candidate's *source* is emitted to `trace` at the decision point (story 3)
+  and then dropped.
 - **Winner-only retention.** The retained map answers "where did the effective
   value come from". Losers live in the logs, which cost nothing to keep. A retained
   full candidate history is out of scope until a concrete consumer demands it.
-- **Discovery record.** The resolution also retains the list of files loaded (story
-  2) — a handful of paths, already known to the pipeline.
+- **Discovery record.** The resolution retains every candidate probe with its
+  outcome — `loaded`, `missing`, or `error` — not just the files that loaded:
+  missing files are exactly the useful candidates when a required key is absent
+  (story 2). Under `SearchMode::FirstMatch`, candidates below the first hit are
+  recorded as `not probed`, never reported as consulted. The relevant probes feed
+  `MissingRequired` diagnostics.
 
 ### Consumers, in order
 
@@ -201,12 +246,18 @@ located-nowhere errors this proposal eliminates.
 ## Acceptance
 
 - Every post-merge validation error names layer + file + line when the value came
-  from a file, and the concrete env var / flag when it did not.
-- Missing-required errors enumerate the files and layers consulted.
+  from a file; the env var name for env-sourced values; and the override key for
+  programmatic overrides.
+- Missing-required errors enumerate the file probes (with outcomes) and layers
+  consulted; under `FirstMatch`, unprobed candidates are not reported as consulted.
 - `find_key_line` is gone; unknown-key errors inside arrays-of-tables and inline
-  tables carry correct lines (regression tests on both shapes).
+  tables carry correct lines (regression tests on both shapes), and origin lookups
+  survive `normalize_keys(true)` and quoted dotted keys (tests distinguishing
+  `"a.b"` from `[a] b`).
 - A `trace`-level subscriber capturing a two-file + env resolution sees discovery
   probes (hits and misses), per-layer summaries, and every cross-layer override
-  with both candidates named (locked by a capturing-subscriber test).
+  with both candidates' sources named (locked by a capturing-subscriber test).
+- No log line at any level contains a config value (asserted by the same
+  capturing-subscriber test over a config containing a sentinel secret string).
 - Healthy resolution emits nothing at `info` or above.
 - The doctrine paragraph lands in the crate-level docs' design principles.
