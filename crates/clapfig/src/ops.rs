@@ -13,7 +13,7 @@ use crate::value::{Map, Value};
 /// Result of a config operation. Returned to the caller for display.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigResult {
-    /// A generated TOML template string.
+    /// A generated config template string, in the requested format.
     Template(String),
     /// Confirmation that a template was written to a file.
     TemplateWritten { path: PathBuf },
