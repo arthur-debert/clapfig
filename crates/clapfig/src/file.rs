@@ -117,7 +117,7 @@ pub fn expand_ancestors_from(start: PathBuf, boundary: &Boundary) -> Vec<PathBuf
 ///
 /// `start_dir` is the logical "current directory" used to interpret
 /// [`SearchPath::Cwd`] and [`SearchPath::Ancestors`]. For top-level
-/// [`load()`](crate::ClapfigBuilder::load) calls this is `std::env::current_dir()`;
+/// [`load()`](crate::RuntimeBuilder::load) calls this is `std::env::current_dir()`;
 /// for [`Resolver::resolve_at(dir)`](crate::Resolver::resolve_at) it is `dir`,
 /// which lets tree-walk tools treat every leaf as its own resolution root.
 pub fn expand_search_paths(

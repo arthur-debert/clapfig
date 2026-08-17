@@ -6,77 +6,21 @@
 
 use std::path::Path;
 
-use confique::Config;
-use serde::Deserialize;
-
 use crate::error::ClapfigError;
 use crate::ops::ConfigResult;
 
 /// Pure function: patch a TOML document string, setting `key` to `raw_value`.
 ///
-/// If `content` is `None` (file doesn't exist yet), starts from the generated template.
-/// Uses `toml_edit` to preserve existing comments and formatting.
+/// Validates the key against an owned [`Schema`](crate::runtime::Schema)
+/// and the value against the leaf's declared
+/// [`LeafType`](crate::runtime::LeafType), so a typo in the key name or a
+/// string where an integer is expected fails before the file is touched.
+///
+/// If `content` is `None` (file doesn't exist yet), starts from the
+/// generated template. Uses `toml_edit` to preserve existing comments and
+/// formatting.
 ///
 /// Returns the modified document string.
-pub fn set_in_document<C: Config>(
-    content: Option<&str>,
-    key: &str,
-    raw_value: &str,
-) -> Result<String, ClapfigError>
-where
-    C::Layer: for<'de> Deserialize<'de>,
-{
-    // Validate key is known to the config schema
-    let valid_keys = crate::overrides::valid_keys(crate::spec::SchemaRef::from_meta(&C::META));
-    if !valid_keys.contains(key) {
-        return Err(ClapfigError::KeyNotFound(key.into()));
-    }
-
-    // Validate value is compatible with the field's type by round-trip
-    // deserializing a minimal table into C::Layer (all-optional fields).
-    let check_value = parse_toml_value(raw_value);
-    let check_table = crate::overrides::overrides_to_table(&[(key.to_string(), check_value)]);
-    let _: C::Layer =
-        toml::Value::Table(check_table)
-            .try_into()
-            .map_err(|e: toml::de::Error| ClapfigError::InvalidValue {
-                key: key.into(),
-                reason: e.to_string(),
-            })?;
-
-    let base = match content {
-        Some(c) => c.to_string(),
-        None => {
-            // Start from template or empty
-            // `config set` doesn't currently know about normalize_keys, so
-            // the seeded template stays snake_case to match today's behavior.
-            // Wiring kebab into the set/unset path (key validation + seed)
-            // is a sibling fix tracked separately.
-            let template = crate::ops::generate_template::<C>(false);
-            if template.trim().is_empty() {
-                String::new()
-            } else {
-                template
-            }
-        }
-    };
-
-    let mut doc: toml_edit::DocumentMut =
-        base.parse()
-            .map_err(|e: toml_edit::TomlError| ClapfigError::InvalidValue {
-                key: key.into(),
-                reason: e.to_string(),
-            })?;
-
-    let parsed_value = parse_toml_edit_value(raw_value);
-    write_at_dotted_path(&mut doc, key, parsed_value)?;
-    Ok(doc.to_string())
-}
-
-/// Runtime-path analogue of [`set_in_document`]. Validates the key against
-/// an owned [`Schema`](crate::runtime::Schema) and the value against the
-/// leaf's declared [`LeafType`](crate::runtime::LeafType) — same fail-fast
-/// invariants as the static path, just driven from a runtime schema.
 pub fn set_in_document_runtime(
     schema: &crate::runtime::Schema,
     content: Option<&str>,
@@ -178,7 +122,9 @@ fn write_at_dotted_path(
     Ok(())
 }
 
-/// Runtime-path wrapper around `set_in_document_runtime` with file I/O.
+/// Wrapper around [`set_in_document_runtime`] with file I/O: reads the file
+/// (if it exists), patches it, writes back. Creates parent directories if
+/// needed.
 pub fn persist_value_runtime(
     schema: &crate::runtime::Schema,
     file_path: &Path,
@@ -236,47 +182,6 @@ fn lookup_leaf_type<'a>(
         }
     }
     None
-}
-
-/// I/O wrapper: reads file (if it exists), patches it, writes back.
-/// Creates parent directories if needed.
-pub fn persist_value<C: Config>(
-    file_path: &Path,
-    key: &str,
-    value: &str,
-) -> Result<ConfigResult, ClapfigError>
-where
-    C::Layer: for<'de> Deserialize<'de>,
-{
-    let content = match std::fs::read_to_string(file_path) {
-        Ok(c) => Some(c),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            return Err(ClapfigError::IoError {
-                path: file_path.to_path_buf(),
-                source: e,
-            });
-        }
-    };
-
-    let new_content = set_in_document::<C>(content.as_deref(), key, value)?;
-
-    if let Some(parent) = file_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-    }
-
-    std::fs::write(file_path, &new_content).map_err(|e| ClapfigError::IoError {
-        path: file_path.to_path_buf(),
-        source: e,
-    })?;
-
-    Ok(ConfigResult::ValueSet {
-        key: key.into(),
-        value: value.into(),
-    })
 }
 
 /// Pure function: remove a key from a TOML document string.
@@ -344,8 +249,9 @@ pub fn unset_value(file_path: &Path, key: &str) -> Result<ConfigResult, ClapfigE
 
 /// Parse a raw string value into a `toml::Value` with type heuristics.
 ///
-/// Used for round-trip validation: build a `toml::Table` and deserialize into
-/// `C::Layer` to catch type mismatches before persisting.
+/// Used for validation: the parsed value is checked against the target
+/// leaf's declared [`LeafType`](crate::runtime::LeafType) to catch type
+/// mismatches before persisting.
 fn parse_toml_value(s: &str) -> toml::Value {
     if s.eq_ignore_ascii_case("true") {
         return toml::Value::Boolean(true);
@@ -386,27 +292,43 @@ fn parse_toml_edit_value(s: &str) -> toml_edit::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::test::{EnumConfig, TestConfig};
+    use crate::fixtures::test::{enum_schema, test_schema};
     use std::fs;
     use tempfile::TempDir;
+
+    fn set_in_document(
+        content: Option<&str>,
+        key: &str,
+        value: &str,
+    ) -> Result<String, ClapfigError> {
+        set_in_document_runtime(&test_schema(), content, key, value)
+    }
+
+    fn persist_value(
+        path: &std::path::Path,
+        key: &str,
+        value: &str,
+    ) -> Result<ConfigResult, ClapfigError> {
+        persist_value_runtime(&test_schema(), path, key, value)
+    }
 
     // --- validation tests ---
 
     #[test]
     fn set_rejects_unknown_key() {
-        let result = set_in_document::<TestConfig>(Some(""), "nonexistent", "value");
+        let result = set_in_document(Some(""), "nonexistent", "value");
         assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
     }
 
     #[test]
     fn set_rejects_invalid_enum_value() {
-        let result = set_in_document::<EnumConfig>(Some(""), "mode", "garbage");
+        let result = set_in_document_runtime(&enum_schema(), Some(""), "mode", "garbage");
         match result {
             Err(ClapfigError::InvalidValue { key, reason }) => {
                 assert_eq!(key, "mode");
                 assert!(
-                    reason.contains("unknown variant"),
-                    "expected 'unknown variant' in: {reason}"
+                    reason.contains("not in allowed set"),
+                    "expected 'not in allowed set' in: {reason}"
                 );
             }
             other => panic!("Expected InvalidValue, got {other:?}"),
@@ -415,13 +337,13 @@ mod tests {
 
     #[test]
     fn set_accepts_valid_enum_value() {
-        let result = set_in_document::<EnumConfig>(Some(""), "mode", "fast");
+        let result = set_in_document_runtime(&enum_schema(), Some(""), "mode", "fast");
         assert!(result.is_ok());
     }
 
     #[test]
     fn set_rejects_wrong_type() {
-        let result = set_in_document::<TestConfig>(Some(""), "port", "not_a_number");
+        let result = set_in_document(Some(""), "port", "not_a_number");
         assert!(matches!(result, Err(ClapfigError::InvalidValue { .. })));
     }
 
@@ -432,7 +354,7 @@ mod tests {
         // pre-fix would panic via `toml_edit::Item::IndexMut`. The guard
         // turns it into a clean InvalidValue.
         let content = "database = \"oops\"\n";
-        let result = set_in_document::<TestConfig>(Some(content), "database.url", "pg://x");
+        let result = set_in_document(Some(content), "database.url", "pg://x");
         match result {
             Err(ClapfigError::InvalidValue { key, reason }) => {
                 assert_eq!(key, "database.url");
@@ -447,7 +369,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
-        let result = persist_value::<EnumConfig>(&path, "mode", "garbage");
+        let result = persist_value_runtime(&enum_schema(), &path, "mode", "garbage");
         assert!(matches!(result, Err(ClapfigError::InvalidValue { .. })));
         // File should NOT have been created
         assert!(!path.exists());
@@ -456,7 +378,7 @@ mod tests {
     #[test]
     fn set_existing_key() {
         let content = "port = 8080\nhost = \"localhost\"\n";
-        let result = set_in_document::<TestConfig>(Some(content), "port", "3000").unwrap();
+        let result = set_in_document(Some(content), "port", "3000").unwrap();
         assert!(result.contains("port = 3000"));
         assert!(result.contains("host = \"localhost\""));
     }
@@ -464,29 +386,28 @@ mod tests {
     #[test]
     fn set_nested_key() {
         let content = "[database]\npool_size = 5\n";
-        let result =
-            set_in_document::<TestConfig>(Some(content), "database.pool_size", "20").unwrap();
+        let result = set_in_document(Some(content), "database.pool_size", "20").unwrap();
         assert!(result.contains("pool_size = 20"));
     }
 
     #[test]
     fn set_new_key_in_existing_file() {
         let content = "port = 8080\n";
-        let result = set_in_document::<TestConfig>(Some(content), "debug", "true").unwrap();
+        let result = set_in_document(Some(content), "debug", "true").unwrap();
         assert!(result.contains("debug = true"));
         assert!(result.contains("port = 8080"));
     }
 
     #[test]
     fn set_creates_from_template_when_none() {
-        let result = set_in_document::<TestConfig>(None, "port", "3000").unwrap();
+        let result = set_in_document(None, "port", "3000").unwrap();
         assert!(result.contains("port = 3000"));
     }
 
     #[test]
     fn preserves_comments() {
         let content = "# This is my config\nport = 8080\n# end\n";
-        let result = set_in_document::<TestConfig>(Some(content), "port", "3000").unwrap();
+        let result = set_in_document(Some(content), "port", "3000").unwrap();
         assert!(result.contains("# This is my config"));
         assert!(result.contains("port = 3000"));
     }
@@ -520,7 +441,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
-        let result = persist_value::<TestConfig>(&path, "port", "3000").unwrap();
+        let result = persist_value(&path, "port", "3000").unwrap();
         assert!(matches!(result, ConfigResult::ValueSet { .. }));
 
         let content = fs::read_to_string(&path).unwrap();
@@ -533,7 +454,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "port = 8080\n").unwrap();
 
-        persist_value::<TestConfig>(&path, "port", "3000").unwrap();
+        persist_value(&path, "port", "3000").unwrap();
 
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("port = 3000"));
@@ -545,7 +466,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sub").join("dir").join("config.toml");
 
-        persist_value::<TestConfig>(&path, "port", "3000").unwrap();
+        persist_value(&path, "port", "3000").unwrap();
         assert!(path.exists());
     }
 

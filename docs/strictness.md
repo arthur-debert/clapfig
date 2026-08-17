@@ -15,11 +15,11 @@ re-tightens. Clapfig models all of these with three composable knobs.
 ### Knob 1 — `.strict(bool)`: the whole-resolution default
 
 ```rust,ignore
-Clapfig::builder::<AppConfig>()
+Clapfig::schema_builder::<AppConfig>()
     .strict(true)   // unknown keys are errors (the default)
     .load()?;
 
-Clapfig::builder::<AppConfig>()
+Clapfig::schema_builder::<AppConfig>()
     .strict(false)  // unknown keys are silently dropped
     .load()?;
 ```
@@ -31,16 +31,15 @@ carry an explicit override.
 
 Two equivalent surfaces:
 
-- `ClapfigBuilder::strict_at(path, bool)` — sets an override on a dotted
-  path (validated against `C`'s schema).
-- `RuntimeBuilder::strict_at(path, bool)` — same, validated against the
-  runtime schema.
+- `strict_at(path, bool)` (on both the typed `SchemaConfigBuilder` and
+  the `RuntimeBuilder`) — sets an override on a dotted path, validated
+  against the schema.
 - `Schema::strict(bool)` — sets an override on a runtime schema node
-  inline.
+  inline (`#[clapfig(strict = ...)]` on a derived struct).
 
 ```rust,ignore
-// Static path
-Clapfig::builder::<AppConfig>()
+// Typed path
+Clapfig::schema_builder::<AppConfig>()
     .strict_at("plugins", false)        // plugins.* subtree: lenient
     .strict_at("plugins.audit", true)   // …but plugins.audit re-tightens
     .load()?;
@@ -60,7 +59,7 @@ unknown path errors at `build_resolver()` time with
 ```rust,ignore
 use clapfig::{UnknownKeyContext, UnknownKeyDecision};
 
-Clapfig::builder::<AppConfig>()
+Clapfig::schema_builder::<AppConfig>()
     .strict(true)
     .on_unknown_key(|c: &UnknownKeyContext<'_>| {
         if c.leaf.contains('.') {
@@ -149,7 +148,7 @@ four segments.
 
 Pre-Phase-3 `.strict(false)` skipped validation entirely, which had a
 side effect of masking type errors in config files (they'd surface
-later in confique's typed-deserialize step instead). Combining a
+later in the typed-deserialize step instead). Combining a
 lenient default with at least one strict override
 (`.strict(false).strict_at("X", true)`) now activates the validation
 step, which can surface type errors that an unconditionally lenient

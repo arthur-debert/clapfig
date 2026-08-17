@@ -60,7 +60,7 @@ pub enum FieldStatic {
     /// Maps of nested objects (TOML `[name.<key>]`). Emitted by the
     /// derive macro for `HashMap<String, NestedStruct>` /
     /// `BTreeMap<String, NestedStruct>` fields where the value type
-    /// derives [`Schema`](crate::Schema).
+    /// derives [`Schema`].
     MapOf(&'static SchemaStatic),
 }
 

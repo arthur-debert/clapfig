@@ -1,66 +1,61 @@
 //! JSON Schema generation from a config schema.
 //!
-//! Entry point is [`generate_schema::<C>()`](generate_schema): it walks the
-//! compile-time `confique::meta::Meta` tree and produces a JSON Schema
-//! document. Useful for auto-generating UI editors, external validation
-//! tools, or IDE integrations.
+//! Entry point is [`generate_schema`]: it walks a
+//! [`runtime::Schema`](crate::runtime::Schema) — built by the runtime
+//! builder or emitted by `#[derive(clapfig::Schema)]` — and produces a JSON
+//! Schema document. Useful for auto-generating UI editors, external
+//! validation tools, or IDE integrations.
 //!
 //! Internally the walker consumes a crate-private `SchemaRef` view so the
-//! same generator will serve runtime-supplied schemas (issue #36) without
-//! a separate code path.
+//! same generator serves both entry points without a separate code path.
 //!
 //! # What is in the schema
 //!
-//! - **Structure**: every nested config struct becomes a JSON `object` with
-//!   `properties`; non-`Option<T>` fields are listed in `required`.
-//! - **Docs**: struct and field `///` doc comments become `description`.
-//! - **Types**: inferred from each field's `#[config(default = ...)]`
-//!   expression. String → `"string"`, integer → `"integer"`, float →
+//! - **Structure**: every nested config object becomes a JSON `object` with
+//!   `properties`; non-optional fields are listed in `required`.
+//! - **Docs**: schema and field doc lines become `description`.
+//! - **Types**: emitted from each leaf's declared
+//!   [`LeafType`] — including leaves without
+//!   defaults. String → `"string"`, integer → `"integer"`, float →
 //!   `"number"`, bool → `"boolean"`, array → `"array"`, map → `"object"`.
 //! - **Defaults**: the literal default value (when present) is emitted as
 //!   `default` on the property.
+//! - **Enums**: `Enum { values }` leaves emit `enum: [...]` alongside the
+//!   primitive type implied by the value set.
 //! - **Env vars**: when a field maps to an env var, the name is attached as
 //!   the non-standard `x-env` extension.
-//!
-//! # Limitation: types without defaults
-//!
-//! Confique's `Meta` tree does not carry Rust type information directly — it
-//! only records the default-value *expression*. A field without a default and
-//! without an explicit type hint therefore gets no `type` key in the schema
-//! (i.e. any JSON value is accepted). This is acceptable for UI generation:
-//! a form generator will still see the field and its docs, and users supply
-//! values anyway.
 //!
 //! # Example
 //!
 //! ```ignore
 //! use clapfig::schema;
 //!
-//! let value = schema::generate_schema::<MyConfig>();
+//! let value = schema::generate_schema(MyConfig::schema());
 //! println!("{}", serde_json::to_string_pretty(&value).unwrap());
 //! ```
 
-use confique::Config;
-use confique::meta::{Expr, MapEntry, MapKey};
 use serde_json::{Map, Value, json};
 
 use crate::runtime::LeafType;
-use crate::spec::{DocSource, FieldKindRef, FieldRef, LeafDefault, LeafRef, SchemaRef};
+use crate::spec::{FieldKindRef, FieldRef, LeafRef, SchemaRef};
 
 /// JSON Schema dialect emitted in the root `$schema` field.
 const SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 
-/// Generate a JSON Schema document from a confique config type.
+/// Generate a JSON Schema document from a config schema.
+///
+/// Works for both entry points: pass the schema handed to
+/// [`Clapfig::runtime`](crate::Clapfig::runtime), or a derive-emitted
+/// schema via `C::schema()`.
 ///
 /// Returns a `serde_json::Value` — the caller serializes it to a string,
 /// writes it to a file, or embeds it wherever needed.
-pub fn generate_schema<C: Config>() -> Value {
-    generate_schema_from_ref(SchemaRef::from_meta(&C::META))
+pub fn generate_schema(schema: &crate::runtime::Schema) -> Value {
+    generate_schema_from_ref(SchemaRef::from_dynamic(schema))
 }
 
 /// Internal entry point. Walks any `SchemaRef`-backed schema and emits the
-/// JSON Schema document. Phase 2's runtime adapter calls this directly with
-/// its own `SchemaRef` variant.
+/// JSON Schema document.
 pub(crate) fn generate_schema_from_ref(schema: SchemaRef<'_>) -> Value {
     let mut root = schema_to_object(schema);
     if let Value::Object(map) = &mut root {
@@ -162,14 +157,9 @@ fn field_to_property(field: FieldRef<'_>) -> (String, Value, bool) {
 /// Apply a leaf's declared type, default, env hint, and allowed-value set
 /// onto its JSON Schema object.
 fn populate_leaf(prop: &mut Map<String, Value>, leaf: LeafRef<'_>) {
-    // Phase 2 runtime path supplies an explicit `LeafType`; emit a faithful
-    // JSON Schema `type` from it without depending on whether a default
-    // happens to be present.
-    if let Some(ty) = leaf.ty
-        && let Some(name) = leaf_type_json_name(ty)
-    {
+    if let Some(name) = leaf_type_json_name(leaf.ty) {
         prop.insert("type".into(), Value::String(name.into()));
-        if let LeafType::Array(item) = ty
+        if let LeafType::Array(item) = leaf.ty
             && let Some(item_name) = leaf_type_json_name(item)
         {
             let mut items = Map::new();
@@ -178,34 +168,17 @@ fn populate_leaf(prop: &mut Map<String, Value>, leaf: LeafRef<'_>) {
         }
     }
 
-    if let Some(default) = leaf.default {
-        match default {
-            LeafDefault::Expr(expr) => {
-                // Confique's `Meta` doesn't carry an explicit type; infer
-                // from the default expression if a `LeafType` wasn't already
-                // emitted above.
-                if leaf.ty.is_none()
-                    && let Some(ty) = infer_type(expr)
-                {
-                    prop.insert("type".into(), Value::String(ty.into()));
-                }
-                if let Some(default_value) = expr_to_json(expr) {
-                    prop.insert("default".into(), default_value);
-                }
-            }
-            LeafDefault::Toml(value) => {
-                if let Some(default_value) = toml_value_to_json(value) {
-                    prop.insert("default".into(), default_value);
-                }
-            }
-        }
+    if let Some(default) = leaf.default
+        && let Some(default_value) = toml_value_to_json(default)
+    {
+        prop.insert("default".into(), default_value);
     }
 
     if let Some(env_name) = leaf.env {
         prop.insert("x-env".into(), Value::String(env_name.into()));
     }
 
-    if let Some(values) = leaf.allowed_values {
+    if let Some(values) = leaf.allowed_values() {
         let enum_array: Vec<Value> = values.iter().filter_map(toml_value_to_json).collect();
         if !enum_array.is_empty() {
             prop.insert("enum".into(), Value::Array(enum_array));
@@ -244,84 +217,35 @@ fn toml_value_json_type(value: &toml::Value) -> Option<&'static str> {
     }
 }
 
-/// Infer a JSON Schema `type` string from a confique default expression.
-fn infer_type(expr: &Expr) -> Option<&'static str> {
-    match expr {
-        Expr::Str(_) => Some("string"),
-        Expr::Integer(_) => Some("integer"),
-        Expr::Float(_) => Some("number"),
-        Expr::Bool(_) => Some("boolean"),
-        Expr::Array(_) => Some("array"),
-        Expr::Map(_) => Some("object"),
-        _ => None,
-    }
-}
-
-/// Convert a confique `Expr` (default value) into a JSON value.
+/// Convert a `toml::Value` into a JSON value for the `default` and `enum`
+/// slots.
 ///
-/// Returns `None` for variants we can't faithfully represent (confique's
-/// `Expr` is `#[non_exhaustive]`), so the caller can omit the `default` key
-/// entirely rather than emitting a misleading `null`.
-fn expr_to_json(expr: &Expr) -> Option<Value> {
-    match expr {
-        Expr::Str(s) => Some(Value::String((*s).into())),
-        Expr::Integer(i) => Some(json!(i)),
-        Expr::Float(f) => Some(json!(f)),
-        Expr::Bool(b) => Some(Value::Bool(*b)),
-        Expr::Array(items) => Some(Value::Array(
-            items.iter().filter_map(expr_to_json).collect(),
-        )),
-        Expr::Map(entries) => {
-            let mut obj = Map::new();
-            for MapEntry { key, value } in *entries {
-                let Some(key_str) = map_key_to_string(key) else {
-                    continue;
-                };
-                let Some(val) = expr_to_json(value) else {
-                    continue;
-                };
-                obj.insert(key_str, val);
-            }
-            Some(Value::Object(obj))
-        }
-        _ => None,
-    }
-}
-
-/// Render a `MapKey` as a JSON object key. Returns `None` for variants we
-/// can't faithfully represent, so the caller can skip the entry rather than
-/// collapsing distinct keys onto an empty string.
-fn map_key_to_string(key: &MapKey) -> Option<String> {
-    match key {
-        MapKey::Str(s) => Some((*s).into()),
-        MapKey::Integer(i) => Some(i.to_string()),
-        MapKey::Float(f) => Some(f.to_string()),
-        MapKey::Bool(b) => Some(b.to_string()),
-        _ => None,
-    }
-}
-
-/// Convert a `toml::Value` into a JSON value for the `enum` slot.
-///
-/// Currently only used by the (Phase-1-dormant) `allowed_values` path on
-/// `LeafRef`. The static spec never populates it; Phase 2 will.
-///
-/// Complex variants (`Array`, `Table`, `Datetime`) are dropped today. The
-/// runtime enum surface in Phase 2 is scalar-only (`Field::enum_of(...)`
-/// over TOML primitives — log levels, modes, format names), so this is the
-/// faithful set for v1. Revisit if Phase 2 widens `enum_of` to accept
-/// container values.
+/// Complex variants (`Datetime`) are dropped rather than emitted as a
+/// misleading `null`. Arrays and tables convert recursively; entries that
+/// can't be represented are skipped.
 fn toml_value_to_json(value: &toml::Value) -> Option<Value> {
     match value {
         toml::Value::String(s) => Some(Value::String(s.clone())),
         toml::Value::Integer(i) => Some(json!(i)),
         toml::Value::Float(f) => Some(json!(f)),
         toml::Value::Boolean(b) => Some(Value::Bool(*b)),
-        _ => None,
+        toml::Value::Array(items) => Some(Value::Array(
+            items.iter().filter_map(toml_value_to_json).collect(),
+        )),
+        toml::Value::Table(entries) => {
+            let mut obj = Map::new();
+            for (key, val) in entries {
+                if let Some(v) = toml_value_to_json(val) {
+                    obj.insert(key.clone(), v);
+                }
+            }
+            Some(Value::Object(obj))
+        }
+        toml::Value::Datetime(_) => None,
     }
 }
 
-fn join_doc(source: DocSource<'_>) -> String {
+fn join_doc(source: &[String]) -> String {
     source
         .iter()
         .map(|l| l.trim())
@@ -334,10 +258,10 @@ fn join_doc(source: DocSource<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::test::TestConfig;
+    use crate::fixtures::test::test_schema;
 
     fn schema() -> Value {
-        generate_schema::<TestConfig>()
+        generate_schema(&test_schema())
     }
 
     #[test]
@@ -359,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn types_inferred_from_defaults() {
+    fn types_emitted_from_declared_leaf_types() {
         let s = schema();
         let props = &s["properties"];
         assert_eq!(props["host"]["type"], "string");
@@ -428,7 +352,7 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert!(db_required.contains(&"pool_size"));
-        // url is Option<String> — must NOT be required.
+        // url is optional — must NOT be required.
         assert!(!db_required.contains(&"url"));
     }
 
@@ -439,8 +363,9 @@ mod tests {
             .as_object()
             .unwrap();
         assert!(db_props.contains_key("url"));
-        // No default and Option<T>, so no `type` and no `default`.
-        assert!(!db_props["url"].as_object().unwrap().contains_key("type"));
+        // Declared string type is emitted even without a default; there is
+        // no `default` key.
+        assert_eq!(db_props["url"]["type"], "string");
         assert!(!db_props["url"].as_object().unwrap().contains_key("default"));
     }
 
@@ -452,9 +377,23 @@ mod tests {
     }
 
     #[test]
+    fn enum_leaf_emits_enum_array_and_primitive_type() {
+        let s = generate_schema(&crate::fixtures::test::enum_schema());
+        let mode = &s["properties"]["mode"];
+        assert_eq!(mode["type"], "string");
+        let allowed: Vec<&str> = mode["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(allowed, vec!["fast", "slow"]);
+    }
+
+    #[test]
     fn optional_field_has_no_null_default_key() {
-        // Regression guard: expr_to_json must not fabricate a `default: null`
-        // for fields that have no default (Option<T> / unrepresentable Expr).
+        // Regression guard: the emitter must not fabricate a `default: null`
+        // for fields that have no default.
         let s = schema();
         let url = &s["properties"]["database"]["properties"]["url"];
         let url_obj = url.as_object().unwrap();

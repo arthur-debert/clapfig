@@ -9,8 +9,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use confique::Config;
-use serde::Deserialize;
 use toml::{Table, Value};
 
 use crate::error::{ClapfigError, UnknownKeyInfo};
@@ -23,57 +21,17 @@ use crate::strict::{
 /// Per-resolution strictness configuration passed into the validate path.
 ///
 /// Bundles the cascade overrides, the builder-level default ([Knob 1]),
-/// and the optional [`on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
+/// and the optional [`on_unknown_key`](crate::RuntimeBuilder::on_unknown_key)
 /// callback. The `normalize_keys` flag is forwarded to the line-number
 /// heuristic so error snippets still point at the user's original line
 /// when keys round-trip through kebab → snake normalization.
 ///
-/// [Knob 1]: crate::ClapfigBuilder::strict
+/// [Knob 1]: crate::RuntimeBuilder::strict
 pub(crate) struct ValidateContext<'a> {
     pub overrides: &'a StrictnessOverrides,
     pub default_strict: bool,
     pub callback: Option<&'a UnknownKeyHook>,
     pub normalize_keys: bool,
-}
-
-/// Static-path collector: deserialize the parsed table through
-/// `serde_ignored` to gather paths the typed `C` doesn't recognize, then
-/// filter them through the strictness cascade.
-///
-/// The `serde_ignored` step also runs `C::Layer` deserialization, so type
-/// errors in the merged-table phase surface here as `ParseError`. (Same
-/// behavior as before Phase 3 — only the post-collect filtering changed.)
-///
-/// Returns the keys the callback elected to [`UnknownKeyDecision::Collect`]
-/// (empty when no callback is registered or no key opts in). Reject
-/// decisions become a `ClapfigError::UnknownKeys` error; lenient keys are
-/// dropped silently.
-pub fn validate_unknown_keys<C: Config>(
-    table: &Table,
-    source: &str,
-    path: &Path,
-    ctx: &ValidateContext<'_>,
-) -> Result<Vec<CollectedUnknown>, ClapfigError>
-where
-    C::Layer: for<'de> Deserialize<'de>,
-{
-    let mut unknown_paths: Vec<String> = Vec::new();
-
-    let value = Value::Table(table.clone());
-    let _layer: C::Layer = serde_ignored::deserialize(value, |ignored_path| {
-        unknown_paths.push(ignored_path.to_string());
-    })
-    .map_err(|e| ClapfigError::ParseError {
-        path: path.to_path_buf(),
-        source: Box::new(e),
-        source_text: Some(Arc::from(source)),
-    })?;
-
-    let unknown_keys: Vec<UnknownKey> = unknown_paths
-        .into_iter()
-        .map(UnknownKey::from_path)
-        .collect();
-    filter_through_cascade(table, source, path, unknown_keys, ctx)
 }
 
 /// Single unknown-key entry passed to `filter_through_cascade`.
@@ -83,26 +41,15 @@ where
 /// key the parser saw at the leaf position — distinct from the trailing
 /// dot-split segment when the key was quoted with `.` inside it (a
 /// literal TOML quoted key like `"acme.task-due-date-missing"`). The
-/// dynamic path captures the raw key during the schema walk; the static
-/// path (`serde_ignored`) only sees the dotted path, so it falls back
-/// to the trailing segment via [`UnknownKey::from_path`].
+/// schema walk captures the raw key so quoted-key semantics survive to
+/// the `on_unknown_key` callback.
 pub(crate) struct UnknownKey {
     pub path: String,
     pub leaf: String,
 }
 
-impl UnknownKey {
-    /// Fallback constructor: derive `leaf` from `path` via dot-split. Used
-    /// on the static path where the original TOML key is no longer
-    /// available after `serde_ignored` flattens the structure.
-    pub fn from_path(path: String) -> Self {
-        let leaf = path.rsplit('.').next().unwrap_or(&path).to_string();
-        Self { path, leaf }
-    }
-}
-
 /// Schema-driven unknown-key walker that works against any
-/// [`SchemaRef`] (static or runtime). The walker recurses through
+/// [`SchemaRef`]. The walker recurses through
 /// [`FieldKindRef::Nested`] and [`FieldKindRef::MapOf`] subtrees; arrays-
 /// of-tables don't show up in non-file layers (env / CLI / URL), so
 /// `ArrayOf` is skipped at this layer.
@@ -186,8 +133,9 @@ fn walk_against_schema<'a>(
 }
 
 /// Resolve an already-collected list of unknown paths against the cascade
-/// and the optional `on_unknown_key` callback. Shared between the static
-/// and dynamic paths so both have identical strictness semantics.
+/// and the optional `on_unknown_key` callback. Shared between the per-file
+/// walker and the env-layer walker so both have identical strictness
+/// semantics.
 ///
 /// Decision chain (per the proposal):
 ///
@@ -438,7 +386,7 @@ fn keys_match(a: &str, b: &str, normalize_keys: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::test::TestConfig;
+    use crate::spec::ConfigSpec;
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
@@ -448,6 +396,18 @@ mod tests {
 
     fn parse(content: &str) -> Table {
         content.parse::<Table>().unwrap()
+    }
+
+    /// Run unknown-key validation against the shared test schema, the way
+    /// the resolve pipeline does per file.
+    fn validate(
+        table: &Table,
+        source: &str,
+        path: &Path,
+        ctx: &ValidateContext<'_>,
+    ) -> Result<Vec<CollectedUnknown>, ClapfigError> {
+        let spec = crate::runtime_spec::DynamicSpec::new(crate::fixtures::test::test_schema());
+        spec.validate_unknown(table, source, path, ctx)
     }
 
     /// Default validate context: strict on, no overrides, no callback.
@@ -475,24 +435,14 @@ debug = true
 url = "postgres://localhost"
 pool_size = 10
 "#;
-        let result = validate_unknown_keys::<TestConfig>(
-            &parse(content),
-            content,
-            &path(),
-            &test_ctx(false),
-        );
+        let result = validate(&parse(content), content, &path(), &test_ctx(false));
         assert!(result.is_ok());
     }
 
     #[test]
     fn unknown_top_level_key() {
         let content = "host = \"localhost\"\ntypo_key = 42\n";
-        let result = validate_unknown_keys::<TestConfig>(
-            &parse(content),
-            content,
-            &path(),
-            &test_ctx(false),
-        );
+        let result = validate(&parse(content), content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
@@ -504,12 +454,7 @@ pool_size = 10
     #[test]
     fn unknown_nested_key() {
         let content = "[database]\nurl = \"pg://\"\ntypo = \"bad\"\n";
-        let result = validate_unknown_keys::<TestConfig>(
-            &parse(content),
-            content,
-            &path(),
-            &test_ctx(false),
-        );
+        let result = validate(&parse(content), content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
@@ -520,12 +465,7 @@ pool_size = 10
     #[test]
     fn multiple_unknown_keys() {
         let content = "typo1 = 1\ntypo2 = 2\n";
-        let result = validate_unknown_keys::<TestConfig>(
-            &parse(content),
-            content,
-            &path(),
-            &test_ctx(false),
-        );
+        let result = validate(&parse(content), content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 2);
@@ -534,12 +474,7 @@ pool_size = 10
     #[test]
     fn line_number_accuracy() {
         let content = "host = \"x\"\nport = 8080\ndebug = false\n\n# comment\nbad_key = 1\n";
-        let result = validate_unknown_keys::<TestConfig>(
-            &parse(content),
-            content,
-            &path(),
-            &test_ctx(false),
-        );
+        let result = validate(&parse(content), content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys[0].line, 6);
@@ -548,31 +483,21 @@ pool_size = 10
     #[test]
     fn empty_content_ok() {
         let table = Table::new();
-        let result = validate_unknown_keys::<TestConfig>(&table, "", &path(), &test_ctx(false));
+        let result = validate(&table, "", &path(), &test_ctx(false));
         assert!(result.is_ok());
     }
 
     #[test]
     fn known_optional_field_ok() {
         let content = "[database]\nurl = \"pg://\"\n";
-        let result = validate_unknown_keys::<TestConfig>(
-            &parse(content),
-            content,
-            &path(),
-            &test_ctx(false),
-        );
+        let result = validate(&parse(content), content, &path(), &test_ctx(false));
         assert!(result.is_ok());
     }
 
     #[test]
     fn sparse_config_ok() {
         let content = "port = 3000\n";
-        let result = validate_unknown_keys::<TestConfig>(
-            &parse(content),
-            content,
-            &path(),
-            &test_ctx(false),
-        );
+        let result = validate(&parse(content), content, &path(), &test_ctx(false));
         assert!(result.is_ok());
     }
 
@@ -580,9 +505,7 @@ pool_size = 10
     fn error_includes_file_path() {
         let content = "typo = 1\n";
         let p = PathBuf::from("/home/user/.config/myapp/config.toml");
-        let err =
-            validate_unknown_keys::<TestConfig>(&parse(content), content, &p, &test_ctx(false))
-                .unwrap_err();
+        let err = validate(&parse(content), content, &p, &test_ctx(false)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("config.toml") || msg.contains("Unknown keys"));
     }
@@ -590,12 +513,7 @@ pool_size = 10
     #[test]
     fn line_number_finds_correct_section_for_duplicate_leaf() {
         let content = "host = \"x\"\nport = 8080\n[database]\ntypo = \"bad\"\n";
-        let result = validate_unknown_keys::<TestConfig>(
-            &parse(content),
-            content,
-            &path(),
-            &test_ctx(false),
-        );
+        let result = validate(&parse(content), content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys[0].key, "database.typo");
@@ -605,12 +523,7 @@ pool_size = 10
     #[test]
     fn line_number_top_level_not_confused_by_nested_same_name() {
         let content = "typo = 99\n[database]\npool_size = 5\n";
-        let result = validate_unknown_keys::<TestConfig>(
-            &parse(content),
-            content,
-            &path(),
-            &test_ctx(false),
-        );
+        let result = validate(&parse(content), content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys[0].key, "typo");
@@ -636,7 +549,7 @@ pool_size = 10
         // pool_size case.
         let content = "host = \"x\"\n";
         let table = parse_and_normalize(content);
-        let result = validate_unknown_keys::<TestConfig>(&table, content, &path(), &test_ctx(true));
+        let result = validate(&table, content, &path(), &test_ctx(true));
         assert!(result.is_ok());
     }
 
@@ -646,7 +559,7 @@ pool_size = 10
         // the `pool_size` field on TestDbConfig.
         let content = "[database]\npool-size = 25\n";
         let table = parse_and_normalize(content);
-        let result = validate_unknown_keys::<TestConfig>(&table, content, &path(), &test_ctx(true));
+        let result = validate(&table, content, &path(), &test_ctx(true));
         assert!(result.is_ok(), "kebab key should be accepted: {result:?}");
     }
 
@@ -657,7 +570,7 @@ pool_size = 10
         // line in the original source.
         let content = "host = \"x\"\n[database]\npool-zize = 99\n";
         let table = parse_and_normalize(content);
-        let result = validate_unknown_keys::<TestConfig>(&table, content, &path(), &test_ctx(true));
+        let result = validate(&table, content, &path(), &test_ctx(true));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
@@ -676,8 +589,7 @@ pool_size = 10
         // `my-section` isn't a known field; we just want to confirm the
         // unknown-key lookup found a line (non-zero) using kebab matching on
         // the section header.
-        let err = validate_unknown_keys::<TestConfig>(&table, content, &path(), &test_ctx(true))
-            .unwrap_err();
+        let err = validate(&table, content, &path(), &test_ctx(true)).unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         // Top-level `my_section` is the unknown key here.
         assert!(keys.iter().any(|k| k.key == "my_section"));
@@ -689,8 +601,7 @@ pool_size = 10
         // strict validation the way it always has.
         let content = "[database]\npool-size = 25\n";
         let table = parse(content);
-        let result =
-            validate_unknown_keys::<TestConfig>(&table, content, &path(), &test_ctx(false));
+        let result = validate(&table, content, &path(), &test_ctx(false));
         assert!(result.is_err());
     }
 }

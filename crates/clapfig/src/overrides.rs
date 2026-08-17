@@ -150,16 +150,10 @@ mod tests {
 
     // --- valid_keys tests ---
 
-    use crate::fixtures::test::TestConfig;
-    use confique::Config;
-
-    fn test_schema() -> SchemaRef<'static> {
-        SchemaRef::from_meta(&TestConfig::META)
-    }
-
     #[test]
     fn valid_keys_collects_all_leaf_paths() {
-        let keys = valid_keys(test_schema());
+        let schema = crate::fixtures::test::test_schema();
+        let keys = valid_keys(SchemaRef::from_dynamic(&schema));
         assert!(keys.contains("host"));
         assert!(keys.contains("port"));
         assert!(keys.contains("debug"));
@@ -170,7 +164,8 @@ mod tests {
 
     #[test]
     fn valid_keys_excludes_section_names() {
-        let keys = valid_keys(test_schema());
+        let schema = crate::fixtures::test::test_schema();
+        let keys = valid_keys(SchemaRef::from_dynamic(&schema));
         assert!(!keys.contains("database"));
     }
 }

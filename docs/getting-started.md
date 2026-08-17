@@ -9,68 +9,74 @@ Add clapfig to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-clapfig = "0.15"
+clapfig = "0.23"
 ```
 
 This pulls in the `clap` feature by default, which gives you the `config`
-subcommand integration. If you don't use clap:
+subcommand integration, and the `derive` feature for
+`#[derive(clapfig::Schema)]`. If you don't use clap:
 
 ```toml
 [dependencies]
-clapfig = { version = "0.15", default-features = false }
+clapfig = { version = "0.23", default-features = false, features = ["derive"] }
 ```
 
 ## Define your config struct
 
-Clapfig uses confique's `Config` derive (re-exported as `clapfig::Config`) to
-turn a plain Rust struct into a layered configuration schema:
+Clapfig's `Schema` derive turns a plain Rust struct into a layered
+configuration schema:
 
 ```rust
-use clapfig::Config;
+use clapfig::Schema;
 use serde::{Serialize, Deserialize};
 
-#[derive(Config, Serialize, Deserialize, Debug)]
+#[derive(Schema, Serialize, Deserialize, Debug)]
 pub struct AppConfig {
     /// The host address to bind to.
-    #[config(default = "127.0.0.1")]
+    #[clapfig(default = "127.0.0.1")]
     pub host: String,
 
     /// The port number.
-    #[config(default = 8080)]
+    #[clapfig(default = 8080)]
     pub port: u16,
 
     /// Enable debug mode.
-    #[config(default = false)]
+    #[clapfig(default = false)]
     pub debug: bool,
 
     /// Database settings.
-    #[config(nested)]
     pub database: DbConfig,
 }
 
-#[derive(Config, Serialize, Deserialize, Debug)]
+#[derive(Schema, Serialize, Deserialize, Debug)]
 pub struct DbConfig {
     /// Connection string URL.
     pub url: Option<String>,
 
     /// Connection pool size.
-    #[config(default = 10)]
+    #[clapfig(default = 10)]
     pub pool_size: usize,
 }
 ```
 
 Key points:
 
-- **`#[config(default = ...)]`** sets the compiled default — the lowest layer,
-  always present. Works with scalars, strings, and collections (`default = {}`
-  for an empty map, `default = []` for an empty vec).
-- **`#[config(nested)]`** marks sub-structs. These map to TOML sections,
-  dotted keys, and `__` env var separators.
+- **`#[clapfig(default = ...)]`** sets the compiled default — the lowest
+  layer, always present. Works with scalars, strings, and collections
+  (`default = []` for an empty vec).
+- **Nested structs** — a field whose type also derives `Schema` becomes a
+  TOML section, addressable via dotted keys and `__` env var separators.
+- **Unit-only enums** deriving `Schema` become constrained value sets:
+  out-of-set values error at load, and generated templates carry an
+  `# Allowed: ...` line.
 - **`Option<T>`** fields are truly optional — omitting them everywhere is
   valid. Non-optional fields without a default must be provided by at least
   one layer.
 - **`///` doc comments** are used in generated templates and `config get`
   output.
+- The struct still derives serde's `Serialize`/`Deserialize` — clapfig uses
+  them for the final typed deserialize, so serde attributes
+  (`#[serde(deserialize_with = ...)]` etc.) apply as usual.
 
 ## Load it
 
@@ -78,7 +84,7 @@ Key points:
 use clapfig::Clapfig;
 
 fn main() -> anyhow::Result<()> {
-    let config: AppConfig = Clapfig::builder()
+    let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
         .app_name("myapp")
         .load()?;
 
@@ -91,7 +97,7 @@ That `app_name("myapp")` call sets sensible defaults:
 
 - Searches for `myapp.toml` in the platform config directory
 - Merges env vars prefixed with `MYAPP__`
-- Fills in `#[config(default)]` values for anything not provided
+- Fills in `#[clapfig(default)]` values for anything not provided
 
 ## Override from the environment
 
@@ -110,7 +116,7 @@ MYAPP__DATABASE__URL=postgres://localhost/mydb cargo run
 Disable env loading with `.no_env()` when you don't want it:
 
 ```rust
-let config: AppConfig = Clapfig::builder()
+let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
     .app_name("myapp")
     .no_env()
     .load()?;
@@ -123,7 +129,7 @@ Control where clapfig looks for config files:
 ```rust
 use clapfig::{Clapfig, SearchPath};
 
-let config: AppConfig = Clapfig::builder()
+let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
     .app_name("myapp")
     .search_paths(vec![
         SearchPath::Platform,             // XDG / Library / AppData
@@ -161,7 +167,7 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let builder = Clapfig::builder::<AppConfig>()
+    let builder = Clapfig::schema_builder::<AppConfig>()
         .app_name("myapp")
         .persist_scope("local", SearchPath::Cwd);
 
@@ -204,6 +210,8 @@ Turn it off with `.strict(false)` if you share config files across tools.
 
 - [Layered Configuration](./layered-config.md) — deep dive into layers,
   search modes, and merge behavior.
+- [Runtime Schemas](./runtime-schemas.md) — building schemas at runtime for
+  plugin hosts and generated apps.
 - [Resolver Guide](./resolver.md) — per-directory config resolution for
   tree-walk tools.
 - [Config Command Guide](./config-command.md) — the full `config`

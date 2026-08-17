@@ -21,8 +21,8 @@
 //! - [`render_rich`](crate::render::render_rich) — colored output with source
 //!   snippets and carets (requires the `rich-errors` feature).
 //!
-//! Errors from the underlying TOML parser and from confique's validation are
-//! wrapped rather than re-invented, so you still get their full detail.
+//! Errors from the underlying TOML parser are wrapped rather than
+//! re-invented, so you still get their full detail.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -90,9 +90,6 @@ pub enum ClapfigError {
         source: std::io::Error,
     },
 
-    #[error("Configuration error: {0}")]
-    ConfigError(#[from] confique::Error),
-
     #[error("Key not found: {0}")]
     KeyNotFound(String),
 
@@ -144,10 +141,8 @@ pub enum ClapfigError {
         originals: Vec<String>,
     },
 
-    /// A required field declared by a runtime [`Schema`](crate::runtime::Schema)
-    /// was not supplied by any layer and has no default. Mirrors confique's
-    /// equivalent required-field check on the static path (which raises
-    /// `ConfigError` instead).
+    /// A required field declared by the [`Schema`](crate::runtime::Schema)
+    /// was not supplied by any layer and has no default.
     #[error("Missing required key: {key}")]
     MissingRequired { key: String },
 

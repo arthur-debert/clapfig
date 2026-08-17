@@ -4,8 +4,9 @@
 //! support for nested configuration. The root [`DemoConfig`] contains two
 //! nested sub-configs: [`ServerConfig`] and [`DisplayConfig`].
 //!
-//! Each struct derives [`confique::Config`] for defaults and template
-//! generation, plus [`Serialize`]/[`Deserialize`] for the merge pipeline.
+//! Each struct derives [`clapfig::Schema`] for defaults, type metadata, and
+//! template generation, plus [`Serialize`]/[`Deserialize`] for the merge
+//! pipeline.
 //!
 //! # Env var mapping
 //!
@@ -22,29 +23,27 @@
 //! | `CLAPFIG_DEMO__DISPLAY__COLOR`       | `display.color`        |
 //! | `CLAPFIG_DEMO__DISPLAY__FORMAT`      | `display.format`       |
 
-use confique::Config;
+use clapfig::Schema;
 use serde::{Deserialize, Serialize};
 
 /// Root configuration for the demo application.
 ///
 /// Contains top-level scalar keys and two nested sub-configs to demonstrate
 /// clapfig's hierarchical merge across files, env vars, and CLI flags.
-#[derive(Config, Serialize, Deserialize, Debug)]
+#[derive(Schema, Serialize, Deserialize, Debug)]
 pub struct DemoConfig {
     /// Application name shown in the echo banner.
-    #[config(default = "clapfig-demo")]
+    #[clapfig(default = "clapfig-demo")]
     pub name: String,
 
     /// Enable verbose output.
-    #[config(default = false)]
+    #[clapfig(default = false)]
     pub verbose: bool,
 
     /// Server settings (nested config).
-    #[config(nested)]
     pub server: ServerConfig,
 
     /// Display and formatting settings (nested config).
-    #[config(nested)]
     pub display: DisplayConfig,
 }
 
@@ -52,18 +51,18 @@ pub struct DemoConfig {
 ///
 /// Lives under the `[server]` section in TOML files and is accessed via
 /// `server.*` dotted keys.
-#[derive(Config, Serialize, Deserialize, Debug)]
+#[derive(Schema, Serialize, Deserialize, Debug)]
 pub struct ServerConfig {
     /// Hostname to bind to.
-    #[config(default = "127.0.0.1")]
+    #[clapfig(default = "127.0.0.1")]
     pub host: String,
 
     /// Port number.
-    #[config(default = 3000)]
+    #[clapfig(default = 3000)]
     pub port: u16,
 
     /// Maximum number of allowed connections.
-    #[config(default = 100)]
+    #[clapfig(default = 100)]
     pub max_connections: u32,
 }
 
@@ -71,15 +70,15 @@ pub struct ServerConfig {
 ///
 /// Lives under the `[display]` section in TOML files. The `color` key is
 /// used by the `echo` command to colorize terminal output via ANSI codes.
-#[derive(Config, Serialize, Deserialize, Debug)]
+#[derive(Schema, Serialize, Deserialize, Debug)]
 pub struct DisplayConfig {
     /// Terminal color for the echo command output.
     ///
     /// Supported values: red, green, yellow, blue, magenta, cyan, white.
-    #[config(default = "yellow")]
+    #[clapfig(default = "yellow")]
     pub color: String,
 
     /// Output format (pretty or plain).
-    #[config(default = "pretty")]
+    #[clapfig(default = "pretty")]
     pub format: String,
 }

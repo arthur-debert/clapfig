@@ -1,15 +1,14 @@
-//! Runtime-path builder API, parallel to [`crate::builder::ClapfigBuilder`].
+//! Builder API for configuring and loading layered configuration.
 //!
 //! Entry point: [`crate::Clapfig::runtime(schema)`](crate::Clapfig::runtime).
-//! The runtime builder exposes the same surface as the static `ClapfigBuilder`
-//! — discovery, persistence, env, URL, CLI overrides, post-validation,
-//! tree-walk resolution — but produces a `toml::Table` instead of a typed
-//! struct.
-//!
-//! The duplication with [`crate::builder`] is deliberate for Phase 2: it
-//! keeps the static path's public surface byte-identical, and most methods
-//! here are one-line forwarders. Phase 4 can revisit factoring the shared
-//! `BuilderConfig` if the maintenance cost matters.
+//! The builder follows a "set what you need, load" pattern: `app_name`
+//! derives sensible defaults (file name, search paths, env prefix), and
+//! everything else is optional overrides — discovery, persistence, env,
+//! URL, CLI overrides, post-validation, tree-walk resolution. `load()`
+//! produces a `toml::Table`; the typed
+//! [`SchemaConfigBuilder`](crate::SchemaConfigBuilder) wraps this builder
+//! and deserializes that table into a `C` deriving
+//! `#[derive(clapfig::Schema)]`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -36,9 +35,22 @@ pub(crate) type RuntimePostValidateHook = Box<dyn Fn(&Table) -> Result<(), Strin
 
 /// Builder for runtime-defined configurations.
 ///
-/// Same surface as [`ClapfigBuilder`](crate::ClapfigBuilder<C>), but the
-/// schema is supplied at runtime (via [`crate::Clapfig::runtime`]) and the
-/// loaded value is a `toml::Table` rather than a typed struct.
+/// Controls three orthogonal axes (see [`types`](crate::types) for the full
+/// picture):
+///
+/// - **Discovery**: [`search_paths()`](Self::search_paths) — where to look
+///   for config files.
+/// - **Resolution**: [`search_mode()`](Self::search_mode) — merge all or
+///   pick one.
+/// - **Persistence**: [`persist_scope()`](Self::persist_scope) — named
+///   targets for writes.
+///
+/// The schema is supplied at runtime (via [`crate::Clapfig::runtime`]) and
+/// the loaded value is a `toml::Table`. For typed output, derive
+/// [`Schema`](crate::Schema) and use
+/// [`Clapfig::schema_builder`](crate::Clapfig::schema_builder), whose
+/// [`SchemaConfigBuilder`](crate::SchemaConfigBuilder) forwards to this
+/// builder.
 pub struct RuntimeBuilder {
     spec: Arc<DynamicSpec>,
     app_name: Option<String>,
@@ -94,29 +106,32 @@ impl RuntimeBuilder {
         }
     }
 
-    /// Set the application name. See
-    /// [`ClapfigBuilder::app_name`](crate::ClapfigBuilder::app_name).
+    /// Set the application name. This derives sensible defaults:
+    /// - `file_name` → `"{app_name}.toml"`
+    /// - `search_paths` → `[SearchPath::Platform]`
+    /// - `env_prefix` → `"{APP_NAME}"` (uppercased)
     pub fn app_name(mut self, name: &str) -> Self {
         self.app_name = Some(name.to_string());
         self
     }
 
-    /// Override the config file name. See
-    /// [`ClapfigBuilder::file_name`](crate::ClapfigBuilder::file_name).
+    /// Override the config file name (default: `"{app_name}.toml"`).
     pub fn file_name(mut self, name: &str) -> Self {
         self.file_name = Some(name.to_string());
         self
     }
 
-    /// Replace the default search paths entirely. See
-    /// [`ClapfigBuilder::search_paths`](crate::ClapfigBuilder::search_paths).
+    /// Replace the default search paths entirely.
+    ///
+    /// Paths are listed in **priority-ascending** order: the last entry has
+    /// the highest priority. See [`SearchPath`] for the available variants.
     pub fn search_paths(mut self, paths: Vec<SearchPath>) -> Self {
         self.search_paths = Some(paths);
         self
     }
 
-    /// Append a single search path. See
-    /// [`ClapfigBuilder::add_search_path`](crate::ClapfigBuilder::add_search_path).
+    /// Append a search path without replacing the defaults.
+    /// If no paths have been set yet, starts from the default `[Platform]`.
     pub fn add_search_path(mut self, path: SearchPath) -> Self {
         self.search_paths
             .get_or_insert_with(|| vec![SearchPath::Platform])
@@ -124,36 +139,57 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Set the search mode (`Merge` vs `FirstMatch`). See
-    /// [`ClapfigBuilder::search_mode`](crate::ClapfigBuilder::search_mode).
+    /// Set the search mode (default: [`SearchMode::Merge`]).
+    ///
+    /// - [`Merge`](SearchMode::Merge): all found config files are
+    ///   deep-merged, later (higher-priority) files overriding earlier ones.
+    /// - [`FirstMatch`](SearchMode::FirstMatch): only the single
+    ///   highest-priority config file found is used.
     pub fn search_mode(mut self, mode: SearchMode) -> Self {
         self.search_mode = mode;
         self
     }
 
-    /// Register a named persist scope for `config set`/`unset`. See
-    /// [`ClapfigBuilder::persist_scope`](crate::ClapfigBuilder::persist_scope).
+    /// Add a named persist scope.
+    ///
+    /// Scopes are named config file targets for `config set`/`unset` (and
+    /// optionally `config get`/`list` with `--scope`). The first scope added
+    /// is the default for write operations when no `--scope` is specified.
+    ///
+    /// Scope paths are automatically added to the search paths (if not
+    /// already present) so that persisted values are discoverable in the
+    /// merged view.
+    ///
+    /// Must be a single-directory variant (`Platform`, `Home`, `Cwd`, or
+    /// `Path`). Using [`Ancestors`](SearchPath::Ancestors) produces an error
+    /// at handle time.
+    ///
+    /// If no scopes are configured, `config set` returns
+    /// [`ClapfigError::NoPersistPath`].
     pub fn persist_scope(mut self, name: &str, path: SearchPath) -> Self {
         self.persist_scopes.push((name.to_string(), path));
         self
     }
 
-    /// Override the env var prefix. See
-    /// [`ClapfigBuilder::env_prefix`](crate::ClapfigBuilder::env_prefix).
+    /// Override the environment variable prefix (default: uppercased
+    /// `app_name`).
     pub fn env_prefix(mut self, prefix: &str) -> Self {
         self.env_prefix = Some(prefix.to_string());
         self
     }
 
-    /// Disable env loading entirely. See
-    /// [`ClapfigBuilder::no_env`](crate::ClapfigBuilder::no_env).
+    /// Disable environment variable loading entirely.
     pub fn no_env(mut self) -> Self {
         self.env_enabled = false;
         self
     }
 
-    /// Set the whole-resolution strictness default. See
-    /// [`ClapfigBuilder::strict`](crate::ClapfigBuilder::strict) and the
+    /// Enable or disable strict mode (default: `true`).
+    ///
+    /// This is the **whole-resolution default** in the strictness cascade —
+    /// it applies to any unknown key whose ancestors don't carry an explicit
+    /// [`strict_at`](Self::strict_at) override or a per-node
+    /// [`Schema::strict`](crate::runtime::Schema::strict) setting. See the
     /// [cascading strictness section](crate#cascading-strictness) of the
     /// crate docs for how this composes with `strict_at` and
     /// `on_unknown_key`.
@@ -162,18 +198,45 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Set per-section strictness for the dotted path `path`. See
-    /// [`ClapfigBuilder::strict_at`](crate::ClapfigBuilder::strict_at) for
-    /// the full cascade semantics — same rule, validated against the
-    /// runtime schema instead of `C::META`.
+    /// Set per-section strictness for the dotted path `path`.
+    ///
+    /// Path-aware variant of [`strict`](Self::strict). The override applies
+    /// to every descendant of `path` that doesn't itself set strictness —
+    /// the same cascade rule used for per-node
+    /// [`Schema::strict`](crate::runtime::Schema::strict).
+    ///
+    /// Common use case: typo protection on the typed part of a config plus
+    /// a lenient subtree where third-party plugin keys land.
+    ///
+    /// `path` must resolve to a nested section in the schema; targeting a
+    /// leaf or an unknown field produces
+    /// [`ClapfigError::InvalidStrictPath`] from `build_resolver`. When
+    /// [`normalize_keys(true)`](Self::normalize_keys) is set, `path` may be
+    /// written in kebab-case — it is normalized before lookup.
+    ///
+    /// An empty `path` ( `""` ) targets the root, equivalent to
+    /// [`strict(bool)`](Self::strict) but lets you still register
+    /// per-subtree overrides.
     pub fn strict_at(mut self, path: &str, strict: bool) -> Self {
         self.strict_at_overrides.push((path.to_string(), strict));
         self
     }
 
-    /// Register a per-key callback for cascade-rejected unknown keys. See
-    /// [`ClapfigBuilder::on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
-    /// for the full decision chain.
+    /// Register a per-key callback that runs on cascade-rejected unknown
+    /// keys.
+    ///
+    /// The cascade rule decides strict/lenient first. If lenient, the key
+    /// drops silently and the callback never runs. If strict and a callback
+    /// is registered, the callback receives an
+    /// [`UnknownKeyContext`](crate::UnknownKeyContext) carrying the dotted
+    /// path, the leaf segment, the parsed value, the source file, and the
+    /// line number — enough to apply a domain-specific decision. Returning
+    /// [`UnknownKeyDecision::Accept`](crate::UnknownKeyDecision::Accept)
+    /// drops the key silently;
+    /// [`Reject`](crate::UnknownKeyDecision::Reject) produces a
+    /// `ClapfigError::UnknownKeys` entry (same as no callback);
+    /// [`Collect`](crate::UnknownKeyDecision::Collect) routes the key into
+    /// [`load_with_unknowns`](Self::load_with_unknowns).
     pub fn on_unknown_key<F>(mut self, callback: F) -> Self
     where
         F: Fn(&crate::UnknownKeyContext<'_>) -> crate::UnknownKeyDecision + Send + Sync + 'static,
@@ -182,10 +245,29 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Convenience: "accept dotted, reject bare" at a dotted-path
-    /// subtree. See
-    /// [`ClapfigBuilder::accept_dotted_extension_keys_in`](crate::ClapfigBuilder::accept_dotted_extension_keys_in)
-    /// for the full semantics — same rule, runtime-path schema.
+    /// Convenience: register an [`on_unknown_key`](Self::on_unknown_key)
+    /// callback implementing the "accept dotted, reject bare" pattern at a
+    /// dotted-path subtree.
+    ///
+    /// Under `path` (and only there), any unknown key whose raw TOML leaf
+    /// contains a `.` — typically a `[serde(flatten)]` extension key emitted
+    /// by some other tool, like a quoted TOML literal
+    /// `"acme.task-due-date-missing"` — is treated as a schema-extension key
+    /// and `decision` decides its fate
+    /// ([`UnknownKeyDecision::Accept`](crate::UnknownKeyDecision::Accept)
+    /// drops it silently;
+    /// [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect)
+    /// routes it into
+    /// [`load_with_unknowns`](Self::load_with_unknowns)). Bare unknown keys
+    /// (no `.` in the leaf) fall through to
+    /// [`UnknownKeyDecision::Reject`](crate::UnknownKeyDecision::Reject) —
+    /// they look like typos, and the usual strict-mode error surfaces.
+    ///
+    /// `path` is bounded by segment: `"diag"` will not match keys under
+    /// `"diagnostics.rules"`. Pass `""` to apply the rule everywhere.
+    ///
+    /// Calling this method replaces any previously-registered
+    /// `on_unknown_key` callback (it is implemented in terms of one).
     pub fn accept_dotted_extension_keys_in(
         mut self,
         path: &str,
@@ -198,22 +280,43 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Accept kebab-case keys in config files and CLI/URL overrides. See
-    /// [`ClapfigBuilder::normalize_keys`](crate::ClapfigBuilder::normalize_keys).
+    /// Accept kebab-case keys in config files and CLI/URL overrides
+    /// (default: `false`).
+    ///
+    /// When enabled, every key crossing the boundary into clapfig — TOML
+    /// table keys, dotted CLI override keys, URL query parameter keys — has
+    /// its `-` characters rewritten to `_` before validation, merging, and
+    /// deserialization. snake_case keys continue to work unchanged; this is
+    /// purely additive. Environment variables are unaffected.
     pub fn normalize_keys(mut self, normalize: bool) -> Self {
         self.normalize_keys = normalize;
         self
     }
 
-    /// Set a custom layer merge order. See
-    /// [`ClapfigBuilder::layer_order`](crate::ClapfigBuilder::layer_order).
+    /// Set a custom layer merge order.
+    ///
+    /// Layers listed later override earlier ones. The default order is
+    /// `[Files, Env, Url, Cli]` — the common-sense precedence where schema
+    /// defaults are lowest and explicit overrides are highest.
+    ///
+    /// Omit a layer to exclude it from merging entirely. Duplicate layers
+    /// are applied in the order given (the second occurrence overrides the
+    /// first).
     pub fn layer_order(mut self, order: Vec<Layer>) -> Self {
         self.layer_order = Some(order);
         self
     }
 
-    /// Post-merge validation hook. Receives the merged `&toml::Table` (the
-    /// runtime analogue of the static path's `&C`).
+    /// Post-merge validation hook. Receives the merged `&toml::Table`.
+    ///
+    /// Use it for constraints the schema can't express: numeric ranges,
+    /// cross-field invariants ("if A is set then B must be set"), enum
+    /// combinations, filesystem preconditions, anything that depends on the
+    /// merged value rather than on a single field's type. Rejections are
+    /// wrapped in [`ClapfigError::PostValidationFailed`]. Calling this
+    /// method more than once replaces the previous hook. (The typed
+    /// [`SchemaConfigBuilder::post_validate`](crate::SchemaConfigBuilder::post_validate)
+    /// variant receives a typed `&C` instead.)
     pub fn post_validate<F>(mut self, f: F) -> Self
     where
         F: Fn(&Table) -> Result<(), String> + Send + Sync + 'static,
@@ -222,8 +325,16 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Add a URL query string as a config layer. See
-    /// [`ClapfigBuilder::url_query`](crate::ClapfigBuilder::url_query).
+    /// Add URL query parameters as a config layer.
+    ///
+    /// Parses the query string (e.g. `"port=9090&database.url=pg://prod"`)
+    /// into config overrides. Keys use `.` for nesting, values are
+    /// percent-decoded and parsed with the same heuristic as env vars
+    /// (bool > int > float > string). A leading `?` is stripped if present.
+    ///
+    /// By default, URL parameters sit between env vars and CLI overrides in
+    /// precedence: defaults < files < env < **URL** < CLI. This position can
+    /// be changed with [`layer_order()`](Self::layer_order).
     #[cfg(feature = "url")]
     pub fn url_query(mut self, query: &str) -> Self {
         self.url_overrides
@@ -231,8 +342,8 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Add a single CLI override. See
-    /// [`ClapfigBuilder::cli_override`](crate::ClapfigBuilder::cli_override).
+    /// Add a CLI override. `None` values are ignored (useful for optional
+    /// clap args).
     pub fn cli_override<V: Into<Value>>(mut self, key: &str, value: Option<V>) -> Self {
         if let Some(v) = value {
             self.cli_overrides.push((key.to_string(), v.into()));
@@ -240,9 +351,15 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Match a serializable struct's fields against the runtime schema's
-    /// keys (same auto-matching behavior as the static path's
-    /// `cli_overrides_from`).
+    /// Add CLI overrides from any serializable source, auto-matching by
+    /// field name.
+    ///
+    /// Serializes `source` into flat key-value pairs, skips `None` values,
+    /// and keeps only keys that match fields in the schema. Non-matching
+    /// keys are silently ignored, so clap-only fields like `command` or
+    /// `verbose` are automatically excluded. Composes with
+    /// [`cli_override`](Self::cli_override) — both push to the same
+    /// override list.
     pub fn cli_overrides_from<S: Serialize>(mut self, source: &S) -> Self {
         let pairs = flatten::flatten(source)
             .expect("clapfig: failed to flatten CLI source for auto-matching");
@@ -298,10 +415,21 @@ impl RuntimeBuilder {
 
     /// Build a reusable [`RuntimeResolver`] that captures the current
     /// builder state and can be called repeatedly with
-    /// [`resolve_at(dir)`](RuntimeResolver::resolve_at). Runtime-path
-    /// analogue of
-    /// [`ClapfigBuilder::build_resolver`](crate::ClapfigBuilder::build_resolver);
-    /// see that method for the full design rationale.
+    /// [`resolve_at(dir)`](RuntimeResolver::resolve_at), each call
+    /// interpreting [`SearchPath::Cwd`] and [`SearchPath::Ancestors`]
+    /// relative to the passed directory.
+    ///
+    /// Use this when you need to resolve configuration at multiple points
+    /// in a directory tree — for example, a static site generator visiting
+    /// every content leaf, or a linter walking a repository. Files read
+    /// from disk are cached inside the resolver so repeated walks pay the
+    /// disk+parse cost once per unique file. Any
+    /// [`post_validate`](Self::post_validate) hook registered on the
+    /// builder is captured into the resolver and fires on every
+    /// `resolve_at` call.
+    ///
+    /// Returns [`ClapfigError::AppNameRequired`] if `.app_name()` was not
+    /// called on the builder.
     pub fn build_resolver(self) -> Result<RuntimeResolver, ClapfigError> {
         let app_name = self.effective_app_name()?.to_string();
         let file_name = self.effective_file_name()?;
@@ -344,9 +472,17 @@ impl RuntimeBuilder {
         })
     }
 
-    /// Load and resolve the configuration through all layers. Runtime-path
-    /// analogue of [`ClapfigBuilder::load`](crate::ClapfigBuilder::load),
-    /// returning a [`toml::Table`] instead of a typed `C`.
+    /// Load and resolve the configuration through all layers, returning
+    /// the merged [`toml::Table`].
+    ///
+    /// If a [`post_validate`](Self::post_validate) hook is registered, it
+    /// runs after the merged configuration has been produced and any
+    /// rejection is returned as [`ClapfigError::PostValidationFailed`].
+    ///
+    /// Internally this is equivalent to
+    /// `self.build_resolver()?.resolve_at(std::env::current_dir()?)`, so
+    /// all resolution logic lives in exactly one place (see
+    /// [`RuntimeResolver`]).
     pub fn load(self) -> Result<Table, ClapfigError> {
         let start_dir = std::env::current_dir().map_err(|e| ClapfigError::IoError {
             path: PathBuf::from("."),
@@ -358,9 +494,7 @@ impl RuntimeBuilder {
     /// Same as [`load`](Self::load) but also returns any keys the
     /// [`on_unknown_key`](Self::on_unknown_key) callback elected to
     /// [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect).
-    /// The list is empty when no callback is registered or no key opts in
-    /// — this is the direct fix for callers that currently smuggle a
-    /// shared `Vec` through closure captures to get the same data out.
+    /// The list is empty when no callback is registered or no key opts in.
     pub fn load_with_unknowns(
         self,
     ) -> Result<(Table, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
@@ -371,9 +505,12 @@ impl RuntimeBuilder {
         self.build_resolver()?.resolve_at_with_unknowns(start_dir)
     }
 
-    /// Dispatch a [`ConfigAction`] and print the result. Runtime-path
-    /// analogue of
-    /// [`ClapfigBuilder::handle_and_print`](crate::ClapfigBuilder::handle_and_print).
+    /// Dispatch a [`ConfigAction`] and print the result to stdout.
+    ///
+    /// Convenience wrapper around [`handle()`](Self::handle) for CLI apps
+    /// that print directly. For programmatic use or integration with other
+    /// output frameworks, prefer [`handle()`](Self::handle) (returns a
+    /// [`ConfigResult`]) or [`handle_to_string()`](Self::handle_to_string).
     pub fn handle_and_print(self, action: &ConfigAction) -> Result<(), ClapfigError> {
         let result = self.handle(action)?;
         print!("{result}");
@@ -381,8 +518,10 @@ impl RuntimeBuilder {
     }
 
     /// Dispatch a [`ConfigAction`] and return the rendered output as a
-    /// `String`. Runtime-path analogue of
-    /// [`ClapfigBuilder::handle_to_string`](crate::ClapfigBuilder::handle_to_string).
+    /// `String`.
+    ///
+    /// Like [`handle_and_print()`](Self::handle_and_print), but captures
+    /// the output instead of printing to stdout.
     pub fn handle_to_string(self, action: &ConfigAction) -> Result<String, ClapfigError> {
         self.handle(action).map(|r| r.to_string())
     }
@@ -489,7 +628,16 @@ impl RuntimeBuilder {
     }
 }
 
-/// Reusable runtime resolution handle. Parallel to [`Resolver<C>`](crate::Resolver).
+/// Reusable resolution handle for tree-walk use cases.
+///
+/// Built once via [`RuntimeBuilder::build_resolver`], then called
+/// repeatedly with [`resolve_at(dir)`](RuntimeResolver::resolve_at) to
+/// produce a merged configuration anchored at a specific directory. This
+/// unlocks the `.htaccess` / `.gitignore` / `.editorconfig` pattern: a
+/// dynamic file tree where every directory is its own resolution root,
+/// each leaf producing an independently merged configuration. See the
+/// [crate-level "Tree-walk resolution" section](crate#tree-walk-resolution--the-runtimeresolver-handle)
+/// for the full design rationale.
 pub struct RuntimeResolver {
     spec: Arc<DynamicSpec>,
     app_name: String,
@@ -520,10 +668,8 @@ impl RuntimeResolver {
     }
 
     /// Same as [`resolve_at`](Self::resolve_at) but also returns any keys
-    /// the [`on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
+    /// the [`on_unknown_key`](RuntimeBuilder::on_unknown_key)
     /// callback elected to [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect).
-    /// Runtime-path analogue of
-    /// [`Resolver::resolve_at_with_unknowns`](crate::Resolver::resolve_at_with_unknowns).
     pub fn resolve_at_with_unknowns(
         &self,
         start_dir: impl AsRef<std::path::Path>,
@@ -1774,7 +1920,7 @@ mod tests {
         );
     }
 
-    // --- RuntimeResolver cache behavior (parity with Resolver<C> tests) ---
+    // --- RuntimeResolver cache behavior ---
 
     fn resolver_with_path(dir: &std::path::Path) -> RuntimeResolver {
         Clapfig::runtime(demo_schema())
@@ -1810,7 +1956,7 @@ mod tests {
         // Rewrite the file on disk. If the cache is honored, the second
         // resolve returns the ORIGINAL value, not the new one — the
         // contract is "no mtime check; build a new resolver for
-        // freshness," same as the static Resolver<C>.
+        // freshness."
         fs::write(&path, "port = 9999\n").unwrap();
         let table2 = resolver.resolve_at(dir.path()).unwrap();
         assert_eq!(
@@ -1850,5 +1996,663 @@ mod tests {
             cache_after_b, cache_after_a,
             "shared ancestor file should be deduplicated in cache"
         );
+    }
+
+    // --- search modes ---
+
+    #[test]
+    fn first_match_uses_highest_priority_file_only() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        fs::write(
+            dir1.path().join("demo.toml"),
+            "port = 1000\nhost = \"low\"\n",
+        )
+        .unwrap();
+        fs::write(dir2.path().join("demo.toml"), "port = 2000\n").unwrap();
+
+        let table = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![
+                SearchPath::Path(dir1.path().to_path_buf()),
+                SearchPath::Path(dir2.path().to_path_buf()), // highest priority
+            ])
+            .search_mode(SearchMode::FirstMatch)
+            .no_env()
+            .load()
+            .unwrap();
+
+        // Should use dir2 only — port from dir2, host from defaults (not dir1!)
+        assert_eq!(table.get("port"), Some(&Value::Integer(2000)));
+        assert_eq!(table.get("host"), Some(&Value::String("localhost".into())));
+    }
+
+    #[test]
+    fn merge_mode_combines_both_files() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        fs::write(
+            dir1.path().join("demo.toml"),
+            "port = 1000\nhost = \"base\"\n",
+        )
+        .unwrap();
+        fs::write(dir2.path().join("demo.toml"), "port = 2000\n").unwrap();
+
+        let table = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![
+                SearchPath::Path(dir1.path().to_path_buf()),
+                SearchPath::Path(dir2.path().to_path_buf()),
+            ])
+            .search_mode(SearchMode::Merge)
+            .no_env()
+            .load()
+            .unwrap();
+
+        // Merge: port from dir2 (higher priority), host from dir1 (lower priority)
+        assert_eq!(table.get("port"), Some(&Value::Integer(2000)));
+        assert_eq!(table.get("host"), Some(&Value::String("base".into())));
+    }
+
+    #[test]
+    fn first_match_falls_back_when_high_priority_missing() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        // Only dir1 (lower priority) has a config
+        fs::write(dir1.path().join("demo.toml"), "port = 1000\n").unwrap();
+
+        let table = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![
+                SearchPath::Path(dir1.path().to_path_buf()),
+                SearchPath::Path(dir2.path().to_path_buf()),
+            ])
+            .search_mode(SearchMode::FirstMatch)
+            .no_env()
+            .load()
+            .unwrap();
+
+        assert_eq!(table.get("port"), Some(&Value::Integer(1000)));
+    }
+
+    #[test]
+    fn missing_app_name_errors() {
+        let result = Clapfig::runtime(demo_schema()).no_env().load();
+        assert!(matches!(result, Err(ClapfigError::AppNameRequired)));
+    }
+
+    // --- layer order (builder wiring; pipeline-level coverage in resolve.rs) ---
+
+    #[test]
+    fn layer_order_cli_below_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "port = 3000\n").unwrap();
+
+        let table = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .cli_override("port", Some(9999i64))
+            .layer_order(vec![Layer::Cli, Layer::Files])
+            .load()
+            .unwrap();
+
+        // Files listed after Cli, so the file wins.
+        assert_eq!(table.get("port"), Some(&Value::Integer(3000)));
+    }
+
+    // --- normalize_keys (builder wiring; pipeline-level coverage in resolve.rs) ---
+
+    #[test]
+    fn normalize_keys_load_accepts_kebab_in_file() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "[db]\npool-size = 42\n").unwrap();
+
+        let table = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .normalize_keys(true)
+            .load()
+            .unwrap();
+
+        let db = table.get("db").and_then(Value::as_table).unwrap();
+        assert_eq!(db.get("pool_size"), Some(&Value::Integer(42)));
+    }
+
+    // --- handle: template + schema output variants ---
+
+    #[test]
+    fn handle_gen_kebab_emits_kebab_keys() {
+        // End-to-end: a builder with .normalize_keys(true) must produce a
+        // template whose keys match what users will type, not the schema
+        // field names.
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .no_env()
+            .normalize_keys(true)
+            .handle(&ConfigAction::Gen { output: None })
+            .unwrap();
+
+        match result {
+            ConfigResult::Template(t) => {
+                assert!(
+                    t.contains("pool-size"),
+                    "expected kebab key in generated template:\n{t}"
+                );
+                assert!(
+                    !t.contains("pool_size"),
+                    "snake form leaked into normalize_keys template:\n{t}"
+                );
+            }
+            other => panic!("Expected Template, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_gen_default_still_snake() {
+        // Without normalize_keys, the template stays snake_case — defaults
+        // unchanged for callers that haven't opted in.
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .no_env()
+            .handle(&ConfigAction::Gen { output: None })
+            .unwrap();
+
+        match result {
+            ConfigResult::Template(t) => {
+                assert!(t.contains("pool_size"));
+                assert!(!t.contains("pool-size"));
+            }
+            other => panic!("Expected Template, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_gen_with_output() {
+        let dir = TempDir::new().unwrap();
+        let out_path = dir.path().join("generated.toml");
+
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .no_env()
+            .handle(&ConfigAction::Gen {
+                output: Some(out_path.clone()),
+            })
+            .unwrap();
+
+        assert!(matches!(result, ConfigResult::TemplateWritten { .. }));
+        let content = fs::read_to_string(&out_path).unwrap();
+        assert!(content.contains("host"));
+        assert!(content.contains("port"));
+    }
+
+    #[test]
+    fn handle_schema_with_output() {
+        let dir = TempDir::new().unwrap();
+        let out_path = dir.path().join("schema.json");
+
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .no_env()
+            .handle(&ConfigAction::Schema {
+                output: Some(out_path.clone()),
+            })
+            .unwrap();
+
+        assert!(matches!(result, ConfigResult::SchemaWritten { .. }));
+        let content = fs::read_to_string(&out_path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["title"], "App");
+    }
+
+    // --- persist scopes ---
+
+    #[test]
+    fn handle_set_requires_persist_scope() {
+        let dir = TempDir::new().unwrap();
+
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "3000".into(),
+                scope: None,
+            });
+
+        assert!(matches!(result, Err(ClapfigError::NoPersistPath)));
+    }
+
+    #[test]
+    fn handle_unset_requires_persist_scope() {
+        let dir = TempDir::new().unwrap();
+
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .handle(&ConfigAction::Unset {
+                key: "port".into(),
+                scope: None,
+            });
+
+        assert!(matches!(result, Err(ClapfigError::NoPersistPath)));
+    }
+
+    #[test]
+    fn handle_set_rejects_ancestors_scope() {
+        use crate::types::Boundary;
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .persist_scope("bad", SearchPath::Ancestors(Boundary::Root))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "3000".into(),
+                scope: None,
+            });
+
+        assert!(matches!(
+            result,
+            Err(ClapfigError::AncestorsNotAllowedAsPersistPath)
+        ));
+    }
+
+    #[test]
+    fn handle_unknown_scope_errors() {
+        let dir = TempDir::new().unwrap();
+
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "3000".into(),
+                scope: Some("nonexistent".into()),
+            });
+
+        match result {
+            Err(ClapfigError::UnknownScope { scope, available }) => {
+                assert_eq!(scope, "nonexistent");
+                assert_eq!(available, vec!["local"]);
+            }
+            other => panic!("Expected UnknownScope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_list_with_scope() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "port = 3000\n").unwrap();
+
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::List {
+                scope: Some("local".into()),
+            })
+            .unwrap();
+
+        match result {
+            ConfigResult::Listing { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0], ("port".into(), "3000".into()));
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_get_with_scope() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "port = 3000\n").unwrap();
+
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Get {
+                key: "port".into(),
+                scope: Some("local".into()),
+            })
+            .unwrap();
+
+        match result {
+            ConfigResult::KeyValue { value, .. } => assert_eq!(value, "3000"),
+            other => panic!("Expected KeyValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_scopes_separate_files() {
+        let local_dir = TempDir::new().unwrap();
+        let global_dir = TempDir::new().unwrap();
+
+        let make_builder = || {
+            Clapfig::runtime(demo_schema())
+                .app_name("demo")
+                .file_name("demo.toml")
+                .persist_scope("local", SearchPath::Path(local_dir.path().to_path_buf()))
+                .persist_scope("global", SearchPath::Path(global_dir.path().to_path_buf()))
+                .no_env()
+        };
+
+        // Set in local (default scope)
+        make_builder()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "3000".into(),
+                scope: None,
+            })
+            .unwrap();
+
+        // Set in global
+        make_builder()
+            .handle(&ConfigAction::Set {
+                key: "host".into(),
+                value: "0.0.0.0".into(),
+                scope: Some("global".into()),
+            })
+            .unwrap();
+
+        // Verify separate files
+        let local_content = fs::read_to_string(local_dir.path().join("demo.toml")).unwrap();
+        assert!(local_content.contains("port = 3000"));
+        assert!(!local_content.contains("host = \"0.0.0.0\""));
+
+        let global_content = fs::read_to_string(global_dir.path().join("demo.toml")).unwrap();
+        assert!(global_content.contains("host = \"0.0.0.0\""));
+        assert!(!global_content.contains("port = 3000"));
+
+        // List scoped: only that file's explicitly-set entries (the seeded
+        // template contributes the defaults, so filter to the set key).
+        let local_list = make_builder()
+            .handle(&ConfigAction::List {
+                scope: Some("local".into()),
+            })
+            .unwrap();
+        match local_list {
+            ConfigResult::Listing { entries } => {
+                assert!(entries.iter().any(|(k, v)| k == "port" && v == "3000"));
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
+
+        // List merged (no scope): sees both files merged + defaults
+        let merged_list = make_builder()
+            .handle(&ConfigAction::List { scope: None })
+            .unwrap();
+        match merged_list {
+            ConfigResult::Listing { entries } => {
+                let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+                assert!(keys.contains(&"port"));
+                assert!(keys.contains(&"host"));
+            }
+            other => panic!("Expected Listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn persist_scope_auto_added_to_search_paths() {
+        // A value set through a persist scope must be discoverable on the
+        // next load even when the scope dir was never listed in
+        // search_paths.
+        let scope_dir = TempDir::new().unwrap();
+
+        Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .persist_scope("local", SearchPath::Path(scope_dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "4242".into(),
+                scope: None,
+            })
+            .unwrap();
+
+        let table = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![])
+            .persist_scope("local", SearchPath::Path(scope_dir.path().to_path_buf()))
+            .no_env()
+            .load()
+            .unwrap();
+
+        assert_eq!(table.get("port"), Some(&Value::Integer(4242)));
+    }
+
+    // --- strict_at path validation ---
+
+    #[test]
+    fn strict_at_invalid_path_errors_at_build_resolver() {
+        // Path that doesn't resolve to a section.
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .strict_at("nonexistent.section", false)
+            .build_resolver()
+            .err();
+        match result {
+            Some(ClapfigError::InvalidStrictPath { path, .. }) => {
+                assert_eq!(path, "nonexistent.section");
+            }
+            other => panic!("expected InvalidStrictPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_at_leaf_path_errors_at_build_resolver() {
+        // host is a leaf, not a section.
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .strict_at("host", false)
+            .build_resolver()
+            .err();
+        match result {
+            Some(ClapfigError::InvalidStrictPath { path, reason }) => {
+                assert_eq!(path, "host");
+                assert!(reason.contains("leaf"));
+            }
+            other => panic!("expected InvalidStrictPath(leaf), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_at_kebab_normalizes_then_rejects_unknown_path() {
+        // `d-b` normalizes to `d_b`, which is not a section in the schema —
+        // confirms normalization runs before lookup (otherwise the kebab
+        // path would never reach the schema walker and we'd hit a
+        // different error path).
+        let err = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .normalize_keys(true)
+            .strict_at("d-b", false)
+            .build_resolver()
+            .err();
+        assert!(matches!(err, Some(ClapfigError::InvalidStrictPath { .. })));
+    }
+
+    #[test]
+    fn strict_at_kebab_normalizes_to_real_snake_section() {
+        // Success-path complement to the previous test: when the kebab
+        // form actually corresponds to a real snake_case section in the
+        // schema, build_resolver must accept it. Uses the kebab fixture
+        // because its sole nested section is multi-word (`my_section`),
+        // so the kebab → snake rewrite is observable.
+        let result = Clapfig::runtime(crate::fixtures::test::kebab_strict_at_schema())
+            .app_name("demo")
+            .normalize_keys(true)
+            .strict_at("my-section", false)
+            .build_resolver();
+        assert!(
+            result.is_ok(),
+            "kebab strict_at path resolving to a real snake section must build (got error: {:?})",
+            result.err()
+        );
+    }
+
+    // --- on_unknown_key basics ---
+
+    #[test]
+    fn on_unknown_key_accept_drops_silently() {
+        // strict default rejects; callback Accepts → key drops, no error.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "rogue_key = 1\nport = 3000\n").unwrap();
+        let table = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .on_unknown_key(|_| crate::UnknownKeyDecision::Accept)
+            .load()
+            .unwrap();
+        assert_eq!(table.get("port"), Some(&Value::Integer(3000)));
+    }
+
+    #[test]
+    fn on_unknown_key_reject_errors() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "rogue_key = 1\n").unwrap();
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .on_unknown_key(|_| crate::UnknownKeyDecision::Reject)
+            .load();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn on_unknown_key_context_carries_path_leaf_value_line() {
+        // The callback must see path, leaf, value, file, and line.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "port = 3000\n# pad\nbogus = 42\n",
+        )
+        .unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(
+            None::<(String, String, i64, Option<usize>)>,
+        ));
+        let seen_clone = std::sync::Arc::clone(&seen);
+        let _result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .on_unknown_key(move |ctx: &crate::UnknownKeyContext<'_>| {
+                if let Some(i) = ctx.value.and_then(|v| v.as_integer()) {
+                    *seen_clone.lock().unwrap() =
+                        Some((ctx.path.into(), ctx.leaf.into(), i, ctx.line));
+                }
+                crate::UnknownKeyDecision::Accept
+            })
+            .load();
+        let captured = seen.lock().unwrap().clone();
+        match captured {
+            Some((path, leaf, value, line)) => {
+                assert_eq!(path, "bogus");
+                assert_eq!(leaf, "bogus");
+                assert_eq!(value, 42);
+                assert_eq!(line, Some(3));
+            }
+            None => panic!("callback never received the unknown key"),
+        }
+    }
+
+    #[test]
+    fn on_unknown_key_not_called_on_cascade_accepted_keys() {
+        // strict_at("db", false) → unknown nested key drops without the
+        // callback ever seeing it.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("demo.toml"),
+            "[db]\nurl = \"pg://\"\nlenient_typo = 1\n",
+        )
+        .unwrap();
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = std::sync::Arc::clone(&called);
+        Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .strict_at("db", false)
+            .on_unknown_key(move |_| {
+                called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                crate::UnknownKeyDecision::Reject
+            })
+            .load()
+            .unwrap();
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "callback must not run for cascade-accepted keys"
+        );
+    }
+
+    // --- post_validate lifecycle ---
+
+    #[test]
+    fn post_validate_not_called_when_upstream_fails() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "typo_key = 1\n").unwrap();
+
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .strict(true)
+            .post_validate(move |_| {
+                called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .load();
+
+        assert!(result.is_err(), "strict validation should have failed");
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "hook must not run when upstream resolution fails"
+        );
+    }
+
+    #[test]
+    fn post_validate_second_call_replaces_first() {
+        let dir = TempDir::new().unwrap();
+
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .post_validate(|_| Err("first".into()))
+            .post_validate(|_| Err("second".into()))
+            .load();
+
+        match result {
+            Err(ClapfigError::PostValidationFailed(msg)) => assert_eq!(msg, "second"),
+            other => panic!("expected PostValidationFailed('second'), got {other:?}"),
+        }
     }
 }

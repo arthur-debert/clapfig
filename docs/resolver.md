@@ -1,12 +1,13 @@
 # Resolver Guide
 
-The `Resolver` is clapfig's answer to the `.editorconfig` / `.eslintrc` /
-`.htaccess` pattern: tools that walk a file tree where every directory can
-carry its own configuration, with ancestor configs layering in from above.
+The `RuntimeResolver` is clapfig's answer to the `.editorconfig` /
+`.eslintrc` / `.htaccess` pattern: tools that walk a file tree where every
+directory can carry its own configuration, with ancestor configs layering in
+from above.
 
 ## The problem
 
-`Clapfig::builder().load()` resolves config once, anchored at the process's
+`load()` resolves config once, anchored at the process's
 current working directory. For a simple CLI tool, that's exactly right. But
 for tools that process many directories — static site generators, linters,
 build systems — you need:
@@ -20,15 +21,19 @@ build systems — you need:
 ## Building a Resolver
 
 ```rust
-use clapfig::{Clapfig, Config, SearchPath, Boundary, SearchMode};
+use clapfig::{Clapfig, SearchPath, Boundary, SearchMode};
 
-let resolver = Clapfig::builder::<SiteConfig>()
+let resolver = Clapfig::runtime(site_schema())
     .app_name("myssg")
     .file_name(".myssg.toml")
     .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
     .search_mode(SearchMode::Merge)
     .build_resolver()?;
 ```
+
+Each `resolve_at()` call returns the merged `toml::Table`; deserialize it
+into your typed struct where you need one (`toml::Table` implements
+`Deserialize`-friendly conversion via `toml::Value::try_into`).
 
 `build_resolver()` captures the builder's state — search paths, env vars,
 overrides, strict mode, post_validate hook — into a reusable handle. The
@@ -57,9 +62,9 @@ Files read during `resolve_at()` are cached by absolute path inside the
 resolver. A tree walk that visits 1000 leaves sharing 5 ancestor config files
 pays the disk+parse cost once per unique file, not 1000 times.
 
-The cache lives for the lifetime of the `Resolver` instance. There is no
-mtime-based invalidation — if files change on disk and you need freshness,
-build a new `Resolver`. This is a deliberate simplicity choice.
+The cache lives for the lifetime of the `RuntimeResolver` instance. There is
+no mtime-based invalidation — if files change on disk and you need
+freshness, build a new resolver. This is a deliberate simplicity choice.
 
 ```rust
 // Cache is scoped to the resolver — drop it to invalidate
@@ -94,7 +99,7 @@ Uses only the single nearest file found. Good when configs are self-contained
 and should not layer:
 
 ```rust
-let resolver = Clapfig::builder::<Config>()
+let resolver = Clapfig::runtime(schema)
     .app_name("fmt")
     .search_paths(vec![SearchPath::Ancestors(Boundary::Root)])
     .search_mode(SearchMode::FirstMatch)
@@ -126,13 +131,14 @@ and fires on every `resolve_at()` call — not just once. This means per-leaf
 semantic validation works automatically:
 
 ```rust
-let resolver = Clapfig::builder::<SiteConfig>()
+let resolver = Clapfig::runtime(site_schema())
     .app_name("myssg")
     .file_name(".myssg.toml")
     .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
-    .post_validate(|c| {
-        if c.port < 1024 {
-            return Err(format!("port {} is privileged", c.port));
+    .post_validate(|t| {
+        let port = t.get("port").and_then(|v| v.as_integer()).unwrap_or(0);
+        if port < 1024 {
+            return Err(format!("port {port} is privileged"));
         }
         Ok(())
     })
@@ -151,7 +157,7 @@ or `Path`) contribute the same files to every `resolve_at()` call, while
 `Ancestors` and `Cwd` vary per call:
 
 ```rust
-let resolver = Clapfig::builder::<Config>()
+let resolver = Clapfig::runtime(schema)
     .app_name("mytool")
     .file_name(".mytool.toml")
     .search_paths(vec![
