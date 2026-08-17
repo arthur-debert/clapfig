@@ -13,7 +13,7 @@
 //! The only bridge to the core is [`ConfigArgs::into_action()`], which
 //! converts clap-parsed arguments into a [`ConfigAction`](crate::ConfigAction).
 //! From there, all logic flows through the clap-free
-//! [`ClapfigBuilder::handle()`](crate::ClapfigBuilder::handle) API.
+//! [`handle()`](crate::RuntimeBuilder::handle) API.
 //!
 //! If you use a different CLI parser (or no CLI at all), you can skip this
 //! module entirely and construct [`ConfigAction`](crate::ConfigAction) values

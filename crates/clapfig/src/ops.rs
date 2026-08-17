@@ -6,9 +6,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use confique::Config;
-use serde::Serialize;
-
 use crate::error::ClapfigError;
 
 /// Result of a config operation. Returned to the caller for display.
@@ -68,27 +65,7 @@ impl fmt::Display for ConfigResult {
     }
 }
 
-/// Generate a commented TOML template from the config struct's doc comments.
-///
-/// When `kebab` is `true`, snake_case field names in the template's keys and
-/// section headers are rewritten to kebab-case (`pool_size` → `pool-size`)
-/// so the template matches what users will actually type when
-/// [`.normalize_keys(true)`](crate::ClapfigBuilder::normalize_keys) is in
-/// effect. Doc comments and values are never touched.
-///
-/// The static path delegates to confique's `toml::template`; Phase 2's
-/// runtime path will walk a [`SchemaRef`](crate::spec::SchemaRef) and emit
-/// its own template.
-pub fn generate_template<C: Config>(kebab: bool) -> String {
-    let raw = confique::toml::template::<C>(confique::toml::FormatOptions::default());
-    if kebab {
-        rewrite_keys_to_kebab(&raw)
-    } else {
-        raw
-    }
-}
-
-/// Rewrite snake_case keys to kebab-case in a confique TOML template.
+/// Rewrite snake_case keys to kebab-case in a generated TOML template.
 ///
 /// Walks the template line by line and rewrites:
 /// - `[section]` / `[parent.section]` / `[[array]]` headers
@@ -97,9 +74,9 @@ pub fn generate_template<C: Config>(kebab: bool) -> String {
 ///
 /// Doc-comment lines (a `#` followed by a space or end-of-line) and the
 /// value portion of any line are left untouched. The disambiguation between
-/// a doc comment and a commented-default line is the same convention
-/// confique itself uses: `# <text>` is documentation, `#key = ...` (no
-/// space after the hashes) is a commented key.
+/// a doc comment and a commented-default line is the template convention
+/// used by [`generate_template_from_runtime`]: `# <text>` is documentation,
+/// `#key = ...` (no space after the hashes) is a commented key.
 fn rewrite_keys_to_kebab(template: &str) -> String {
     let mut out = String::with_capacity(template.len());
     let ends_with_newline = template.ends_with('\n');
@@ -144,7 +121,7 @@ fn rewrite_template_line(line: &str) -> String {
     let (hashes, body) = if stripped.starts_with('#') {
         let count = stripped.bytes().take_while(|&b| b == b'#').count();
         let after = &stripped[count..];
-        // confique's convention: hashes + whitespace (or EOL) = doc comment;
+        // Template convention: hashes + whitespace (or EOL) = doc comment;
         // hashes + bareword = commented-out default. Only rewrite the latter.
         if after.is_empty() || after.starts_with(|c: char| c.is_whitespace()) {
             return line.to_string();
@@ -186,20 +163,8 @@ fn swap_underscores_to_dashes(dotted: &str) -> String {
     dotted.replace('_', "-")
 }
 
-/// Generate a JSON Schema document (pretty-printed) describing the config struct.
-///
-/// Walks the schema via [`crate::schema::generate_schema_from_ref`] and
-/// serializes the result. Serialization of a `serde_json::Value` is infallible
-/// for the shapes this module produces, so we propagate any panic rather than
-/// masking it with a bogus "{}" payload.
-pub fn generate_schema_string<C: Config>() -> String {
-    let schema = crate::spec::SchemaRef::from_meta(&C::META);
-    let value = crate::schema::generate_schema_from_ref(schema);
-    serde_json::to_string_pretty(&value).expect("serde_json::Value serialization is infallible")
-}
-
-/// Runtime-path template generator. Walks the runtime [`Schema`] and emits
-/// a commented TOML template parallel to confique's `toml::template` output:
+/// Template generator: walks a runtime [`Schema`] and emits a commented
+/// TOML template.
 ///
 /// - Top-level `///`-equivalent doc lines render as `# <line>` at file head.
 /// - Each leaf field renders its doc lines as `# <line>`, then either
@@ -209,7 +174,7 @@ pub fn generate_schema_string<C: Config>() -> String {
 ///   don't have to look the set up elsewhere.
 /// - Nested sections render as `[parent.child]` headers; array-of-objects
 ///   render as `[[parent.child]]`.
-/// - `kebab=true` applies the same key rewriter the static path uses, so
+/// - `kebab=true` applies the [`rewrite_keys_to_kebab`] rewriter, so
 ///   the rendered template matches what a `normalize_keys(true)` builder
 ///   accepts.
 ///
@@ -385,8 +350,7 @@ fn format_inline_toml(value: &toml::Value) -> String {
 
 impl crate::runtime::LeafType {
     /// Single-word placeholder rendered in a commented-out template line
-    /// for a leaf without a default. Mirrors what confique emits as a
-    /// type-hint comment.
+    /// for a leaf without a default, hinting the expected value shape.
     pub(crate) fn template_placeholder(&self) -> &'static str {
         match self {
             crate::runtime::LeafType::String => "\"\"",
@@ -400,56 +364,6 @@ impl crate::runtime::LeafType {
             crate::runtime::LeafType::Value => "\"\"",
         }
     }
-}
-
-/// Get a config value by dotted key, including its doc comment.
-pub fn get_value<C: Config + Serialize>(
-    config: &C,
-    key: &str,
-) -> Result<ConfigResult, ClapfigError> {
-    let toml_value = toml::Value::try_from(config).map_err(|e| ClapfigError::InvalidValue {
-        key: key.into(),
-        reason: e.to_string(),
-    })?;
-
-    let table = toml_value
-        .as_table()
-        .ok_or_else(|| ClapfigError::InvalidValue {
-            key: key.into(),
-            reason: "config did not serialize to a table".into(),
-        })?;
-
-    let value = table_get(table, key).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
-
-    let value_str = format_value(value);
-    let doc = crate::meta::doc_for::<C>(key).unwrap_or_default();
-
-    Ok(ConfigResult::KeyValue {
-        key: key.into(),
-        value: value_str,
-        doc,
-    })
-}
-
-/// List all resolved config values as flattened dotted key-value pairs.
-pub fn list_values<C: Config + Serialize>(config: &C) -> Result<ConfigResult, ClapfigError> {
-    let pairs = crate::flatten::flatten(config).map_err(|e| ClapfigError::InvalidValue {
-        key: "<list>".into(),
-        reason: e.to_string(),
-    })?;
-
-    let entries: Vec<(String, String)> = pairs
-        .into_iter()
-        .map(|(key, value)| {
-            let display = match value {
-                Some(v) => format_value(&v),
-                None => "<not set>".to_string(),
-            };
-            (key, display)
-        })
-        .collect();
-
-    Ok(ConfigResult::Listing { entries })
 }
 
 /// List entries from a single scope's config file (raw file content, not merged).
@@ -484,47 +398,6 @@ pub fn list_scope_file(file_path: &Path) -> Result<ConfigResult, ClapfigError> {
     flatten_toml_table(&table, "", &mut entries);
 
     Ok(ConfigResult::Listing { entries })
-}
-
-/// Get a value from a single scope's config file by dotted key.
-///
-/// Returns the raw value from the file, plus doc comments from the config struct's
-/// metadata. Returns `KeyNotFound` if the key is not present in the file.
-pub fn get_scope_value<C: Config>(
-    file_path: &Path,
-    key: &str,
-) -> Result<ConfigResult, ClapfigError> {
-    let content = match std::fs::read_to_string(file_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ClapfigError::KeyNotFound(key.into()));
-        }
-        Err(e) => {
-            return Err(ClapfigError::IoError {
-                path: file_path.to_path_buf(),
-                source: e,
-            });
-        }
-    };
-
-    let table: toml::Table =
-        content
-            .parse()
-            .map_err(|e: toml::de::Error| ClapfigError::ParseError {
-                path: file_path.to_path_buf(),
-                source: Box::new(e),
-                source_text: Some(std::sync::Arc::from(content.as_str())),
-            })?;
-
-    let value = table_get(&table, key).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
-    let value_str = format_value(value);
-    let doc = crate::meta::doc_for::<C>(key).unwrap_or_default();
-
-    Ok(ConfigResult::KeyValue {
-        key: key.into(),
-        value: value_str,
-        doc,
-    })
 }
 
 /// Recursively flatten a TOML table into dotted key-value pairs.
@@ -579,15 +452,11 @@ fn format_value(value: &toml::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::test::TestConfig;
-
-    fn test_config() -> TestConfig {
-        TestConfig::builder().load().unwrap()
-    }
+    use crate::fixtures::test::test_schema;
 
     #[test]
     fn generate_template_contains_keys() {
-        let template = generate_template::<TestConfig>(false);
+        let template = generate_template_from_runtime(&test_schema(), false);
         assert!(template.contains("host"));
         assert!(template.contains("port"));
         assert!(template.contains("database"));
@@ -596,14 +465,14 @@ mod tests {
 
     #[test]
     fn generate_template_contains_doc_comments() {
-        let template = generate_template::<TestConfig>(false);
+        let template = generate_template_from_runtime(&test_schema(), false);
         assert!(template.contains("application host"));
         assert!(template.contains("port number"));
     }
 
     #[test]
     fn generate_template_kebab_rewrites_snake_keys() {
-        let template = generate_template::<TestConfig>(true);
+        let template = generate_template_from_runtime(&test_schema(), true);
         // The nested `pool_size` field should be emitted as `pool-size`.
         assert!(
             template.contains("pool-size"),
@@ -618,20 +487,20 @@ mod tests {
     #[test]
     fn generate_template_kebab_preserves_doc_comments() {
         // Doc comments that happen to mention the snake form (in prose, not
-        // as keys) should not be rewritten. TestConfig's docs include
+        // as keys) should not be rewritten. The fixture's docs include
         // "Connection pool size."—lowercase plain English—but we also want
         // the structural guarantee that `# ` lines pass through verbatim.
-        let template = generate_template::<TestConfig>(true);
+        let template = generate_template_from_runtime(&test_schema(), true);
         assert!(template.contains("Connection pool size."));
     }
 
     #[test]
     fn generate_template_kebab_off_is_default_behavior() {
-        // Sanity: with the flag off, output is byte-identical to the bare
-        // confique template (kebab path is opt-in).
-        let raw = generate_template::<TestConfig>(false);
-        let bare = confique::toml::template::<TestConfig>(confique::toml::FormatOptions::default());
-        assert_eq!(raw, bare);
+        // Sanity: with the flag off, snake keys pass through untouched
+        // (kebab path is opt-in).
+        let raw = generate_template_from_runtime(&test_schema(), false);
+        assert!(raw.contains("pool_size"));
+        assert!(!raw.contains("pool-size"));
     }
 
     // -- rewrite_keys_to_kebab unit tests -----------------------------------
@@ -667,8 +536,8 @@ mod tests {
 
     #[test]
     fn rewriter_skips_doc_comments() {
-        // `#` followed by a space is a doc comment in confique's convention —
-        // any `_` in prose must survive the rewriter untouched.
+        // `#` followed by a space is a doc comment in the template
+        // convention — any `_` in prose must survive the rewriter untouched.
         let input = "# Set pool_size to a positive integer.\n";
         let out = rewrite_keys_to_kebab(input);
         assert_eq!(out, input);
@@ -701,65 +570,6 @@ mod tests {
     }
 
     #[test]
-    fn get_flat_key() {
-        let config = test_config();
-        let result = get_value::<TestConfig>(&config, "port").unwrap();
-        match result {
-            ConfigResult::KeyValue { value, .. } => assert_eq!(value, "8080"),
-            other => panic!("Expected KeyValue, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn get_nested_key() {
-        let config = test_config();
-        let result = get_value::<TestConfig>(&config, "database.pool_size").unwrap();
-        match result {
-            ConfigResult::KeyValue { value, .. } => assert_eq!(value, "5"),
-            other => panic!("Expected KeyValue, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn get_nonexistent_key() {
-        let config = test_config();
-        let result = get_value::<TestConfig>(&config, "nonexistent");
-        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
-    }
-
-    #[test]
-    fn get_includes_doc() {
-        let config = test_config();
-        let result = get_value::<TestConfig>(&config, "host").unwrap();
-        match result {
-            ConfigResult::KeyValue { doc, .. } => {
-                let doc_text = doc.join(" ");
-                assert!(
-                    doc_text.contains("host"),
-                    "doc should mention host: {doc_text}"
-                );
-            }
-            other => panic!("Expected KeyValue, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn get_nested_doc() {
-        let config = test_config();
-        let result = get_value::<TestConfig>(&config, "database.pool_size").unwrap();
-        match result {
-            ConfigResult::KeyValue { doc, .. } => {
-                let doc_text = doc.join(" ");
-                assert!(
-                    doc_text.contains("pool size") || doc_text.contains("Connection pool"),
-                    "doc should mention pool: {doc_text}"
-                );
-            }
-            other => panic!("Expected KeyValue, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn table_get_flat() {
         let table: toml::Table = toml::from_str("port = 8080").unwrap();
         let val = table_get(&table, "port").unwrap();
@@ -777,52 +587,6 @@ mod tests {
     fn table_get_missing() {
         let table: toml::Table = toml::from_str("port = 8080").unwrap();
         assert!(table_get(&table, "nope").is_none());
-    }
-
-    #[test]
-    fn list_values_includes_all_keys() {
-        let config = test_config();
-        let result = list_values::<TestConfig>(&config).unwrap();
-        match result {
-            ConfigResult::Listing { entries } => {
-                let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
-                assert!(keys.contains(&"host"));
-                assert!(keys.contains(&"port"));
-                assert!(keys.contains(&"debug"));
-                assert!(keys.contains(&"database.url"));
-                assert!(keys.contains(&"database.pool_size"));
-                assert_eq!(entries.len(), 5);
-            }
-            other => panic!("Expected Listing, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn list_values_shows_not_set_for_none() {
-        let config = test_config();
-        let result = list_values::<TestConfig>(&config).unwrap();
-        match result {
-            ConfigResult::Listing { entries } => {
-                let db_url = entries.iter().find(|(k, _)| k == "database.url").unwrap();
-                assert_eq!(db_url.1, "<not set>");
-            }
-            other => panic!("Expected Listing, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn list_values_formats_correctly() {
-        let config = test_config();
-        let result = list_values::<TestConfig>(&config).unwrap();
-        match result {
-            ConfigResult::Listing { entries } => {
-                let port = entries.iter().find(|(k, _)| k == "port").unwrap();
-                assert_eq!(port.1, "8080");
-                let host = entries.iter().find(|(k, _)| k == "host").unwrap();
-                assert_eq!(host.1, "localhost");
-            }
-            other => panic!("Expected Listing, got {other:?}"),
-        }
     }
 
     #[test]
@@ -881,70 +645,6 @@ mod tests {
         match result {
             ConfigResult::Listing { entries } => assert!(entries.is_empty()),
             other => panic!("Expected empty Listing, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn get_scope_value_found() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "port = 3000\n").unwrap();
-
-        let result = get_scope_value::<TestConfig>(&path, "port").unwrap();
-        match result {
-            ConfigResult::KeyValue { value, .. } => assert_eq!(value, "3000"),
-            other => panic!("Expected KeyValue, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn get_scope_value_nested() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[database]\npool_size = 20\n").unwrap();
-
-        let result = get_scope_value::<TestConfig>(&path, "database.pool_size").unwrap();
-        match result {
-            ConfigResult::KeyValue { value, .. } => assert_eq!(value, "20"),
-            other => panic!("Expected KeyValue, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn get_scope_value_not_found() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "port = 3000\n").unwrap();
-
-        let result = get_scope_value::<TestConfig>(&path, "missing");
-        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
-    }
-
-    #[test]
-    fn get_scope_value_missing_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("nonexistent.toml");
-
-        let result = get_scope_value::<TestConfig>(&path, "port");
-        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
-    }
-
-    #[test]
-    fn get_scope_value_includes_doc() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "host = \"myhost\"\n").unwrap();
-
-        let result = get_scope_value::<TestConfig>(&path, "host").unwrap();
-        match result {
-            ConfigResult::KeyValue { doc, .. } => {
-                let doc_text = doc.join(" ");
-                assert!(
-                    doc_text.contains("host"),
-                    "doc should mention host: {doc_text}"
-                );
-            }
-            other => panic!("Expected KeyValue, got {other:?}"),
         }
     }
 }

@@ -4,25 +4,26 @@ Rich, layered configuration for Rust applications. Define a struct, point at you
 
 **clapfig** discovers, merges, and manages configuration from multiple sources — config files, environment variables, and programmatic overrides — through a pure Rust builder API. The core library has **no dependency on any CLI framework**: you can use it in GUI apps, servers, or with any argument parser. For [clap](https://docs.rs/clap) users, an optional adapter provides drop-in `config gen|list|get|set|unset` subcommands with zero boilerplate.
 
-Built on [confique](https://github.com/LukasKalbertodt/confique) for struct-driven defaults and commented template generation.
+Your struct is the schema: `#[derive(clapfig::Schema)]` captures types, defaults, enum sets, and doc comments, and every feature — loading, template generation, JSON Schema, persistence validation — reads from that one definition. Apps whose schema isn't known at compile time build the same schema at runtime instead.
 
 ## Features
 
 **Core** (always available, no CLI framework needed):
 
-- **Struct as source of truth** — define settings as a Rust struct with defaults and `///` doc comments
+- **Struct as source of truth** — define settings as a Rust struct with defaults and `///` doc comments; the derive emits the full schema (types, enum sets, docs) available at runtime
 - **Layered merge** — defaults < config files < env vars < overrides, every layer sparse, [customizable precedence order](#layer-precedence)
 - **Multi-path file search** — platform config dir, home, cwd, ancestor walk, or any path
 - **Search modes** — merge all found configs or use the first match
 - **Ancestor walk** — walk up from cwd to find project configs, with configurable boundary (`.git`, filesystem root)
-- **Tree-walk resolution** — build a reusable [`Resolver<C>`](https://docs.rs/clapfig/latest/clapfig/struct.Resolver.html) once, call `.resolve_at(&dir)` for every leaf in a dynamic file tree (`.htaccess`/`.editorconfig` pattern). Per-call `Cwd`/`Ancestors` anchoring, instance-scoped file cache so repeated walks pay disk+parse once per unique file.
+- **Tree-walk resolution** — build a reusable [`RuntimeResolver`](https://docs.rs/clapfig/latest/clapfig/struct.RuntimeResolver.html) once, call `.resolve_at(&dir)` for every leaf in a dynamic file tree (`.htaccess`/`.editorconfig` pattern). Per-call `Cwd`/`Ancestors` anchoring, instance-scoped file cache so repeated walks pay disk+parse once per unique file.
+- **Runtime-defined schemas** — plugin hosts and generated apps build an owned [`Schema`](https://docs.rs/clapfig/latest/clapfig/runtime/struct.Schema.html) with a fluent builder and get the exact same pipeline; `load()` returns a `toml::Table`
 - **Prefix-based env vars** — `MYAPP__DATABASE__URL` maps to `database.url` automatically
 - **Kebab-case keys** — opt-in `.normalize_keys(true)` lets users write `pool-size = 5` in config files (or `--set database.pool-size=5` on the CLI) and have it map to a `pool_size` Rust field
-- **Strict mode** — unknown keys error with file path, key name, and line number (on by default)
-- **Post-merge validation hook** — `.post_validate(|c| ...)` closes the gap between confique's structural validation and the semantic constraints every real app has: port ranges, cross-field invariants, enum combinations, filesystem preconditions
+- **Strict mode** — unknown keys error with file path, key name, and line number (on by default), with a cascading per-subtree override system and a per-key callback for the edge cases
+- **Post-merge validation hook** — `.post_validate(|c| ...)` closes the gap between structural validation and the semantic constraints every real app has: port ranges, cross-field invariants, enum combinations, filesystem preconditions
 - **Structured errors + rendering** — [`ClapfigError`](https://docs.rs/clapfig/latest/clapfig/error/enum.ClapfigError.html) carries data (keys, paths, lines, source text); the [`render`](https://docs.rs/clapfig/latest/clapfig/render/index.html) module turns it into plain text or [`miette`](https://docs.rs/miette)-style output with snippets and carets (rich mode behind the `rich-errors` feature)
-- **Template generation** — emit a commented sample config from the struct's doc comments
-- **JSON Schema generation** — [`clapfig::schema::generate_schema::<C>()`](https://docs.rs/clapfig/latest/clapfig/schema/fn.generate_schema.html) produces a Draft 2020-12 JSON Schema for UI editors, external validators, and IDE integrations; also exposed as `app config schema`
+- **Template generation** — emit a commented sample config from the struct's doc comments, including `# Allowed:` lines for enum fields and typed placeholders for required fields
+- **JSON Schema generation** — [`clapfig::schema::generate_schema`](https://docs.rs/clapfig/latest/clapfig/schema/fn.generate_schema.html) produces a Draft 2020-12 JSON Schema — with `type` on every field and `enum` sets — for UI editors, external validators, and IDE integrations; also exposed as `app config schema`
 - **Persistence with named scopes** — global/local config file patterns with `--scope` targeting
 
 **Clap adapter** (`clap` feature, on by default):
@@ -35,37 +36,36 @@ Built on [confique](https://github.com/LukasKalbertodt/confique) for struct-driv
 
 ```toml
 [dependencies]
-clapfig = "0.10"
+clapfig = "0.23"
 ```
 
-Define your config with the `Config` derive (re-exported from confique):
+Define your config with the `Schema` derive:
 
 ```rust
-use clapfig::Config;
+use clapfig::Schema;
 use serde::{Serialize, Deserialize};
 
-#[derive(Config, Serialize, Deserialize, Debug)]
+#[derive(Schema, Serialize, Deserialize, Debug)]
 pub struct AppConfig {
     /// The host address to bind to.
-    #[config(default = "127.0.0.1")]
+    #[clapfig(default = "127.0.0.1")]
     pub host: String,
 
     /// The port number.
-    #[config(default = 8080)]
+    #[clapfig(default = 8080)]
     pub port: u16,
 
     /// Database settings.
-    #[config(nested)]
     pub database: DbConfig,
 }
 
-#[derive(Config, Serialize, Deserialize, Debug)]
+#[derive(Schema, Serialize, Deserialize, Debug)]
 pub struct DbConfig {
     /// Connection string URL.
     pub url: Option<String>,
 
     /// Connection pool size.
-    #[config(default = 10)]
+    #[clapfig(default = 10)]
     pub pool_size: usize,
 }
 ```
@@ -76,7 +76,7 @@ Load it:
 use clapfig::Clapfig;
 
 fn main() -> anyhow::Result<()> {
-    let config: AppConfig = Clapfig::builder()
+    let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
         .app_name("myapp")
         .load()?;
 
@@ -89,18 +89,18 @@ That `app_name("myapp")` call sets sensible defaults:
 
 - Searches for `myapp.toml` in the platform config directory
 - Merges env vars prefixed with `MYAPP__`
-- Fills in `#[config(default)]` values for anything not provided
+- Fills in `#[clapfig(default)]` values for anything not provided
 
 Without clap:
 
 ```toml
-clapfig = { version = "0.10", default-features = false }
+clapfig = { version = "0.23", default-features = false, features = ["derive"] }
 ```
 
 ## Layer Precedence
 
 ```text
-Compiled defaults     #[config(default = ...)]
+Compiled defaults     #[clapfig(default = ...)]
        ↑ overridden by
 Config files          search paths in order, later paths win
        ↑ overridden by
@@ -118,7 +118,7 @@ This is the default order. You can customize it with `.layer_order()`:
 ```rust
 use clapfig::{Clapfig, Layer};
 
-let config: AppConfig = Clapfig::builder()
+let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
     .app_name("myapp")
     .layer_order(vec![Layer::Env, Layer::Files, Layer::Cli])
     .load()?;
@@ -142,16 +142,16 @@ cargo run --example clapfig_demo --features rich-errors -- echo
 # (drop a `clapfig-demo.toml` with an unknown key like `typo = 1` first)
 ```
 
-See [`examples/clapfig_demo/`](examples/clapfig_demo/) for the full source.
+See [`examples/clapfig_demo/`](crates/clapfig/examples/clapfig_demo/) for the full source.
 
-## Tree-Walk Resolution with `Resolver`
+## Tree-Walk Resolution
 
-For tools that walk a file tree where every directory can have its own config — the `.editorconfig` / `.eslintrc` / `.htaccess` pattern — `Resolver` provides cached, per-directory resolution:
+For tools that walk a file tree where every directory can have its own config — the `.editorconfig` / `.eslintrc` / `.htaccess` pattern — the resolver handle provides cached, per-directory resolution:
 
 ```rust
-use clapfig::{Clapfig, Config, SearchPath, Boundary};
+use clapfig::{Clapfig, SearchPath, Boundary};
 
-let resolver = Clapfig::builder::<MyConfig>()
+let resolver = Clapfig::runtime(schema)
     .app_name("mytool")
     .file_name(".mytool.toml")
     .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
@@ -171,7 +171,7 @@ Key properties:
 - **File caching** — files are cached by absolute path inside the resolver. A tree walk over 1000 directories sharing 5 ancestor configs pays disk+parse once per unique file.
 - **`post_validate` composition** — a validation hook registered on the builder fires on every `resolve_at()` call.
 
-See the [Resolver docs](https://docs.rs/clapfig/latest/clapfig/struct.Resolver.html) for the full API.
+See the [RuntimeResolver docs](https://docs.rs/clapfig/latest/clapfig/struct.RuntimeResolver.html) for the full API.
 
 ## Documentation
 
@@ -179,6 +179,8 @@ See the [Resolver docs](https://docs.rs/clapfig/latest/clapfig/struct.Resolver.h
 
 - [Getting Started](docs/getting-started.md) — installation, first config struct, basic usage
 - [Layered Configuration](docs/layered-config.md) — layers, search paths, merge modes, env vars, overrides
+- [Runtime Schemas](docs/runtime-schemas.md) — building schemas at runtime for plugin hosts and generated apps
+- [Strictness Guide](docs/strictness.md) — the cascading strict-mode system
 - [Resolver Guide](docs/resolver.md) — per-directory resolution for tree-walk tools
 - [Config Command Guide](docs/config-command.md) — the `config gen|list|get|set|unset` integration
 

@@ -1,6 +1,6 @@
 //! Runtime-defined schemas: owned `Schema` / `Field` / `LeafType` types and a
-//! fluent builder, for callers without a compile-time `confique::Config`
-//! struct.
+//! fluent builder, for callers without a compile-time
+//! `#[derive(clapfig::Schema)]` struct.
 //!
 //! Pairs with a crate-private schema abstraction introduced in Phase 1
 //! (a borrowed `SchemaRef` view). The runtime-side `Schema` is converted

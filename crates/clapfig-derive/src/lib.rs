@@ -56,7 +56,16 @@ use syn::{
 ///   match TOML's grammar (RFC 3339 offset / local datetime / local
 ///   date / local time) before shipping.
 /// - `#[clapfig(env = "NAME")]` — explicit env-var override
-/// - `#[clapfig(rename = "name")]` — override the field's schema/serde name
+/// - `#[clapfig(rename = "name")]` — override the field's schema name.
+///   `#[serde(rename = "name")]` alone also works — the schema follows
+///   serde's spelling so the merged config and the typed deserialize agree.
+///   The directional `#[serde(rename(deserialize = "...", ...))]` form
+///   contributes its `deserialize` spelling (a serialize-only rename
+///   leaves the schema on the Rust identifier, matching serde). If both
+///   attributes are present they must match (a differing pair is a
+///   derive-time error), and a `#[clapfig(rename)]` without the matching
+///   serde attribute still needs one for the deserialize side. Struct-level
+///   `#[serde(rename_all = ...)]` is rejected (see *Struct attributes*).
 /// - `#[clapfig(value)]` — force `LeafType::Value` (untyped escape hatch
 ///   — meant for fields whose value can take multiple incompatible
 ///   shapes, e.g. a `#[serde(untagged)] enum`. The macro does not
@@ -75,6 +84,17 @@ use syn::{
 ///   struct name)
 /// - `#[clapfig(strict = true/false)]` — set per-node strictness for the
 ///   cascade
+///
+/// `rename_all` (clapfig or serde spelling, including serde's directional
+/// `rename_all(deserialize = "...")` form) is **rejected on structs**:
+/// schema field names are not rewritten through rename rules, so accepting
+/// the attribute would leave the schema expecting the Rust identifiers
+/// while serde's deserialize expects the converted names. Rename fields
+/// individually. (A serialize-only `rename_all(serialize = "...")` is
+/// allowed — it doesn't touch the deserialize side. On unit-only enums,
+/// `rename_all` — either spelling, directional included — IS supported:
+/// it rewrites variant names, where schema and serde can be kept in
+/// agreement.)
 #[proc_macro_derive(Schema, attributes(clapfig))]
 pub fn derive_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -115,6 +135,32 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
     let (fields_body, enum_variants_body) = match &input.data {
         Data::Struct(s) => match &s.fields {
             Fields::Named(named) => {
+                // `rename_all` (either spelling) is rejected on structs:
+                // schema field names are not rewritten through rename rules,
+                // so honoring the attribute silently — or accepting it and
+                // ignoring it — would leave the schema expecting the Rust
+                // identifiers while serde's deserialize expects the converted
+                // names (strict validation then rejects the file's spelling
+                // and the typed deserialize misses the field).
+                if struct_attrs.rename_all.is_some() {
+                    return Err(syn::Error::new(
+                        input.ident.span(),
+                        "#[clapfig(rename_all)] applies only to unit-only enums — \
+                         schema field names are not rewritten through rename rules. \
+                         Rename fields individually with #[serde(rename = \"...\")] \
+                         (the schema follows it).",
+                    ));
+                }
+                if find_serde_string_meta(&input.attrs, "rename_all").is_some() {
+                    return Err(syn::Error::new(
+                        input.ident.span(),
+                        "#[serde(rename_all)] on a struct deriving clapfig::Schema \
+                         is not supported — the schema would expect the Rust field \
+                         identifiers while serde's deserialize expects the converted \
+                         names. Rename fields individually with \
+                         #[serde(rename = \"...\")] (the schema follows it).",
+                    ));
+                }
                 let mut field_entries = Vec::with_capacity(named.named.len());
                 for f in &named.named {
                     field_entries.push(expand_field(f)?);
@@ -222,7 +268,7 @@ fn expand_enum_variants(
     let rename_all = struct_attrs
         .rename_all
         .clone()
-        .or_else(|| parse_serde_rename_all(type_attrs).ok().flatten());
+        .or_else(|| find_serde_string_meta(type_attrs, "rename_all"));
     let mut out = Vec::with_capacity(data.variants.len());
     let mut seen = std::collections::HashSet::new();
     for variant in &data.variants {
@@ -358,60 +404,98 @@ fn pascal_to_snake(name: &str, sep: char) -> String {
     out
 }
 
-/// Parse `#[clapfig(rename = "name")]` or `#[serde(rename = "name")]` off a
-/// variant. Returns the override string or `None` if neither is present.
+/// Parse `#[clapfig(rename = "name")]` or `#[serde(rename = "name")]`
+/// (including serde's directional `rename(deserialize = "name", ...)`) off
+/// a variant. Returns the override string or `None` if neither is present.
+///
+/// clapfig wins over serde if both are present on the same variant. We
+/// accept serde for migration convenience; the clapfig form is the
+/// authoritative spelling. The serde side goes through
+/// [`find_serde_string_meta`], so the directional form contributes its
+/// `deserialize` spelling and a serialize-only rename is ignored.
 fn parse_variant_rename(attrs: &[Attribute]) -> syn::Result<Option<String>> {
-    let mut found: Option<String> = None;
+    let mut clapfig_rename: Option<String> = None;
     for attr in attrs {
-        let path = attr.path();
-        let is_clapfig = path.is_ident("clapfig");
-        let is_serde = path.is_ident("serde");
-        if !is_clapfig && !is_serde {
+        if !attr.path().is_ident("clapfig") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("rename") {
                 let value: syn::LitStr = meta.value()?.parse()?;
-                // clapfig wins over serde if both are present on the same
-                // variant. We accept serde for migration convenience; the
-                // clapfig form is the authoritative spelling.
-                if is_clapfig || found.is_none() {
-                    found = Some(value.value());
-                }
+                clapfig_rename = Some(value.value());
                 Ok(())
             } else {
-                // Silently skip other meta items — serde has many unrelated
-                // attrs (`alias`, `borrow`, etc.) we mustn't choke on.
+                // Silently skip other meta items so unrelated clapfig
+                // attrs on the variant don't choke the rename probe.
                 let _ = meta.input.parse::<proc_macro2::TokenStream>();
                 Ok(())
             }
         })?;
     }
-    Ok(found)
+    Ok(clapfig_rename.or_else(|| find_serde_string_meta(attrs, "rename")))
 }
 
-/// Parse `#[serde(rename_all = "...")]` off the enum's attrs as a fallback
-/// when no `#[clapfig(rename_all = ...)]` was given.
-fn parse_serde_rename_all(attrs: &[Attribute]) -> syn::Result<Option<String>> {
-    let mut found: Option<String> = None;
+/// Find the deserialize-facing spelling of a `#[serde(<key> = "...")]` or
+/// directional `#[serde(<key>(deserialize = "...", ...))]` meta across
+/// `attrs`.
+///
+/// Used for the enum-level `rename_all` fallback, the struct-level
+/// `rename_all` rejection probe, and the field/variant-level `rename`
+/// fallbacks. Each serde attribute is parsed as a comma-separated
+/// `syn::Meta` list (which covers serde's attribute grammar), so a
+/// preceding unrelated item (`#[serde(default, rename = "x")]`) cannot
+/// hide the one we're after. Attributes that don't parse as a meta list
+/// are skipped — serde's own derive is the authority on rejecting
+/// malformed input.
+///
+/// The split `rename(serialize = ..., deserialize = ...)` form is a
+/// `Meta::List`; it contributes its `deserialize` value — the schema
+/// tracks what serde's deserialize expects, and the serialize spelling is
+/// irrelevant to config loading. A serialize-only directional meta leaves
+/// the deserialize side on the Rust spelling, so it is treated as absent.
+fn find_serde_string_meta(attrs: &[Attribute], key: &str) -> Option<String> {
     for attr in attrs {
         if !attr.path().is_ident("serde") {
             continue;
         }
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("rename_all") {
-                let value: syn::LitStr = meta.value()?.parse()?;
-                if found.is_none() {
-                    found = Some(value.value());
-                }
-                Ok(())
-            } else {
-                let _ = meta.input.parse::<proc_macro2::TokenStream>();
-                Ok(())
+        let Ok(metas) = attr.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            continue;
+        };
+        for meta in metas {
+            if !meta.path().is_ident(key) {
+                continue;
             }
-        })?;
+            match meta {
+                syn::Meta::NameValue(nv) => {
+                    if let syn::Expr::Lit(lit) = nv.value
+                        && let syn::Lit::Str(s) = lit.lit
+                    {
+                        return Some(s.value());
+                    }
+                }
+                syn::Meta::List(list) => {
+                    let Ok(inner) = list.parse_args_with(
+                        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                    ) else {
+                        continue;
+                    };
+                    for nested in inner {
+                        if let syn::Meta::NameValue(nv) = nested
+                            && nv.path.is_ident("deserialize")
+                            && let syn::Expr::Lit(lit) = nv.value
+                            && let syn::Lit::Str(s) = lit.lit
+                        {
+                            return Some(s.value());
+                        }
+                    }
+                }
+                syn::Meta::Path(_) => {}
+            }
+        }
     }
-    Ok(found)
+    None
 }
 
 fn discriminant(data: &Data) -> &'static str {
@@ -427,10 +511,10 @@ struct StructAttrs {
     name: Option<String>,
     strict: Option<bool>,
     /// `#[clapfig(rename_all = "...")]` — applies to every variant of a
-    /// unit-only enum that derives `Schema`. Unused on structs (an
-    /// equivalent rename for struct fields would conflict with serde's
-    /// existing `#[serde(rename_all)]` rule, which we leave authoritative
-    /// for deserialize.)
+    /// unit-only enum that derives `Schema`. Rejected on structs (as is
+    /// serde's spelling): schema field names are not rewritten through
+    /// rename rules, so accepting either attribute would leave the schema
+    /// and serde's deserialize expecting different spellings.
     rename_all: Option<String>,
 }
 
@@ -936,7 +1020,29 @@ fn expand_field(field: &syn::Field) -> syn::Result<TokenStream2> {
         .ok_or_else(|| syn::Error::new(field.span(), "expected named field"))?;
     let attrs = parse_field_attrs(&field.attrs)?;
     let doc_lines = collect_doc_lines(&field.attrs);
-    let name = attrs.rename.clone().unwrap_or_else(|| ident.to_string());
+    // Schema-facing field name: `#[clapfig(rename)]` if present, else
+    // `#[serde(rename)]` (the schema follows serde so the merged config and
+    // the typed deserialize agree on one spelling), else the Rust identifier.
+    // A differing clapfig/serde pair is a hard error — the schema would
+    // expect one spelling and serde's deserialize the other, so every load
+    // would fail at runtime.
+    let serde_rename = find_serde_string_meta(&field.attrs, "rename");
+    let name = match (&attrs.rename, &serde_rename) {
+        (Some(c), Some(s)) if c != s => {
+            return Err(syn::Error::new(
+                ident.span(),
+                format!(
+                    "#[clapfig(rename = {c:?})] conflicts with #[serde(rename = {s:?})] — \
+                     the schema would expect one spelling and serde's deserialize the \
+                     other. Use the same name in both, or drop the clapfig one (the \
+                     schema follows serde's rename when only serde has one)."
+                ),
+            ));
+        }
+        (Some(c), _) => c.clone(),
+        (None, Some(s)) => s.clone(),
+        (None, None) => ident.to_string(),
+    };
     let doc_expr = doc_slice(&doc_lines);
 
     // `#[clapfig(value)]` is the universal escape hatch: the user opts out

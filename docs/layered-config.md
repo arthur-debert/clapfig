@@ -10,7 +10,7 @@ merge behavior, and common patterns.
 By default, layers are merged in this order (later wins):
 
 ```text
-Compiled defaults     #[config(default = ...)]
+Compiled defaults     #[clapfig(default = ...)]
        ↑ overridden by
 Config files          search paths in order, later paths win
        ↑ overridden by
@@ -29,7 +29,7 @@ Unset keys fall through to the layer below.
 ```rust
 use clapfig::{Clapfig, Layer};
 
-let config: AppConfig = Clapfig::builder()
+let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
     .app_name("myapp")
     .layer_order(vec![Layer::Env, Layer::Files, Layer::Cli])
     .load()?;
@@ -113,8 +113,8 @@ With `env_prefix("MYAPP")` (or derived from `app_name("myapp")`):
 is literal. Segments are lowercased to match Rust field names.
 
 Values are parsed heuristically: `true`/`false` → bool, then integer, then
-float, then string. For exact control, use confique's
-`#[config(deserialize_with = ...)]`.
+float, then string. For exact control, use serde's
+`#[serde(deserialize_with = ...)]` on the field.
 
 Disable env entirely with `.no_env()`.
 
@@ -141,7 +141,7 @@ exactly (`pool_size`, not `pool-size`). Opt into kebab-case acceptance with
 `.normalize_keys(true)`:
 
 ```rust
-let config: AppConfig = Clapfig::builder()
+let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
     .app_name("myapp")
     .normalize_keys(true)
     .load()?;
@@ -183,7 +183,7 @@ separator.
 `persist_scope()` names a target for `config set` and `config unset`:
 
 ```rust
-let builder = Clapfig::builder::<AppConfig>()
+let builder = Clapfig::schema_builder::<AppConfig>()
     .app_name("myapp")
     .persist_scope("local", SearchPath::Cwd)
     .persist_scope("global", SearchPath::Platform);
@@ -201,11 +201,11 @@ values are always discoverable during `load()`.
 ## Post-merge validation
 
 Structural validation (known keys, required fields, correct types) is handled
-by confique and strict mode. For semantic constraints that need the final
-merged config, use `post_validate`:
+by the schema's type checks and strict mode. For semantic constraints that
+need the final merged config, use `post_validate`:
 
 ```rust
-let config: AppConfig = Clapfig::builder()
+let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
     .app_name("myapp")
     .post_validate(|c| {
         if c.port < 1024 {
@@ -227,7 +227,7 @@ become `ClapfigError::PostValidationFailed`.
 ### Global + local config
 
 ```rust
-Clapfig::builder::<AppConfig>()
+Clapfig::schema_builder::<AppConfig>()
     .app_name("myapp")
     .search_paths(vec![
         SearchPath::Platform,   // ~/.config/myapp/myapp.toml (global)
@@ -241,7 +241,7 @@ Clapfig::builder::<AppConfig>()
 ### No env vars, no files — just defaults + overrides
 
 ```rust
-Clapfig::builder::<AppConfig>()
+Clapfig::schema_builder::<AppConfig>()
     .app_name("myapp")
     .no_env()
     .search_paths(vec![])
@@ -252,7 +252,7 @@ Clapfig::builder::<AppConfig>()
 ### Per-project config with repo boundary
 
 ```rust
-Clapfig::builder::<AppConfig>()
+Clapfig::schema_builder::<AppConfig>()
     .app_name("myapp")
     .search_paths(vec![
         SearchPath::Platform,

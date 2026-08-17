@@ -11,9 +11,8 @@
 //!   leaves (gap #3) and `#key = <placeholder>` for required leaves
 //!   without a default (gap #4).
 //!
-//! Plus end-to-end load behavior parallels the confique-driven path:
-//! defaults, env vars, CLI overrides, strict-mode validation, typed
-//! post_validate.
+//! Plus end-to-end load behavior for the typed path: defaults, env vars,
+//! CLI overrides, strict-mode validation, typed post_validate.
 
 #![cfg(feature = "derive")]
 
@@ -249,7 +248,7 @@ fn template_emits_placeholder_for_required_leaf_without_default() {
     };
     // The runtime-path emitter writes `#key = <placeholder>` for required
     // leaves without a default — `#name = ""` for a String, `#port = 0` for
-    // an integer. The confique-driven static path doesn't (gap #4).
+    // an integer (gap #4 from the symmetry proposal).
     assert!(
         t.contains("#name = \"\""),
         "gap #4: required String leaf must get `#name = \"\"` placeholder. Got:\n{t}"
@@ -348,6 +347,85 @@ struct RenameConfig {
 fn rename_attribute_changes_schema_field_name() {
     let s = RenameConfig::schema_static();
     assert_eq!(s.fields[0].name, "Host");
+}
+
+// -- `#[serde(rename = "...")]` alone is honored by the schema --------------
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct SerdeRenameConfig {
+    #[serde(rename = "listen-port")]
+    #[clapfig(default = 8080)]
+    listen_port: i64,
+}
+
+#[test]
+fn serde_rename_alone_sets_schema_field_name() {
+    let s = SerdeRenameConfig::schema_static();
+    assert_eq!(s.fields[0].name, "listen-port");
+}
+
+// A matching clapfig/serde pair (the historical spelling) still works and
+// resolves to the shared name — locked separately from `RenameConfig` above
+// so the pair-vs-serde-only paths each have a guard.
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct MatchingPairConfig {
+    #[clapfig(rename = "log-level", default = "info")]
+    #[serde(rename = "log-level")]
+    log_level: String,
+}
+
+#[test]
+fn matching_clapfig_serde_rename_pair_is_accepted() {
+    let s = MatchingPairConfig::schema_static();
+    assert_eq!(s.fields[0].name, "log-level");
+}
+
+// -- serde directional `rename(deserialize = ..., serialize = ...)` ---------
+//
+// The schema follows the deserialize spelling — that's the side the merged
+// config flows through. A directional rename that fell through to the Rust
+// identifier would leave strict validation and the typed deserialize
+// disagreeing on the key.
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct DirectionalRenameConfig {
+    #[serde(rename(deserialize = "listen-port", serialize = "listen_port"))]
+    #[clapfig(default = 8080)]
+    listen_port: i64,
+}
+
+#[test]
+fn serde_directional_rename_uses_deserialize_spelling() {
+    let s = DirectionalRenameConfig::schema_static();
+    assert_eq!(s.fields[0].name, "listen-port");
+}
+
+#[test]
+fn serde_directional_rename_loads_end_to_end() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("test.toml"), "listen-port = 9090\n").unwrap();
+    let cfg: DirectionalRenameConfig = Clapfig::schema_builder::<DirectionalRenameConfig>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.listen_port, 9090);
+}
+
+// A serialize-only directional rename leaves the deserialize side on the
+// Rust identifier, so the schema keeps it too.
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct SerializeOnlyRenameConfig {
+    #[serde(rename(serialize = "listenPort"))]
+    #[clapfig(default = 8080)]
+    listen_port: i64,
+}
+
+#[test]
+fn serde_serialize_only_rename_keeps_rust_identifier() {
+    let s = SerializeOnlyRenameConfig::schema_static();
+    assert_eq!(s.fields[0].name, "listen_port");
 }
 
 // -- Struct-level attrs: name override and per-node strict -----------------
@@ -552,6 +630,37 @@ enum Mixed {
 fn unit_enum_variant_rename_overrides_rename_all() {
     let s = Mixed::schema_static();
     assert_eq!(s.enum_variants, &["alpha_beta", "GAMMA"]);
+}
+
+// Directional `rename_all(deserialize = ...)` on a unit-only enum applies
+// its deserialize rule to the schema's variant names (the serialize rule is
+// irrelevant to config loading).
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all(deserialize = "lowercase", serialize = "UPPERCASE"))]
+enum DirectionalMode {
+    Fast,
+    Slow,
+}
+
+#[test]
+fn unit_enum_directional_rename_all_uses_deserialize_rule() {
+    let s = DirectionalMode::schema_static();
+    assert_eq!(s.enum_variants, &["fast", "slow"]);
+}
+
+// Directional per-variant `rename(deserialize = ...)` contributes its
+// deserialize spelling, like the name-value form.
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq, Eq)]
+enum DirectionalVariant {
+    #[serde(rename(deserialize = "quick", serialize = "QUICK"))]
+    Fast,
+    Slow,
+}
+
+#[test]
+fn unit_enum_directional_variant_rename_uses_deserialize_spelling() {
+    let s = DirectionalVariant::schema_static();
+    assert_eq!(s.enum_variants, &["quick", "Slow"]);
 }
 
 // Acronym runs in variant names render the serde way: consecutive
@@ -845,4 +954,80 @@ struct OptionalStructDoc {
 #[should_panic(expected = "Option<InnerStruct>")]
 fn option_of_struct_typed_field_panic_mentions_option_wrapper() {
     let _ = OptionalStructDoc::schema();
+}
+
+// --- serde deserialize_with normalization on the typed path ---
+//
+// The typed deserialize goes through serde, so `#[serde(deserialize_with)]`
+// applies to values from every source — files, env, CLI overrides, and
+// schema defaults (defaults are injected into the merged table before the
+// typed deserialize, so they pass through the deserializer too).
+
+fn normalize_lowercase<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(s.to_lowercase())
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
+struct NormalizedConfig {
+    /// A color name, normalized to lowercase.
+    #[serde(deserialize_with = "normalize_lowercase")]
+    #[clapfig(default = "red")]
+    color: String,
+
+    /// Plain field with no normalization.
+    #[clapfig(default = 42)]
+    count: u32,
+}
+
+#[test]
+fn deserialize_with_normalizes_from_file() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("norm.toml"), "color = \"BLUE\"\n").unwrap();
+
+    let cfg: NormalizedConfig = Clapfig::schema_builder::<NormalizedConfig>()
+        .app_name("norm")
+        .file_name("norm.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+
+    assert_eq!(cfg.color, "blue");
+    assert_eq!(cfg.count, 42);
+}
+
+#[test]
+fn deserialize_with_normalizes_from_cli_override() {
+    let dir = TempDir::new().unwrap();
+    let cfg: NormalizedConfig = Clapfig::schema_builder::<NormalizedConfig>()
+        .app_name("norm")
+        .file_name("norm.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .cli_override("color", Some("MAGENTA"))
+        .load()
+        .unwrap();
+
+    assert_eq!(cfg.color, "magenta");
+}
+
+#[test]
+fn deserialize_with_applies_to_schema_defaults_too() {
+    // Defaults are injected into the merged table and then deserialized
+    // through serde, so they pass through deserialize_with as well. A
+    // pre-normalized default round-trips unchanged.
+    let dir = TempDir::new().unwrap();
+    let cfg: NormalizedConfig = Clapfig::schema_builder::<NormalizedConfig>()
+        .app_name("norm")
+        .file_name("norm.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+
+    assert_eq!(cfg.color, "red");
 }

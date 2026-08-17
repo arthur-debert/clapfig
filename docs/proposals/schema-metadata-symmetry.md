@@ -2,9 +2,12 @@
 
 ## Status
 
-Planning. This document precedes implementation. It exists to capture the
-design intent so review can happen before a single line of macro code is
-written.
+Implemented — historical record. The `#[derive(clapfig::Schema)]` macro
+landed as designed here, and issue #104 completed the end state: the
+confique-driven static path was removed entirely, `SchemaRef::from_meta`
+is gone, everything flows `from_dynamic`, and `LeafRef.ty` lost its
+`Option` wrapper. This document is preserved as the design rationale;
+the descriptions of the pre-removal static path below are historical.
 
 ## Motivation
 

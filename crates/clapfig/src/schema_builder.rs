@@ -5,18 +5,9 @@
 //! Internally this wraps a [`RuntimeBuilder`](crate::RuntimeBuilder)
 //! constructed from `C::schema()` (the cached runtime view of the
 //! macro-emitted `SchemaStatic`). Every method forwards through to the
-//! runtime builder so the static and runtime paths share one resolve
+//! runtime builder so the typed and runtime paths share one resolve
 //! pipeline. The only added work is the final `Table → C` deserialize
 //! step on `load()` and the typed `post_validate(&C)` hook.
-//!
-//! ## Why a separate builder
-//!
-//! `ClapfigBuilder<C: confique::Config>` (the existing static path) and
-//! `SchemaConfigBuilder<C: clapfig::Schema>` (this one) share most of
-//! their surface but bind on different schema-source traits. Keeping
-//! them as separate types lets the confique-driven path keep working
-//! byte-identically while the new macro-driven path moves to the runtime
-//! pipeline.
 
 use std::marker::PhantomData;
 
@@ -32,11 +23,10 @@ use crate::types::{ConfigAction, Layer, SearchMode, SearchPath};
 
 /// Typed-config builder driven by a `#[derive(clapfig::Schema)]` struct.
 ///
-/// Parallel to [`ClapfigBuilder<C>`](crate::ClapfigBuilder) for the
-/// confique-derived path. Same surface — `app_name`, `search_paths`,
-/// `env_prefix`, `cli_override`, `post_validate`, `load`, `handle` — but
-/// the schema comes from the new derive macro rather than confique's
-/// `Meta` tree.
+/// Same surface as [`RuntimeBuilder`](crate::RuntimeBuilder) — `app_name`,
+/// `search_paths`, `env_prefix`, `cli_override`, `post_validate`, `load`,
+/// `handle` — but `load()` returns the typed `C` and `post_validate`
+/// receives a typed `&C`.
 pub struct SchemaConfigBuilder<C: Schema> {
     inner: RuntimeBuilder,
     _phantom: PhantomData<fn() -> C>,
@@ -54,14 +44,14 @@ impl<C: Schema> SchemaConfigBuilder<C> {
     }
 
     /// Set the application name. See
-    /// [`ClapfigBuilder::app_name`](crate::ClapfigBuilder::app_name).
+    /// [`RuntimeBuilder::app_name`](crate::RuntimeBuilder::app_name).
     pub fn app_name(mut self, name: &str) -> Self {
         self.inner = self.inner.app_name(name);
         self
     }
 
     /// Override the config file name. See
-    /// [`ClapfigBuilder::file_name`](crate::ClapfigBuilder::file_name).
+    /// [`RuntimeBuilder::file_name`](crate::RuntimeBuilder::file_name).
     pub fn file_name(mut self, name: &str) -> Self {
         self.inner = self.inner.file_name(name);
         self
@@ -126,7 +116,7 @@ impl<C: Schema> SchemaConfigBuilder<C> {
 
     /// Convenience: "accept dotted, reject bare" at a dotted-path
     /// subtree. See
-    /// [`ClapfigBuilder::accept_dotted_extension_keys_in`](crate::ClapfigBuilder::accept_dotted_extension_keys_in)
+    /// [`RuntimeBuilder::accept_dotted_extension_keys_in`](crate::RuntimeBuilder::accept_dotted_extension_keys_in)
     /// for the full semantics.
     pub fn accept_dotted_extension_keys_in(
         mut self,
@@ -173,7 +163,7 @@ impl<C: Schema + DeserializeOwned> SchemaConfigBuilder<C> {
     /// Post-merge validation hook. Receives the typed `&C`.
     ///
     /// Conceptually the same as
-    /// [`ClapfigBuilder::post_validate`](crate::ClapfigBuilder::post_validate)
+    /// [`RuntimeBuilder::post_validate`](crate::RuntimeBuilder::post_validate)
     /// — internally we deserialize the merged `toml::Table` into `C`
     /// inside the runtime builder's hook so the user's closure stays
     /// typed.

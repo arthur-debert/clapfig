@@ -1,5 +1,13 @@
 # Runtime-defined schemas and cascading strictness
 
+## Status
+
+Implemented — historical record. References to the confique-derived
+static path below describe the crate as it stood when this was written;
+that path was later removed entirely (issue #104) in favor of
+`#[derive(clapfig::Schema)]`, which emits the same runtime schema shape
+this proposal introduced.
+
 ## Motivation
 
 Clapfig today is built around a single source of truth: a Rust struct that

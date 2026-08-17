@@ -2,9 +2,8 @@
 //! owned [`Schema`].
 //!
 //! Pairs with [`crate::runtime`] (the owned schema data) and [`crate::spec`]
-//! (the `SchemaRef` view that every other consumer walks). The static path's
-//! `StaticSpec<C>` delegates to confique; this adapter walks the schema
-//! directly:
+//! (the `SchemaRef` view that every other consumer walks). The adapter
+//! walks the schema directly:
 //!
 //! - **`validate_unknown`**: recursive walk against the schema, every key
 //!   not declared in the schema is collected and reported with line numbers
@@ -13,8 +12,8 @@
 //!   declared `default` is populated in place into the merged table.
 //! - **`finalize`**: recursive walk, type-checks every value against its
 //!   `LeafType`, enum-checks `LeafType::Enum`, enforces required fields.
-//!   Returns the merged `toml::Table` unchanged (the runtime path produces
-//!   raw TOML rather than a typed struct).
+//!   Returns the merged `toml::Table` unchanged (the typed
+//!   `SchemaConfigBuilder` deserializes that table into `C` afterwards).
 //!
 //! [`ConfigSpec`]: crate::spec::ConfigSpec
 //! [`Schema`]: crate::runtime::Schema
@@ -259,8 +258,8 @@ fn check_required_and_types(
             Field::ArrayOf(item_schema) => match table.get(&nf.name) {
                 None => {
                     // Absent array-of: empty list is the natural default,
-                    // not an error. Matches confique's behavior for
-                    // `Vec<Nested>`-style fields.
+                    // not an error — `Vec<Nested>`-style fields can be
+                    // legitimately empty.
                 }
                 Some(Value::Array(items)) => {
                     for (i, item) in items.iter().enumerate() {

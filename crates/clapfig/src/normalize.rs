@@ -1,6 +1,6 @@
 //! Kebab-case → snake_case key normalization.
 //!
-//! When [`ClapfigBuilder::normalize_keys`](crate::ClapfigBuilder::normalize_keys)
+//! When [`normalize_keys`](crate::RuntimeBuilder::normalize_keys)
 //! is enabled, every key crossing the boundary into clapfig — TOML file keys,
 //! CLI override key strings, URL query parameter keys — has its `-` characters
 //! rewritten to `_` before deserialization, validation, and merging. The user

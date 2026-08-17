@@ -1,0 +1,5 @@
+error: #[clapfig(rename = "Host")] conflicts with #[serde(rename = "host-name")] — the schema would expect one spelling and serde's deserialize the other. Use the same name in both, or drop the clapfig one (the schema follows serde's rename when only serde has one).
+ --> tests/ui/derive/rename_conflict_rejected.rs:7:5
+  |
+7 |     host: String,
+  |     ^^^^

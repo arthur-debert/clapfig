@@ -4,9 +4,8 @@
 //! Phase 3 (#37). Defaults preserve today's behavior; everything is additive.
 //!
 //! 1. **`strict(bool)`** — whole-resolution default. Existing API, unchanged.
-//! 2. **Per-node strictness** — runtime [`Schema::strict`](crate::runtime::Schema::strict)
-//!    and static [`ClapfigBuilder::strict_at`](crate::ClapfigBuilder::strict_at) /
-//!    [`RuntimeBuilder::strict_at`](crate::RuntimeBuilder::strict_at) set an
+//! 2. **Per-node strictness** — per-node [`Schema::strict`](crate::runtime::Schema::strict)
+//!    and [`RuntimeBuilder::strict_at`](crate::RuntimeBuilder::strict_at) set an
 //!    explicit `strict` value on a schema node (or on a dotted path that
 //!    resolves to one). The cascade picks the nearest explicit ancestor.
 //! 3. **`on_unknown_key(callback)`** — last word for keys the cascade
@@ -28,7 +27,7 @@
 //! - The first descendant that sets its own `strict` becomes the new root
 //!   for its subtree, overriding the inherited value below it.
 //!
-//! [Knob 1]: crate::ClapfigBuilder::strict
+//! [Knob 1]: crate::RuntimeBuilder::strict
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -38,7 +37,7 @@ use toml::Value;
 
 use crate::spec::{FieldKindRef, SchemaRef};
 
-/// Context handed to an [`on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
+/// Context handed to an [`on_unknown_key`](crate::RuntimeBuilder::on_unknown_key)
 /// callback. Carries every signal the callback needs to make a per-key
 /// decision: where the key lives in the merged tree, what it was, what
 /// file produced it, and which line.
@@ -56,7 +55,7 @@ pub struct UnknownKeyContext<'a> {
     /// `leaf = "acme.task-due-date-missing"` (the dots are part of the
     /// key, not segment separators).
     ///
-    /// With [`normalize_keys(true)`](crate::ClapfigBuilder::normalize_keys)
+    /// With [`normalize_keys(true)`](crate::RuntimeBuilder::normalize_keys)
     /// the key has been rewritten (kebab → snake) before reaching the
     /// callback, matching the form every other downstream consumer sees.
     /// Callbacks that pattern-match on raw user-supplied spellings
@@ -87,7 +86,7 @@ pub struct UnknownKeyContext<'a> {
     pub line: Option<usize>,
 }
 
-/// Decision returned by an [`on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
+/// Decision returned by an [`on_unknown_key`](crate::RuntimeBuilder::on_unknown_key)
 /// callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownKeyDecision {
@@ -97,7 +96,7 @@ pub enum UnknownKeyDecision {
     /// Drop the key silently (same outcome as a lenient subtree).
     Accept,
     /// Route the key into the collected-unknowns list returned by
-    /// [`load_with_unknowns`](crate::ClapfigBuilder::load_with_unknowns).
+    /// [`load_with_unknowns`](crate::RuntimeBuilder::load_with_unknowns).
     /// The key is NOT a strict-mode violation — load succeeds — but the
     /// caller can inspect the list to surface diagnostic-style "we saw
     /// this key, it wasn't in the schema, here's what to do" feedback
@@ -106,9 +105,9 @@ pub enum UnknownKeyDecision {
 }
 
 /// One collected unknown-key entry returned alongside the loaded config
-/// from [`load_with_unknowns`](crate::ClapfigBuilder::load_with_unknowns).
+/// from [`load_with_unknowns`](crate::RuntimeBuilder::load_with_unknowns).
 ///
-/// Produced when an [`on_unknown_key`](crate::ClapfigBuilder::on_unknown_key)
+/// Produced when an [`on_unknown_key`](crate::RuntimeBuilder::on_unknown_key)
 /// callback returns [`UnknownKeyDecision::Collect`] for a key the
 /// strictness cascade flagged. Owned variant of [`UnknownKeyContext`] —
 /// the values are cloned out of the parsed table so the caller can use
@@ -178,8 +177,8 @@ pub(crate) fn dotted_extension_callback(
 ///
 /// Built once at `build_resolver` time from:
 ///
-/// - `ClapfigBuilder::strict_at(path, bool)` / `RuntimeBuilder::strict_at`
-///   calls (static and runtime paths).
+/// - `RuntimeBuilder::strict_at(path, bool)` calls (and, through the
+///   forwarding `SchemaConfigBuilder`, the typed path's `strict_at`).
 /// - Walking a runtime [`Schema`](crate::runtime::Schema) and copying every
 ///   node where `strict.is_some()` into the same map.
 ///

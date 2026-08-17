@@ -1,10 +1,10 @@
 # Runtime-defined schemas
 
-Some apps don't have a single compile-time `Config` struct. Plugin hosts
+Some apps don't have a single compile-time config struct. Plugin hosts
 assemble their schema from loaded plugins. Scripting hosts read it from
 a config descriptor file. Generated apps build it programmatically. For
 those cases, clapfig exposes a runtime-schema entry point next to the
-static `Clapfig::builder::<C>()` one.
+typed `Clapfig::schema_builder::<C>()` one.
 
 ## When to reach for it
 
@@ -20,9 +20,10 @@ at compile time**. Examples:
   combination of fields without writing a Rust type for it.
 
 If your config schema is known at compile time, use
-`Clapfig::builder::<C>()` instead — the static path is simpler, gives you
-typed access to the result, and benefits from confique's `derive(Config)`
-ergonomics.
+`Clapfig::schema_builder::<C>()` instead — the typed path is simpler,
+gives you typed access to the result, and benefits from
+`#[derive(clapfig::Schema)]` ergonomics. Both paths produce identical
+schema metadata and share one resolve pipeline.
 
 ## Building a schema
 
@@ -77,7 +78,7 @@ consumer.
 ## Using a schema
 
 `Clapfig::runtime(schema)` returns a `RuntimeBuilder` with the same
-surface as `Clapfig::builder::<C>()`:
+surface as `Clapfig::schema_builder::<C>()`:
 
 ```rust,ignore
 use clapfig::{Clapfig, types::SearchPath};
@@ -90,12 +91,12 @@ let table: toml::Table = Clapfig::runtime(schema)
     .load()?;
 ```
 
-Differences from the static path:
+Differences from the typed path:
 
 - `load()` returns `toml::Table`, not a typed struct.
 - `post_validate` receives `&Table` instead of `&C`.
-- `RuntimeResolver` (returned by `build_resolver()`) parallels
-  `Resolver<C>` for tree-walk use cases.
+- `build_resolver()` returns a `RuntimeResolver` for tree-walk use
+  cases (see the [Resolver Guide](./resolver.md)).
 
 Everything else — `search_paths`, `search_mode`, `env_prefix`,
 `cli_override`, `cli_overrides_from`, `url_query`, `normalize_keys`,
@@ -105,7 +106,7 @@ Everything else — `search_paths`, `search_mode`, `env_prefix`,
 ## Subcommand support
 
 `RuntimeBuilder::handle(&ConfigAction)` drives the same
-`config gen|list|get|set|unset|schema` actions the static path
+`config gen|list|get|set|unset|schema` actions the typed path
 supports. Doc comments and enum allowed-value lists are read straight
 off the schema:
 
