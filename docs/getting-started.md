@@ -80,8 +80,10 @@ Key points:
   is shared with the schema: `#[serde(rename = "...")]` on a field renames
   the config key too (the schema follows serde's spelling; the directional
   `rename(deserialize = "...")` form contributes its deserialize name),
-  while struct-level `#[serde(rename_all = ...)]` — directional included —
-  is rejected at compile time — rename fields individually.
+  while struct-level `#[serde(rename_all = ...)]`, including
+  `rename_all(deserialize = "...")`, is rejected at compile time — rename
+  fields individually. (A serialize-only `rename_all(serialize = "...")`
+  is allowed: it doesn't affect config loading.)
 
 ## Load it
 
