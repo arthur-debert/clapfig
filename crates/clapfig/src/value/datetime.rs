@@ -111,8 +111,8 @@ impl Datetime {
 
 /// Calendar date component of a [`Datetime`] (`YYYY-MM-DD`).
 ///
-/// Fields are private so only [`Date::new`]'s validation (month and day
-/// ranges, leap years) can produce a value.
+/// Fields are private so only [`Date::new`]'s validation (year 0–9999,
+/// month and day ranges, leap years) can produce a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Date {
     year: u16,
