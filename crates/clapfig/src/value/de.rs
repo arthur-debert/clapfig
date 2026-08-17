@@ -108,12 +108,19 @@ impl<'de> de::Deserialize<'de> for Value {
                 A: de::MapAccess<'de>,
             {
                 let mut map = Map::new();
-                // The datetime marker only ever appears as a lone first
-                // key (the marker struct has exactly one field).
+                // The datetime marker key is reserved: it only ever
+                // appears as the lone key of the one-field marker struct.
+                // Anything else marker-shaped is malformed input and must
+                // error — never lose entries or leave them unconsumed.
                 if let Some(key) = access.next_key::<String>()? {
                     if key == DATETIME_MARKER {
                         let repr: String = access.next_value()?;
                         let dt = repr.parse().map_err(de::Error::custom)?;
+                        if access.next_key::<de::IgnoredAny>()?.is_some() {
+                            return Err(de::Error::custom(
+                                "datetime marker struct must have exactly one field",
+                            ));
+                        }
                         return Ok(Value::Datetime(dt));
                     }
                     map.insert(key, access.next_value()?);
@@ -489,6 +496,29 @@ mod tests {
     fn type_mismatch_is_a_typed_error() {
         let err = from_value::<i64>(Value::from("nope")).unwrap_err();
         assert!(err.to_string().contains("invalid type"), "{err}");
+    }
+
+    #[test]
+    fn lone_marker_key_map_deserializes_as_datetime() {
+        // The marker key is reserved: a one-entry map carrying it IS the
+        // wire shape of a datetime, so it round-trips as one. This is the
+        // documented reservation that makes Value::Datetime survive
+        // self-describing deserialization.
+        let mut m = Map::new();
+        m.insert(DATETIME_MARKER.into(), Value::from("1979-05-27"));
+        let out: Value = from_value(Value::Map(m)).unwrap();
+        assert_eq!(out, Value::Datetime("1979-05-27".parse().unwrap()));
+    }
+
+    #[test]
+    fn marker_key_alongside_other_entries_is_rejected() {
+        // Marker-shaped but not the one-field marker struct: an error,
+        // never silent loss of the other entries.
+        let mut m = Map::new();
+        m.insert(DATETIME_MARKER.into(), Value::from("1979-05-27"));
+        m.insert("other".into(), Value::Integer(1));
+        let err = from_value::<Value>(Value::Map(m)).unwrap_err();
+        assert!(err.to_string().contains("exactly one field"), "{err}");
     }
 
     #[test]

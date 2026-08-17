@@ -41,42 +41,178 @@ pub(crate) const DATETIME_MARKER: &str = "$__clapfig_private_Datetime";
 /// | Local date | yes | — | — | `1979-05-27` |
 /// | Local time | — | yes | — | `07:32:00` |
 ///
-/// Invariant (upheld by [`FromStr`], expected of hand-built values): at
-/// least one of `date`/`time` is present, and `offset` only appears
-/// alongside both `date` and `time`.
+/// Invariants (enforced by construction — the fields are private, and the
+/// only public construction paths are [`FromStr`] and the four form
+/// constructors): at least one of date/time is present, and an offset only
+/// appears alongside both date and time. Every value this type can hold
+/// displays as a parseable spelling of one of the four forms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Datetime {
     /// Calendar date component, absent for the local-time form.
-    pub date: Option<Date>,
+    date: Option<Date>,
     /// Time-of-day component, absent for the local-date form.
-    pub time: Option<Time>,
+    time: Option<Time>,
     /// UTC offset, present only for the offset date-time form.
-    pub offset: Option<Offset>,
+    offset: Option<Offset>,
+}
+
+impl Datetime {
+    /// Build an offset date-time (`1979-05-27T07:32:00Z`).
+    pub fn offset_date_time(date: Date, time: Time, offset: Offset) -> Datetime {
+        Datetime {
+            date: Some(date),
+            time: Some(time),
+            offset: Some(offset),
+        }
+    }
+
+    /// Build a local date-time (`1979-05-27T07:32:00`).
+    pub fn local_date_time(date: Date, time: Time) -> Datetime {
+        Datetime {
+            date: Some(date),
+            time: Some(time),
+            offset: None,
+        }
+    }
+
+    /// Build a local date (`1979-05-27`).
+    pub fn local_date(date: Date) -> Datetime {
+        Datetime {
+            date: Some(date),
+            time: None,
+            offset: None,
+        }
+    }
+
+    /// Build a local time (`07:32:00`).
+    pub fn local_time(time: Time) -> Datetime {
+        Datetime {
+            date: None,
+            time: Some(time),
+            offset: None,
+        }
+    }
+
+    /// The calendar date component, absent for the local-time form.
+    pub fn date(&self) -> Option<Date> {
+        self.date
+    }
+
+    /// The time-of-day component, absent for the local-date form.
+    pub fn time(&self) -> Option<Time> {
+        self.time
+    }
+
+    /// The UTC offset, present only for the offset date-time form.
+    pub fn offset(&self) -> Option<Offset> {
+        self.offset
+    }
 }
 
 /// Calendar date component of a [`Datetime`] (`YYYY-MM-DD`).
+///
+/// Fields are private so only [`Date::new`]'s validation (month and day
+/// ranges, leap years) can produce a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Date {
+    year: u16,
+    month: u8,
+    day: u8,
+}
+
+impl Date {
+    /// Build a validated calendar date. Errors when `month` is outside
+    /// 1–12 or `day` is outside the month's length (leap years included).
+    pub fn new(year: u16, month: u8, day: u8) -> Result<Date, DatetimeParseError> {
+        if !(1..=12).contains(&month) {
+            return Err(DatetimeParseError::new("month out of range (1-12)"));
+        }
+        if day < 1 || day > days_in_month(year, month) {
+            return Err(DatetimeParseError::new("day out of range for month"));
+        }
+        Ok(Date { year, month, day })
+    }
+
     /// Four-digit year (0–9999).
-    pub year: u16,
+    pub fn year(&self) -> u16 {
+        self.year
+    }
+
     /// Month of the year (1–12).
-    pub month: u8,
-    /// Day of the month (1–31, validated against month and leap years).
-    pub day: u8,
+    pub fn month(&self) -> u8 {
+        self.month
+    }
+
+    /// Day of the month (1–31, valid for the month and leap year).
+    pub fn day(&self) -> u8 {
+        self.day
+    }
 }
 
 /// Time-of-day component of a [`Datetime`] (`HH:MM:SS[.fraction]`).
+///
+/// Fields are private so only [`Time::new`]'s range validation can
+/// produce a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Time {
+    hour: u8,
+    minute: u8,
+    second: u8,
+    nanosecond: u32,
+}
+
+impl Time {
+    /// Build a validated time of day. Errors when a component is out of
+    /// range: hour 0–23, minute 0–59, second 0–60 (60 permits RFC 3339
+    /// leap seconds), nanosecond 0–999,999,999.
+    pub fn new(
+        hour: u8,
+        minute: u8,
+        second: u8,
+        nanosecond: u32,
+    ) -> Result<Time, DatetimeParseError> {
+        if hour > 23 {
+            return Err(DatetimeParseError::new("hour out of range (0-23)"));
+        }
+        if minute > 59 {
+            return Err(DatetimeParseError::new("minute out of range (0-59)"));
+        }
+        if second > 60 {
+            return Err(DatetimeParseError::new("second out of range (0-60)"));
+        }
+        if nanosecond > 999_999_999 {
+            return Err(DatetimeParseError::new(
+                "fractional second out of range (0-999999999 ns)",
+            ));
+        }
+        Ok(Time {
+            hour,
+            minute,
+            second,
+            nanosecond,
+        })
+    }
+
     /// Hour (0–23).
-    pub hour: u8,
+    pub fn hour(&self) -> u8 {
+        self.hour
+    }
+
     /// Minute (0–59).
-    pub minute: u8,
+    pub fn minute(&self) -> u8 {
+        self.minute
+    }
+
     /// Second (0–60; 60 permits RFC 3339 leap seconds).
-    pub second: u8,
+    pub fn second(&self) -> u8 {
+        self.second
+    }
+
     /// Fractional second in nanoseconds (0–999,999,999). Input digits
     /// beyond nanosecond precision are truncated at parse.
-    pub nanosecond: u32,
+    pub fn nanosecond(&self) -> u32 {
+        self.nanosecond
+    }
 }
 
 /// UTC offset of an offset date-time.
@@ -86,10 +222,27 @@ pub enum Offset {
     Z,
     /// A numeric `±hh:mm` offset, stored as signed minutes east of UTC.
     /// `-00:00` parses to zero minutes and displays as `+00:00`.
+    ///
+    /// Non-exhaustive so external code can match on it but only
+    /// [`Offset::custom`]'s range validation can construct it.
+    #[non_exhaustive]
     Custom {
         /// Total offset in minutes (`-1439..=1439`).
         minutes: i16,
     },
+}
+
+impl Offset {
+    /// Build a validated numeric offset from signed minutes east of UTC.
+    /// Errors outside `-1439..=1439` (±23:59).
+    pub fn custom(minutes: i16) -> Result<Offset, DatetimeParseError> {
+        if !(-1439..=1439).contains(&minutes) {
+            return Err(DatetimeParseError::new(
+                "offset out of range (-23:59 to +23:59)",
+            ));
+        }
+        Ok(Offset::Custom { minutes })
+    }
 }
 
 /// Error returned when a string is not one of the four TOML datetime forms.
@@ -147,13 +300,7 @@ fn parse_date(b: &[u8]) -> Result<Date, DatetimeParseError> {
     let year = digits::<4>(&b[0..4], "expected four-digit year")? as u16;
     let month = digits::<2>(&b[5..7], "expected two-digit month")? as u8;
     let day = digits::<2>(&b[8..10], "expected two-digit day")? as u8;
-    if !(1..=12).contains(&month) {
-        return Err(DatetimeParseError::new("month out of range (1-12)"));
-    }
-    if day < 1 || day > days_in_month(year, month) {
-        return Err(DatetimeParseError::new("day out of range for month"));
-    }
-    Ok(Date { year, month, day })
+    Date::new(year, month, day)
 }
 
 /// Parse an `HH:MM:SS[.fraction]` time from the front of `b`.
@@ -167,15 +314,6 @@ fn parse_time(b: &[u8]) -> Result<(Time, usize), DatetimeParseError> {
     let hour = digits::<2>(&b[0..2], "expected two-digit hour")? as u8;
     let minute = digits::<2>(&b[3..5], "expected two-digit minute")? as u8;
     let second = digits::<2>(&b[6..8], "expected two-digit second")? as u8;
-    if hour > 23 {
-        return Err(DatetimeParseError::new("hour out of range (0-23)"));
-    }
-    if minute > 59 {
-        return Err(DatetimeParseError::new("minute out of range (0-59)"));
-    }
-    if second > 60 {
-        return Err(DatetimeParseError::new("second out of range (0-60)"));
-    }
     let mut consumed = 8;
     let mut nanosecond: u32 = 0;
     if b.len() > 8 && b[8] == b'.' {
@@ -195,15 +333,7 @@ fn parse_time(b: &[u8]) -> Result<(Time, usize), DatetimeParseError> {
         }
         consumed = 9 + digit_count;
     }
-    Ok((
-        Time {
-            hour,
-            minute,
-            second,
-            nanosecond,
-        },
-        consumed,
-    ))
+    Ok((Time::new(hour, minute, second, nanosecond)?, consumed))
 }
 
 /// Parse a `Z`/`z` or `±hh:mm` offset occupying all of `b`.
@@ -224,7 +354,7 @@ fn parse_offset(b: &[u8]) -> Result<Offset, DatetimeParseError> {
             }
             let total = hours * 60 + minutes;
             let total = if *sign == b'-' { -total } else { total };
-            Ok(Offset::Custom { minutes: total })
+            Offset::custom(total)
         }
         _ => Err(DatetimeParseError::new("expected Z or ±hh:mm offset")),
     }
@@ -364,6 +494,13 @@ impl<'de> de::Deserialize<'de> for Datetime {
                     return Err(de::Error::custom("datetime key not found"));
                 }
                 let repr: String = map.next_value()?;
+                // The marker struct has exactly one field; extra entries
+                // mean malformed input, never data to ignore.
+                if map.next_key::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(
+                        "datetime marker struct must have exactly one field",
+                    ));
+                }
                 repr.parse().map_err(de::Error::custom)
             }
         }
@@ -419,72 +556,90 @@ mod tests {
     #[test]
     fn offset_datetime_z() {
         let dt = parse("1979-05-27T07:32:00Z");
-        assert_eq!(
-            dt.date,
-            Some(Date {
-                year: 1979,
-                month: 5,
-                day: 27
-            })
-        );
-        assert_eq!(
-            dt.time,
-            Some(Time {
-                hour: 7,
-                minute: 32,
-                second: 0,
-                nanosecond: 0
-            })
-        );
-        assert_eq!(dt.offset, Some(Offset::Z));
+        assert_eq!(dt.date(), Some(Date::new(1979, 5, 27).unwrap()));
+        assert_eq!(dt.time(), Some(Time::new(7, 32, 0, 0).unwrap()));
+        assert_eq!(dt.offset(), Some(Offset::Z));
         assert_eq!(dt.to_string(), "1979-05-27T07:32:00Z");
     }
 
     #[test]
     fn offset_datetime_numeric_offset() {
         let dt = parse("1979-05-27T00:32:00-07:00");
-        assert_eq!(dt.offset, Some(Offset::Custom { minutes: -420 }));
+        assert_eq!(dt.offset(), Some(Offset::custom(-420).unwrap()));
         assert_eq!(dt.to_string(), "1979-05-27T00:32:00-07:00");
     }
 
     #[test]
     fn offset_datetime_fractional_seconds() {
         let dt = parse("1979-05-27T00:32:00.999999-07:00");
-        assert_eq!(dt.time.unwrap().nanosecond, 999_999_000);
+        assert_eq!(dt.time().unwrap().nanosecond(), 999_999_000);
         assert_eq!(dt.to_string(), "1979-05-27T00:32:00.999999-07:00");
     }
 
     #[test]
     fn local_datetime() {
         let dt = parse("1979-05-27T07:32:00");
-        assert!(dt.date.is_some());
-        assert!(dt.time.is_some());
-        assert_eq!(dt.offset, None);
+        assert!(dt.date().is_some());
+        assert!(dt.time().is_some());
+        assert_eq!(dt.offset(), None);
         assert_eq!(dt.to_string(), "1979-05-27T07:32:00");
     }
 
     #[test]
     fn local_date() {
         let dt = parse("1979-05-27");
-        assert!(dt.date.is_some());
-        assert_eq!(dt.time, None);
-        assert_eq!(dt.offset, None);
+        assert!(dt.date().is_some());
+        assert_eq!(dt.time(), None);
+        assert_eq!(dt.offset(), None);
         assert_eq!(dt.to_string(), "1979-05-27");
     }
 
     #[test]
     fn local_time() {
         let dt = parse("07:32:00");
-        assert_eq!(dt.date, None);
-        assert!(dt.time.is_some());
+        assert_eq!(dt.date(), None);
+        assert!(dt.time().is_some());
         assert_eq!(dt.to_string(), "07:32:00");
     }
 
     #[test]
     fn local_time_fractional() {
         let dt = parse("00:32:00.5");
-        assert_eq!(dt.time.unwrap().nanosecond, 500_000_000);
+        assert_eq!(dt.time().unwrap().nanosecond(), 500_000_000);
         assert_eq!(dt.to_string(), "00:32:00.5");
+    }
+
+    #[test]
+    fn component_constructors_validate_ranges() {
+        assert!(Date::new(1979, 5, 27).is_ok());
+        assert!(Date::new(1979, 13, 1).is_err());
+        assert!(Date::new(1979, 0, 1).is_err());
+        assert!(Date::new(2023, 2, 29).is_err());
+        assert!(Date::new(2024, 2, 29).is_ok());
+        assert!(Time::new(23, 59, 60, 999_999_999).is_ok());
+        assert!(Time::new(24, 0, 0, 0).is_err());
+        assert!(Time::new(0, 60, 0, 0).is_err());
+        assert!(Time::new(0, 0, 61, 0).is_err());
+        assert!(Time::new(0, 0, 0, 1_000_000_000).is_err());
+        assert!(Offset::custom(1439).is_ok());
+        assert!(Offset::custom(-1439).is_ok());
+        assert!(Offset::custom(1440).is_err());
+        assert!(Offset::custom(-1440).is_err());
+    }
+
+    #[test]
+    fn every_form_constructor_displays_a_parseable_value() {
+        let date = Date::new(1979, 5, 27).unwrap();
+        let time = Time::new(7, 32, 0, 500_000_000).unwrap();
+        for dt in [
+            Datetime::offset_date_time(date, time, Offset::Z),
+            Datetime::offset_date_time(date, time, Offset::custom(-420).unwrap()),
+            Datetime::local_date_time(date, time),
+            Datetime::local_date(date),
+            Datetime::local_time(time),
+        ] {
+            assert_eq!(dt.to_string().parse::<Datetime>().unwrap(), dt);
+        }
     }
 
     #[test]
@@ -520,7 +675,7 @@ mod tests {
     #[test]
     fn negative_zero_offset_normalizes() {
         let dt = parse("1979-05-27T07:32:00-00:00");
-        assert_eq!(dt.offset, Some(Offset::Custom { minutes: 0 }));
+        assert_eq!(dt.offset(), Some(Offset::custom(0).unwrap()));
         assert_eq!(dt.to_string(), "1979-05-27T07:32:00+00:00");
     }
 

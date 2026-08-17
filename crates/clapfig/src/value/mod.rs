@@ -22,8 +22,9 @@
 //!   null (YAML, JSON) reject it at their adapter boundary.
 //! - **[`Display`](std::fmt::Display)** renders a deterministic,
 //!   TOML-flavored inline notation (quoted strings, `[..]` arrays,
-//!   `{ k = v }` maps) for error messages, `config get` output, and tests
-//!   — it is not a serialization format; adapters own those.
+//!   `{ k = v }` maps; map keys that are not TOML bare keys are quoted and
+//!   escaped) for error messages, `config get` output, and tests — it is
+//!   not a serialization format; adapters own those.
 //!
 //! The serde bridge — [`to_value`] to build a [`Value`] from any
 //! `Serialize` type and [`from_value`] to deserialize a typed struct out of
@@ -226,6 +227,15 @@ fn write_escaped(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
     f.write_str("\"")
 }
 
+/// Whether `key` is a TOML bare key (`A-Za-z0-9_-`, non-empty), safe to
+/// display unquoted without ambiguity.
+fn is_bare_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 impl fmt::Display for Value {
     /// Deterministic TOML-flavored inline notation; see the [module
     /// docs](self). Floats always show a decimal point or exponent
@@ -266,7 +276,15 @@ impl fmt::Display for Value {
                     if i > 0 {
                         f.write_str(", ")?;
                     }
-                    write!(f, "{k} = {v}")?;
+                    // Non-bare keys (dots, spaces, `=`, quotes, control
+                    // characters, empty) are quoted so the notation stays
+                    // unambiguous.
+                    if is_bare_key(k) {
+                        write!(f, "{k}")?;
+                    } else {
+                        write_escaped(f, k)?;
+                    }
+                    write!(f, " = {v}")?;
                 }
                 f.write_str(" }")
             }
@@ -354,5 +372,24 @@ mod tests {
     #[test]
     fn control_characters_escape_as_unicode() {
         assert_eq!(Value::from("a\u{1}b").to_string(), "\"a\\u0001b\"");
+    }
+
+    #[test]
+    fn non_bare_map_keys_display_quoted() {
+        let display = |key: &str| {
+            let mut m = Map::new();
+            m.insert(key.into(), Value::Integer(1));
+            Value::Map(m).to_string()
+        };
+        // Bare keys stay bare.
+        assert_eq!(display("port_8-a"), "{ port_8-a = 1 }");
+        // Everything else is quoted and escaped, so keys never read as
+        // structure.
+        assert_eq!(display("my.key"), r#"{ "my.key" = 1 }"#);
+        assert_eq!(display("my key"), r#"{ "my key" = 1 }"#);
+        assert_eq!(display("my=key"), r#"{ "my=key" = 1 }"#);
+        assert_eq!(display("my\"key"), r#"{ "my\"key" = 1 }"#);
+        assert_eq!(display(""), r#"{ "" = 1 }"#);
+        assert_eq!(display("a\u{1}b"), "{ \"a\\u0001b\" = 1 }");
     }
 }

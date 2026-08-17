@@ -123,6 +123,89 @@ pub enum FormatError {
     },
 }
 
+/// One step of a [`ConfigPath`]: a map key or an array index.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PathSegment {
+    /// A map key. The key is a literal string — a key containing `.` is
+    /// one segment, never nesting.
+    Key(String),
+    /// A zero-based array element index.
+    Index(usize),
+}
+
+/// Structured address of one node in a [`Value`] tree.
+///
+/// A path is a sequence of [`PathSegment`]s, so a literal key named
+/// `"database.port"` (one `Key` segment) is distinct from the nested keys
+/// `database` → `port` (two `Key` segments), and array elements are
+/// addressable via `Index` — an unstructured dotted string can express
+/// neither distinction. This is the path type the adapter contract
+/// traffics in ([`SpanIndex`], [`FileEdit`]); every adapter builds and
+/// consumes the same representation.
+///
+/// [`Display`](fmt::Display) renders the familiar dotted notation for
+/// error messages (`database.port`, `servers[0].host`), quoting key
+/// segments that are not bare (`"my.key".port`) — display only, never
+/// parsed back.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConfigPath {
+    segments: Vec<PathSegment>,
+}
+
+impl ConfigPath {
+    /// The empty path (the tree's root).
+    pub fn new() -> Self {
+        ConfigPath::default()
+    }
+
+    /// Append a map-key segment (builder style).
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.segments.push(PathSegment::Key(key.into()));
+        self
+    }
+
+    /// Append an array-index segment (builder style).
+    pub fn index(mut self, index: usize) -> Self {
+        self.segments.push(PathSegment::Index(index));
+        self
+    }
+
+    /// The path's segments, root-first.
+    pub fn segments(&self) -> &[PathSegment] {
+        &self.segments
+    }
+}
+
+impl From<Vec<PathSegment>> for ConfigPath {
+    fn from(segments: Vec<PathSegment>) -> Self {
+        ConfigPath { segments }
+    }
+}
+
+impl fmt::Display for ConfigPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, segment) in self.segments.iter().enumerate() {
+            match segment {
+                PathSegment::Key(k) => {
+                    if i > 0 {
+                        f.write_str(".")?;
+                    }
+                    let bare = !k.is_empty()
+                        && k.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+                    if bare {
+                        f.write_str(k)?;
+                    } else {
+                        write!(f, "{k:?}")?;
+                    }
+                }
+                PathSegment::Index(n) => write!(f, "[{n}]")?,
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A half-open byte range (`start..end`) into a format's source text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -135,13 +218,13 @@ pub struct Span {
 /// Path → [`Span`] index over one file's source text — the seam the
 /// provenance epic consumes.
 ///
-/// Keys are dotted value paths (`"database.port"`); the span locates that
-/// value's bytes in the source the adapter parsed. WS01 pins the shape
-/// only: adapters return it from [`FormatAdapter::span_index`], and the
+/// Keys are structured [`ConfigPath`]s; the span locates that value's
+/// bytes in the source the adapter parsed. WS01 pins the shape only:
+/// adapters return it from [`FormatAdapter::span_index`], and the
 /// provenance epic decides what to build on top.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpanIndex {
-    spans: BTreeMap<String, Span>,
+    spans: BTreeMap<ConfigPath, Span>,
 }
 
 impl SpanIndex {
@@ -150,19 +233,19 @@ impl SpanIndex {
         SpanIndex::default()
     }
 
-    /// Record the span for a dotted value path.
-    pub fn insert(&mut self, path: String, span: Span) {
+    /// Record the span for a value path.
+    pub fn insert(&mut self, path: ConfigPath, span: Span) {
         self.spans.insert(path, span);
     }
 
-    /// Look up the span recorded for a dotted value path.
-    pub fn get(&self, path: &str) -> Option<Span> {
+    /// Look up the span recorded for a value path.
+    pub fn get(&self, path: &ConfigPath) -> Option<Span> {
         self.spans.get(path).copied()
     }
 
     /// Iterate all `(path, span)` entries in sorted path order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, Span)> {
-        self.spans.iter().map(|(k, v)| (k.as_str(), *v))
+    pub fn iter(&self) -> impl Iterator<Item = (&ConfigPath, Span)> {
+        self.spans.iter().map(|(k, v)| (k, *v))
     }
 }
 
@@ -175,18 +258,18 @@ impl SpanIndex {
 /// is [`FormatAdapter::template`] plus a set — no separate entry point.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileEdit<'a> {
-    /// Set the value at a dotted path, replacing an existing value or
-    /// creating the path.
+    /// Set the value at a path, replacing an existing value or creating
+    /// the path.
     Set {
-        /// Dotted key path (`"database.port"`).
-        path: &'a str,
+        /// Structured path of the target node.
+        path: &'a ConfigPath,
         /// The value to write.
         value: &'a Value,
     },
-    /// Remove the key at a dotted path.
+    /// Remove the key at a path.
     Unset {
-        /// Dotted key path (`"database.port"`).
-        path: &'a str,
+        /// Structured path of the target node.
+        path: &'a ConfigPath,
     },
 }
 
@@ -196,7 +279,11 @@ pub enum FileEdit<'a> {
 /// does for clapfig goes through these entry points; capability
 /// differences are declared, and refusals are typed
 /// ([`UnsupportedByFormat`]) — see the [module docs](self).
-pub trait FormatAdapter {
+///
+/// `Send + Sync` is a supertrait so a [`FormatRegistry`] (and any runtime
+/// holding one) can cross threads and live in an `Arc`; adapters are
+/// stateless translators, so the bound costs implementations nothing.
+pub trait FormatAdapter: Send + Sync {
     /// The format's canonical lowercase name (`"toml"`), used in error
     /// messages and [`FormatRegistry::by_name`] lookups.
     fn name(&self) -> &'static str;
@@ -397,14 +484,70 @@ mod tests {
     #[test]
     fn span_index_records_and_looks_up_paths() {
         let mut index = SpanIndex::new();
-        index.insert("database.port".into(), Span { start: 10, end: 14 });
-        assert_eq!(
-            index.get("database.port"),
-            Some(Span { start: 10, end: 14 })
-        );
-        assert_eq!(index.get("missing"), None);
+        let path = ConfigPath::new().key("database").key("port");
+        index.insert(path.clone(), Span { start: 10, end: 14 });
+        assert_eq!(index.get(&path), Some(Span { start: 10, end: 14 }));
+        assert_eq!(index.get(&ConfigPath::new().key("missing")), None);
         let entries: Vec<_> = index.iter().collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn literal_dotted_key_is_distinct_from_nested_keys() {
+        let nested = ConfigPath::new().key("database").key("port");
+        let literal = ConfigPath::new().key("database.port");
+        assert_ne!(nested, literal);
+
+        let mut index = SpanIndex::new();
+        index.insert(nested.clone(), Span { start: 0, end: 1 });
+        index.insert(literal.clone(), Span { start: 2, end: 3 });
+        assert_eq!(index.get(&nested), Some(Span { start: 0, end: 1 }));
+        assert_eq!(index.get(&literal), Some(Span { start: 2, end: 3 }));
+    }
+
+    #[test]
+    fn array_elements_are_addressable() {
+        let path = ConfigPath::new().key("servers").index(0).key("host");
+        assert_eq!(
+            path.segments(),
+            [
+                PathSegment::Key("servers".into()),
+                PathSegment::Index(0),
+                PathSegment::Key("host".into()),
+            ]
+        );
+        let mut index = SpanIndex::new();
+        index.insert(path.clone(), Span { start: 5, end: 9 });
+        assert_eq!(index.get(&path), Some(Span { start: 5, end: 9 }));
+    }
+
+    #[test]
+    fn config_path_display_quotes_non_bare_keys() {
+        assert_eq!(
+            ConfigPath::new().key("database").key("port").to_string(),
+            "database.port"
+        );
+        assert_eq!(
+            ConfigPath::new()
+                .key("servers")
+                .index(0)
+                .key("host")
+                .to_string(),
+            "servers[0].host"
+        );
+        assert_eq!(
+            ConfigPath::new().key("my.key").key("port").to_string(),
+            "\"my.key\".port"
+        );
+        assert_eq!(ConfigPath::new().key("").to_string(), "\"\"");
+        assert_eq!(ConfigPath::new().to_string(), "");
+    }
+
+    #[test]
+    fn registry_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FormatRegistry>();
+        assert_send_sync::<Box<dyn FormatAdapter>>();
     }
 
     #[test]

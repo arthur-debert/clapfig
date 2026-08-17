@@ -8,10 +8,11 @@
 //! serialize-reparse round trip.
 //!
 //! Baseline mapping (ADR-0002): map keys must be strings; `u64` values
-//! above `i64::MAX` are range errors; `None`/unit have no value-model
-//! representation (absence expresses unset), so a bare `None` is an error
+//! above `i64::MAX` are range errors. `None` has no value-model
+//! representation (absence expresses unset): a bare `None` is an error,
 //! while `None` map/struct *entries* are skipped, matching how the model
-//! treats a missing key.
+//! treats a missing key. Unit (`()`) is simply unrepresentable and is an
+//! error everywhere — a unit *entry* is never silently dropped.
 
 use std::fmt;
 
@@ -29,8 +30,12 @@ pub struct SerializeError {
 /// What went wrong. Private: callers get the rendered message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ErrorKind {
-    /// Serialized a bare `None` or unit: the value model has no null.
+    /// Serialized a bare `None`: the value model has no null. The one
+    /// kind container serializers translate into "skip the entry".
     UnsupportedNone,
+    /// Serialized a unit `()`: unrepresentable, and — unlike `None` —
+    /// never skippable, so container entries fail loudly.
+    UnsupportedUnit,
     /// A serde data-model shape the value model cannot hold.
     UnsupportedType(&'static str),
     /// An integer outside the `i64` baseline range.
@@ -48,6 +53,9 @@ impl fmt::Display for ErrorKind {
         match self {
             ErrorKind::UnsupportedNone => {
                 f.write_str("the value model has no null: absence expresses unset")
+            }
+            ErrorKind::UnsupportedUnit => {
+                f.write_str("unit values are not representable in the value model")
             }
             ErrorKind::UnsupportedType(name) => {
                 write!(f, "{name} values are not representable in the value model")
@@ -202,7 +210,7 @@ impl ser::Serializer for ValueSerializer {
     }
 
     fn serialize_unit(self) -> Result<Value, SerializeError> {
-        Err(SerializeError::new(ErrorKind::UnsupportedNone))
+        Err(SerializeError::new(ErrorKind::UnsupportedUnit))
     }
 
     fn serialize_unit_struct(self, _name: &'static str) -> Result<Value, SerializeError> {
@@ -461,8 +469,12 @@ impl ser::SerializeStruct for SerializeStruct {
         match self {
             SerializeStruct::Map(map) => map.entry(key.to_owned(), value),
             SerializeStruct::Datetime { value: slot } => {
-                // The marker struct has exactly one field: the display
-                // string. Extract and parse it back into the owned type.
+                // The marker struct has exactly one field, keyed by the
+                // marker name, holding the display string. Any other
+                // shape riding the marker struct name is malformed.
+                if key != DATETIME_MARKER || slot.is_some() {
+                    return Err(SerializeError::new(ErrorKind::InvalidDatetime));
+                }
                 let repr = value.serialize(RawStringExtractor)?;
                 *slot = Some(
                     repr.parse()
@@ -749,6 +761,48 @@ mod tests {
         let map = v.as_map().unwrap();
         assert_eq!(map.get("present"), Some(&Value::Integer(1)));
         assert!(!map.contains_key("absent"));
+    }
+
+    #[test]
+    fn unit_is_an_error_everywhere_never_a_skipped_entry() {
+        // A bare unit is unrepresentable...
+        assert!(to_value(()).is_err());
+
+        // ...and unlike `None`, a unit *entry* fails loudly instead of
+        // being silently dropped.
+        #[derive(serde::Serialize)]
+        struct S {
+            broken: (),
+        }
+        assert!(to_value(S { broken: () }).is_err());
+
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("k".to_string(), ());
+        assert!(to_value(&m).is_err());
+    }
+
+    #[test]
+    fn malformed_marker_structs_are_rejected() {
+        use serde::ser::{SerializeStruct as _, Serializer as _};
+
+        // Wrong field key under the marker struct name.
+        let mut s = ValueSerializer
+            .serialize_struct(DATETIME_MARKER, 1)
+            .unwrap();
+        assert!(s.serialize_field("not_the_marker", "1979-05-27").is_err());
+
+        // A second field where exactly one is allowed.
+        let mut s = ValueSerializer
+            .serialize_struct(DATETIME_MARKER, 2)
+            .unwrap();
+        s.serialize_field(DATETIME_MARKER, "1979-05-27").unwrap();
+        assert!(s.serialize_field(DATETIME_MARKER, "2001-01-01").is_err());
+
+        // No field at all.
+        let s = ValueSerializer
+            .serialize_struct(DATETIME_MARKER, 0)
+            .unwrap();
+        assert!(s.end().is_err());
     }
 
     #[test]
