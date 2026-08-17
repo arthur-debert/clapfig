@@ -3195,7 +3195,7 @@ mod tests {
         );
     }
 
-    // --- WS03/WS04 stub adapters: reachable inputs error, never panic ---
+    // --- WS04 stub adapter: reachable inputs error, never panic ---
 
     #[test]
     fn enabled_stub_format_file_errors_instead_of_panicking() {
@@ -3203,11 +3203,11 @@ mod tests {
         // in it yields the adapter's typed refusal wrapped as a parse
         // error — a clean ClapfigError, not a todo-panic.
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("demo.yaml"), "port: 1\n").unwrap();
+        fs::write(dir.path().join("demo.json"), "{\"port\": 1}\n").unwrap();
         let err = Clapfig::runtime(demo_schema())
             .app_name("demo")
             .file_stem("demo")
-            .formats(["toml", "yaml"])
+            .formats(["toml", "json"])
             .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
             .no_env()
             .load()
@@ -3228,7 +3228,7 @@ mod tests {
         let err = Clapfig::runtime(demo_schema())
             .app_name("demo")
             .file_stem("demo")
-            .formats(["yaml"])
+            .formats(["json"])
             .no_env()
             .handle(&ConfigAction::Gen { output: None })
             .unwrap_err();

@@ -2,6 +2,10 @@
 name = "clapfig"
 version = "0.22.1"
 edition = "2024"
+# Declared so the MSRV-aware resolver (workspace resolver = "3") skips
+# dependency versions needing a newer toolchain — notably the YAML edit
+# stack's tree-sitter-iter, whose latest releases require rustc 1.97.
+rust-version = "1.96"
 description = "Rich, layered configuration for Rust CLI apps"
 license = "MIT"
 repository = "https://github.com/arthur-debert/clapfig"
@@ -28,6 +32,15 @@ directories = "6"
 percent-encoding = { version = "2", optional = true }
 miette = { version = "7", features = ["fancy"], optional = true }
 thiserror = "2"
+# The YAML stack (ADR-0003), confined to src/format/yaml.rs: serde_norway
+# parses/serializes; yamlpath + yamlpatch do comment-preserving span
+# edits; yaml_serde exists only because yamlpatch's patch values are its
+# type. yamlpath/yamlpatch are held to the 1.26 series: later releases
+# pull tree-sitter-iter builds whose MSRV (1.97) exceeds ours.
+serde_norway = "0.9"
+yamlpath = ">=1.26, <1.28"
+yamlpatch = ">=1.26, <1.28"
+yaml_serde = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

@@ -20,8 +20,9 @@
 //! branches.
 //!
 //! This module holds the contract and its pure data structures; the
-//! adapters themselves live in [`toml`], [`yaml`], and [`json`]
-//! (implemented across the value-model epic's later workstreams).
+//! adapters themselves live in [`toml`], [`yaml`], and [`json`] (JSON is
+//! the value-model epic's remaining workstream; TOML and YAML are
+//! implemented).
 
 pub mod json;
 pub mod toml;
@@ -733,14 +734,35 @@ mod tests {
     }
 
     #[test]
+    fn yaml_adapter_declares_its_matrix_rows() {
+        // YAML's ADR-0002 matrix row declares every operation (its known
+        // refusals are shape-level, inside the declared edits). SpanIndex
+        // stays undeclared until the provenance epic builds the index.
+        for operation in ALL_OPERATIONS {
+            if operation == Operation::SpanIndex {
+                assert!(!yaml::YamlAdapter.supports(operation));
+                assert!(matches!(
+                    yaml::YamlAdapter.span_index("").unwrap_err(),
+                    FormatError::Unsupported(_)
+                ));
+            } else {
+                assert!(
+                    yaml::YamlAdapter.supports(operation),
+                    "yaml should declare {operation}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stub_adapters_declare_nothing_and_refuse_typed() {
-        // Until WS03/WS04 implement them, the YAML/JSON adapters carry
-        // contract data only: capabilities are empty and every operation
-        // returns the typed refusal — reachable inputs (an enabled
-        // `app.yaml`, `gen --output x.json`, a persist edit) get a clean
-        // `ClapfigError`, never a panic. The workstreams flip the matrix
-        // rows on as they land the bodies.
-        for adapter in [&yaml::YamlAdapter as &dyn FormatAdapter, &json::JsonAdapter] {
+        // Until WS04 implements it, the JSON adapter carries contract data
+        // only: capabilities are empty and every operation returns the
+        // typed refusal — reachable inputs (an enabled `app.json`,
+        // `gen --output x.json`, a persist edit) get a clean
+        // `ClapfigError`, never a panic. The workstream flips the matrix
+        // rows on as it lands the bodies.
+        for adapter in [&json::JsonAdapter as &dyn FormatAdapter] {
             for operation in ALL_OPERATIONS {
                 assert!(
                     !adapter.supports(operation),
@@ -798,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn stub_adapters_carry_names_and_extensions() {
+    fn adapters_carry_names_and_extensions() {
         assert_eq!(toml::TomlAdapter.name(), "toml");
         assert_eq!(toml::TomlAdapter.extensions(), ["toml"]);
         assert_eq!(yaml::YamlAdapter.name(), "yaml");

@@ -397,13 +397,13 @@ mod tests {
 
     #[test]
     fn set_on_unparseable_format_fails_at_parse() {
-        // A format that cannot parse at all (the WS03/WS04 stubs) fails
+        // A format that cannot parse at all (the WS04 stub) fails
         // classification at its parse refusal — editing an existing file
         // begins with reading it, so that is the honest earliest error.
         let u = refusal(set_in_document_runtime(
-            &crate::format::YamlAdapter,
+            &crate::format::JsonAdapter,
             &test_schema(),
-            Some("port: 1\n"),
+            Some("{\"port\": 1}\n"),
             "port",
             "2",
         ));
