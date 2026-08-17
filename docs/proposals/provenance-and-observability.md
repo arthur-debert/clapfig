@@ -4,13 +4,16 @@ Status: accepted. Builds on #104 (confique-path removal, landed in PR #105): one
 schema model, one resolution pipeline.
 
 Amendment (2026-08-17): the value-model refactor (`docs/spec/value-model.md`)
-now precedes this work. Where this proposal says `toml_edit` supplies spans, read:
-each **format adapter** supplies the path → span index and source text through
-the adapter contract (ADR-0002), so provenance attaches at one seam for every
-input type and format; and origin paths key the clapfig-owned `Value` model
-(ADR-0001), not `toml::Value`. The origin carriage decision is recorded as
-ADR-0004 (shadow tree merged in lockstep). Nothing else in this proposal
-changes.
+now precedes this work. Where this proposal says `toml_edit` supplies spans,
+read: for **file inputs**, the format adapter supplies the path → span index
+and source text through the adapter contract (ADR-0002) — files are the only
+input type where spans exist. Non-file inputs (env, URL, overrides, defaults)
+keep the synthetic origins this proposal already assigns at their layer
+constructors. The uniform seam is the origin contract itself — every input
+type produces `Origin` entries, with fields it cannot fill as `None` — plus
+the value/origin lockstep merge (ADR-0004). Origin paths key the
+clapfig-owned `Value` model (ADR-0001), not `toml::Value`. Nothing else in
+this proposal changes.
 
 Related: the source-provenance qualifications recorded on #100, #101, and #102; the
 `find_key_line` heuristic and its documented limitations (`validate.rs`).

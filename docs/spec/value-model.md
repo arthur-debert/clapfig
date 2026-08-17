@@ -106,12 +106,26 @@ Mistaking configuration values for TOML values has concrete costs today:
   construction, ops/list, and resolution output move from `toml::Value` to
   `Value`. Format-specific code (e.g. `toml_edit` comment-preserving
   persistence) stays inside its adapter.
-- **Format selection** — file inputs choose their adapter by extension.
-  Discovery probes the configured stem across the app's enabled extensions;
-  finding more than one match **in the same directory** is a hard error naming
-  both files (no silent precedence, no merging of same-stem siblings). Across
-  directories, normal layering applies — each directory contributes at most one
-  file.
+- **Format selection and the file-name contract** — file inputs choose their
+  adapter by extension, under an explicit builder contract:
+  - The existing `.file_name("myapp.toml")` keeps exact-name discovery and
+    enables only that extension's format — current TOML-only callers are
+    unchanged.
+  - New: `.file_stem("myapp")` plus an explicit enabled-formats list. Formats
+    are opt-in and ordered; the default with no declaration is TOML only —
+    never inferred from compiled-in cargo features. Discovery probes the stem
+    across enabled extensions; more than one match **in the same directory**
+    is a hard error naming both files (no silent precedence, no merging of
+    same-stem siblings). Across directories, normal layering applies — each
+    directory contributes at most one file.
+  - Explicit paths (persist scopes, `--output`, direct file arguments) select
+    their adapter by extension, independent of the enabled list.
+  - The first enabled format is the app's **preferred format**: `config gen`
+    with no output path renders it, and `config set` against a scope with no
+    existing file creates `<stem>.<preferred extension>` seeded from the
+    generated template. When exactly one same-stem file exists, `set` edits
+    that file in its own format.
+  Each of these cases carries an acceptance test.
 
 ## User / Agent Stories
 
@@ -167,8 +181,12 @@ Mistaking configuration values for TOML values has concrete costs today:
 - **Observability:** none added here (that is the next epic), but the adapter
   contract is designed so the next epic adds span/source supply without
   reshaping it.
-- **Dependencies:** two new format crates (YAML successor, `serde_json`);
-  choices justified in the ADR, maintained crates only.
+- **Dependencies:** newly introduced — `serde_norway` (YAML parsing, with its
+  forked backend as a transitive dependency) and `yamlpath` + `yamlpatch`
+  (YAML editing, tree-sitter transitively). Already present and re-purposed —
+  `serde_json` (JSON Schema export today; additionally becomes the JSON
+  adapter's parser). `toml` / `toml_edit` remain, confined to the TOML
+  adapter. Selection rationale in ADR-0003.
 - **CI/release:** parity suite runs in the standard gates; changelog fragment
   with migration guide.
 

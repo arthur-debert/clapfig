@@ -21,10 +21,17 @@ Shape decisions folded into this ADR:
   timezone-aware types and would import semantics beyond the baseline.
 - **Datetime across formats**: schema-driven coercion, never sniffing. YAML and
   JSON deliver datetimes as strings (parsing is schema-blind); for leaves
-  declared `DateTime`, the validation/typed pass parses RFC 3339 into
-  `Value::Datetime`, and a failed parse is a normal type error. Adapter-side
-  "looks like a date" detection was rejected as implicit typing by pattern
-  match — the Norway problem in another hat.
+  declared `DateTime`, the validation/typed pass parses the string against
+  **TOML's four datetime lexical forms** — offset date-time, local date-time,
+  local date, local time, i.e. the owned type's own grammar — and a string
+  matching none of them is a normal type error. Each adapter serializes
+  `Value::Datetime` with the same spellings (TOML natively, YAML/JSON as
+  strings), so every variant round-trips in every format. "RFC 3339 only" was
+  rejected: RFC 3339 defines just the offset form, which would have made three
+  of the four baseline variants unreachable from YAML/JSON. Cross-adapter
+  tests cover each form plus malformed input. Adapter-side "looks like a date"
+  detection was rejected as implicit typing by pattern match — the Norway
+  problem in another hat.
 - **Serde bridge**: direct `Deserializer`/`Serializer` implementations for
   `Value` (the `serde_json::Value`/`toml::Value` pattern), with datetime
   carried via a private marker newtype the way `toml` does it. This retires the
