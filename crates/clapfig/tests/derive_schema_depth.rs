@@ -317,6 +317,29 @@ fn rename_attribute_makes_load_accept_the_renamed_key() {
     assert_eq!(cfg.host, "prod");
 }
 
+// -- End-to-end: serde-only rename — schema follows serde's spelling -------
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct SerdeRenamed {
+    /// On disk: `listen-port` (kebab-case via `#[serde(rename)]` alone).
+    #[serde(rename = "listen-port")]
+    #[clapfig(default = 1)]
+    listen_port: i64,
+}
+
+#[test]
+fn serde_only_rename_makes_load_accept_the_renamed_key() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("test.toml"), "listen-port = 9000\n").unwrap();
+    let cfg: SerdeRenamed = Clapfig::schema_builder::<SerdeRenamed>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.listen_port, 9000);
+}
+
 // -- `allowed` accepts integer and bool sets ------------------------------
 
 #[derive(Schema, Serialize, Deserialize, Debug)]

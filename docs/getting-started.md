@@ -75,8 +75,12 @@ Key points:
 - **`///` doc comments** are used in generated templates and `config get`
   output.
 - The struct still derives serde's `Serialize`/`Deserialize` — clapfig uses
-  them for the final typed deserialize, so serde attributes
-  (`#[serde(deserialize_with = ...)]` etc.) apply as usual.
+  them for the final typed deserialize, so value-shaping serde attributes
+  (`#[serde(deserialize_with = ...)]` etc.) apply as usual. Field *naming*
+  is shared with the schema: `#[serde(rename = "...")]` on a field renames
+  the config key too (the schema follows serde's spelling), while
+  struct-level `#[serde(rename_all = ...)]` is rejected at compile time —
+  rename fields individually.
 
 ## Load it
 

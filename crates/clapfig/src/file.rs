@@ -43,7 +43,7 @@ use crate::types::{Boundary, SearchPath};
 ///
 /// `cwd_override` lets the caller interpret [`SearchPath::Cwd`] as an explicit
 /// directory rather than the process's current working directory. This is used
-/// by [`Resolver`](crate::Resolver) so that each `resolve_at(dir)` call treats
+/// by [`RuntimeResolver`](crate::RuntimeResolver) so that each `resolve_at(dir)` call treats
 /// `dir` as its logical "current directory" — the key enabler for tree-walk
 /// use cases where every leaf is its own resolution root.
 ///
@@ -118,7 +118,7 @@ pub fn expand_ancestors_from(start: PathBuf, boundary: &Boundary) -> Vec<PathBuf
 /// `start_dir` is the logical "current directory" used to interpret
 /// [`SearchPath::Cwd`] and [`SearchPath::Ancestors`]. For top-level
 /// [`load()`](crate::RuntimeBuilder::load) calls this is `std::env::current_dir()`;
-/// for [`Resolver::resolve_at(dir)`](crate::Resolver::resolve_at) it is `dir`,
+/// for [`RuntimeResolver::resolve_at(dir)`](crate::RuntimeResolver::resolve_at) it is `dir`,
 /// which lets tree-walk tools treat every leaf as its own resolution root.
 pub fn expand_search_paths(
     search_paths: &[SearchPath],

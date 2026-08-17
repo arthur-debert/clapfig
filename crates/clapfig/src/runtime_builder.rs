@@ -751,7 +751,6 @@ impl RuntimeResolver {
 
     /// Number of files currently held in the resolver's cache. Intended for
     /// tests and diagnostics; production code should not branch on this.
-    /// Parallel to [`Resolver::cache_size`](crate::Resolver::cache_size).
     #[doc(hidden)]
     pub fn cache_size(&self) -> usize {
         self.file_cache

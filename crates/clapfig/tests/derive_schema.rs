@@ -349,6 +349,37 @@ fn rename_attribute_changes_schema_field_name() {
     assert_eq!(s.fields[0].name, "Host");
 }
 
+// -- `#[serde(rename = "...")]` alone is honored by the schema --------------
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct SerdeRenameConfig {
+    #[serde(rename = "listen-port")]
+    #[clapfig(default = 8080)]
+    listen_port: i64,
+}
+
+#[test]
+fn serde_rename_alone_sets_schema_field_name() {
+    let s = SerdeRenameConfig::schema_static();
+    assert_eq!(s.fields[0].name, "listen-port");
+}
+
+// A matching clapfig/serde pair (the historical spelling) still works and
+// resolves to the shared name — locked separately from `RenameConfig` above
+// so the pair-vs-serde-only paths each have a guard.
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct MatchingPairConfig {
+    #[clapfig(rename = "log-level", default = "info")]
+    #[serde(rename = "log-level")]
+    log_level: String,
+}
+
+#[test]
+fn matching_clapfig_serde_rename_pair_is_accepted() {
+    let s = MatchingPairConfig::schema_static();
+    assert_eq!(s.fields[0].name, "log-level");
+}
+
 // -- Struct-level attrs: name override and per-node strict -----------------
 
 #[derive(Schema, Serialize, Deserialize, Debug)]
