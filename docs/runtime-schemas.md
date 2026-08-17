@@ -94,7 +94,7 @@ let table: clapfig::value::Map = Clapfig::runtime(schema)
 Differences from the typed path:
 
 - `load()` returns `clapfig::value::Map`, not a typed struct.
-- `post_validate` receives `&Table` instead of `&C`.
+- `post_validate` receives `&clapfig::value::Map` instead of `&C`.
 - `build_resolver()` returns a `RuntimeResolver` for tree-walk use
   cases (see the [Resolver Guide](./resolver.md)).
 

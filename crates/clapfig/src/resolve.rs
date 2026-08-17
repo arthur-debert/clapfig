@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::env;
 use crate::error::ClapfigError;
-use crate::format::FormatRegistry;
+use crate::format::{self, FormatRegistry};
 use crate::merge::deep_merge;
 use crate::normalize::{normalize_key, normalize_table};
 use crate::overrides;
@@ -148,7 +148,7 @@ pub(crate) fn resolve<S: ConfigSpec>(
                 .or_else(|| input.registry.preferred())
                 .ok_or_else(|| ClapfigError::UnknownFormat {
                     name: path.display().to_string(),
-                    available: Vec::new(),
+                    available: format::builtin_names(),
                 })?;
             let parsed = adapter
                 .parse(content)

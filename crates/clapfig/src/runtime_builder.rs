@@ -135,8 +135,10 @@ impl RuntimeBuilder {
     ///
     /// Exact-name discovery: only files with this precise name are
     /// considered, and the name's extension selects the (only) enabled
-    /// format. Mutually exclusive with [`file_stem`](Self::file_stem) —
-    /// the last call wins.
+    /// format. An extensionless name (e.g. an rc file) parses as TOML;
+    /// an extension no adapter claims errors at `build_resolver`/`load`
+    /// time with [`ClapfigError::UnknownFormat`]. Mutually exclusive with
+    /// [`file_stem`](Self::file_stem) — the last call wins.
     pub fn file_name(mut self, name: &str) -> Self {
         self.file_naming = Some(FileNaming::Exact(name.to_string()));
         self
@@ -166,7 +168,8 @@ impl RuntimeBuilder {
     /// output path renders it, and `config set` against a scope with no
     /// existing file creates `<stem>.<preferred extension>`. An unknown
     /// name errors at `build_resolver`/`load` time with
-    /// [`ClapfigError::UnknownFormat`].
+    /// [`ClapfigError::UnknownFormat`]; an empty list or a repeated name
+    /// errors there with [`ClapfigError::InvalidFormats`].
     pub fn formats<I, S>(mut self, names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -445,32 +448,42 @@ impl RuntimeBuilder {
 
     /// Build the enabled-formats registry for the effective file naming.
     ///
-    /// - Exact-name mode enables only the name's extension's format
-    ///   (falling back to TOML for extensionless/unknown names, matching
-    ///   the pre-registry behavior of parsing every discovered file as
-    ///   TOML).
+    /// - Exact-name mode enables only the name's extension's format.
+    ///   Extensionless names fall back to TOML (matching the pre-registry
+    ///   behavior for rc-style names); an extension no adapter claims is
+    ///   a hard [`ClapfigError::UnknownFormat`] — never a silent TOML
+    ///   fallback.
     /// - Stem mode enables the [`formats`](Self::formats) list in order
-    ///   (default: TOML only).
+    ///   (default: TOML only). The list must be non-empty (the preferred
+    ///   format is the first entry) and free of repeats (a repeated name
+    ///   would collect the same file twice and misreport it as
+    ///   ambiguous); violations are
+    ///   [`ClapfigError::InvalidFormats`].
     fn effective_registry(&self) -> Result<FormatRegistry, ClapfigError> {
         let mut registry = FormatRegistry::new();
         match self.effective_naming()? {
             FileNaming::Exact(name) => {
-                let adapter = Path::new(&name)
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .and_then(format::builtin_adapter_for_extension)
-                    .unwrap_or_else(|| {
-                        format::builtin_adapter("toml").expect("toml adapter is built in")
-                    });
-                registry.register(adapter);
+                registry.register(adapter_for_explicit_path(Path::new(&name))?);
             }
             FileNaming::Stem(_) => {
                 let names = self
                     .formats
                     .clone()
                     .unwrap_or_else(|| vec!["toml".to_string()]);
-                for name in names {
-                    let adapter = format::builtin_adapter(&name).ok_or_else(|| {
+                if names.is_empty() {
+                    return Err(ClapfigError::InvalidFormats {
+                        reason: "formats(...) must enable at least one format".into(),
+                    });
+                }
+                let mut seen: Vec<&str> = Vec::new();
+                for name in &names {
+                    if seen.contains(&name.as_str()) {
+                        return Err(ClapfigError::InvalidFormats {
+                            reason: format!("formats(...) names '{name}' more than once"),
+                        });
+                    }
+                    seen.push(name);
+                    let adapter = format::builtin_adapter(name).ok_or_else(|| {
                         ClapfigError::UnknownFormat {
                             name: name.clone(),
                             available: format::builtin_names(),
@@ -632,8 +645,9 @@ impl RuntimeBuilder {
     /// that file in its own format; none → create
     /// `<stem>.<preferred extension>`; several → the same hard
     /// ambiguity error discovery raises. The adapter is then selected by
-    /// the final path's extension (explicit-path rule), falling back to
-    /// TOML for extensionless names.
+    /// the final path's extension (explicit-path rule): extensionless
+    /// names fall back to TOML, and an unclaimed extension is a hard
+    /// [`ClapfigError::UnknownFormat`].
     fn resolve_scope_persist_path(
         &self,
         scope: Option<&str>,
@@ -691,7 +705,7 @@ impl RuntimeBuilder {
                 }
             }
         };
-        let adapter = adapter_for_explicit_path(&path);
+        let adapter = adapter_for_explicit_path(&path)?;
         Ok((path, adapter))
     }
 
@@ -716,20 +730,21 @@ impl RuntimeBuilder {
                 match output {
                     Some(path) => {
                         // Explicit output path: the extension selects the
-                        // adapter, independent of the enabled list;
-                        // extensionless paths fall back to the preferred
+                        // adapter, independent of the enabled list — an
+                        // extension no adapter claims is a hard
+                        // UnknownFormat error. Only a genuinely
+                        // extensionless path falls back to the preferred
                         // format.
-                        let adapter = path
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .and_then(format::builtin_adapter_for_extension)
-                            .unwrap_or_else(|| {
+                        let adapter = match path.extension() {
+                            None => {
                                 let preferred = registry
                                     .preferred()
                                     .expect("effective_registry always registers an adapter");
                                 format::builtin_adapter(preferred.name())
                                     .expect("preferred adapters are built in")
-                            });
+                            }
+                            Some(_) => adapter_for_explicit_path(path)?,
+                        };
                         let template = ops::generate_template(
                             adapter.as_ref(),
                             &self.spec.schema,
@@ -1000,13 +1015,22 @@ impl RuntimeResolver {
 }
 
 /// Select the format adapter for an explicit file path by its extension
-/// (independent of the enabled-formats list), falling back to TOML for
-/// extensionless or unrecognized names.
-fn adapter_for_explicit_path(path: &Path) -> Box<dyn FormatAdapter> {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .and_then(format::builtin_adapter_for_extension)
-        .unwrap_or_else(|| format::builtin_adapter("toml").expect("toml adapter is built in"))
+/// (independent of the enabled-formats list). Extensionless names fall
+/// back to TOML (the rc-style preservation rule); an extension no adapter
+/// claims is a hard [`ClapfigError::UnknownFormat`] — never a silent TOML
+/// fallback that would write or parse one format's content under another
+/// format's extension.
+fn adapter_for_explicit_path(path: &Path) -> Result<Box<dyn FormatAdapter>, ClapfigError> {
+    match path.extension() {
+        None => Ok(format::builtin_adapter("toml").expect("toml adapter is built in")),
+        Some(ext) => {
+            let ext = ext.to_string_lossy();
+            format::builtin_adapter_for_extension(&ext).ok_or_else(|| ClapfigError::UnknownFormat {
+                name: ext.into_owned(),
+                available: format::builtin_names(),
+            })
+        }
+    }
 }
 
 /// Render every leaf in a resolved runtime table as `dotted.key = value`
@@ -3071,6 +3095,150 @@ mod tests {
             .load()
             .unwrap();
         assert_eq!(table.get("port"), Some(&Value::Integer(999)));
+    }
+
+    #[test]
+    fn exact_file_name_with_unknown_extension_errors() {
+        // An extension no adapter claims is a hard error at
+        // build/load time — never a silent parse-as-TOML fallback.
+        let err = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.ini")
+            .no_env()
+            .build_resolver()
+            .err();
+        match err {
+            Some(ClapfigError::UnknownFormat { name, available }) => {
+                assert_eq!(name, "ini");
+                assert_eq!(available, ["toml", "yaml", "json"]);
+            }
+            other => panic!("expected UnknownFormat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn formats_empty_list_errors() {
+        let err = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .formats(Vec::<String>::new())
+            .no_env()
+            .build_resolver()
+            .err();
+        match err {
+            Some(ClapfigError::InvalidFormats { reason }) => {
+                assert!(reason.contains("at least one"), "got: {reason}");
+            }
+            other => panic!("expected InvalidFormats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn formats_duplicate_name_errors() {
+        // A repeated name would register the same extension twice, so
+        // stem discovery would collect one physical file twice and
+        // misreport it as AmbiguousConfigFiles.
+        let err = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .formats(["toml", "toml"])
+            .no_env()
+            .build_resolver()
+            .err();
+        match err {
+            Some(ClapfigError::InvalidFormats { reason }) => {
+                assert!(reason.contains("'toml'"), "got: {reason}");
+            }
+            other => panic!("expected InvalidFormats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gen_output_unknown_extension_errors() {
+        // `gen --output config.ini` must not silently write the
+        // preferred format's content under a foreign extension.
+        let dir = TempDir::new().unwrap();
+        let out_path = dir.path().join("config.ini");
+        let err = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .no_env()
+            .handle(&ConfigAction::Gen {
+                output: Some(out_path.clone()),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, ClapfigError::UnknownFormat { ref name, .. } if name == "ini"),
+            "expected UnknownFormat('ini'), got {err:?}"
+        );
+        assert!(!out_path.exists(), "no file may be written on error");
+    }
+
+    #[test]
+    fn set_explicit_path_unknown_extension_errors() {
+        // Persist targets follow the same explicit-path rule: an
+        // unclaimed extension is a hard error, not TOML-under-.ini.
+        let dir = TempDir::new().unwrap();
+        let err = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.ini")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "1".into(),
+                scope: None,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, ClapfigError::UnknownFormat { ref name, .. } if name == "ini"),
+            "expected UnknownFormat('ini'), got {err:?}"
+        );
+    }
+
+    // --- WS03/WS04 stub adapters: reachable inputs error, never panic ---
+
+    #[test]
+    fn enabled_stub_format_file_errors_instead_of_panicking() {
+        // Enabling a not-yet-implemented format and discovering a file
+        // in it yields the adapter's typed refusal wrapped as a parse
+        // error — a clean ClapfigError, not a todo-panic.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.yaml"), "port: 1\n").unwrap();
+        let err = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .formats(["toml", "yaml"])
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::ParseError { source, .. } => {
+                assert!(
+                    matches!(*source, crate::format::FormatError::Unsupported(_)),
+                    "expected the typed refusal, got {source:?}"
+                );
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gen_with_stub_preferred_format_errors_instead_of_panicking() {
+        let err = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .formats(["yaml"])
+            .no_env()
+            .handle(&ConfigAction::Gen { output: None })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClapfigError::Format(crate::format::FormatError::Unsupported(_))
+            ),
+            "expected Format(Unsupported), got {err:?}"
+        );
     }
 
     // --- schema-driven datetime coercion, end to end ---

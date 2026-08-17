@@ -162,13 +162,24 @@ pub enum ClapfigError {
     #[error(transparent)]
     Format(#[from] crate::format::FormatError),
 
-    /// The builder's `formats(...)` list names a format clapfig does not
-    /// ship an adapter for.
+    /// A format name or file extension resolves to no shipped adapter:
+    /// the builder's `formats(...)` list names an unknown format, or a
+    /// file name / explicit path (a persist target, `gen --output`)
+    /// carries an extension no adapter claims. Extensionless names are
+    /// not this error — they fall back to TOML (exact-name discovery,
+    /// explicit paths) or the preferred format (`gen --output`).
     #[error("Unknown format '{name}' — available formats: {}", available.join(", "))]
     UnknownFormat {
         name: String,
         available: Vec<String>,
     },
+
+    /// The builder's `formats(...)` list cannot form a usable registry:
+    /// it is empty (no preferred format exists for `config gen` or file
+    /// seeding) or repeats a format name (stem discovery would collect
+    /// the same file twice and misreport it as ambiguous).
+    #[error("Invalid formats list: {reason}")]
+    InvalidFormats { reason: String },
 
     /// Stem-based discovery found more than one same-stem config file in
     /// one directory (e.g. `myapp.toml` AND `myapp.yaml`). The spec pins

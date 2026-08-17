@@ -27,6 +27,12 @@ use crate::value::Value;
 /// If `content` is `None` (file doesn't exist yet), starts from the
 /// adapter's generated template so the new file carries doc comments.
 ///
+/// Schema/key validation failures are [`ClapfigError::KeyNotFound`] /
+/// [`ClapfigError::InvalidValue`]; adapter edit failures — including the
+/// typed [`UnsupportedByFormat`](crate::format::UnsupportedByFormat)
+/// refusal and path conflicts — propagate as [`ClapfigError::Format`],
+/// preserving the full [`FormatError`](crate::format::FormatError).
+///
 /// Returns the modified document string.
 pub fn set_in_document_runtime(
     adapter: &dyn FormatAdapter,
@@ -70,10 +76,7 @@ pub fn set_in_document_runtime(
                 value: &value,
             },
         )
-        .map_err(|e| ClapfigError::InvalidValue {
-            key: key.into(),
-            reason: e.detail(),
-        })
+        .map_err(ClapfigError::from)
 }
 
 /// Wrapper around [`set_in_document_runtime`] with file I/O: reads the file
@@ -144,7 +147,8 @@ fn lookup_leaf_type<'a>(
 ///
 /// If the key doesn't exist, returns the document unchanged.
 /// Navigates dotted key paths (e.g. `"database.pool_size"`). Comment
-/// preservation is per the adapter's declared edit capability.
+/// preservation is per the adapter's declared edit capability; adapter
+/// failures propagate as [`ClapfigError::Format`].
 ///
 /// Returns the modified document string.
 pub fn unset_in_document(
@@ -155,10 +159,7 @@ pub fn unset_in_document(
     let path = dotted_config_path(key);
     adapter
         .edit(content, FileEdit::Unset { path: &path })
-        .map_err(|e| ClapfigError::InvalidValue {
-            key: key.into(),
-            reason: e.detail(),
-        })
+        .map_err(ClapfigError::from)
 }
 
 /// I/O wrapper: reads file, removes the key, writes back.
@@ -278,15 +279,19 @@ mod tests {
         // Existing file has `database` as a scalar string; `config set
         // database.url x` would dereference into a non-table item, which
         // pre-fix would panic inside the TOML editor's IndexMut. The
-        // guard turns it into a clean InvalidValue.
+        // guard turns it into the adapter's typed edit failure, which
+        // propagates as ClapfigError::Format (never collapsed into
+        // InvalidValue — that variant is for schema/type validation).
         let content = "database = \"oops\"\n";
         let result = set_in_document(Some(content), "database.url", "pg://x");
         match result {
-            Err(ClapfigError::InvalidValue { key, reason }) => {
-                assert_eq!(key, "database.url");
-                assert!(reason.contains("path conflict"), "got: {reason}");
+            Err(ClapfigError::Format(crate::format::FormatError::Edit {
+                format, message, ..
+            })) => {
+                assert_eq!(format, "toml");
+                assert!(message.contains("path conflict"), "got: {message}");
             }
-            other => panic!("expected InvalidValue, got {other:?}"),
+            other => panic!("expected Format(Edit), got {other:?}"),
         }
     }
 

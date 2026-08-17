@@ -23,8 +23,10 @@ use super::{
 /// The TOML format behind the adapter contract.
 ///
 /// TOML is the baseline format: per ADR-0002's capability matrix it
-/// declares every operation with no known refusals, including lossless
-/// comment-preserving edits.
+/// declares every implemented operation with no known refusals, including
+/// lossless comment-preserving edits. The one gap is
+/// [`span_index`](TomlAdapter::span_index) — undeclared and refused typed
+/// until the provenance epic builds the index.
 pub struct TomlAdapter;
 
 impl FormatAdapter for TomlAdapter {
@@ -37,6 +39,8 @@ impl FormatAdapter for TomlAdapter {
     }
 
     fn capabilities(&self) -> &'static [Operation] {
+        // The provenance epic adds Operation::SpanIndex when it
+        // implements span_index.
         &[
             Operation::Parse,
             Operation::Template,
@@ -45,7 +49,6 @@ impl FormatAdapter for TomlAdapter {
             Operation::EditCreateKey,
             Operation::EditCreateFile,
             Operation::EditUnset,
-            Operation::SpanIndex,
         ]
     }
 
@@ -131,7 +134,12 @@ impl FormatAdapter for TomlAdapter {
     }
 
     fn span_index(&self, _text: &str) -> Result<SpanIndex, FormatError> {
-        todo!("provenance epic: build the path → span index from parser spans")
+        // Provenance epic: build the path → span index from parser spans.
+        Err(UnsupportedByFormat {
+            format: self.name(),
+            operation: Operation::SpanIndex,
+        }
+        .into())
     }
 }
 
