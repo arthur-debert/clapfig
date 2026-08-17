@@ -78,9 +78,10 @@ Key points:
   them for the final typed deserialize, so value-shaping serde attributes
   (`#[serde(deserialize_with = ...)]` etc.) apply as usual. Field *naming*
   is shared with the schema: `#[serde(rename = "...")]` on a field renames
-  the config key too (the schema follows serde's spelling), while
-  struct-level `#[serde(rename_all = ...)]` is rejected at compile time —
-  rename fields individually.
+  the config key too (the schema follows serde's spelling; the directional
+  `rename(deserialize = "...")` form contributes its deserialize name),
+  while struct-level `#[serde(rename_all = ...)]` — directional included —
+  is rejected at compile time — rename fields individually.
 
 ## Load it
 

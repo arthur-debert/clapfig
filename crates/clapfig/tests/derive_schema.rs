@@ -380,6 +380,54 @@ fn matching_clapfig_serde_rename_pair_is_accepted() {
     assert_eq!(s.fields[0].name, "log-level");
 }
 
+// -- serde directional `rename(deserialize = ..., serialize = ...)` ---------
+//
+// The schema follows the deserialize spelling — that's the side the merged
+// config flows through. A directional rename that fell through to the Rust
+// identifier would leave strict validation and the typed deserialize
+// disagreeing on the key.
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct DirectionalRenameConfig {
+    #[serde(rename(deserialize = "listen-port", serialize = "listen_port"))]
+    #[clapfig(default = 8080)]
+    listen_port: i64,
+}
+
+#[test]
+fn serde_directional_rename_uses_deserialize_spelling() {
+    let s = DirectionalRenameConfig::schema_static();
+    assert_eq!(s.fields[0].name, "listen-port");
+}
+
+#[test]
+fn serde_directional_rename_loads_end_to_end() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("test.toml"), "listen-port = 9090\n").unwrap();
+    let cfg: DirectionalRenameConfig = Clapfig::schema_builder::<DirectionalRenameConfig>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.listen_port, 9090);
+}
+
+// A serialize-only directional rename leaves the deserialize side on the
+// Rust identifier, so the schema keeps it too.
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct SerializeOnlyRenameConfig {
+    #[serde(rename(serialize = "listenPort"))]
+    #[clapfig(default = 8080)]
+    listen_port: i64,
+}
+
+#[test]
+fn serde_serialize_only_rename_keeps_rust_identifier() {
+    let s = SerializeOnlyRenameConfig::schema_static();
+    assert_eq!(s.fields[0].name, "listen_port");
+}
+
 // -- Struct-level attrs: name override and per-node strict -----------------
 
 #[derive(Schema, Serialize, Deserialize, Debug)]
@@ -582,6 +630,37 @@ enum Mixed {
 fn unit_enum_variant_rename_overrides_rename_all() {
     let s = Mixed::schema_static();
     assert_eq!(s.enum_variants, &["alpha_beta", "GAMMA"]);
+}
+
+// Directional `rename_all(deserialize = ...)` on a unit-only enum applies
+// its deserialize rule to the schema's variant names (the serialize rule is
+// irrelevant to config loading).
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all(deserialize = "lowercase", serialize = "UPPERCASE"))]
+enum DirectionalMode {
+    Fast,
+    Slow,
+}
+
+#[test]
+fn unit_enum_directional_rename_all_uses_deserialize_rule() {
+    let s = DirectionalMode::schema_static();
+    assert_eq!(s.enum_variants, &["fast", "slow"]);
+}
+
+// Directional per-variant `rename(deserialize = ...)` contributes its
+// deserialize spelling, like the name-value form.
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq, Eq)]
+enum DirectionalVariant {
+    #[serde(rename(deserialize = "quick", serialize = "QUICK"))]
+    Fast,
+    Slow,
+}
+
+#[test]
+fn unit_enum_directional_variant_rename_uses_deserialize_spelling() {
+    let s = DirectionalVariant::schema_static();
+    assert_eq!(s.enum_variants, &["quick", "Slow"]);
 }
 
 // Acronym runs in variant names render the serde way: consecutive
