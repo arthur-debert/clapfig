@@ -35,7 +35,7 @@
 //!     .build();
 //! ```
 
-use toml::Value;
+use crate::value::Value;
 
 /// Owned, runtime-defined schema for a config node.
 ///
@@ -200,7 +200,8 @@ impl Field {
         FieldBuilder::new(LeafType::Bool)
     }
 
-    /// Start a leaf builder for a TOML datetime value.
+    /// Start a leaf builder for a datetime value (TOML's four lexical
+    /// forms).
     pub fn datetime() -> FieldBuilder {
         FieldBuilder::new(LeafType::DateTime)
     }
@@ -217,7 +218,7 @@ impl Field {
 
     /// Start a leaf builder constrained to one of `values`.
     ///
-    /// Each `value` must be representable as a TOML primitive (string,
+    /// Each `value` must be representable as a baseline primitive (string,
     /// integer, float, or bool). At load time, a merged value not in this
     /// set produces [`ClapfigError::InvalidValue`](crate::error::ClapfigError::InvalidValue).
     pub fn enum_of<V: Into<Value>, I: IntoIterator<Item = V>>(values: I) -> FieldBuilder {
@@ -225,7 +226,7 @@ impl Field {
         FieldBuilder::new(LeafType::Enum { values })
     }
 
-    /// Start a leaf builder that accepts any TOML value.
+    /// Start a leaf builder that accepts any config value.
     ///
     /// Escape hatch for keys whose value can take multiple incompatible
     /// shapes (e.g. a bare string *or* an array, like serde's
@@ -263,18 +264,21 @@ pub enum LeafType {
     Integer,
     Float,
     Bool,
-    /// TOML datetime (offset, local-datetime, local-date, local-time).
+    /// Datetime in one of the baseline's four lexical forms (offset
+    /// date-time, local date-time, local date, local time). String values
+    /// matching one of the forms are coerced during finalization —
+    /// schema-driven coercion, per ADR-0001.
     DateTime,
     /// Homogeneous array. The boxed `LeafType` is the element type.
     Array(Box<LeafType>),
     /// String-keyed map with homogeneous values. The boxed `LeafType` is the
     /// value type.
     Map(Box<LeafType>),
-    /// Constrained value: must equal one of the listed TOML values.
+    /// Constrained value: must equal one of the listed values.
     Enum {
         values: Vec<Value>,
     },
-    /// Accept any TOML value (scalar, array, table). Clapfig performs no
+    /// Accept any config value (scalar, array, map). Clapfig performs no
     /// shape check; the caller is responsible for further validation,
     /// typically via `serde` in a `post_validate` hook. Used for keys
     /// whose value can take multiple incompatible shapes on the same
@@ -298,7 +302,7 @@ impl LeafType {
         }
     }
 
-    /// Check whether a `toml::Value` is shape-compatible with this leaf type.
+    /// Check whether a [`Value`] is shape-compatible with this leaf type.
     ///
     /// Containers (`Array`, `Map`) recurse into their elements. `Enum` checks
     /// literal equality against the allowed-value set. Returns `Ok(())` on
@@ -317,7 +321,7 @@ impl LeafType {
                 }
                 Ok(())
             }
-            (LeafType::Map(elem), Value::Table(table)) => {
+            (LeafType::Map(elem), Value::Map(table)) => {
                 for (k, v) in table {
                     elem.check(v).map_err(|e| format!("map[{k}]: {e}"))?;
                 }
@@ -429,7 +433,7 @@ fn validate_field_name(schema: &Schema, name: &str) {
     );
 }
 
-/// Pretty-print a `toml::Value` for error messages.
+/// Pretty-print a [`Value`] for error messages.
 fn format_toml_value(v: &Value) -> String {
     match v {
         Value::String(s) => format!("\"{s}\""),
@@ -438,7 +442,7 @@ fn format_toml_value(v: &Value) -> String {
         Value::Boolean(b) => b.to_string(),
         Value::Datetime(d) => d.to_string(),
         Value::Array(_) => "<array>".into(),
-        Value::Table(_) => "<table>".into(),
+        Value::Map(_) => "<table>".into(),
     }
 }
 
@@ -450,7 +454,7 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Boolean(_) => "bool",
         Value::Datetime(_) => "datetime",
         Value::Array(_) => "array",
-        Value::Table(_) => "table",
+        Value::Map(_) => "table",
     }
 }
 
@@ -550,15 +554,15 @@ mod tests {
         assert!(
             v.check(&Value::Array(vec![
                 Value::String("warn".into()),
-                Value::Table({
-                    let mut t = toml::Table::new();
+                Value::Map({
+                    let mut t = crate::value::Map::new();
                     t.insert("max_columns".into(), Value::Integer(80));
                     t
                 }),
             ]))
             .is_ok()
         );
-        assert!(v.check(&Value::Table(toml::Table::new())).is_ok());
+        assert!(v.check(&Value::Map(crate::value::Map::new())).is_ok());
     }
 
     #[test]
@@ -627,12 +631,12 @@ mod tests {
     #[test]
     fn leaf_type_check_map_recurses() {
         let map = LeafType::Map(Box::new(LeafType::Integer));
-        let mut t = toml::map::Map::new();
+        let mut t = crate::value::Map::new();
         t.insert("a".into(), Value::Integer(1));
-        assert!(map.check(&Value::Table(t.clone())).is_ok());
+        assert!(map.check(&Value::Map(t.clone())).is_ok());
 
         t.insert("b".into(), Value::String("oops".into()));
-        let err = map.check(&Value::Table(t)).unwrap_err();
+        let err = map.check(&Value::Map(t)).unwrap_err();
         assert!(err.contains("map[b]"));
     }
 }

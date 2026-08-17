@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use toml::{Table, Value};
+use crate::value::{Map, Value};
 
 /// Two distinct keys in the same table collapsed to the same normalized form.
 /// Surfaced from [`normalize_table`] and wrapped at the call site with the
@@ -59,11 +59,11 @@ pub fn normalize_key(key: &str) -> String {
 /// `Err(KeyCollision)` with the table's dotted section path and the
 /// offending source keys. On success, all dash-bearing keys have been
 /// rewritten with `-` → `_`.
-pub fn normalize_table(table: &mut Table) -> Result<(), KeyCollision> {
+pub fn normalize_table(table: &mut Map) -> Result<(), KeyCollision> {
     normalize_at(table, "")
 }
 
-fn normalize_at(table: &mut Table, section: &str) -> Result<(), KeyCollision> {
+fn normalize_at(table: &mut Map, section: &str) -> Result<(), KeyCollision> {
     // First pass: detect collisions before mutating anything. BTreeMap so
     // the iteration that picks an offending bucket is deterministic.
     let mut buckets: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -100,7 +100,7 @@ fn normalize_at(table: &mut Table, section: &str) -> Result<(), KeyCollision> {
 
 fn normalize_value(value: &mut Value, section: &str) -> Result<(), KeyCollision> {
     match value {
-        Value::Table(t) => normalize_at(t, section),
+        Value::Map(t) => normalize_at(t, section),
         Value::Array(arr) => {
             for (i, item) in arr.iter_mut().enumerate() {
                 let nested = format!("{section}[{i}]");
@@ -116,8 +116,8 @@ fn normalize_value(value: &mut Value, section: &str) -> Result<(), KeyCollision>
 mod tests {
     use super::*;
 
-    fn table(toml_str: &str) -> Table {
-        toml_str.parse::<Table>().unwrap()
+    fn table(toml_str: &str) -> Map {
+        crate::fixtures::test::parse_toml(toml_str)
     }
 
     #[test]
@@ -167,7 +167,7 @@ mod tests {
             "#,
         );
         normalize_table(&mut t).unwrap();
-        let db = t["my_database"].as_table().unwrap();
+        let db = t["my_database"].as_map().unwrap();
         assert_eq!(db["pool_size"].as_integer().unwrap(), 20);
     }
 
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn normalize_table_empty_is_noop() {
-        let mut t = Table::new();
+        let mut t = Map::new();
         normalize_table(&mut t).unwrap();
         assert!(t.is_empty());
     }

@@ -17,10 +17,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use toml::{Table, Value};
-
 use crate::env;
 use crate::error::ClapfigError;
+use crate::format::{self, FormatRegistry};
 use crate::merge::deep_merge;
 use crate::normalize::{normalize_key, normalize_table};
 use crate::overrides;
@@ -28,6 +27,7 @@ use crate::spec::ConfigSpec;
 use crate::strict::{CollectedUnknown, StrictnessOverrides, UnknownKeyHook};
 use crate::types::Layer;
 use crate::validate::ValidateContext;
+use crate::value::{Map, Value};
 
 /// All pre-loaded data needed to resolve a config. No I/O happens here.
 ///
@@ -37,6 +37,11 @@ pub(crate) struct ResolveInput<'a, S: ConfigSpec> {
     /// Schema-walking strategy: validate unknown keys, finalize the merged
     /// table into the spec's `Output`.
     pub spec: &'a S,
+    /// Enabled format adapters — the routing seam every file parse goes
+    /// through. Per-file adapter selection is by extension; files whose
+    /// extension no enabled adapter claims fall back to the preferred
+    /// (first-registered) adapter.
+    pub registry: &'a FormatRegistry,
     /// File contents in precedence order: first = lowest priority, last = highest.
     pub files: Vec<(PathBuf, String)>,
     /// Raw environment variable pairs (pass `std::env::vars().collect()` or synthetic data).
@@ -73,9 +78,9 @@ pub(crate) struct ResolveInput<'a, S: ConfigSpec> {
 /// `-` → `_` rule as [`normalize_table`]. Used so CLI/URL-supplied keys land
 /// in the same shape as keys coming from normalized config files.
 fn normalize_override_keys(
-    entries: &[(String, toml::Value)],
+    entries: &[(String, Value)],
     normalize_keys: bool,
-) -> Vec<(String, toml::Value)> {
+) -> Vec<(String, Value)> {
     if !normalize_keys {
         return entries.to_vec();
     }
@@ -134,14 +139,36 @@ pub(crate) fn resolve<S: ConfigSpec>(
     // normalized keys are checked in the same form they will reach the merge.
     let mut collected_unknowns: Vec<CollectedUnknown> = Vec::new();
     let files_table = {
-        let mut t = Table::new();
+        let mut t = Map::new();
         for (path, content) in &input.files {
-            let mut table: Table =
-                toml::from_str(content).map_err(|e| ClapfigError::ParseError {
+            let adapter = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .and_then(|ext| input.registry.by_extension(ext))
+                .or_else(|| input.registry.preferred())
+                .ok_or_else(|| ClapfigError::UnknownFormat {
+                    name: path.display().to_string(),
+                    available: format::builtin_names(),
+                })?;
+            let parsed = adapter
+                .parse(content)
+                .map_err(|e| ClapfigError::ParseError {
                     path: path.clone(),
                     source: Box::new(e),
                     source_text: Some(Arc::from(content.as_str())),
                 })?;
+            let mut table = match parsed {
+                Value::Map(map) => map,
+                other => {
+                    return Err(ClapfigError::InvalidValue {
+                        key: path.display().to_string(),
+                        reason: format!(
+                            "config documents must be maps at the root, got {}",
+                            other.type_str()
+                        ),
+                    });
+                }
+            };
             if input.normalize_keys {
                 normalize_table(&mut table).map_err(|c| ClapfigError::NormalizedKeyCollision {
                     path: path.clone(),
@@ -220,7 +247,7 @@ pub(crate) fn resolve<S: ConfigSpec>(
     let order = input.layer_order.as_deref().unwrap_or(&default_order);
 
     // Merge layers in the specified order (first = lowest priority)
-    let mut merged = Table::new();
+    let mut merged = Map::new();
     for layer in order {
         let table = match layer {
             Layer::Files => Some(files_table.clone()),
@@ -252,9 +279,20 @@ mod tests {
         DynamicSpec::new(test_schema())
     }
 
+    fn toml_only_registry() -> &'static FormatRegistry {
+        use std::sync::OnceLock;
+        static REGISTRY: OnceLock<FormatRegistry> = OnceLock::new();
+        REGISTRY.get_or_init(|| {
+            let mut r = FormatRegistry::new();
+            r.register(Box::new(crate::format::TomlAdapter));
+            r
+        })
+    }
+
     fn empty_input<S: ConfigSpec>(spec: &S) -> ResolveInput<'_, S> {
         ResolveInput {
             spec,
+            registry: toml_only_registry(),
             files: vec![],
             env_vars: vec![],
             env_prefix: None,
@@ -269,7 +307,7 @@ mod tests {
         }
     }
 
-    fn get<'a>(table: &'a Table, dotted: &str) -> Option<&'a Value> {
+    fn get<'a>(table: &'a Map, dotted: &str) -> Option<&'a Value> {
         crate::ops::table_get(table, dotted)
     }
 

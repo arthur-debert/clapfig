@@ -27,6 +27,10 @@ pub mod json;
 pub mod toml;
 pub mod yaml;
 
+pub use json::JsonAdapter;
+pub use toml::TomlAdapter;
+pub use yaml::YamlAdapter;
+
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -110,6 +114,9 @@ pub enum FormatError {
         /// Human-readable description; adapters name the offending key
         /// where the mapping table requires it.
         message: String,
+        /// Byte range of the offending source text, when the underlying
+        /// parser reports one. Renderers use it to draw snippets/carets.
+        span: Option<Span>,
     },
 
     /// A [`Value`] tree contains something this format cannot serialize
@@ -121,6 +128,40 @@ pub enum FormatError {
         /// Human-readable description naming the offending key/value.
         message: String,
     },
+
+    /// A declared edit operation failed on the given source text (e.g. a
+    /// path conflict where an existing scalar sits where the edit needs a
+    /// table).
+    #[error("failed to edit {format}: {message}")]
+    Edit {
+        /// The editing format's name.
+        format: &'static str,
+        /// Human-readable description naming the conflicting path.
+        message: String,
+    },
+}
+
+impl FormatError {
+    /// The bare human-readable detail carried by this error, without the
+    /// `failed to <operation> <format>:` framing — what rendering call
+    /// sites embed into their own messages (e.g. the parse-error
+    /// snippet renderer's labels).
+    pub fn detail(&self) -> String {
+        match self {
+            FormatError::Unsupported(u) => u.to_string(),
+            FormatError::Parse { message, .. }
+            | FormatError::Serialize { message, .. }
+            | FormatError::Edit { message, .. } => message.clone(),
+        }
+    }
+
+    /// The source-text byte range for a parse failure, when reported.
+    pub fn parse_span(&self) -> Option<Span> {
+        match self {
+            FormatError::Parse { span, .. } => *span,
+            _ => None,
+        }
+    }
 }
 
 /// One step of a [`ConfigPath`]: a map key or an array index.
@@ -249,28 +290,70 @@ impl SpanIndex {
     }
 }
 
+/// Which capability-matrix row a [`FileEdit::Set`] request falls under.
+///
+/// ADR-0002's matrix deliberately keeps three distinct set-family rows —
+/// replacing an existing value ([`Operation::EditSet`]), creating a
+/// missing key path ([`Operation::EditCreateKey`]), and creating a
+/// missing file ([`Operation::EditCreateFile`]) — so a format can
+/// honestly declare, and refuse, each half separately. Only the caller
+/// knows which row applies (it depends on whether the file and the
+/// target path exist), so the classification travels with the request
+/// and refusals name the operation actually attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetTarget {
+    /// The path already holds a value — this set replaces it
+    /// ([`Operation::EditSet`]).
+    ExistingValue,
+    /// The file exists but the path does not — this set creates the key
+    /// path ([`Operation::EditCreateKey`]).
+    MissingKey,
+    /// The file itself did not exist — this set lands in a
+    /// template-seeded document ([`Operation::EditCreateFile`]).
+    MissingFile,
+}
+
 /// One edit request against an existing config file's source text.
 ///
 /// The variants deliberately cover only what the capability matrix rows
-/// express: setting (which replaces an existing value or creates a missing
-/// path — [`Operation::EditSet`] vs [`Operation::EditCreateKey`] declare
-/// which halves a format supports) and unsetting. Creating a missing file
-/// is [`FormatAdapter::template`] plus a set — no separate entry point.
+/// express: setting (whose [`SetTarget`] names which of the three
+/// set-family rows the request falls under) and unsetting. Creating a
+/// missing file is [`FormatAdapter::template`] plus a set carrying
+/// [`SetTarget::MissingFile`] — no separate entry point.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileEdit<'a> {
     /// Set the value at a path, replacing an existing value or creating
-    /// the path.
+    /// the path, per `target`.
     Set {
         /// Structured path of the target node.
         path: &'a ConfigPath,
         /// The value to write.
         value: &'a Value,
+        /// The capability-matrix row this set falls under, classified by
+        /// the caller from whether the file and the path exist.
+        target: SetTarget,
     },
     /// Remove the key at a path.
     Unset {
         /// Structured path of the target node.
         path: &'a ConfigPath,
     },
+}
+
+impl FileEdit<'_> {
+    /// The capability-matrix row this edit request falls under (`Set` →
+    /// its [`SetTarget`]'s operation, `Unset` → [`Operation::EditUnset`]),
+    /// for refusal messages and capability checks.
+    pub fn operation(&self) -> Operation {
+        match self {
+            FileEdit::Set { target, .. } => match target {
+                SetTarget::ExistingValue => Operation::EditSet,
+                SetTarget::MissingKey => Operation::EditCreateKey,
+                SetTarget::MissingFile => Operation::EditCreateFile,
+            },
+            FileEdit::Unset { .. } => Operation::EditUnset,
+        }
+    }
 }
 
 /// A serialization format behind the adapter contract.
@@ -398,6 +481,39 @@ impl FormatRegistry {
     }
 }
 
+/// Construct the built-in adapter for a canonical format name, if the name
+/// is known. The name set matches [`FormatAdapter::name`] of the shipped
+/// adapters: `"toml"`, `"yaml"`, `"json"`.
+pub(crate) fn builtin_adapter(name: &str) -> Option<Box<dyn FormatAdapter>> {
+    match name {
+        "toml" => Some(Box::new(toml::TomlAdapter)),
+        "yaml" => Some(Box::new(yaml::YamlAdapter)),
+        "json" => Some(Box::new(json::JsonAdapter)),
+        _ => None,
+    }
+}
+
+/// The canonical names of every built-in adapter, for error messages.
+pub(crate) fn builtin_names() -> Vec<String> {
+    ["toml", "yaml", "json"].map(String::from).to_vec()
+}
+
+/// The built-in adapter claiming `extension` (matched case-insensitively,
+/// without the dot), independent of any enabled-formats list. This is the
+/// **explicit-path** selection rule: persist scopes, `--output` targets,
+/// and direct file arguments pick their adapter by extension even for
+/// formats the discovery list has not enabled.
+pub(crate) fn builtin_adapter_for_extension(extension: &str) -> Option<Box<dyn FormatAdapter>> {
+    let extension = extension.to_ascii_lowercase();
+    ["toml", "yaml", "json"].iter().find_map(|name| {
+        let adapter = builtin_adapter(name).expect("names enumerate the built-in set");
+        adapter
+            .extensions()
+            .contains(&extension.as_str())
+            .then_some(adapter)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,8 +546,8 @@ mod tests {
             Err(self.require(Operation::Template).unwrap_err().into())
         }
 
-        fn edit(&self, _source: &str, _edit: FileEdit<'_>) -> Result<String, FormatError> {
-            Err(self.require(Operation::EditSet).unwrap_err().into())
+        fn edit(&self, _source: &str, edit: FileEdit<'_>) -> Result<String, FormatError> {
+            Err(self.require(edit.operation()).unwrap_err().into())
         }
 
         fn span_index(&self, _text: &str) -> Result<SpanIndex, FormatError> {
@@ -544,38 +660,140 @@ mod tests {
     }
 
     #[test]
+    fn builtin_extension_lookup_selects_by_extension() {
+        // Explicit-path rule: the extension picks the adapter, whatever
+        // the enabled list says.
+        assert_eq!(
+            builtin_adapter_for_extension("toml").unwrap().name(),
+            "toml"
+        );
+        assert_eq!(
+            builtin_adapter_for_extension("TOML").unwrap().name(),
+            "toml"
+        );
+        assert_eq!(
+            builtin_adapter_for_extension("yaml").unwrap().name(),
+            "yaml"
+        );
+        assert_eq!(builtin_adapter_for_extension("yml").unwrap().name(), "yaml");
+        assert_eq!(
+            builtin_adapter_for_extension("json").unwrap().name(),
+            "json"
+        );
+        assert!(builtin_adapter_for_extension("ini").is_none());
+    }
+
+    #[test]
+    fn builtin_adapter_lookup_by_canonical_name() {
+        assert_eq!(builtin_adapter("toml").unwrap().name(), "toml");
+        assert_eq!(builtin_adapter("yaml").unwrap().name(), "yaml");
+        assert_eq!(builtin_adapter("json").unwrap().name(), "json");
+        assert!(builtin_adapter("ini").is_none());
+        assert_eq!(builtin_names(), ["toml", "yaml", "json"]);
+    }
+
+    #[test]
     fn registry_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<FormatRegistry>();
         assert_send_sync::<Box<dyn FormatAdapter>>();
     }
 
+    const ALL_OPERATIONS: [Operation; 8] = [
+        Operation::Parse,
+        Operation::Template,
+        Operation::Serialize,
+        Operation::EditSet,
+        Operation::EditCreateKey,
+        Operation::EditCreateFile,
+        Operation::EditUnset,
+        Operation::SpanIndex,
+    ];
+
     #[test]
-    fn stub_adapters_declare_their_matrix_rows() {
-        // The ADR-0002 matrix has no refusal rows for TOML and JSON, and
-        // YAML's known refusals are shape-level (inside declared edit
-        // operations), so all three declare every operation.
-        for adapter in [
-            &toml::TomlAdapter as &dyn FormatAdapter,
-            &yaml::YamlAdapter,
-            &json::JsonAdapter,
-        ] {
-            for operation in [
-                Operation::Parse,
-                Operation::Template,
-                Operation::Serialize,
-                Operation::EditSet,
-                Operation::EditCreateKey,
-                Operation::EditCreateFile,
-                Operation::EditUnset,
-                Operation::SpanIndex,
-            ] {
+    fn toml_adapter_declares_its_matrix_rows() {
+        // The ADR-0002 matrix has no refusal rows for TOML, so the shipped
+        // adapter declares every implemented operation. SpanIndex stays
+        // undeclared (and refuses typed) until the provenance epic builds
+        // the index.
+        for operation in ALL_OPERATIONS {
+            if operation == Operation::SpanIndex {
+                assert!(!toml::TomlAdapter.supports(operation));
+                assert!(matches!(
+                    toml::TomlAdapter.span_index("").unwrap_err(),
+                    FormatError::Unsupported(_)
+                ));
+            } else {
                 assert!(
-                    adapter.supports(operation),
-                    "{} should declare {operation}",
+                    toml::TomlAdapter.supports(operation),
+                    "toml should declare {operation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stub_adapters_declare_nothing_and_refuse_typed() {
+        // Until WS03/WS04 implement them, the YAML/JSON adapters carry
+        // contract data only: capabilities are empty and every operation
+        // returns the typed refusal — reachable inputs (an enabled
+        // `app.yaml`, `gen --output x.json`, a persist edit) get a clean
+        // `ClapfigError`, never a panic. The workstreams flip the matrix
+        // rows on as they land the bodies.
+        for adapter in [&yaml::YamlAdapter as &dyn FormatAdapter, &json::JsonAdapter] {
+            for operation in ALL_OPERATIONS {
+                assert!(
+                    !adapter.supports(operation),
+                    "{} must not declare {operation} before its workstream lands",
                     adapter.name()
                 );
             }
+            let name = adapter.name();
+            let unsupported =
+                |result: Result<(), FormatError>, operation: Operation| match result.unwrap_err() {
+                    FormatError::Unsupported(u) => {
+                        assert_eq!(u.format, name);
+                        assert_eq!(u.operation, operation);
+                    }
+                    other => panic!("{name} must refuse typed, got {other:?}"),
+                };
+            unsupported(adapter.parse("x = 1").map(drop), Operation::Parse);
+            unsupported(
+                adapter.template(&Schema::object("T").build()).map(drop),
+                Operation::Template,
+            );
+            unsupported(
+                adapter.serialize(&Value::Boolean(true)).map(drop),
+                Operation::Serialize,
+            );
+            let path = ConfigPath::new().key("port");
+            // Each set-family matrix row refuses under its own name: the
+            // request's SetTarget classifies replace vs create-key vs
+            // create-file, and the refusal reports that operation.
+            for (target, operation) in [
+                (SetTarget::ExistingValue, Operation::EditSet),
+                (SetTarget::MissingKey, Operation::EditCreateKey),
+                (SetTarget::MissingFile, Operation::EditCreateFile),
+            ] {
+                unsupported(
+                    adapter
+                        .edit(
+                            "",
+                            FileEdit::Set {
+                                path: &path,
+                                value: &Value::Integer(1),
+                                target,
+                            },
+                        )
+                        .map(drop),
+                    operation,
+                );
+            }
+            unsupported(
+                adapter.edit("", FileEdit::Unset { path: &path }).map(drop),
+                Operation::EditUnset,
+            );
+            unsupported(adapter.span_index("").map(drop), Operation::SpanIndex);
         }
     }
 

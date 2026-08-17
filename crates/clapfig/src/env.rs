@@ -1,12 +1,13 @@
-//! Convert environment variables into a `toml::Table` for merging into config.
+//! Convert environment variables into a config value [`Map`] for merging
+//! into config.
 //!
 //! Env vars matching `{PREFIX}__*` are collected, with `__` as the nesting separator
 //! and segments lowercased to match Rust field names. Values are parsed heuristically
 //! (bool > integer > float > string). Takes an iterator for testability.
 
-use toml::{Table, Value};
+use crate::value::{Map, Value};
 
-/// Build a `toml::Table` from environment variables matching `{PREFIX}__*`.
+/// Build a config value [`Map`] from environment variables matching `{PREFIX}__*`.
 ///
 /// Double underscore `__` separates nesting levels.
 /// Single `_` within a segment is literal (part of the field name).
@@ -15,9 +16,9 @@ use toml::{Table, Value};
 /// Values are parsed heuristically: bool > integer > float > string.
 ///
 /// Takes an iterator so tests can pass synthetic data instead of `std::env::vars()`.
-pub fn env_to_table(prefix: &str, vars: impl IntoIterator<Item = (String, String)>) -> Table {
+pub fn env_to_table(prefix: &str, vars: impl IntoIterator<Item = (String, String)>) -> Map {
     let needle = format!("{prefix}__");
-    let mut table = Table::new();
+    let mut table = Map::new();
 
     for (key, value) in vars {
         let Some(rest) = key.strip_prefix(&needle) else {
@@ -34,7 +35,7 @@ pub fn env_to_table(prefix: &str, vars: impl IntoIterator<Item = (String, String
     table
 }
 
-fn insert_nested(table: &mut Table, segments: &[&str], value: Value) {
+fn insert_nested(table: &mut Map, segments: &[&str], value: Value) {
     debug_assert!(!segments.is_empty());
 
     let key = segments[0].to_lowercase();
@@ -42,21 +43,19 @@ fn insert_nested(table: &mut Table, segments: &[&str], value: Value) {
     if segments.len() == 1 {
         table.insert(key, value);
     } else {
-        let sub = table
-            .entry(&key)
-            .or_insert_with(|| Value::Table(Table::new()));
+        let sub = table.entry(key).or_insert_with(|| Value::Map(Map::new()));
         // If a flat var (e.g. MYAPP__DATABASE=x) already set this key to a
-        // non-table, replace it — the more specific nested key wins.
-        if !sub.is_table() {
-            *sub = Value::Table(Table::new());
+        // non-map, replace it — the more specific nested key wins.
+        if !matches!(sub, Value::Map(_)) {
+            *sub = Value::Map(Map::new());
         }
-        if let Value::Table(sub_table) = sub {
-            insert_nested(sub_table, &segments[1..], value);
+        if let Value::Map(sub_map) = sub {
+            insert_nested(sub_map, &segments[1..], value);
         }
     }
 }
 
-/// Parse a string value into a typed TOML value.
+/// Parse a string value into a typed config value.
 /// Tries: bool → integer → float → string.
 pub(crate) fn parse_env_value(s: &str) -> Value {
     if s.eq_ignore_ascii_case("true") {
@@ -98,7 +97,7 @@ mod tests {
     #[test]
     fn nested_key() {
         let table = env_to_table("MYAPP", vars(&[("MYAPP__DATABASE__URL", "postgres://db")]));
-        let db = table["database"].as_table().unwrap();
+        let db = table["database"].as_map().unwrap();
         assert_eq!(db["url"].as_str().unwrap(), "postgres://db");
     }
 
@@ -175,7 +174,7 @@ mod tests {
         );
         assert_eq!(table["host"].as_str().unwrap(), "0.0.0.0");
         assert_eq!(table["port"].as_integer().unwrap(), 3000);
-        let db = table["database"].as_table().unwrap();
+        let db = table["database"].as_map().unwrap();
         assert_eq!(db["url"].as_str().unwrap(), "pg://");
         assert_eq!(db["pool_size"].as_integer().unwrap(), 20);
     }
@@ -191,7 +190,7 @@ mod tests {
                 ("MYAPP__DATABASE__URL", "pg://"),
             ]),
         );
-        let db = table["database"].as_table().unwrap();
+        let db = table["database"].as_map().unwrap();
         assert_eq!(db["url"].as_str().unwrap(), "pg://");
     }
 

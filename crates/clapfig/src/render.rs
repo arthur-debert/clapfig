@@ -94,7 +94,7 @@ fn render_unknown_keys_plain(infos: &[crate::error::UnknownKeyInfo]) -> String {
 
 fn render_parse_error_plain(
     path: &std::path::Path,
-    source: &toml::de::Error,
+    source: &crate::format::FormatError,
     source_text: Option<&str>,
 ) -> String {
     use std::fmt::Write;
@@ -103,7 +103,7 @@ fn render_parse_error_plain(
         path.display()
     );
 
-    if let Some(span) = source.span()
+    if let Some(span) = source.parse_span()
         && let Some(src) = source_text
     {
         let (line, col) = byte_offset_to_line_col(src, span.start);
@@ -119,7 +119,7 @@ fn render_parse_error_plain(
         }
     }
 
-    let _ = write!(out, "\n\n{}", source.message());
+    let _ = write!(out, "\n\n{}", source.detail());
     out
 }
 
@@ -263,11 +263,11 @@ fn build_diagnostic(err: &ClapfigError) -> RichDiagnostic {
             let Some(src) = source_text.as_deref() else {
                 return RichDiagnostic::Plain(render_plain(err));
             };
-            let span = match source.span() {
+            let span = match source.parse_span() {
                 Some(s) => s,
                 None => return RichDiagnostic::Plain(render_plain(err)),
             };
-            let labels = vec![LabeledSpan::at(span.clone(), source.message().to_string())];
+            let labels = vec![LabeledSpan::at(span.start..span.end, source.detail())];
             RichDiagnostic::WithSource {
                 message: "failed to parse config file".to_string(),
                 labels,

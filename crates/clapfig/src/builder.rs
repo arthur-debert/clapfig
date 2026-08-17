@@ -8,7 +8,7 @@
 //!   `#[derive(clapfig::Schema)]`, and `load()` returns a typed `C`.
 //! - [`Clapfig::runtime(schema)`](Clapfig::runtime) — the runtime path: the
 //!   schema is an owned [`runtime::Schema`](crate::runtime::Schema) built at
-//!   run time, and `load()` returns a `toml::Table`.
+//!   run time, and `load()` returns a value [`Map`](crate::value::Map).
 //!
 //! Both produce builders with the same surface — `app_name`, `search_paths`,
 //! `env_prefix`, `cli_override`, `post_validate`, `load`, `handle` — backed
@@ -27,8 +27,8 @@ impl Clapfig {
     /// Returns a [`RuntimeBuilder`](crate::RuntimeBuilder) with the same
     /// surface as [`Self::schema_builder`] — `app_name`, `search_paths`,
     /// `env_prefix`, `cli_override`, `post_validate`, `load`, `handle`,
-    /// `build_resolver`, etc. — but produces a `toml::Table` rather than a
-    /// typed `C`.
+    /// `build_resolver`, etc. — but produces a value
+    /// [`Map`](crate::value::Map) rather than a typed `C`.
     ///
     /// # Example
     ///
@@ -39,7 +39,7 @@ impl Clapfig {
     ///     .field("port", Field::integer().default(8080i64))
     ///     .build();
     ///
-    /// let table: toml::Table = Clapfig::runtime(schema)
+    /// let table: clapfig::value::Map = Clapfig::runtime(schema)
     ///     .app_name("myapp")
     ///     .load()?;
     /// ```

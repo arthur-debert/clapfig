@@ -753,7 +753,7 @@ struct DateTimeDefault {
     /// `ValueStatic::Datetime`, not `ValueStatic::String`. Otherwise the
     /// runtime `LeafType::DateTime` check rejects the default at finalize.
     #[clapfig(default = "1970-01-01T00:00:00Z")]
-    stamp: toml::value::Datetime,
+    stamp: clapfig::value::Datetime,
 }
 
 #[test]
@@ -770,7 +770,7 @@ fn datetime_default_emits_value_static_datetime() {
 
 #[test]
 fn datetime_default_survives_runtime_conversion() {
-    // End-to-end: the static default must convert into a `toml::Value::Datetime`
+    // End-to-end: the static default must convert into a `Value::Datetime`
     // and pass the `LeafType::DateTime` check at finalize.
     let dir = TempDir::new().unwrap();
     let cfg: DateTimeDefault = Clapfig::schema_builder::<DateTimeDefault>()
@@ -864,7 +864,7 @@ fn option_of_map_emits_optional_map_leaf() {
     assert!(matches!(leaf.ty, LeafTypeStatic::Map(_)));
 }
 
-// -- `#[clapfig(value)]` works on non-toml::Value field types ------------
+// -- `#[clapfig(value)]` works on non-Value field types ------------------
 //
 // Regression coverage for the migration bug: the macro previously rejected
 // `#[clapfig(value)]` on any field whose Rust type classified as
@@ -938,7 +938,10 @@ enum RuleConfig {
     /// Bare severity string.
     Severity(String),
     /// Severity plus per-rule options.
-    Detailed(String, std::collections::BTreeMap<String, toml::Value>),
+    Detailed(
+        String,
+        std::collections::BTreeMap<String, clapfig::value::Value>,
+    ),
 }
 
 #[derive(Schema, Serialize, Deserialize, Debug)]
