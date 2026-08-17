@@ -21,7 +21,7 @@ produces carries a dotted key and nothing else: no file, no line, not even which
 CLI overrides, `invalid value for key 'database.pool_size'` leaves the user to
 search every source by hand.
 
-The only located *post-merge validation* errors today are unknown-key errors, and
+The only located *schema-driven post-merge* errors today are unknown-key errors, and
 their line numbers come from `find_key_line` — a text-scan heuristic that cannot
 handle arrays-of-tables or inline tables and silently degrades to "line 0" (no
 snippet) when it fails. (Parse errors are already located: they carry parser spans.)
@@ -161,10 +161,11 @@ A per-resolution map from key path to the winning value's origin:
 
 ```rust
 struct Origin {
-    layer: OriginLayer,          // File | Env | Url | Override | Default
-    file: Option<PathBuf>,       // File layer only
-    span: Option<Range<usize>>,  // byte range in the source, where parser data exists
-    detail: Option<String>,      // e.g. the env var name
+    layer: OriginLayer,           // File | Env | Url | Override | Default
+    file: Option<PathBuf>,        // File layer only
+    span: Option<Range<usize>>,   // byte range into `source`, where parser data exists
+    source: Option<Arc<str>>,     // the file's full text, shared; None for non-file origins
+    detail: Option<String>,       // e.g. the env var name
 }
 ```
 
@@ -184,11 +185,13 @@ struct Origin {
   field, or HTTP header produced them, and no caller-supplied origin-label API is
   proposed now), and `Default` (schema-filled).
 - **Spans are byte ranges plus shared source.** `(line, column)` alone cannot
-  render the caret or the snippet. An origin retains the parser's byte
+  render the caret or the snippet. A file origin retains the parser's byte
   `Range<usize>` over the *value* of the assignment (unknown-key diagnostics use
-  the key's range from the span index), alongside the file's source text shared as
-  `Arc<str>` — the same pattern `UnknownKeyInfo` uses today. Line/column are
-  derived at render time.
+  the key's range from the span index) together with the file's full source text
+  in its `source: Option<Arc<str>>` field — the same sharing pattern
+  `UnknownKeyInfo` uses today, so one `Arc` per parsed file serves every origin
+  from that file. Non-file origins carry `span: None, source: None`. Line/column
+  are derived at render time.
 - **Built at parse time.** Each file parse also produces a path → span index from
   real parser span data (`toml_edit` retains spans). The `find_key_line` text
   heuristic is deleted outright — which also fixes its array-of-tables and
@@ -217,9 +220,14 @@ struct Origin {
 ### Consumers, in order
 
 1. **Errors** — the load-bearing consumer and the #100/#101/#102 prerequisite.
-   Post-merge checks (required, type, enum, shape, future tagged-union variants)
-   consult the origin map; unknown-key errors take their line from the span index.
-   Error variants gain origin fields; `render` learns to print non-file origins.
+   *Schema-driven* post-merge checks (required, type, enum, shape, future
+   tagged-union variants) consult the origin map; unknown-key errors take their
+   line from the span index. Error variants gain origin fields; `render` learns to
+   print non-file origins. The user-supplied `post_validate` hook is **out of
+   scope**: it receives the resolved config and returns an opaque `String`
+   (`PostValidationFailed`), so clapfig has no key path to join to the origin map.
+   A structured-diagnostics redesign of that hook (returning key paths that could
+   be located) is a possible follow-on, not part of this work.
 2. **Tracing** — the pipeline narrates itself per the doctrine above, including
    merge losers and discovery misses.
 3. **Follow-ons, explicitly not in this work:** `config list` origin annotations;
@@ -245,9 +253,10 @@ located-nowhere errors this proposal eliminates.
 
 ## Acceptance
 
-- Every post-merge validation error names layer + file + line when the value came
-  from a file; the env var name for env-sourced values; and the override key for
-  programmatic overrides.
+- Every *schema-driven* post-merge error (required, type, enum, shape) names
+  layer + file + line when the value came from a file; the env var name for
+  env-sourced values; and the override key for programmatic overrides.
+  `PostValidationFailed` (the opaque user hook) is explicitly excluded.
 - Missing-required errors enumerate the file probes (with outcomes) and layers
   consulted; under `FirstMatch`, unprobed candidates are not reported as consulted.
 - `find_key_line` is gone; unknown-key errors inside arrays-of-tables and inline
