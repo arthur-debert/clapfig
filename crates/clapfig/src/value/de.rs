@@ -108,10 +108,13 @@ impl<'de> de::Deserialize<'de> for Value {
                 A: de::MapAccess<'de>,
             {
                 let mut map = Map::new();
-                // The datetime marker key is reserved: it only ever
-                // appears as the lone key of the one-field marker struct.
-                // Anything else marker-shaped is malformed input and must
-                // error — never lose entries or leave them unconsumed.
+                // The datetime marker key is reserved: it is only valid as
+                // the lone key of the one-field marker struct. At any other
+                // position — after other entries, in whatever order the
+                // serializer yields them — it is malformed marker-shaped
+                // input and must error, never silently become an ordinary
+                // map entry (which would re-serialize marker-first and
+                // blow up one round trip later).
                 if let Some(key) = access.next_key::<String>()? {
                     if key == DATETIME_MARKER {
                         let repr: String = access.next_value()?;
@@ -125,7 +128,12 @@ impl<'de> de::Deserialize<'de> for Value {
                     }
                     map.insert(key, access.next_value()?);
                 }
-                while let Some((key, value)) = access.next_entry()? {
+                while let Some((key, value)) = access.next_entry::<String, Value>()? {
+                    if key == DATETIME_MARKER {
+                        return Err(de::Error::custom(
+                            "datetime marker struct must have exactly one field",
+                        ));
+                    }
                     map.insert(key, value);
                 }
                 Ok(Value::Map(map))
@@ -518,6 +526,22 @@ mod tests {
         m.insert(DATETIME_MARKER.into(), Value::from("1979-05-27"));
         m.insert("other".into(), Value::Integer(1));
         let err = from_value::<Value>(Value::Map(m)).unwrap_err();
+        assert!(err.to_string().contains("exactly one field"), "{err}");
+    }
+
+    #[test]
+    fn marker_key_after_other_entries_is_rejected() {
+        // `Value::Map` is a BTreeMap, which happens to sort the marker key
+        // first — so drive the visitor with an order-preserving MapAccess
+        // to prove entry order cannot smuggle the reserved key past the
+        // reservation.
+        let pairs = vec![
+            ("other".to_string(), Value::Integer(1)),
+            (DATETIME_MARKER.to_string(), Value::from("1979-05-27")),
+        ];
+        let deserializer = de::value::MapDeserializer::new(pairs.into_iter());
+        let err: DeserializeError = <Value as de::Deserialize>::deserialize(deserializer)
+            .expect_err("marker key after other entries must be rejected");
         assert!(err.to_string().contains("exactly one field"), "{err}");
     }
 

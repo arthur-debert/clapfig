@@ -121,9 +121,13 @@ pub struct Date {
 }
 
 impl Date {
-    /// Build a validated calendar date. Errors when `month` is outside
-    /// 1–12 or `day` is outside the month's length (leap years included).
+    /// Build a validated calendar date. Errors when `year` is above 9999
+    /// (the display spelling is exactly four digits), `month` is outside
+    /// 1–12, or `day` is outside the month's length (leap years included).
     pub fn new(year: u16, month: u8, day: u8) -> Result<Date, DatetimeParseError> {
+        if year > 9999 {
+            return Err(DatetimeParseError::new("year out of range (0-9999)"));
+        }
         if !(1..=12).contains(&month) {
             return Err(DatetimeParseError::new("month out of range (1-12)"));
         }
@@ -612,6 +616,8 @@ mod tests {
     #[test]
     fn component_constructors_validate_ranges() {
         assert!(Date::new(1979, 5, 27).is_ok());
+        assert!(Date::new(9999, 12, 31).is_ok());
+        assert!(Date::new(10000, 1, 1).is_err());
         assert!(Date::new(1979, 13, 1).is_err());
         assert!(Date::new(1979, 0, 1).is_err());
         assert!(Date::new(2023, 2, 29).is_err());
@@ -640,6 +646,24 @@ mod tests {
         ] {
             assert_eq!(dt.to_string().parse::<Datetime>().unwrap(), dt);
         }
+    }
+
+    #[test]
+    fn year_boundary_9999_displays_parseable_and_10000_is_rejected() {
+        // The display spelling is exactly four digits, so 9999 is the
+        // last constructible year — the boundary must still round-trip
+        // through every form constructor, and 10000 must never construct
+        // (it would display as five digits, which FromStr cannot parse).
+        let date = Date::new(9999, 12, 31).unwrap();
+        let time = Time::new(23, 59, 59, 0).unwrap();
+        for dt in [
+            Datetime::offset_date_time(date, time, Offset::Z),
+            Datetime::local_date_time(date, time),
+            Datetime::local_date(date),
+        ] {
+            assert_eq!(dt.to_string().parse::<Datetime>().unwrap(), dt);
+        }
+        assert!(Date::new(10000, 1, 1).is_err());
     }
 
     #[test]
