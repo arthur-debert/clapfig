@@ -38,6 +38,7 @@ use serde_json::{Map, Value, json};
 
 use crate::runtime::LeafType;
 use crate::spec::{FieldKindRef, FieldRef, LeafRef, SchemaRef};
+use crate::value::Value as ConfigValue;
 
 /// JSON Schema dialect emitted in the root `$schema` field.
 const SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -169,7 +170,7 @@ fn populate_leaf(prop: &mut Map<String, Value>, leaf: LeafRef<'_>) {
     }
 
     if let Some(default) = leaf.default
-        && let Some(default_value) = toml_value_to_json(default)
+        && let Some(default_value) = value_to_json(default)
     {
         prop.insert("default".into(), default_value);
     }
@@ -179,7 +180,7 @@ fn populate_leaf(prop: &mut Map<String, Value>, leaf: LeafRef<'_>) {
     }
 
     if let Some(values) = leaf.allowed_values() {
-        let enum_array: Vec<Value> = values.iter().filter_map(toml_value_to_json).collect();
+        let enum_array: Vec<Value> = values.iter().filter_map(value_to_json).collect();
         if !enum_array.is_empty() {
             prop.insert("enum".into(), Value::Array(enum_array));
         }
@@ -198,7 +199,7 @@ fn leaf_type_json_name(ty: &LeafType) -> Option<&'static str> {
         LeafType::DateTime => Some("string"),
         LeafType::Array(_) => Some("array"),
         LeafType::Map(_) => Some("object"),
-        LeafType::Enum { values } => values.first().and_then(toml_value_json_type),
+        LeafType::Enum { values } => values.first().and_then(value_json_type),
         // Unconstrained: JSON Schema convention is to omit `type` entirely,
         // signalling that any value is acceptable. Callers reading the
         // schema are expected to validate the value themselves.
@@ -206,42 +207,42 @@ fn leaf_type_json_name(ty: &LeafType) -> Option<&'static str> {
     }
 }
 
-/// Map a `toml::Value` to its JSON Schema `type` name.
-fn toml_value_json_type(value: &toml::Value) -> Option<&'static str> {
+/// Map an owned config [`ConfigValue`] to its JSON Schema `type` name.
+fn value_json_type(value: &ConfigValue) -> Option<&'static str> {
     match value {
-        toml::Value::String(_) => Some("string"),
-        toml::Value::Integer(_) => Some("integer"),
-        toml::Value::Float(_) => Some("number"),
-        toml::Value::Boolean(_) => Some("boolean"),
+        ConfigValue::String(_) => Some("string"),
+        ConfigValue::Integer(_) => Some("integer"),
+        ConfigValue::Float(_) => Some("number"),
+        ConfigValue::Boolean(_) => Some("boolean"),
         _ => None,
     }
 }
 
-/// Convert a `toml::Value` into a JSON value for the `default` and `enum`
-/// slots.
+/// Convert an owned config [`ConfigValue`] into a JSON value for the
+/// `default` and `enum` slots.
 ///
 /// Complex variants (`Datetime`) are dropped rather than emitted as a
-/// misleading `null`. Arrays and tables convert recursively; entries that
+/// misleading `null`. Arrays and maps convert recursively; entries that
 /// can't be represented are skipped.
-fn toml_value_to_json(value: &toml::Value) -> Option<Value> {
+fn value_to_json(value: &ConfigValue) -> Option<Value> {
     match value {
-        toml::Value::String(s) => Some(Value::String(s.clone())),
-        toml::Value::Integer(i) => Some(json!(i)),
-        toml::Value::Float(f) => Some(json!(f)),
-        toml::Value::Boolean(b) => Some(Value::Bool(*b)),
-        toml::Value::Array(items) => Some(Value::Array(
-            items.iter().filter_map(toml_value_to_json).collect(),
+        ConfigValue::String(s) => Some(Value::String(s.clone())),
+        ConfigValue::Integer(i) => Some(json!(i)),
+        ConfigValue::Float(f) => Some(json!(f)),
+        ConfigValue::Boolean(b) => Some(Value::Bool(*b)),
+        ConfigValue::Array(items) => Some(Value::Array(
+            items.iter().filter_map(value_to_json).collect(),
         )),
-        toml::Value::Table(entries) => {
+        ConfigValue::Map(entries) => {
             let mut obj = Map::new();
             for (key, val) in entries {
-                if let Some(v) = toml_value_to_json(val) {
+                if let Some(v) = value_to_json(val) {
                     obj.insert(key.clone(), v);
                 }
             }
             Some(Value::Object(obj))
         }
-        toml::Value::Datetime(_) => None,
+        ConfigValue::Datetime(_) => None,
     }
 }
 

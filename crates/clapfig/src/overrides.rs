@@ -1,28 +1,27 @@
-//! Convert dotted-key CLI overrides into a nested `toml::Table`.
+//! Convert dotted-key CLI overrides into a nested config value [`Map`].
 //!
-//! Each `("database.url", Value)` pair is expanded into the nested table structure
+//! Each `("database.url", Value)` pair is expanded into the nested map structure
 //! needed for deep-merge with other config layers.
 
 use std::collections::HashSet;
 
-use toml::{Table, Value};
-
 use crate::spec::{FieldKindRef, SchemaRef};
+use crate::value::{Map, Value};
 
-/// Convert dotted-key overrides into a nested `toml::Table`.
+/// Convert dotted-key overrides into a nested config value [`Map`].
 ///
 /// `("database.url", Value::String("pg://"))` becomes `{database = {url = "pg://"}}`
 ///
 /// If multiple entries target the same key, the last one wins.
-pub fn overrides_to_table(entries: &[(String, Value)]) -> Table {
-    let mut table = Table::new();
+pub fn overrides_to_table(entries: &[(String, Value)]) -> Map {
+    let mut table = Map::new();
     for (dotted_key, value) in entries {
         set_nested(&mut table, dotted_key, value.clone());
     }
     table
 }
 
-fn set_nested(table: &mut Table, dotted_key: &str, value: Value) {
+fn set_nested(table: &mut Map, dotted_key: &str, value: Value) {
     let segments: Vec<&str> = dotted_key.split('.').collect();
     let (leaf, parents) = segments
         .split_last()
@@ -30,10 +29,10 @@ fn set_nested(table: &mut Table, dotted_key: &str, value: Value) {
     let mut current = table;
     for segment in parents {
         current = current
-            .entry(*segment)
-            .or_insert_with(|| Value::Table(Table::new()))
-            .as_table_mut()
-            .expect("clapfig: override path conflict — intermediate key is not a table");
+            .entry((*segment).to_string())
+            .or_insert_with(|| Value::Map(Map::new()))
+            .as_map_mut()
+            .expect("clapfig: override path conflict — intermediate key is not a map");
     }
     current.insert((*leaf).to_string(), value);
 }
@@ -110,7 +109,7 @@ mod tests {
     fn nested_key() {
         let table =
             overrides_to_table(&entries(&[("database.url", Value::String("pg://".into()))]));
-        let db = table["database"].as_table().unwrap();
+        let db = table["database"].as_map().unwrap();
         assert_eq!(db["url"].as_str().unwrap(), "pg://");
     }
 
@@ -128,7 +127,7 @@ mod tests {
             ("database.pool_size", Value::Integer(20)),
         ]));
         assert_eq!(table["host"].as_str().unwrap(), "x");
-        let db = table["database"].as_table().unwrap();
+        let db = table["database"].as_map().unwrap();
         assert_eq!(db["url"].as_str().unwrap(), "pg://");
         assert_eq!(db["pool_size"].as_integer().unwrap(), 20);
     }

@@ -10,10 +10,13 @@
 //!   from the same `find_key_line` heuristic the static path uses.
 //! - **`fill_defaults`**: recursive walk, every missing leaf with a
 //!   declared `default` is populated in place into the merged table.
-//! - **`finalize`**: recursive walk, type-checks every value against its
-//!   `LeafType`, enum-checks `LeafType::Enum`, enforces required fields.
-//!   Returns the merged `toml::Table` unchanged (the typed
-//!   `SchemaConfigBuilder` deserializes that table into `C` afterwards).
+//! - **`finalize`**: coerces schema-declared datetime leaves (string
+//!   values in TOML's four lexical forms become [`Value::Datetime`] —
+//!   schema-driven coercion per ADR-0001), then recursively type-checks
+//!   every value against its `LeafType`, enum-checks `LeafType::Enum`,
+//!   and enforces required fields. Returns the merged value [`Map`] (the
+//!   typed `SchemaConfigBuilder` deserializes that map into `C`
+//!   afterwards).
 //!
 //! [`ConfigSpec`]: crate::spec::ConfigSpec
 //! [`Schema`]: crate::runtime::Schema
@@ -21,12 +24,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use toml::{Table, Value};
-
 use crate::error::ClapfigError;
 use crate::runtime::{Field, NamedField, Schema};
 use crate::spec::{ConfigSpec, SchemaRef};
 use crate::validate::{UnknownKey, ValidateContext, filter_through_cascade};
+use crate::value::{Map, Value};
 
 /// Runtime-path adapter: drives the resolve pipeline from a user-supplied
 /// schema. The schema is held behind an `Arc` so the macro-driven static
@@ -50,7 +52,7 @@ impl DynamicSpec {
 }
 
 impl ConfigSpec for DynamicSpec {
-    type Output = Table;
+    type Output = Map;
 
     fn schema(&self) -> SchemaRef<'_> {
         SchemaRef::from_dynamic(&self.schema)
@@ -58,7 +60,7 @@ impl ConfigSpec for DynamicSpec {
 
     fn validate_unknown(
         &self,
-        table: &Table,
+        table: &Map,
         source: &str,
         path: &Path,
         ctx: &ValidateContext<'_>,
@@ -68,12 +70,13 @@ impl ConfigSpec for DynamicSpec {
         filter_through_cascade(table, source, path, unknown, ctx)
     }
 
-    fn fill_defaults(&self, table: &mut Table) -> Result<(), ClapfigError> {
+    fn fill_defaults(&self, table: &mut Map) -> Result<(), ClapfigError> {
         fill_defaults_into(table, &self.schema);
         Ok(())
     }
 
-    fn finalize(&self, merged: Table) -> Result<Table, ClapfigError> {
+    fn finalize(&self, mut merged: Map) -> Result<Map, ClapfigError> {
+        coerce_datetimes(&mut merged, &self.schema);
         check_required_and_types(&merged, &self.schema, "")?;
         Ok(merged)
     }
@@ -88,7 +91,7 @@ impl ConfigSpec for DynamicSpec {
 /// against the item schema (with the user-supplied key forming a path
 /// segment).
 fn collect_unknown_paths(
-    table: &Table,
+    table: &Map,
     schema: &Schema,
     prefix: &str,
     unknown: &mut Vec<UnknownKey>,
@@ -121,7 +124,7 @@ fn collect_unknown_paths(
                 field: Field::Nested(nested),
                 ..
             }) => {
-                if let Value::Table(t) = value {
+                if let Value::Map(t) = value {
                     collect_unknown_paths(t, nested, &full, unknown);
                 }
             }
@@ -131,7 +134,7 @@ fn collect_unknown_paths(
             }) => {
                 if let Value::Array(items) = value {
                     for (i, item) in items.iter().enumerate() {
-                        if let Value::Table(t) = item {
+                        if let Value::Map(t) = item {
                             let indexed = format!("{full}[{i}]");
                             collect_unknown_paths(t, item_schema, &indexed, unknown);
                         }
@@ -146,9 +149,9 @@ fn collect_unknown_paths(
                 // forms a path segment, so `plugins.audit.rogue` is the
                 // path for an unknown key inside the `audit` entry of a
                 // `plugins` MapOf.
-                if let Value::Table(entries) = value {
+                if let Value::Map(entries) = value {
                     for (entry_key, entry_value) in entries {
-                        if let Value::Table(t) = entry_value {
+                        if let Value::Map(t) = entry_value {
                             let entry_path = format!("{full}.{entry_key}");
                             collect_unknown_paths(t, item_schema, &entry_path, unknown);
                         }
@@ -165,7 +168,7 @@ fn find_field<'a>(schema: &'a Schema, name: &str) -> Option<&'a NamedField> {
 
 /// Recursively populate missing leaves in `table` with their schema-declared
 /// defaults. Existing values are never overwritten.
-fn fill_defaults_into(table: &mut Table, schema: &Schema) {
+fn fill_defaults_into(table: &mut Map, schema: &Schema) {
     for nf in &schema.fields {
         match &nf.field {
             Field::Leaf(leaf) => {
@@ -178,8 +181,8 @@ fn fill_defaults_into(table: &mut Table, schema: &Schema) {
             Field::Nested(nested) => {
                 let entry = table
                     .entry(nf.name.clone())
-                    .or_insert_with(|| Value::Table(Table::new()));
-                if let Value::Table(t) = entry {
+                    .or_insert_with(|| Value::Map(Map::new()));
+                if let Value::Map(t) = entry {
                     fill_defaults_into(t, nested);
                 }
             }
@@ -188,7 +191,7 @@ fn fill_defaults_into(table: &mut Table, schema: &Schema) {
                 // existing entries, never synthesize missing array items.
                 if let Some(Value::Array(items)) = table.get_mut(&nf.name) {
                     for item in items {
-                        if let Value::Table(t) = item {
+                        if let Value::Map(t) = item {
                             fill_defaults_into(t, item_schema);
                         }
                     }
@@ -197,9 +200,9 @@ fn fill_defaults_into(table: &mut Table, schema: &Schema) {
             Field::MapOf(item_schema) => {
                 // Map entries are user-supplied — only push defaults into
                 // existing entries, never synthesize missing map values.
-                if let Some(Value::Table(entries)) = table.get_mut(&nf.name) {
+                if let Some(Value::Map(entries)) = table.get_mut(&nf.name) {
                     for (_entry_key, entry_value) in entries.iter_mut() {
-                        if let Value::Table(t) = entry_value {
+                        if let Value::Map(t) = entry_value {
                             fill_defaults_into(t, item_schema);
                         }
                     }
@@ -209,9 +212,87 @@ fn fill_defaults_into(table: &mut Table, schema: &Schema) {
     }
 }
 
+/// Schema-driven datetime coercion (ADR-0001): for every leaf the schema
+/// declares [`LeafType::DateTime`], a merged string value that parses as
+/// one of TOML's four datetime lexical forms is replaced in place with the
+/// typed [`Value::Datetime`]. Strings matching none of the forms are left
+/// untouched, so the type check that follows reports the normal "expected
+/// datetime, got string" error.
+///
+/// This is the seam that lets schema-blind sources — YAML/JSON files, env
+/// vars, CLI/URL overrides — express datetimes as strings. Detection is
+/// never value-sniffing: only leaves the schema declares as datetimes are
+/// candidates.
+fn coerce_datetimes(table: &mut Map, schema: &Schema) {
+    for nf in &schema.fields {
+        match &nf.field {
+            Field::Leaf(leaf) => {
+                if let Some(value) = table.get_mut(&nf.name) {
+                    coerce_datetime_value(value, &leaf.ty);
+                }
+            }
+            Field::Nested(nested) => {
+                if let Some(Value::Map(t)) = table.get_mut(&nf.name) {
+                    coerce_datetimes(t, nested);
+                }
+            }
+            Field::ArrayOf(item_schema) => {
+                if let Some(Value::Array(items)) = table.get_mut(&nf.name) {
+                    for item in items {
+                        if let Value::Map(t) = item {
+                            coerce_datetimes(t, item_schema);
+                        }
+                    }
+                }
+            }
+            Field::MapOf(item_schema) => {
+                if let Some(Value::Map(entries)) = table.get_mut(&nf.name) {
+                    for entry_value in entries.values_mut() {
+                        if let Value::Map(t) = entry_value {
+                            coerce_datetimes(t, item_schema);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Coerce one value against its declared leaf type, recursing through
+/// declared containers (`Array` elements, homogeneous `Map` values).
+/// Shared with the persist path, which validates `config set` values
+/// against the same leaf declarations.
+pub(crate) fn coerce_datetime_value(value: &mut Value, ty: &crate::runtime::LeafType) {
+    use crate::runtime::LeafType;
+    match ty {
+        LeafType::DateTime => {
+            if let Value::String(s) = value
+                && let Ok(dt) = s.parse::<crate::value::Datetime>()
+            {
+                *value = Value::Datetime(dt);
+            }
+        }
+        LeafType::Array(elem) => {
+            if let Value::Array(items) = value {
+                for item in items {
+                    coerce_datetime_value(item, elem);
+                }
+            }
+        }
+        LeafType::Map(elem) => {
+            if let Value::Map(entries) = value {
+                for entry in entries.values_mut() {
+                    coerce_datetime_value(entry, elem);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Recursively validate required-field presence and per-leaf types.
 fn check_required_and_types(
-    table: &Table,
+    table: &Map,
     schema: &Schema,
     prefix: &str,
 ) -> Result<(), ClapfigError> {
@@ -242,10 +323,10 @@ fn check_required_and_types(
                     // A nested section is required if any of its leaves is
                     // required. Recurse with an empty table so the missing-
                     // required check below fires for inner leaves.
-                    let empty = Table::new();
+                    let empty = Map::new();
                     check_required_and_types(&empty, nested, &path)?;
                 }
-                Some(Value::Table(inner)) => {
+                Some(Value::Map(inner)) => {
                     check_required_and_types(inner, nested, &path)?;
                 }
                 Some(other) => {
@@ -265,7 +346,7 @@ fn check_required_and_types(
                     for (i, item) in items.iter().enumerate() {
                         let indexed = format!("{path}[{i}]");
                         match item {
-                            Value::Table(inner) => {
+                            Value::Map(inner) => {
                                 check_required_and_types(inner, item_schema, &indexed)?;
                             }
                             other => {
@@ -293,11 +374,11 @@ fn check_required_and_types(
                     // an error. Same rule as ArrayOf — user-supplied
                     // entries can be zero.
                 }
-                Some(Value::Table(entries)) => {
+                Some(Value::Map(entries)) => {
                     for (entry_key, entry_value) in entries {
                         let entry_path = format!("{path}.{entry_key}");
                         match entry_value {
-                            Value::Table(inner) => {
+                            Value::Map(inner) => {
                                 check_required_and_types(inner, item_schema, &entry_path)?;
                             }
                             other => {
@@ -332,7 +413,7 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Boolean(_) => "bool",
         Value::Datetime(_) => "datetime",
         Value::Array(_) => "array",
-        Value::Table(_) => "table",
+        Value::Map(_) => "table",
     }
 }
 
@@ -360,8 +441,8 @@ mod tests {
             .build()
     }
 
-    fn parse(toml_text: &str) -> Table {
-        toml_text.parse().unwrap()
+    fn parse(toml_text: &str) -> Map {
+        crate::fixtures::test::parse_toml(toml_text)
     }
 
     /// Default validate context — strict on, no overrides, no callback.
@@ -444,7 +525,7 @@ mod tests {
         let spec = DynamicSpec::new(test_schema());
         let mut table = parse("name = \"x\"\n");
         spec.fill_defaults(&mut table).unwrap();
-        let db = table.get("db").and_then(Value::as_table).unwrap();
+        let db = table.get("db").and_then(Value::as_map).unwrap();
         assert_eq!(db.get("pool_size"), Some(&Value::Integer(5)));
         // `url` is optional; should stay absent.
         assert!(db.get("url").is_none());
@@ -504,6 +585,88 @@ mod tests {
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+    }
+
+    // --- finalize: schema-driven datetime coercion (ADR-0001) ---
+
+    fn datetime_schema() -> Schema {
+        Schema::object("T")
+            .field("dt", RtField::datetime().optional())
+            .field(
+                "dts",
+                RtField::array_of_type(crate::runtime::LeafType::DateTime).optional(),
+            )
+            .build()
+    }
+
+    #[test]
+    fn finalize_coerces_datetime_strings_in_all_four_lexical_forms() {
+        // TOML's four datetime forms: offset date-time, local date-time,
+        // local date, local time. Schema-blind sources deliver them as
+        // strings; the DateTime leaf declaration coerces each.
+        let spec = DynamicSpec::new(datetime_schema());
+        for form in [
+            "1979-05-27T07:32:00Z",
+            "1979-05-27T07:32:00",
+            "1979-05-27",
+            "07:32:00",
+        ] {
+            let mut table = Map::new();
+            table.insert("dt".into(), Value::String(form.into()));
+            let out = spec.finalize(table).unwrap();
+            match &out["dt"] {
+                Value::Datetime(dt) => assert_eq!(dt.to_string(), form),
+                other => panic!("{form}: expected Datetime, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn finalize_coerces_datetimes_inside_declared_arrays() {
+        let spec = DynamicSpec::new(datetime_schema());
+        let mut table = Map::new();
+        table.insert(
+            "dts".into(),
+            Value::Array(vec![Value::String("1979-05-27".into())]),
+        );
+        let out = spec.finalize(table).unwrap();
+        match &out["dts"][0] {
+            Value::Datetime(dt) => assert_eq!(dt.to_string(), "1979-05-27"),
+            other => panic!("expected Datetime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_rejects_malformed_datetime_string_as_type_error() {
+        // A string matching none of the four forms is a normal type
+        // error, never a silent pass-through.
+        let spec = DynamicSpec::new(datetime_schema());
+        for bad in ["not-a-date", "1979-13-45", "07:99:00", "2024/01/02"] {
+            let mut table = Map::new();
+            table.insert("dt".into(), Value::String(bad.into()));
+            match spec.finalize(table) {
+                Err(ClapfigError::InvalidValue { key, reason }) => {
+                    assert_eq!(key, "dt");
+                    assert!(reason.contains("expected datetime"), "{bad}: {reason}");
+                }
+                other => panic!("{bad}: expected InvalidValue, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn finalize_never_coerces_strings_on_non_datetime_leaves() {
+        // Coercion is schema-driven, not sniffing: a datetime-looking
+        // string on a String leaf stays a string.
+        let spec = DynamicSpec::new(
+            Schema::object("T")
+                .field("s", RtField::string().optional())
+                .build(),
+        );
+        let mut table = Map::new();
+        table.insert("s".into(), Value::String("1979-05-27".into()));
+        let out = spec.finalize(table).unwrap();
+        assert_eq!(out["s"], Value::String("1979-05-27".into()));
     }
 
     #[test]

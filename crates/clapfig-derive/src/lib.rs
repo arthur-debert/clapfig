@@ -30,8 +30,9 @@ use syn::{
 ///   (`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`usize`/`isize` — all
 ///   mapped to TOML's signed 64-bit integer; see the
 ///   `LeafTypeStatic::Integer` doc comment for the `i64::MAX` caveat on
-///   the unsigned variants), `f32`, `f64`, `toml::value::Datetime`,
-///   `toml::Value`. `i128` and `u128` are rejected at derive time.
+///   the unsigned variants), `f32`, `f64`, `clapfig::value::Datetime`,
+///   `clapfig::value::Value`. `i128` and `u128` are rejected at derive
+///   time.
 /// - `Option<T>`: marks the leaf optional
 /// - `Vec<T>` where `T` is a scalar: maps to `LeafType::Array(T)`
 /// - Nested struct: assumed to also derive `clapfig::Schema`; produces a
@@ -43,11 +44,11 @@ use syn::{
 ///   integer, float, bool, and unary-negated numeric literals
 ///   (`-9223372036854775808i64` works for `i64::MIN`); on `Vec<T>` fields,
 ///   also accepts an array literal of literals. On
-///   `toml::value::Datetime` fields, a string literal is emitted as
+///   `clapfig::value::Datetime` fields, a string literal is emitted as
 ///   `ValueStatic::Datetime`.
 ///
 ///   **Datetime caveat:** datetime defaults are *not* parsed at derive
-///   time — the macro intentionally avoids pulling the `toml` parser
+///   time — the macro intentionally avoids pulling a datetime parser
 ///   into its dependency tree. A malformed datetime literal (e.g.
 ///   `default = "not-a-date"` on a `Datetime` field) compiles
 ///   successfully and panics with `"clapfig: invalid datetime literal
@@ -665,7 +666,7 @@ enum TypeShape {
     MapOfNested(TokenStream2),
     /// Nested type referencing another struct's `clapfig::Schema` impl.
     Nested(TokenStream2),
-    /// `toml::Value` — emits `LeafType::Value`.
+    /// `clapfig::value::Value` — emits `LeafType::Value`.
     Value,
 }
 
@@ -756,13 +757,13 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
             )),
             TypeShape::Value => Err(syn::Error::new(
                 inner.span(),
-                "Vec<toml::Value> is not supported; use a single `toml::Value` with \
-                 #[clapfig(value)] instead",
+                "Vec<clapfig::value::Value> is not supported; use a single \
+                 `clapfig::value::Value` with #[clapfig(value)] instead",
             )),
             TypeShape::Map(_) | TypeShape::MapOfNested(_) => Err(syn::Error::new(
                 inner.span(),
                 "Vec<HashMap<...>> / Vec<BTreeMap<...>> is not supported by clapfig::Schema. \
-                 Use `#[clapfig(value)]` with `toml::Value` for free-form nested shapes.",
+                 Use `#[clapfig(value)]` with `clapfig::value::Value` for free-form nested shapes.",
             )),
         };
     }
@@ -801,7 +802,7 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
                 value_ty.span(),
                 format!(
                     "{name}<String, {name}<...>> (map-of-map) is not yet supported by clapfig::Schema. \
-                     Use `#[clapfig(value)]` with `toml::Value` for free-form nested shapes."
+                     Use `#[clapfig(value)]` with `clapfig::value::Value` for free-form nested shapes."
                 ),
             )),
             // {Hash,BTree}Map<String, NestedStruct> → `FieldStatic::MapOf` at the
@@ -812,10 +813,10 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
         };
     }
 
-    if name == "Value" && is_toml_value_path(path) {
+    if name == "Value" && is_clapfig_value_path(path) {
         return Ok(TypeShape::Value);
     }
-    if name == "Datetime" && is_toml_datetime_path(path) {
+    if name == "Datetime" && is_clapfig_datetime_path(path) {
         return Ok(TypeShape::Scalar(
             ScalarKind::DateTime,
             quote! { ::clapfig::static_schema::LeafTypeStatic::DateTime },
@@ -833,7 +834,7 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
                 "clapfig::Schema does not support `{name}` field types: TOML's integer \
                  width is signed 64-bit and 128-bit values cannot be represented faithfully. \
                  Store as `String` and parse explicitly, or use `#[clapfig(value)]` with \
-                 `toml::Value` for a free-form leaf."
+                 `clapfig::value::Value` for a free-form leaf."
             ),
         ));
     }
@@ -980,36 +981,40 @@ fn is_string_path(ty: &Type) -> bool {
     false
 }
 
-fn is_toml_value_path(path: &syn::Path) -> bool {
-    // Strict suffix match for the toml crate's `Value` type:
-    //   `Value`                     — assumed to be a use-imported toml::Value
-    //   `toml::Value`               — canonical form (incl. leading `::`)
-    // Anything else (e.g. `my_crate::Value`, `crate::toml::Value`, or a
-    // longer path ending in `toml::Value`) is rejected. The leading-colon
-    // form parses as the same segments — `syn::Path::leading_colon` is a
+fn is_clapfig_value_path(path: &syn::Path) -> bool {
+    // Strict suffix match for clapfig's owned `Value` type
+    // (`clapfig::value::Value`, the value-model lingua franca):
+    //   `Value`                        — assumed use-imported
+    //   `value::Value`                 — module-qualified
+    //   `clapfig::value::Value`        — canonical form (incl. leading `::`)
+    // Anything else (e.g. `my_crate::Value`, the toml crate's `Value`, or a longer
+    // path ending in `value::Value`) is rejected. The leading-colon form
+    // parses as the same segments — `syn::Path::leading_colon` is a
     // separate field, not a segment.
     let segs: Vec<_> = path.segments.iter().map(|s| s.ident.to_string()).collect();
     matches!(segs.as_slice(),
         [a] if a == "Value"
     ) || matches!(segs.as_slice(),
-        [a, b] if a == "toml" && b == "Value"
+        [a, b] if a == "value" && b == "Value"
+    ) || matches!(segs.as_slice(),
+        [a, b, c] if a == "clapfig" && b == "value" && c == "Value"
     )
 }
 
-fn is_toml_datetime_path(path: &syn::Path) -> bool {
-    // Strict suffix match for `toml::value::Datetime`:
-    //   `Datetime`                  — use-imported
-    //   `toml::Datetime`            — common re-export
-    //   `toml::value::Datetime`     — canonical
-    // Any other path is rejected — `my_crate::toml::internal::value::Datetime`
-    // and friends do NOT match.
+fn is_clapfig_datetime_path(path: &syn::Path) -> bool {
+    // Strict suffix match for `clapfig::value::Datetime`:
+    //   `Datetime`                     — use-imported
+    //   `value::Datetime`              — module-qualified
+    //   `clapfig::value::Datetime`     — canonical
+    // Any other path is rejected — the toml crate's `Datetime` and friends do
+    // NOT match (the format types are confined to their adapters).
     let segs: Vec<_> = path.segments.iter().map(|s| s.ident.to_string()).collect();
     matches!(segs.as_slice(),
         [a] if a == "Datetime"
     ) || matches!(segs.as_slice(),
-        [a, b] if a == "toml" && b == "Datetime"
+        [a, b] if a == "value" && b == "Datetime"
     ) || matches!(segs.as_slice(),
-        [a, b, c] if a == "toml" && b == "value" && c == "Datetime"
+        [a, b, c] if a == "clapfig" && b == "value" && c == "Datetime"
     )
 }
 
@@ -1381,7 +1386,7 @@ fn scalar_kind_of(shape: &TypeShape) -> Option<ScalarKind> {
 /// Parse a literal-or-negated-literal expression into a `ValueStatic`
 /// token, without kind validation. Used inside array-literal defaults
 /// where the element type is already constrained by the field's `Vec<T>`
-/// declaration (the per-element kind check is done by the toml
+/// declaration (the per-element kind check is done by the value
 /// deserializer at load time, not here).
 fn value_static_from_expr(expr: &Expr) -> syn::Result<TokenStream2> {
     match expr {
@@ -1484,10 +1489,10 @@ fn expr_to_value_static(expr: &Expr, shape: &TypeShape) -> syn::Result<TokenStre
     // would emit `ValueStatic::String` and the leaf type-check would
     // reject the default at startup. We route the literal verbatim into
     // `ValueStatic::Datetime`; the parse happens inside
-    // `ValueStatic::to_toml()` on first schema access and a malformed
+    // `ValueStatic::to_value()` on first schema access and a malformed
     // literal panics with `"clapfig: invalid datetime literal in static
-    // schema default"`. (Compile-time parsing would require pulling
-    // `toml` / `toml_datetime` into `clapfig-derive`, which we deliberately
+    // schema default"`. (Compile-time parsing would require pulling a
+    // datetime parser into `clapfig-derive`, which we deliberately
     // avoid to keep the proc-macro crate light.)
     if is_datetime_shape(shape)
         && let Expr::Lit(ExprLit {

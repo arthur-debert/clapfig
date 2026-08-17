@@ -21,7 +21,8 @@
 //! - [`render_rich`](crate::render::render_rich) — colored output with source
 //!   snippets and carets (requires the `rich-errors` feature).
 //!
-//! Errors from the underlying TOML parser are wrapped rather than
+//! Errors from the underlying format parsers are wrapped (as the format
+//! module's [`FormatError`](crate::format::FormatError)) rather than
 //! re-invented, so you still get their full detail.
 
 use std::path::{Path, PathBuf};
@@ -74,13 +75,13 @@ pub enum ClapfigError {
     #[error("{}", format_unknown_keys(.0))]
     UnknownKeys(Vec<UnknownKeyInfo>),
 
-    /// The TOML parser failed on a config file. `source_text` holds the
-    /// file contents (when retained) so renderers can draw a snippet.
-    /// The parser error is boxed to keep the enum variant small.
+    /// A format adapter failed to parse a config file. `source_text`
+    /// holds the file contents (when retained) so renderers can draw a
+    /// snippet. The adapter error is boxed to keep the enum variant small.
     #[error("Failed to parse {}: {source}", path.display())]
     ParseError {
         path: PathBuf,
-        source: Box<toml::de::Error>,
+        source: Box<crate::format::FormatError>,
         source_text: Option<Arc<str>>,
     },
 
@@ -152,6 +153,29 @@ pub enum ClapfigError {
     /// property, not a per-leaf one).
     #[error("Invalid strict_at path '{path}': {reason}")]
     InvalidStrictPath { path: String, reason: String },
+
+    /// A format adapter refused or failed an operation outside the
+    /// file-parse path (template generation, serialization, an edit) —
+    /// including the typed
+    /// [`UnsupportedByFormat`](crate::format::UnsupportedByFormat)
+    /// capability refusal.
+    #[error(transparent)]
+    Format(#[from] crate::format::FormatError),
+
+    /// The builder's `formats(...)` list names a format clapfig does not
+    /// ship an adapter for.
+    #[error("Unknown format '{name}' — available formats: {}", available.join(", "))]
+    UnknownFormat {
+        name: String,
+        available: Vec<String>,
+    },
+
+    /// Stem-based discovery found more than one same-stem config file in
+    /// one directory (e.g. `myapp.toml` AND `myapp.yaml`). The spec pins
+    /// this as a hard error naming the files — no silent precedence, no
+    /// merging of same-stem siblings.
+    #[error("Ambiguous config files in {}: {} — keep exactly one of them", dir.display(), files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))]
+    AmbiguousConfigFiles { dir: PathBuf, files: Vec<PathBuf> },
 }
 
 impl ClapfigError {
@@ -166,9 +190,10 @@ impl ClapfigError {
         }
     }
 
-    /// If this error is a TOML parse failure, return the file path, the
-    /// underlying parser error, and the source text (when retained).
-    pub fn parse_error(&self) -> Option<(&Path, &toml::de::Error, Option<&str>)> {
+    /// If this error is a config-file parse failure, return the file
+    /// path, the underlying adapter error, and the source text (when
+    /// retained).
+    pub fn parse_error(&self) -> Option<(&Path, &crate::format::FormatError, Option<&str>)> {
         match self {
             ClapfigError::ParseError {
                 path,

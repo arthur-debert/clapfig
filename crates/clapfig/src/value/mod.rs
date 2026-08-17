@@ -210,6 +210,43 @@ impl From<Map> for Value {
     }
 }
 
+impl std::ops::Index<&str> for Value {
+    type Output = Value;
+
+    /// Index into a [`Value::Map`] by key.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the value is not a map or the key is absent — the same
+    /// contract as `serde_json::Value` / `BTreeMap` indexing. Use
+    /// [`Value::as_map`] + `get` for fallible access.
+    fn index(&self, key: &str) -> &Value {
+        match self {
+            Value::Map(map) => map
+                .get(key)
+                .unwrap_or_else(|| panic!("no key {key:?} in map")),
+            other => panic!("cannot index {} with a string key", other.type_str()),
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Value {
+    type Output = Value;
+
+    /// Index into a [`Value::Array`] by position.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the value is not an array or the index is out of
+    /// bounds. Use [`Value::as_array`] + `get` for fallible access.
+    fn index(&self, index: usize) -> &Value {
+        match self {
+            Value::Array(items) => &items[index],
+            other => panic!("cannot index {} with a numeric index", other.type_str()),
+        }
+    }
+}
+
 /// Write `s` as a double-quoted string with TOML basic-string escapes.
 fn write_escaped(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
     f.write_str("\"")?;

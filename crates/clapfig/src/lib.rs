@@ -348,7 +348,7 @@
 //! The [`UnknownKeyContext`] carries the dotted path, the raw TOML leaf
 //! key (preserves quoted-key semantics — `"acme.task-due-date-missing"`
 //! stays as a single literal even though it contains dots), the parsed
-//! value as `Option<&toml::Value>` (`None` in the rare case lookup can't
+//! value as `Option<&value::Value>` (`None` in the rare case lookup can't
 //! resolve — out-of-bounds array index, path through a non-table
 //! intermediate), the source file, and the 1-indexed line number.
 //!
@@ -380,7 +380,7 @@
 //!     )
 //!     .build();
 //!
-//! let table: toml::Table = Clapfig::runtime(schema)
+//! let table: clapfig::value::Map = Clapfig::runtime(schema)
 //!     .app_name("myapp")
 //!     .load()?;
 //! ```
@@ -388,16 +388,16 @@
 //! Same surface as [`Clapfig::schema_builder`] — `app_name`, `search_paths`,
 //! `env_prefix`, `cli_override`, `post_validate`, `build_resolver`,
 //! `handle` (drives `config gen|list|get|set|unset|schema`) — but the
-//! result is a [`toml::Table`] rather than a typed `C`, and `post_validate`
-//! receives `&Table`.
+//! result is a value [`Map`](value::Map) rather than a typed `C`, and
+//! `post_validate` receives `&Map`.
 //!
 //! Both entry points produce identical schema metadata: the typed path's
 //! derive macro emits the same [`runtime::Schema`] shape the runtime
 //! builder constructs, so `config gen`, JSON Schema emission, persistence
 //! validation, and strict-mode value context behave identically. The only
 //! difference is that `Clapfig::schema_builder::<C>().load()` returns a
-//! typed `C` while `Clapfig::runtime(schema).load()` returns a
-//! `toml::Table`.
+//! typed `C` while `Clapfig::runtime(schema).load()` returns a value
+//! [`Map`](value::Map).
 //!
 //! `LeafType` covers TOML primitives + array + map, plus
 //! `Enum { values }` for constrained value sets (log levels, output
@@ -611,8 +611,10 @@
 //! `config set` and `config unset` write to config files through named
 //! persist scopes. Key design decisions:
 //!
-//! - **Comment preservation**: edits use `toml_edit`, so existing comments
-//!   and formatting are preserved. Users won't lose their annotations.
+//! - **Comment preservation**: edits go through the format adapter's
+//!   comment-preserving editor (lossless for TOML), so existing
+//!   comments and formatting are preserved. Users won't lose their
+//!   annotations.
 //! - **Seeded files**: if the target file doesn't exist, a new one is created
 //!   from the generated template, so the user gets doc comments for every
 //!   field out of the box.

@@ -1,27 +1,35 @@
-//! Config persistence: patch values into TOML files while preserving formatting.
+//! Config persistence: patch values into config files while preserving
+//! formatting.
 //!
-//! Uses `toml_edit` for comment-preserving edits. When no file exists yet,
-//! starts from the generated template so the new file includes doc comments.
-//! Creates parent directories as needed.
+//! All source-text mechanics route through the format adapter contract
+//! ([`FormatAdapter::edit`]) — for TOML that is lossless
+//! comment-preserving editing. This module owns the format-agnostic half:
+//! key/type validation against the schema, template seeding for missing
+//! files, and the file I/O around each edit.
 
 use std::path::Path;
 
 use crate::error::ClapfigError;
+use crate::format::{ConfigPath, FileEdit, FormatAdapter};
 use crate::ops::ConfigResult;
+use crate::value::Value;
 
-/// Pure function: patch a TOML document string, setting `key` to `raw_value`.
+/// Pure function: patch a config document string, setting `key` to
+/// `raw_value`, through `adapter`.
 ///
 /// Validates the key against an owned [`Schema`](crate::runtime::Schema)
 /// and the value against the leaf's declared
-/// [`LeafType`](crate::runtime::LeafType), so a typo in the key name or a
-/// string where an integer is expected fails before the file is touched.
+/// [`LeafType`](crate::runtime::LeafType) — with schema-driven datetime
+/// coercion for `DateTime` leaves (ADR-0001) — so a typo in the key name
+/// or a string where an integer is expected fails before the file is
+/// touched.
 ///
 /// If `content` is `None` (file doesn't exist yet), starts from the
-/// generated template. Uses `toml_edit` to preserve existing comments and
-/// formatting.
+/// adapter's generated template so the new file carries doc comments.
 ///
 /// Returns the modified document string.
 pub fn set_in_document_runtime(
+    adapter: &dyn FormatAdapter,
     schema: &crate::runtime::Schema,
     content: Option<&str>,
     key: &str,
@@ -32,10 +40,11 @@ pub fn set_in_document_runtime(
         return Err(ClapfigError::KeyNotFound(key.into()));
     }
 
-    let check_value = parse_toml_value(raw_value);
+    let mut value = parse_raw_value(raw_value);
     if let Some(leaf_ty) = lookup_leaf_type(schema, key) {
+        crate::runtime_spec::coerce_datetime_value(&mut value, leaf_ty);
         leaf_ty
-            .check(&check_value)
+            .check(&value)
             .map_err(|reason| ClapfigError::InvalidValue {
                 key: key.into(),
                 reason,
@@ -44,7 +53,7 @@ pub fn set_in_document_runtime(
 
     let base = match content {
         Some(c) => c.to_string(),
-        None => crate::ops::generate_template_from_runtime(schema, false),
+        None => crate::ops::generate_template(adapter, schema, false)?,
     };
     let base = if base.trim().is_empty() {
         String::new()
@@ -52,80 +61,26 @@ pub fn set_in_document_runtime(
         base
     };
 
-    let mut doc: toml_edit::DocumentMut =
-        base.parse()
-            .map_err(|e: toml_edit::TomlError| ClapfigError::InvalidValue {
-                key: key.into(),
-                reason: e.to_string(),
-            })?;
-
-    let parsed_value = parse_toml_edit_value(raw_value);
-    write_at_dotted_path(&mut doc, key, parsed_value)?;
-    Ok(doc.to_string())
-}
-
-/// Walk a dotted path through `doc`, creating intermediate tables when
-/// missing, and assign `value` at the leaf. Returns
-/// [`ClapfigError::InvalidValue`] when an existing intermediate is a
-/// non-table scalar — `toml_edit`'s `IndexMut` would panic on that case,
-/// and the schema-time pre-checks only validate the schema, not the
-/// shape of an existing on-disk file (`config set database.url x` with
-/// `database = "string"` already in the file).
-fn write_at_dotted_path(
-    doc: &mut toml_edit::DocumentMut,
-    key: &str,
-    value: toml_edit::Value,
-) -> Result<(), ClapfigError> {
-    let segments: Vec<&str> = key.split('.').collect();
-    let (leaf, parents) = segments
-        .split_last()
-        .expect("split('.') always yields at least one segment");
-    let mut current: &mut toml_edit::Item = doc.as_item_mut();
-    for segment in parents {
-        if current.get(segment).is_none() {
-            // current must be table-like to insert a new section here;
-            // otherwise the existing file has a scalar where we need a
-            // table.
-            if current.as_table_like_mut().is_none() {
-                return Err(ClapfigError::InvalidValue {
-                    key: key.into(),
-                    reason: format!(
-                        "path conflict: existing file has a non-table value at the path before '{segment}'"
-                    ),
-                });
-            }
-            current[*segment] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        // After the (possibly-created) child, navigate into it. The child
-        // might be a scalar from a pre-existing file; guard before
-        // indexing.
-        let next = current
-            .get_mut(*segment)
-            .expect("just confirmed or inserted above");
-        if next.as_table_like().is_none() {
-            return Err(ClapfigError::InvalidValue {
-                key: key.into(),
-                reason: format!(
-                    "path conflict: existing file has a non-table value at '{segment}'"
-                ),
-            });
-        }
-        current = next;
-    }
-    if current.as_table_like_mut().is_none() {
-        return Err(ClapfigError::InvalidValue {
+    let path = dotted_config_path(key);
+    adapter
+        .edit(
+            &base,
+            FileEdit::Set {
+                path: &path,
+                value: &value,
+            },
+        )
+        .map_err(|e| ClapfigError::InvalidValue {
             key: key.into(),
-            reason: "path conflict: leaf parent is not a table".into(),
-        });
-    }
-    current[*leaf] = toml_edit::value(value);
-    Ok(())
+            reason: e.detail(),
+        })
 }
 
 /// Wrapper around [`set_in_document_runtime`] with file I/O: reads the file
 /// (if it exists), patches it, writes back. Creates parent directories if
 /// needed.
 pub fn persist_value_runtime(
+    adapter: &dyn FormatAdapter,
     schema: &crate::runtime::Schema,
     file_path: &Path,
     key: &str,
@@ -142,7 +97,7 @@ pub fn persist_value_runtime(
         }
     };
 
-    let new_content = set_in_document_runtime(schema, content.as_deref(), key, value)?;
+    let new_content = set_in_document_runtime(adapter, schema, content.as_deref(), key, value)?;
 
     if let Some(parent) = file_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
@@ -184,46 +139,35 @@ fn lookup_leaf_type<'a>(
     None
 }
 
-/// Pure function: remove a key from a TOML document string.
+/// Pure function: remove a key from a config document string through
+/// `adapter`.
 ///
 /// If the key doesn't exist, returns the document unchanged.
-/// Navigates dotted key paths (e.g. `"database.pool_size"`).
-/// Uses `toml_edit` to preserve existing comments and formatting.
+/// Navigates dotted key paths (e.g. `"database.pool_size"`). Comment
+/// preservation is per the adapter's declared edit capability.
 ///
 /// Returns the modified document string.
-pub fn unset_in_document(content: &str, key: &str) -> Result<String, ClapfigError> {
-    let mut doc: toml_edit::DocumentMut =
-        content
-            .parse()
-            .map_err(|e: toml_edit::TomlError| ClapfigError::InvalidValue {
-                key: key.into(),
-                reason: e.to_string(),
-            })?;
-
-    let segments: Vec<&str> = key.split('.').collect();
-    let (leaf, parents) = segments
-        .split_last()
-        .expect("split('.') always yields at least one segment");
-
-    // Navigate to the parent, then remove the leaf.
-    let mut current: &mut toml_edit::Item = doc.as_item_mut();
-    for segment in parents {
-        match current.get_mut(segment) {
-            Some(item) => current = item,
-            None => return Ok(doc.to_string()), // parent doesn't exist, nothing to unset
-        }
-    }
-
-    if let Some(table) = current.as_table_like_mut() {
-        table.remove(leaf);
-    }
-
-    Ok(doc.to_string())
+pub fn unset_in_document(
+    adapter: &dyn FormatAdapter,
+    content: &str,
+    key: &str,
+) -> Result<String, ClapfigError> {
+    let path = dotted_config_path(key);
+    adapter
+        .edit(content, FileEdit::Unset { path: &path })
+        .map_err(|e| ClapfigError::InvalidValue {
+            key: key.into(),
+            reason: e.detail(),
+        })
 }
 
 /// I/O wrapper: reads file, removes the key, writes back.
 /// If the file doesn't exist, succeeds silently (nothing to unset).
-pub fn unset_value(file_path: &Path, key: &str) -> Result<ConfigResult, ClapfigError> {
+pub fn unset_value(
+    adapter: &dyn FormatAdapter,
+    file_path: &Path,
+    key: &str,
+) -> Result<ConfigResult, ClapfigError> {
     let content = match std::fs::read_to_string(file_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -237,7 +181,7 @@ pub fn unset_value(file_path: &Path, key: &str) -> Result<ConfigResult, ClapfigE
         }
     };
 
-    let new_content = unset_in_document(&content, key)?;
+    let new_content = unset_in_document(adapter, &content, key)?;
 
     std::fs::write(file_path, &new_content).map_err(|e| ClapfigError::IoError {
         path: file_path.to_path_buf(),
@@ -247,52 +191,32 @@ pub fn unset_value(file_path: &Path, key: &str) -> Result<ConfigResult, ClapfigE
     Ok(ConfigResult::ValueUnset { key: key.into() })
 }
 
-/// Parse a raw string value into a `toml::Value` with type heuristics.
-///
-/// Used for validation: the parsed value is checked against the target
-/// leaf's declared [`LeafType`](crate::runtime::LeafType) to catch type
-/// mismatches before persisting.
-fn parse_toml_value(s: &str) -> toml::Value {
-    if s.eq_ignore_ascii_case("true") {
-        return toml::Value::Boolean(true);
+/// Build a structured [`ConfigPath`] from a dotted persist key. Persist
+/// keys are schema-validated dotted paths, so every `.` is a nesting
+/// separator (schema field names cannot contain dots).
+fn dotted_config_path(key: &str) -> ConfigPath {
+    let mut path = ConfigPath::new();
+    for segment in key.split('.') {
+        path = path.key(segment);
     }
-    if s.eq_ignore_ascii_case("false") {
-        return toml::Value::Boolean(false);
-    }
-    if let Ok(i) = s.parse::<i64>() {
-        return toml::Value::Integer(i);
-    }
-    if s.contains('.')
-        && let Ok(f) = s.parse::<f64>()
-    {
-        return toml::Value::Float(f);
-    }
-    toml::Value::String(s.to_string())
+    path
 }
 
-/// Parse a raw string value into a `toml_edit::Value` with type heuristics.
-fn parse_toml_edit_value(s: &str) -> toml_edit::Value {
-    if s.eq_ignore_ascii_case("true") {
-        return toml_edit::value(true).into_value().unwrap();
-    }
-    if s.eq_ignore_ascii_case("false") {
-        return toml_edit::value(false).into_value().unwrap();
-    }
-    if let Ok(i) = s.parse::<i64>() {
-        return toml_edit::value(i).into_value().unwrap();
-    }
-    if s.contains('.')
-        && let Ok(f) = s.parse::<f64>()
-    {
-        return toml_edit::value(f).into_value().unwrap();
-    }
-    toml_edit::value(s).into_value().unwrap()
+/// Parse a raw `config set` string into a typed config value with the
+/// same bool > integer > float > string heuristic as env/URL values.
+///
+/// The parsed value is checked against the target leaf's declared
+/// [`LeafType`](crate::runtime::LeafType) to catch type mismatches before
+/// persisting.
+fn parse_raw_value(s: &str) -> Value {
+    crate::env::parse_env_value(s)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fixtures::test::{enum_schema, test_schema};
+    use crate::format::TomlAdapter;
     use std::fs;
     use tempfile::TempDir;
 
@@ -301,7 +225,7 @@ mod tests {
         key: &str,
         value: &str,
     ) -> Result<String, ClapfigError> {
-        set_in_document_runtime(&test_schema(), content, key, value)
+        set_in_document_runtime(&TomlAdapter, &test_schema(), content, key, value)
     }
 
     fn persist_value(
@@ -309,7 +233,7 @@ mod tests {
         key: &str,
         value: &str,
     ) -> Result<ConfigResult, ClapfigError> {
-        persist_value_runtime(&test_schema(), path, key, value)
+        persist_value_runtime(&TomlAdapter, &test_schema(), path, key, value)
     }
 
     // --- validation tests ---
@@ -322,7 +246,8 @@ mod tests {
 
     #[test]
     fn set_rejects_invalid_enum_value() {
-        let result = set_in_document_runtime(&enum_schema(), Some(""), "mode", "garbage");
+        let result =
+            set_in_document_runtime(&TomlAdapter, &enum_schema(), Some(""), "mode", "garbage");
         match result {
             Err(ClapfigError::InvalidValue { key, reason }) => {
                 assert_eq!(key, "mode");
@@ -337,7 +262,8 @@ mod tests {
 
     #[test]
     fn set_accepts_valid_enum_value() {
-        let result = set_in_document_runtime(&enum_schema(), Some(""), "mode", "fast");
+        let result =
+            set_in_document_runtime(&TomlAdapter, &enum_schema(), Some(""), "mode", "fast");
         assert!(result.is_ok());
     }
 
@@ -351,8 +277,8 @@ mod tests {
     fn set_rejects_path_through_scalar() {
         // Existing file has `database` as a scalar string; `config set
         // database.url x` would dereference into a non-table item, which
-        // pre-fix would panic via `toml_edit::Item::IndexMut`. The guard
-        // turns it into a clean InvalidValue.
+        // pre-fix would panic inside the TOML editor's IndexMut. The
+        // guard turns it into a clean InvalidValue.
         let content = "database = \"oops\"\n";
         let result = set_in_document(Some(content), "database.url", "pg://x");
         match result {
@@ -369,7 +295,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
-        let result = persist_value_runtime(&enum_schema(), &path, "mode", "garbage");
+        let result = persist_value_runtime(&TomlAdapter, &enum_schema(), &path, "mode", "garbage");
         assert!(matches!(result, Err(ClapfigError::InvalidValue { .. })));
         // File should NOT have been created
         assert!(!path.exists());
@@ -413,27 +339,38 @@ mod tests {
     }
 
     #[test]
-    fn value_parsing_integer() {
-        let v = parse_toml_edit_value("42");
-        assert!(v.is_integer());
+    fn value_parsing_heuristics() {
+        assert!(matches!(parse_raw_value("42"), Value::Integer(42)));
+        assert!(matches!(parse_raw_value("true"), Value::Boolean(true)));
+        assert!(matches!(parse_raw_value("hello"), Value::String(_)));
+        assert!(matches!(parse_raw_value("1.5"), Value::Float(_)));
     }
 
     #[test]
-    fn value_parsing_bool() {
-        let v = parse_toml_edit_value("true");
-        assert!(v.is_bool());
-    }
+    fn set_coerces_datetime_string_for_datetime_leaf() {
+        // Schema-driven datetime coercion (ADR-0001) applies to `config
+        // set` too: the heuristic parses the raw string as a String, and
+        // the DateTime leaf declaration coerces it before the type check.
+        use crate::runtime::{Field, Schema};
+        let schema = Schema::object("T")
+            .field("stamp", Field::datetime().optional())
+            .build();
+        let result = set_in_document_runtime(
+            &TomlAdapter,
+            &schema,
+            Some(""),
+            "stamp",
+            "2024-01-02T03:04:05Z",
+        )
+        .unwrap();
+        assert!(
+            result.contains("stamp = 2024-01-02T03:04:05Z"),
+            "datetime must persist unquoted (typed), got: {result}"
+        );
 
-    #[test]
-    fn value_parsing_string() {
-        let v = parse_toml_edit_value("hello");
-        assert!(v.is_str());
-    }
-
-    #[test]
-    fn value_parsing_float() {
-        let v = parse_toml_edit_value("1.5");
-        assert!(v.is_float());
+        let err = set_in_document_runtime(&TomlAdapter, &schema, Some(""), "stamp", "not-a-date")
+            .unwrap_err();
+        assert!(matches!(err, ClapfigError::InvalidValue { .. }));
     }
 
     #[test]
@@ -472,10 +409,14 @@ mod tests {
 
     // --- unset tests ---
 
+    fn unset_doc(content: &str, key: &str) -> Result<String, ClapfigError> {
+        unset_in_document(&TomlAdapter, content, key)
+    }
+
     #[test]
     fn unset_removes_key() {
         let content = "port = 8080\nhost = \"localhost\"\n";
-        let result = unset_in_document(content, "port").unwrap();
+        let result = unset_doc(content, "port").unwrap();
         assert!(!result.contains("port"));
         assert!(result.contains("host = \"localhost\""));
     }
@@ -483,7 +424,7 @@ mod tests {
     #[test]
     fn unset_nested_key() {
         let content = "[database]\npool_size = 5\nurl = \"pg://\"\n";
-        let result = unset_in_document(content, "database.pool_size").unwrap();
+        let result = unset_doc(content, "database.pool_size").unwrap();
         assert!(!result.contains("pool_size"));
         assert!(result.contains("url = \"pg://\""));
     }
@@ -491,21 +432,21 @@ mod tests {
     #[test]
     fn unset_nonexistent_key_is_noop() {
         let content = "port = 8080\n";
-        let result = unset_in_document(content, "missing").unwrap();
+        let result = unset_doc(content, "missing").unwrap();
         assert!(result.contains("port = 8080"));
     }
 
     #[test]
     fn unset_nonexistent_nested_key_is_noop() {
         let content = "port = 8080\n";
-        let result = unset_in_document(content, "database.missing").unwrap();
+        let result = unset_doc(content, "database.missing").unwrap();
         assert!(result.contains("port = 8080"));
     }
 
     #[test]
     fn unset_preserves_comments_on_other_keys() {
         let content = "port = 8080\n# The host address\nhost = \"localhost\"\n";
-        let result = unset_in_document(content, "port").unwrap();
+        let result = unset_doc(content, "port").unwrap();
         assert!(result.contains("# The host address"));
         assert!(result.contains("host = \"localhost\""));
         assert!(!result.contains("port"));
@@ -517,7 +458,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "port = 8080\nhost = \"localhost\"\n").unwrap();
 
-        let result = unset_value(&path, "port").unwrap();
+        let result = unset_value(&TomlAdapter, &path, "port").unwrap();
         assert!(matches!(result, ConfigResult::ValueUnset { .. }));
 
         let content = fs::read_to_string(&path).unwrap();
@@ -530,7 +471,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.toml");
 
-        let result = unset_value(&path, "port").unwrap();
+        let result = unset_value(&TomlAdapter, &path, "port").unwrap();
         assert!(matches!(result, ConfigResult::ValueUnset { .. }));
     }
 }

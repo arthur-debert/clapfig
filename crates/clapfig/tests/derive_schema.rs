@@ -301,7 +301,7 @@ fn explicit_env_attribute_is_carried_into_static_schema() {
 struct ValueConfig {
     /// Free-form rule shape.
     #[clapfig(value)]
-    rule: toml::Value,
+    rule: clapfig::value::Value,
 }
 
 #[test]
@@ -535,9 +535,9 @@ fn unit_enum_field_flattens_to_runtime_leaf_enum() {
     match &leaf.ty {
         clapfig::runtime::LeafType::Enum { values } => {
             assert_eq!(values.len(), 3);
-            assert_eq!(values[0], toml::Value::String("a4".into()));
-            assert_eq!(values[1], toml::Value::String("letter".into()));
-            assert_eq!(values[2], toml::Value::String("legal".into()));
+            assert_eq!(values[0], clapfig::value::Value::String("a4".into()));
+            assert_eq!(values[1], clapfig::value::Value::String("letter".into()));
+            assert_eq!(values[2], clapfig::value::Value::String("legal".into()));
         }
         other => panic!("expected Enum, got {other:?}"),
     }
@@ -826,11 +826,14 @@ fn default_on_enum_typed_field_round_trips_through_schema() {
     match &leaf.ty {
         clapfig::runtime::LeafType::Enum { values } => {
             assert_eq!(values.len(), 3);
-            assert_eq!(values[1], toml::Value::String("letter".into()));
+            assert_eq!(values[1], clapfig::value::Value::String("letter".into()));
         }
         other => panic!("expected Enum, got {other:?}"),
     }
-    assert_eq!(leaf.default, Some(toml::Value::String("letter".into())));
+    assert_eq!(
+        leaf.default,
+        Some(clapfig::value::Value::String("letter".into()))
+    );
     assert!(!leaf.optional);
 }
 

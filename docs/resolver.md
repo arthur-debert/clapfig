@@ -31,9 +31,9 @@ let resolver = Clapfig::runtime(site_schema())
     .build_resolver()?;
 ```
 
-Each `resolve_at()` call returns the merged `toml::Table`; deserialize it
-into your typed struct where you need one (`toml::Table` implements
-`Deserialize`-friendly conversion via `toml::Value::try_into`).
+Each `resolve_at()` call returns the merged `clapfig::value::Map`;
+deserialize it into your typed struct where you need one via
+`clapfig::value::from_value(Value::Map(map))`.
 
 `build_resolver()` captures the builder's state — search paths, env vars,
 overrides, strict mode, post_validate hook — into a reusable handle. The

@@ -5,20 +5,20 @@
 //! derives sensible defaults (file name, search paths, env prefix), and
 //! everything else is optional overrides — discovery, persistence, env,
 //! URL, CLI overrides, post-validation, tree-walk resolution. `load()`
-//! produces a `toml::Table`; the typed
+//! produces a value [`Map`]; the typed
 //! [`SchemaConfigBuilder`](crate::SchemaConfigBuilder) wraps this builder
-//! and deserializes that table into a `C` deriving
+//! and deserializes that map into a `C` deriving
 //! `#[derive(clapfig::Schema)]`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use toml::{Table, Value};
 
 use crate::error::ClapfigError;
 use crate::file;
 use crate::flatten;
+use crate::format::{self, FormatAdapter, FormatRegistry};
 use crate::ops::{self, ConfigResult};
 use crate::overrides;
 use crate::persist;
@@ -28,10 +28,24 @@ use crate::runtime_spec::DynamicSpec;
 use crate::spec::SchemaRef;
 use crate::strict::{StrictnessOverrides, UnknownKeyHook};
 use crate::types::{ConfigAction, Layer, SearchMode, SearchPath};
+use crate::value::{Map, Value};
 
 /// Post-merge validation hook for the runtime path: receives the merged
-/// `toml::Table` (the runtime equivalent of the static path's `&C`).
-pub(crate) type RuntimePostValidateHook = Box<dyn Fn(&Table) -> Result<(), String> + Send + Sync>;
+/// value [`Map`] (the runtime equivalent of the static path's `&C`).
+pub(crate) type RuntimePostValidateHook = Box<dyn Fn(&Map) -> Result<(), String> + Send + Sync>;
+
+/// How config files are discovered inside each search directory — the
+/// file-name half of the builder's file contract.
+#[derive(Debug, Clone)]
+enum FileNaming {
+    /// `.file_name("myapp.toml")` (or the `app_name`-derived default):
+    /// exact-name discovery, that name's format only.
+    Exact(String),
+    /// `.file_stem("myapp")`: probe `<stem>.<ext>` across the enabled
+    /// formats' extensions; more than one match in the same directory is
+    /// a hard error.
+    Stem(String),
+}
 
 /// Builder for runtime-defined configurations.
 ///
@@ -46,7 +60,7 @@ pub(crate) type RuntimePostValidateHook = Box<dyn Fn(&Table) -> Result<(), Strin
 ///   targets for writes.
 ///
 /// The schema is supplied at runtime (via [`crate::Clapfig::runtime`]) and
-/// the loaded value is a `toml::Table`. For typed output, derive
+/// the loaded value is a value [`Map`]. For typed output, derive
 /// [`Schema`](crate::Schema) and use
 /// [`Clapfig::schema_builder`](crate::Clapfig::schema_builder), whose
 /// [`SchemaConfigBuilder`](crate::SchemaConfigBuilder) forwards to this
@@ -54,7 +68,8 @@ pub(crate) type RuntimePostValidateHook = Box<dyn Fn(&Table) -> Result<(), Strin
 pub struct RuntimeBuilder {
     spec: Arc<DynamicSpec>,
     app_name: Option<String>,
-    file_name: Option<String>,
+    file_naming: Option<FileNaming>,
+    formats: Option<Vec<String>>,
     search_paths: Option<Vec<SearchPath>>,
     search_mode: SearchMode,
     persist_scopes: Vec<(String, SearchPath)>,
@@ -88,7 +103,8 @@ impl RuntimeBuilder {
         Self {
             spec,
             app_name: None,
-            file_name: None,
+            file_naming: None,
+            formats: None,
             search_paths: None,
             search_mode: SearchMode::default(),
             persist_scopes: Vec::new(),
@@ -116,8 +132,47 @@ impl RuntimeBuilder {
     }
 
     /// Override the config file name (default: `"{app_name}.toml"`).
+    ///
+    /// Exact-name discovery: only files with this precise name are
+    /// considered, and the name's extension selects the (only) enabled
+    /// format. Mutually exclusive with [`file_stem`](Self::file_stem) —
+    /// the last call wins.
     pub fn file_name(mut self, name: &str) -> Self {
-        self.file_name = Some(name.to_string());
+        self.file_naming = Some(FileNaming::Exact(name.to_string()));
+        self
+    }
+
+    /// Discover config files by stem across the enabled formats'
+    /// extensions (see [`formats`](Self::formats)): `.file_stem("myapp")`
+    /// probes `myapp.toml` (and `myapp.yaml` / `myapp.json` when those
+    /// formats are enabled) in every search directory.
+    ///
+    /// More than one same-stem match **in the same directory** is a hard
+    /// error naming both files
+    /// ([`ClapfigError::AmbiguousConfigFiles`]); across directories,
+    /// normal layering applies. Mutually exclusive with
+    /// [`file_name`](Self::file_name) — the last call wins.
+    pub fn file_stem(mut self, stem: &str) -> Self {
+        self.file_naming = Some(FileNaming::Stem(stem.to_string()));
+        self
+    }
+
+    /// Set the enabled formats for stem-based discovery, in preference
+    /// order (canonical names: `"toml"`, `"yaml"`, `"json"`).
+    ///
+    /// Formats are opt-in and ordered — never inferred from compiled-in
+    /// cargo features; the default with no call is TOML only. The first
+    /// entry is the app's **preferred format**: `config gen` with no
+    /// output path renders it, and `config set` against a scope with no
+    /// existing file creates `<stem>.<preferred extension>`. An unknown
+    /// name errors at `build_resolver`/`load` time with
+    /// [`ClapfigError::UnknownFormat`].
+    pub fn formats<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.formats = Some(names.into_iter().map(Into::into).collect());
         self
     }
 
@@ -307,7 +362,7 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Post-merge validation hook. Receives the merged `&toml::Table`.
+    /// Post-merge validation hook. Receives the merged value [`Map`].
     ///
     /// Use it for constraints the schema can't express: numeric ranges,
     /// cross-field invariants ("if A is set then B must be set"), enum
@@ -319,7 +374,7 @@ impl RuntimeBuilder {
     /// variant receives a typed `&C` instead.)
     pub fn post_validate<F>(mut self, f: F) -> Self
     where
-        F: Fn(&Table) -> Result<(), String> + Send + Sync + 'static,
+        F: Fn(&Map) -> Result<(), String> + Send + Sync + 'static,
     {
         self.post_validate = Some(Box::new(f));
         self
@@ -380,12 +435,52 @@ impl RuntimeBuilder {
             .ok_or(ClapfigError::AppNameRequired)
     }
 
-    fn effective_file_name(&self) -> Result<String, ClapfigError> {
-        if let Some(name) = &self.file_name {
-            return Ok(name.clone());
+    fn effective_naming(&self) -> Result<FileNaming, ClapfigError> {
+        if let Some(naming) = &self.file_naming {
+            return Ok(naming.clone());
         }
         let app = self.effective_app_name()?;
-        Ok(format!("{app}.toml"))
+        Ok(FileNaming::Exact(format!("{app}.toml")))
+    }
+
+    /// Build the enabled-formats registry for the effective file naming.
+    ///
+    /// - Exact-name mode enables only the name's extension's format
+    ///   (falling back to TOML for extensionless/unknown names, matching
+    ///   the pre-registry behavior of parsing every discovered file as
+    ///   TOML).
+    /// - Stem mode enables the [`formats`](Self::formats) list in order
+    ///   (default: TOML only).
+    fn effective_registry(&self) -> Result<FormatRegistry, ClapfigError> {
+        let mut registry = FormatRegistry::new();
+        match self.effective_naming()? {
+            FileNaming::Exact(name) => {
+                let adapter = Path::new(&name)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .and_then(format::builtin_adapter_for_extension)
+                    .unwrap_or_else(|| {
+                        format::builtin_adapter("toml").expect("toml adapter is built in")
+                    });
+                registry.register(adapter);
+            }
+            FileNaming::Stem(_) => {
+                let names = self
+                    .formats
+                    .clone()
+                    .unwrap_or_else(|| vec!["toml".to_string()]);
+                for name in names {
+                    let adapter = format::builtin_adapter(&name).ok_or_else(|| {
+                        ClapfigError::UnknownFormat {
+                            name: name.clone(),
+                            available: format::builtin_names(),
+                        }
+                    })?;
+                    registry.register(adapter);
+                }
+            }
+        }
+        Ok(registry)
     }
 
     fn effective_search_paths(&self) -> Vec<SearchPath> {
@@ -432,7 +527,8 @@ impl RuntimeBuilder {
     /// called on the builder.
     pub fn build_resolver(self) -> Result<RuntimeResolver, ClapfigError> {
         let app_name = self.effective_app_name()?.to_string();
-        let file_name = self.effective_file_name()?;
+        let naming = self.effective_naming()?;
+        let registry = self.effective_registry()?;
         let search_paths = self.effective_search_paths();
         let env_prefix = self.effective_env_prefix()?;
         let env_vars = if env_prefix.is_some() {
@@ -454,7 +550,8 @@ impl RuntimeBuilder {
         Ok(RuntimeResolver {
             spec: self.spec,
             app_name,
-            file_name,
+            naming,
+            registry,
             search_paths,
             search_mode: self.search_mode,
             env_prefix,
@@ -473,7 +570,7 @@ impl RuntimeBuilder {
     }
 
     /// Load and resolve the configuration through all layers, returning
-    /// the merged [`toml::Table`].
+    /// the merged value [`Map`].
     ///
     /// If a [`post_validate`](Self::post_validate) hook is registered, it
     /// runs after the merged configuration has been produced and any
@@ -483,7 +580,7 @@ impl RuntimeBuilder {
     /// `self.build_resolver()?.resolve_at(std::env::current_dir()?)`, so
     /// all resolution logic lives in exactly one place (see
     /// [`RuntimeResolver`]).
-    pub fn load(self) -> Result<Table, ClapfigError> {
+    pub fn load(self) -> Result<Map, ClapfigError> {
         let start_dir = std::env::current_dir().map_err(|e| ClapfigError::IoError {
             path: PathBuf::from("."),
             source: e,
@@ -497,7 +594,7 @@ impl RuntimeBuilder {
     /// The list is empty when no callback is registered or no key opts in.
     pub fn load_with_unknowns(
         self,
-    ) -> Result<(Table, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
+    ) -> Result<(Map, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
         let start_dir = std::env::current_dir().map_err(|e| ClapfigError::IoError {
             path: PathBuf::from("."),
             source: e,
@@ -526,12 +623,26 @@ impl RuntimeBuilder {
         self.handle(action).map(|r| r.to_string())
     }
 
-    fn resolve_scope_persist_path(&self, scope: Option<&str>) -> Result<PathBuf, ClapfigError> {
+    /// Resolve the file path AND format adapter for a named persist
+    /// scope.
+    ///
+    /// Exact-name scopes join the configured name onto the scope
+    /// directory (the pre-registry behavior). Stem scopes apply the
+    /// spec's `set` rules: exactly one existing same-stem file → edit
+    /// that file in its own format; none → create
+    /// `<stem>.<preferred extension>`; several → the same hard
+    /// ambiguity error discovery raises. The adapter is then selected by
+    /// the final path's extension (explicit-path rule), falling back to
+    /// TOML for extensionless names.
+    fn resolve_scope_persist_path(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<(PathBuf, Box<dyn FormatAdapter>), ClapfigError> {
         if self.persist_scopes.is_empty() {
             return Err(ClapfigError::NoPersistPath);
         }
         let app_name = self.effective_app_name()?;
-        let file_name = self.effective_file_name()?;
+        let naming = self.effective_naming()?;
         let (_, search_path) = match scope {
             None => &self.persist_scopes[0],
             Some(name) => self
@@ -543,7 +654,45 @@ impl RuntimeBuilder {
                     available: self.persist_scopes.iter().map(|(n, _)| n.clone()).collect(),
                 })?,
         };
-        file::resolve_persist_path(search_path, &file_name, app_name)
+        let path = match naming {
+            FileNaming::Exact(name) => file::resolve_persist_path(search_path, &name, app_name)?,
+            FileNaming::Stem(stem) => {
+                let dir = match search_path {
+                    SearchPath::Ancestors(_) => {
+                        return Err(ClapfigError::AncestorsNotAllowedAsPersistPath);
+                    }
+                    other => file::resolve_search_path(other, app_name, None)
+                        .ok_or(ClapfigError::NoPersistPath)?,
+                };
+                let registry = self.effective_registry()?;
+                let mut matches: Vec<PathBuf> = Vec::new();
+                for adapter in registry.iter() {
+                    for ext in adapter.extensions() {
+                        let candidate = dir.join(format!("{stem}.{ext}"));
+                        if candidate.is_file() {
+                            matches.push(candidate);
+                        }
+                    }
+                }
+                match matches.len() {
+                    0 => {
+                        let preferred = registry
+                            .preferred()
+                            .expect("effective_registry always registers an adapter");
+                        dir.join(format!("{stem}.{}", preferred.extensions()[0]))
+                    }
+                    1 => matches.remove(0),
+                    _ => {
+                        return Err(ClapfigError::AmbiguousConfigFiles {
+                            dir,
+                            files: matches,
+                        });
+                    }
+                }
+            }
+        };
+        let adapter = adapter_for_explicit_path(&path);
+        Ok((path, adapter))
     }
 
     /// Dispatch a [`ConfigAction`] against the runtime schema.
@@ -558,15 +707,34 @@ impl RuntimeBuilder {
                     Ok(list_from_table(&table))
                 }
                 Some(name) => {
-                    let path = self.resolve_scope_persist_path(Some(name))?;
-                    ops::list_scope_file(&path)
+                    let (path, adapter) = self.resolve_scope_persist_path(Some(name))?;
+                    ops::list_scope_file(adapter.as_ref(), &path)
                 }
             },
             ConfigAction::Gen { output } => {
-                let template =
-                    ops::generate_template_from_runtime(&self.spec.schema, self.normalize_keys);
+                let registry = self.effective_registry()?;
                 match output {
                     Some(path) => {
+                        // Explicit output path: the extension selects the
+                        // adapter, independent of the enabled list;
+                        // extensionless paths fall back to the preferred
+                        // format.
+                        let adapter = path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .and_then(format::builtin_adapter_for_extension)
+                            .unwrap_or_else(|| {
+                                let preferred = registry
+                                    .preferred()
+                                    .expect("effective_registry always registers an adapter");
+                                format::builtin_adapter(preferred.name())
+                                    .expect("preferred adapters are built in")
+                            });
+                        let template = ops::generate_template(
+                            adapter.as_ref(),
+                            &self.spec.schema,
+                            self.normalize_keys,
+                        )?;
                         if let Some(parent) = path.parent() {
                             std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
                                 path: parent.to_path_buf(),
@@ -579,7 +747,19 @@ impl RuntimeBuilder {
                         })?;
                         Ok(ConfigResult::TemplateWritten { path: path.clone() })
                     }
-                    None => Ok(ConfigResult::Template(template)),
+                    None => {
+                        // Stdout gen renders the preferred (first-enabled)
+                        // format.
+                        let preferred = registry
+                            .preferred()
+                            .expect("effective_registry always registers an adapter");
+                        let template = ops::generate_template(
+                            preferred,
+                            &self.spec.schema,
+                            self.normalize_keys,
+                        )?;
+                        Ok(ConfigResult::Template(template))
+                    }
                 }
             }
             ConfigAction::Schema { output } => {
@@ -612,17 +792,23 @@ impl RuntimeBuilder {
                     get_from_table(&spec.schema, &table, key)
                 }
                 Some(name) => {
-                    let path = self.resolve_scope_persist_path(Some(name))?;
-                    get_scope_runtime(&self.spec.schema, &path, key)
+                    let (path, adapter) = self.resolve_scope_persist_path(Some(name))?;
+                    get_scope_runtime(adapter.as_ref(), &self.spec.schema, &path, key)
                 }
             },
             ConfigAction::Set { key, value, scope } => {
-                let path = self.resolve_scope_persist_path(scope.as_deref())?;
-                persist::persist_value_runtime(&self.spec.schema, &path, key, value)
+                let (path, adapter) = self.resolve_scope_persist_path(scope.as_deref())?;
+                persist::persist_value_runtime(
+                    adapter.as_ref(),
+                    &self.spec.schema,
+                    &path,
+                    key,
+                    value,
+                )
             }
             ConfigAction::Unset { key, scope } => {
-                let path = self.resolve_scope_persist_path(scope.as_deref())?;
-                crate::persist::unset_value(&path, key)
+                let (path, adapter) = self.resolve_scope_persist_path(scope.as_deref())?;
+                crate::persist::unset_value(adapter.as_ref(), &path, key)
             }
         }
     }
@@ -641,7 +827,8 @@ impl RuntimeBuilder {
 pub struct RuntimeResolver {
     spec: Arc<DynamicSpec>,
     app_name: String,
-    file_name: String,
+    naming: FileNaming,
+    registry: FormatRegistry,
     search_paths: Vec<SearchPath>,
     search_mode: SearchMode,
     env_prefix: Option<String>,
@@ -659,10 +846,7 @@ pub struct RuntimeResolver {
 }
 
 impl RuntimeResolver {
-    pub fn resolve_at(
-        &self,
-        start_dir: impl AsRef<std::path::Path>,
-    ) -> Result<Table, ClapfigError> {
+    pub fn resolve_at(&self, start_dir: impl AsRef<std::path::Path>) -> Result<Map, ClapfigError> {
         self.resolve_at_inner(start_dir.as_ref())
             .map(|(table, _unknowns)| table)
     }
@@ -673,7 +857,7 @@ impl RuntimeResolver {
     pub fn resolve_at_with_unknowns(
         &self,
         start_dir: impl AsRef<std::path::Path>,
-    ) -> Result<(Table, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
+    ) -> Result<(Map, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
         self.resolve_at_inner(start_dir.as_ref())
     }
 
@@ -684,7 +868,7 @@ impl RuntimeResolver {
     fn resolve_at_inner(
         &self,
         start_dir: &std::path::Path,
-    ) -> Result<(Table, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
+    ) -> Result<(Map, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
         let absolute = if start_dir.is_absolute() {
             start_dir.to_path_buf()
         } else {
@@ -705,6 +889,7 @@ impl RuntimeResolver {
 
         let input = ResolveInput {
             spec: self.spec.as_ref(),
+            registry: &self.registry,
             files,
             env_vars: self.env_vars.clone(),
             env_prefix: self.env_prefix.clone(),
@@ -730,21 +915,54 @@ impl RuntimeResolver {
             SearchMode::Merge => {
                 let mut out = Vec::new();
                 for dir in dirs {
-                    let path = dir.join(&self.file_name);
-                    if let Some(contents) = self.read_cached(&path)? {
-                        out.push((path, contents));
+                    if let Some(found) = self.find_in_dir(dir)? {
+                        out.push(found);
                     }
                 }
                 Ok(out)
             }
             SearchMode::FirstMatch => {
                 for dir in dirs.iter().rev() {
-                    let path = dir.join(&self.file_name);
-                    if let Some(contents) = self.read_cached(&path)? {
-                        return Ok(vec![(path, contents)]);
+                    if let Some(found) = self.find_in_dir(dir)? {
+                        return Ok(vec![found]);
                     }
                 }
                 Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Discover this resolver's config file inside one directory.
+    ///
+    /// Exact naming probes the single configured name. Stem naming probes
+    /// `<stem>.<ext>` across every enabled adapter's extensions; more
+    /// than one hit in the same directory is the spec's hard
+    /// [`AmbiguousConfigFiles`](ClapfigError::AmbiguousConfigFiles) error
+    /// (no silent precedence, no merging of same-stem siblings).
+    fn find_in_dir(&self, dir: &Path) -> Result<Option<(PathBuf, String)>, ClapfigError> {
+        match &self.naming {
+            FileNaming::Exact(name) => {
+                let path = dir.join(name);
+                Ok(self.read_cached(&path)?.map(|contents| (path, contents)))
+            }
+            FileNaming::Stem(stem) => {
+                let mut found: Vec<(PathBuf, String)> = Vec::new();
+                for adapter in self.registry.iter() {
+                    for ext in adapter.extensions() {
+                        let path = dir.join(format!("{stem}.{ext}"));
+                        if let Some(contents) = self.read_cached(&path)? {
+                            found.push((path, contents));
+                        }
+                    }
+                }
+                match found.len() {
+                    0 => Ok(None),
+                    1 => Ok(found.pop()),
+                    _ => Err(ClapfigError::AmbiguousConfigFiles {
+                        dir: dir.to_path_buf(),
+                        files: found.into_iter().map(|(p, _)| p).collect(),
+                    }),
+                }
             }
         }
     }
@@ -781,15 +999,25 @@ impl RuntimeResolver {
     }
 }
 
+/// Select the format adapter for an explicit file path by its extension
+/// (independent of the enabled-formats list), falling back to TOML for
+/// extensionless or unrecognized names.
+fn adapter_for_explicit_path(path: &Path) -> Box<dyn FormatAdapter> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(format::builtin_adapter_for_extension)
+        .unwrap_or_else(|| format::builtin_adapter("toml").expect("toml adapter is built in"))
+}
+
 /// Render every leaf in a resolved runtime table as `dotted.key = value`
 /// entries, matching what the static path's `ops::list_values` produces.
-fn list_from_table(table: &Table) -> ConfigResult {
+fn list_from_table(table: &Map) -> ConfigResult {
     let mut entries = Vec::new();
     flatten_table(table, "", &mut entries);
     ConfigResult::Listing { entries }
 }
 
-fn flatten_table(table: &Table, prefix: &str, out: &mut Vec<(String, String)>) {
+fn flatten_table(table: &Map, prefix: &str, out: &mut Vec<(String, String)>) {
     for (key, value) in table {
         let full = if prefix.is_empty() {
             key.clone()
@@ -797,7 +1025,7 @@ fn flatten_table(table: &Table, prefix: &str, out: &mut Vec<(String, String)>) {
             format!("{prefix}.{key}")
         };
         match value {
-            Value::Table(t) => flatten_table(t, &full, out),
+            Value::Map(t) => flatten_table(t, &full, out),
             _ => out.push((full, format_runtime_value(value))),
         }
     }
@@ -810,13 +1038,13 @@ fn format_runtime_value(value: &Value) -> String {
         Value::Float(f) => f.to_string(),
         Value::Boolean(b) => b.to_string(),
         Value::Datetime(d) => d.to_string(),
-        Value::Array(_) | Value::Table(_) => {
-            toml::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
-        }
+        // Containers render in the value model's deterministic inline
+        // notation.
+        Value::Array(_) | Value::Map(_) => value.to_string(),
     }
 }
 
-fn get_from_table(schema: &Schema, table: &Table, key: &str) -> Result<ConfigResult, ClapfigError> {
+fn get_from_table(schema: &Schema, table: &Map, key: &str) -> Result<ConfigResult, ClapfigError> {
     let value = ops::table_get(table, key).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
     let doc = crate::meta::doc_for_runtime(schema, key).unwrap_or_default();
     Ok(ConfigResult::KeyValue {
@@ -827,6 +1055,7 @@ fn get_from_table(schema: &Schema, table: &Table, key: &str) -> Result<ConfigRes
 }
 
 fn get_scope_runtime(
+    adapter: &dyn FormatAdapter,
     schema: &Schema,
     file_path: &std::path::Path,
     key: &str,
@@ -844,13 +1073,24 @@ fn get_scope_runtime(
         }
     };
 
-    let table: Table = content
-        .parse()
-        .map_err(|e: toml::de::Error| ClapfigError::ParseError {
+    let table = match adapter
+        .parse(&content)
+        .map_err(|e| ClapfigError::ParseError {
             path: file_path.to_path_buf(),
             source: Box::new(e),
             source_text: Some(Arc::from(content.as_str())),
-        })?;
+        })? {
+        Value::Map(map) => map,
+        other => {
+            return Err(ClapfigError::InvalidValue {
+                key: file_path.display().to_string(),
+                reason: format!(
+                    "config documents must be maps at the root, got {}",
+                    other.type_str()
+                ),
+            });
+        }
+    };
 
     let value = ops::table_get(&table, key).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
     let doc = crate::meta::doc_for_runtime(schema, key).unwrap_or_default();
@@ -912,7 +1152,7 @@ mod tests {
         assert_eq!(table.get("host"), Some(&Value::String("localhost".into())));
         assert_eq!(table.get("port"), Some(&Value::Integer(8080)));
         assert_eq!(table.get("level"), Some(&Value::String("info".into())));
-        let db = table.get("db").and_then(Value::as_table).unwrap();
+        let db = table.get("db").and_then(Value::as_map).unwrap();
         assert_eq!(db.get("pool_size"), Some(&Value::Integer(5)));
     }
 
@@ -934,7 +1174,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(table.get("port"), Some(&Value::Integer(9090)));
-        let db = table.get("db").and_then(Value::as_table).unwrap();
+        let db = table.get("db").and_then(Value::as_map).unwrap();
         assert_eq!(db.get("url"), Some(&Value::String("pg://prod".into())));
     }
 
@@ -1075,7 +1315,7 @@ mod tests {
             .file_name("demo.toml")
             .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
             .no_env()
-            .post_validate(move |t: &Table| {
+            .post_validate(move |t: &Map| {
                 *seen_clone.lock().unwrap() = t.get("port").and_then(Value::as_integer).unwrap();
                 Ok(())
             })
@@ -1129,13 +1369,13 @@ mod tests {
         };
         // Re-parse the output as TOML and verify `second` is at the root,
         // not inside `[inner]`.
-        let parsed: toml::Table = t.parse().unwrap();
-        assert!(parsed.get("first").is_some(), "first must be at root:\n{t}");
+        let parsed = crate::fixtures::test::parse_toml(&t);
+        assert!(parsed.contains_key("first"), "first must be at root:\n{t}");
         assert!(
-            parsed.get("second").is_some(),
+            parsed.contains_key("second"),
             "second leaked into [inner] (template ordering bug):\n{t}"
         );
-        let inner = parsed.get("inner").and_then(|v| v.as_table()).unwrap();
+        let inner = parsed.get("inner").and_then(|v| v.as_map()).unwrap();
         assert!(
             inner.get("second").is_none(),
             "second must not be under inner"
@@ -1248,7 +1488,7 @@ mod tests {
             .load()
             .unwrap();
 
-        let rules = table["rules"].as_table().unwrap();
+        let rules = table["rules"].as_map().unwrap();
         assert_eq!(rules["missing_footnote"].as_str(), Some("warn"));
         assert!(rules["bad_columns"].as_array().is_some());
     }
@@ -1318,7 +1558,7 @@ mod tests {
             .no_env()
             .load()
             .unwrap();
-        let plugins = table["plugins"].as_table().unwrap();
+        let plugins = table["plugins"].as_map().unwrap();
         assert_eq!(plugins.len(), 2);
         assert!(plugins.contains_key("audit"));
         assert!(plugins.contains_key("fmt"));
@@ -1341,15 +1581,15 @@ mod tests {
             .no_env()
             .load()
             .unwrap();
-        let plugins = table["plugins"].as_table().unwrap();
+        let plugins = table["plugins"].as_map().unwrap();
         assert!(
-            !plugins["audit"].as_table().unwrap()["enabled"]
+            !plugins["audit"].as_map().unwrap()["enabled"]
                 .as_bool()
                 .unwrap(),
             "missing leaf in map entry must get the default"
         );
         assert!(
-            plugins["fmt"].as_table().unwrap()["enabled"]
+            plugins["fmt"].as_map().unwrap()["enabled"]
                 .as_bool()
                 .unwrap(),
             "explicit leaf in map entry must not be overwritten"
@@ -1418,7 +1658,7 @@ mod tests {
         // `plugins` may or may not be present in the resulting table;
         // what matters is that load doesn't error.
         if let Some(plugins) = table.get("plugins") {
-            let plugins_table = plugins.as_table().unwrap();
+            let plugins_table = plugins.as_map().unwrap();
             assert!(plugins_table.is_empty());
         }
     }
@@ -1616,7 +1856,7 @@ mod tests {
         assert_eq!(table.get("host"), Some(&Value::String("from-cli".into())));
         assert_eq!(table.get("port"), Some(&Value::Integer(4242)));
         // `verbose` was silently ignored — not in schema.
-        assert!(table.get("verbose").is_none());
+        assert!(!table.contains_key("verbose"));
     }
 
     // --- Phase 3 cascading strictness (#37) ---
@@ -1660,7 +1900,7 @@ mod tests {
         assert!(
             table
                 .get("mid")
-                .and_then(|v| v.as_table())
+                .and_then(|v| v.as_map())
                 .and_then(|t| t.get("deep"))
                 .is_some()
         );
@@ -2120,7 +2360,7 @@ mod tests {
             .load()
             .unwrap();
 
-        let db = table.get("db").and_then(Value::as_table).unwrap();
+        let db = table.get("db").and_then(Value::as_map).unwrap();
         assert_eq!(db.get("pool_size"), Some(&Value::Integer(42)));
     }
 
@@ -2635,6 +2875,227 @@ mod tests {
             !called.load(std::sync::atomic::Ordering::SeqCst),
             "hook must not run when upstream resolution fails"
         );
+    }
+
+    // --- the builder file-name contract (value-model spec) ---
+
+    #[test]
+    fn file_stem_discovers_default_toml_only() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "port = 4321\n").unwrap();
+        // A same-stem file in a format that is NOT enabled is invisible
+        // to discovery (formats are opt-in, never inferred).
+        fs::write(dir.path().join("demo.json"), "{}").unwrap();
+
+        let table = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap();
+        assert_eq!(table.get("port"), Some(&Value::Integer(4321)));
+    }
+
+    #[test]
+    fn file_stem_same_directory_multi_format_match_is_hard_error() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "port = 1\n").unwrap();
+        fs::write(dir.path().join("demo.json"), "{}").unwrap();
+
+        let err = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .formats(["toml", "json"])
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::AmbiguousConfigFiles {
+                dir: err_dir,
+                files,
+            } => {
+                assert_eq!(err_dir, dir.path());
+                assert_eq!(files.len(), 2);
+                let msg = ClapfigError::AmbiguousConfigFiles {
+                    dir: err_dir,
+                    files,
+                }
+                .to_string();
+                assert!(msg.contains("demo.toml"), "must name both files: {msg}");
+                assert!(msg.contains("demo.json"), "must name both files: {msg}");
+            }
+            other => panic!("expected AmbiguousConfigFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_stem_multi_format_enabled_single_match_loads() {
+        // Enabling several formats is fine as long as each directory has
+        // at most one same-stem file.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "port = 7\n").unwrap();
+
+        let table = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .formats(["toml", "json"])
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap();
+        assert_eq!(table.get("port"), Some(&Value::Integer(7)));
+    }
+
+    #[test]
+    fn file_stem_layering_across_directories_still_merges() {
+        // Across directories the same-stem rule does NOT fire — each
+        // directory contributes at most one file; normal layering applies.
+        let low = TempDir::new().unwrap();
+        let high = TempDir::new().unwrap();
+        fs::write(low.path().join("demo.toml"), "port = 1\nhost = \"low\"\n").unwrap();
+        fs::write(high.path().join("demo.toml"), "port = 2\n").unwrap();
+
+        let table = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .search_paths(vec![
+                SearchPath::Path(low.path().to_path_buf()),
+                SearchPath::Path(high.path().to_path_buf()),
+            ])
+            .no_env()
+            .load()
+            .unwrap();
+        assert_eq!(table.get("port"), Some(&Value::Integer(2)));
+        assert_eq!(table.get("host"), Some(&Value::String("low".into())));
+    }
+
+    #[test]
+    fn formats_unknown_name_errors() {
+        let err = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .formats(["toml", "xml"])
+            .no_env()
+            .build_resolver()
+            .err();
+        match err {
+            Some(ClapfigError::UnknownFormat { name, available }) => {
+                assert_eq!(name, "xml");
+                assert_eq!(available, ["toml", "yaml", "json"]);
+            }
+            other => panic!("expected UnknownFormat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_stem_set_creates_preferred_format_file_seeded_from_template() {
+        // `config set` against a stem scope with no existing file creates
+        // `<stem>.<preferred extension>` seeded from the template.
+        let dir = TempDir::new().unwrap();
+        Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "12345".into(),
+                scope: None,
+            })
+            .unwrap();
+        let created = dir.path().join("demo.toml");
+        assert!(created.exists(), "preferred-format file must be created");
+        let content = fs::read_to_string(&created).unwrap();
+        assert!(content.contains("port = 12345"));
+        // Seeded from the template → doc comments present.
+        assert!(content.contains("# App host"));
+    }
+
+    #[test]
+    fn file_stem_set_edits_the_single_existing_same_stem_file() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "port = 1\n").unwrap();
+        Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .formats(["toml", "json"])
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "2".into(),
+                scope: None,
+            })
+            .unwrap();
+        let content = fs::read_to_string(dir.path().join("demo.toml")).unwrap();
+        assert!(content.contains("port = 2"));
+        assert!(
+            !dir.path().join("demo.json").exists(),
+            "set must edit the existing file in its own format"
+        );
+    }
+
+    #[test]
+    fn file_stem_set_with_ambiguous_files_errors() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "port = 1\n").unwrap();
+        fs::write(dir.path().join("demo.json"), "{}").unwrap();
+        let err = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .formats(["toml", "json"])
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "2".into(),
+                scope: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ClapfigError::AmbiguousConfigFiles { .. }));
+    }
+
+    #[test]
+    fn exact_file_name_without_extension_still_parses_as_toml() {
+        // Behavior preservation: extensionless exact names (e.g. an rc
+        // file) keep parsing as TOML, exactly as before the registry.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demorc"), "port = 999\n").unwrap();
+        let table = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demorc")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap();
+        assert_eq!(table.get("port"), Some(&Value::Integer(999)));
+    }
+
+    // --- schema-driven datetime coercion, end to end ---
+
+    #[test]
+    fn override_string_coerces_into_datetime_leaf() {
+        // CLI/URL/env layers are schema-blind (heuristics deliver
+        // strings); the DateTime leaf declaration coerces at finalize
+        // (ADR-0001).
+        let dir = TempDir::new().unwrap();
+        let schema = Schema::object("T")
+            .field("stamp", RtField::datetime().optional())
+            .build();
+        let table = Clapfig::runtime(schema)
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .cli_override("stamp", Some("1979-05-27T07:32:00Z"))
+            .load()
+            .unwrap();
+        match &table["stamp"] {
+            Value::Datetime(dt) => assert_eq!(dt.to_string(), "1979-05-27T07:32:00Z"),
+            other => panic!("expected Datetime, got {other:?}"),
+        }
     }
 
     #[test]

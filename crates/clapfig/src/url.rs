@@ -5,7 +5,8 @@
 //! string). Values are percent-decoded before parsing.
 
 use percent_encoding::percent_decode_str;
-use toml::Value;
+
+use crate::value::Value;
 
 use crate::env::parse_env_value;
 

@@ -1,6 +1,21 @@
 #[cfg(test)]
 pub mod test {
+    use crate::format::FormatAdapter;
     use crate::runtime::{Field, Schema};
+    use crate::value::{Map, Value};
+
+    /// Parse TOML source text into a value [`Map`] through the TOML
+    /// adapter — the test-side stand-in for the discovery path, so unit
+    /// tests never touch the `toml` crate directly.
+    pub fn parse_toml(text: &str) -> Map {
+        match crate::format::TomlAdapter
+            .parse(text)
+            .expect("test fixture TOML must parse")
+        {
+            Value::Map(map) => map,
+            _ => unreachable!("TOML documents are maps at the root"),
+        }
+    }
 
     /// The canonical test schema shared across unit-test modules.
     ///
@@ -69,13 +84,13 @@ pub mod test {
         use crate::spec::ConfigSpec;
 
         let spec = crate::runtime_spec::DynamicSpec::new(test_schema());
-        let mut table = toml::Table::new();
+        let mut table = Map::new();
         spec.fill_defaults(&mut table).unwrap();
         let table = spec.finalize(table).unwrap();
         assert_eq!(table["host"].as_str(), Some("localhost"));
         assert_eq!(table["port"].as_integer(), Some(8080));
         assert_eq!(table["debug"].as_bool(), Some(false));
-        let db = table["database"].as_table().unwrap();
+        let db = table["database"].as_map().unwrap();
         assert!(db.get("url").is_none());
         assert_eq!(db["pool_size"].as_integer(), Some(5));
     }

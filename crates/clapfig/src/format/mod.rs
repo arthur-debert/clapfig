@@ -27,6 +27,10 @@ pub mod json;
 pub mod toml;
 pub mod yaml;
 
+pub use json::JsonAdapter;
+pub use toml::TomlAdapter;
+pub use yaml::YamlAdapter;
+
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -110,6 +114,9 @@ pub enum FormatError {
         /// Human-readable description; adapters name the offending key
         /// where the mapping table requires it.
         message: String,
+        /// Byte range of the offending source text, when the underlying
+        /// parser reports one. Renderers use it to draw snippets/carets.
+        span: Option<Span>,
     },
 
     /// A [`Value`] tree contains something this format cannot serialize
@@ -121,6 +128,40 @@ pub enum FormatError {
         /// Human-readable description naming the offending key/value.
         message: String,
     },
+
+    /// A declared edit operation failed on the given source text (e.g. a
+    /// path conflict where an existing scalar sits where the edit needs a
+    /// table).
+    #[error("failed to edit {format}: {message}")]
+    Edit {
+        /// The editing format's name.
+        format: &'static str,
+        /// Human-readable description naming the conflicting path.
+        message: String,
+    },
+}
+
+impl FormatError {
+    /// The bare human-readable detail carried by this error, without the
+    /// `failed to <operation> <format>:` framing — what call sites embed
+    /// into their own error types (e.g. `ClapfigError::InvalidValue`'s
+    /// `reason`).
+    pub fn detail(&self) -> String {
+        match self {
+            FormatError::Unsupported(u) => u.to_string(),
+            FormatError::Parse { message, .. }
+            | FormatError::Serialize { message, .. }
+            | FormatError::Edit { message, .. } => message.clone(),
+        }
+    }
+
+    /// The source-text byte range for a parse failure, when reported.
+    pub fn parse_span(&self) -> Option<Span> {
+        match self {
+            FormatError::Parse { span, .. } => *span,
+            _ => None,
+        }
+    }
 }
 
 /// One step of a [`ConfigPath`]: a map key or an array index.
@@ -398,6 +439,39 @@ impl FormatRegistry {
     }
 }
 
+/// Construct the built-in adapter for a canonical format name, if the name
+/// is known. The name set matches [`FormatAdapter::name`] of the shipped
+/// adapters: `"toml"`, `"yaml"`, `"json"`.
+pub(crate) fn builtin_adapter(name: &str) -> Option<Box<dyn FormatAdapter>> {
+    match name {
+        "toml" => Some(Box::new(toml::TomlAdapter)),
+        "yaml" => Some(Box::new(yaml::YamlAdapter)),
+        "json" => Some(Box::new(json::JsonAdapter)),
+        _ => None,
+    }
+}
+
+/// The canonical names of every built-in adapter, for error messages.
+pub(crate) fn builtin_names() -> Vec<String> {
+    ["toml", "yaml", "json"].map(String::from).to_vec()
+}
+
+/// The built-in adapter claiming `extension` (matched case-insensitively,
+/// without the dot), independent of any enabled-formats list. This is the
+/// **explicit-path** selection rule: persist scopes, `--output` targets,
+/// and direct file arguments pick their adapter by extension even for
+/// formats the discovery list has not enabled.
+pub(crate) fn builtin_adapter_for_extension(extension: &str) -> Option<Box<dyn FormatAdapter>> {
+    let extension = extension.to_ascii_lowercase();
+    ["toml", "yaml", "json"].iter().find_map(|name| {
+        let adapter = builtin_adapter(name).expect("names enumerate the built-in set");
+        adapter
+            .extensions()
+            .contains(&extension.as_str())
+            .then_some(adapter)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +615,39 @@ mod tests {
         );
         assert_eq!(ConfigPath::new().key("").to_string(), "\"\"");
         assert_eq!(ConfigPath::new().to_string(), "");
+    }
+
+    #[test]
+    fn builtin_extension_lookup_selects_by_extension() {
+        // Explicit-path rule: the extension picks the adapter, whatever
+        // the enabled list says.
+        assert_eq!(
+            builtin_adapter_for_extension("toml").unwrap().name(),
+            "toml"
+        );
+        assert_eq!(
+            builtin_adapter_for_extension("TOML").unwrap().name(),
+            "toml"
+        );
+        assert_eq!(
+            builtin_adapter_for_extension("yaml").unwrap().name(),
+            "yaml"
+        );
+        assert_eq!(builtin_adapter_for_extension("yml").unwrap().name(), "yaml");
+        assert_eq!(
+            builtin_adapter_for_extension("json").unwrap().name(),
+            "json"
+        );
+        assert!(builtin_adapter_for_extension("ini").is_none());
+    }
+
+    #[test]
+    fn builtin_adapter_lookup_by_canonical_name() {
+        assert_eq!(builtin_adapter("toml").unwrap().name(), "toml");
+        assert_eq!(builtin_adapter("yaml").unwrap().name(), "yaml");
+        assert_eq!(builtin_adapter("json").unwrap().name(), "json");
+        assert!(builtin_adapter("ini").is_none());
+        assert_eq!(builtin_names(), ["toml", "yaml", "json"]);
     }
 
     #[test]

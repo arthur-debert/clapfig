@@ -1,6 +1,6 @@
 //! Strict-mode validation: detect unknown keys in config files.
 //!
-//! Operates on an already-parsed [`toml::Table`] so it sees exactly the same
+//! Operates on an already-parsed value [`Map`] so it sees exactly the same
 //! keys that will reach the merge step. When kebab-case normalization is
 //! enabled the table arrives with `-` already rewritten to `_`, and the
 //! line-number lookup is taught to match keys regardless of dash/underscore
@@ -9,14 +9,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use toml::{Table, Value};
-
 use crate::error::{ClapfigError, UnknownKeyInfo};
 use crate::normalize::normalize_key;
 use crate::spec::{FieldKindRef, SchemaRef};
 use crate::strict::{
     CollectedUnknown, StrictnessOverrides, UnknownKeyContext, UnknownKeyDecision, UnknownKeyHook,
 };
+use crate::value::{Map, Value};
 
 /// Per-resolution strictness configuration passed into the validate path.
 ///
@@ -62,7 +61,7 @@ pub(crate) struct UnknownKey {
 /// caller threads the resulting `UnknownKey` list through
 /// [`filter_through_cascade`].
 pub(crate) fn collect_unknown_paths_ref(
-    table: &Table,
+    table: &Map,
     schema: SchemaRef<'_>,
     prefix: &str,
 ) -> Vec<UnknownKey> {
@@ -72,7 +71,7 @@ pub(crate) fn collect_unknown_paths_ref(
 }
 
 fn walk_against_schema<'a>(
-    table: &Table,
+    table: &Map,
     schema: SchemaRef<'a>,
     prefix: &str,
     out: &mut Vec<UnknownKey>,
@@ -106,16 +105,16 @@ fn walk_against_schema<'a>(
                 // Leaf — type checking is the merged-table's job, not ours.
             }
             Some(FieldKindRef::Nested { schema: nested }) => {
-                if let Value::Table(t) = value {
+                if let Value::Map(t) = value {
                     walk_against_schema(t, nested, &full, out);
                 }
             }
             Some(FieldKindRef::MapOf {
                 schema: item_schema,
             }) => {
-                if let Value::Table(entries) = value {
+                if let Value::Map(entries) = value {
                     for (entry_key, entry_value) in entries {
-                        if let Value::Table(t) = entry_value {
+                        if let Value::Map(t) = entry_value {
                             let entry_path = format!("{full}.{entry_key}");
                             walk_against_schema(t, item_schema, &entry_path, out);
                         }
@@ -151,7 +150,7 @@ fn walk_against_schema<'a>(
 /// fell through to a Reject decision (in which case the error path runs
 /// instead).
 pub(crate) fn filter_through_cascade(
-    table: &Table,
+    table: &Map,
     source: &str,
     path: &Path,
     unknown_keys: Vec<UnknownKey>,
@@ -239,7 +238,7 @@ pub(crate) fn filter_through_cascade(
 /// callback receives this `Option` directly through
 /// [`UnknownKeyContext::value`](crate::UnknownKeyContext::value) and can
 /// decide based on path/leaf/file/line when the value is unavailable.
-fn lookup_value<'a>(table: &'a Table, path: &str, leaf: &str) -> Option<&'a Value> {
+fn lookup_value<'a>(table: &'a Map, path: &str, leaf: &str) -> Option<&'a Value> {
     let section = crate::strict::section_path_of(path, leaf);
     if section.is_empty() {
         return table.get(leaf);
@@ -253,12 +252,12 @@ fn lookup_value<'a>(table: &'a Table, path: &str, leaf: &str) -> Option<&'a Valu
     }
     for seg in segments {
         let (name, idx) = parse_segment(seg);
-        cursor = cursor.as_table()?.get(name)?;
+        cursor = cursor.as_map()?.get(name)?;
         if let Some(i) = idx {
             cursor = cursor.as_array()?.get(i)?;
         }
     }
-    cursor.as_table()?.get(leaf)
+    cursor.as_map()?.get(leaf)
 }
 
 /// Split a path segment into `(name, optional index)`.
@@ -394,14 +393,14 @@ mod tests {
         PathBuf::from("/test/config.toml")
     }
 
-    fn parse(content: &str) -> Table {
-        content.parse::<Table>().unwrap()
+    fn parse(content: &str) -> Map {
+        crate::fixtures::test::parse_toml(content)
     }
 
     /// Run unknown-key validation against the shared test schema, the way
     /// the resolve pipeline does per file.
     fn validate(
-        table: &Table,
+        table: &Map,
         source: &str,
         path: &Path,
         ctx: &ValidateContext<'_>,
@@ -482,7 +481,7 @@ pool_size = 10
 
     #[test]
     fn empty_content_ok() {
-        let table = Table::new();
+        let table = Map::new();
         let result = validate(&table, "", &path(), &test_ctx(false));
         assert!(result.is_ok());
     }
@@ -534,7 +533,7 @@ pool_size = 10
 
     use crate::normalize::normalize_table;
 
-    fn parse_and_normalize(content: &str) -> Table {
+    fn parse_and_normalize(content: &str) -> Map {
         let mut t = parse(content);
         normalize_table(&mut t).expect("test fixtures must not contain collisions");
         t

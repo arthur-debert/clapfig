@@ -79,7 +79,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "load" => {
             let table = make_builder().load()?;
             println!("Loaded config (as TOML):");
-            println!("{}", toml::to_string_pretty(&table)?);
+            use clapfig::format::FormatAdapter;
+            let rendered =
+                clapfig::format::TomlAdapter.serialize(&clapfig::value::Value::Map(table))?;
+            println!("{rendered}");
         }
         "gen" => {
             make_builder().handle_and_print(&ConfigAction::Gen { output: None })?;

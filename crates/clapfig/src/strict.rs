@@ -33,9 +33,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use toml::Value;
-
 use crate::spec::{FieldKindRef, SchemaRef};
+use crate::value::Value;
 
 /// Context handed to an [`on_unknown_key`](crate::RuntimeBuilder::on_unknown_key)
 /// callback. Carries every signal the callback needs to make a per-key
