@@ -632,12 +632,14 @@
 //! builder method to call. See the [`error`] module for the full set.
 
 pub mod error;
+pub mod format;
 pub mod meta;
 pub mod render;
 pub mod runtime;
 pub mod schema;
 pub mod static_schema;
 pub mod types;
+pub mod value;
 
 mod builder;
 #[cfg(feature = "clap")]
