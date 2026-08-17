@@ -120,13 +120,14 @@ impl FormatAdapter for TomlAdapter {
                         end: r.end,
                     }),
                 })?;
+        let operation = edit.operation();
         match edit {
-            FileEdit::Set { path, value } => {
-                let keys = key_segments(path, Operation::EditSet)?;
+            FileEdit::Set { path, value, .. } => {
+                let keys = key_segments(path, operation)?;
                 write_at_path(&mut doc, &keys, value)?;
             }
             FileEdit::Unset { path } => {
-                let keys = key_segments(path, Operation::EditUnset)?;
+                let keys = key_segments(path, operation)?;
                 unset_at_path(&mut doc, &keys);
             }
         }
@@ -468,7 +469,7 @@ fn template_placeholder(ty: &LeafType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ConfigPath;
+    use super::super::{ConfigPath, SetTarget};
     use super::*;
 
     #[test]
@@ -594,6 +595,7 @@ pool_size = 5
                 FileEdit::Set {
                     path: &path,
                     value: &value,
+                    target: SetTarget::ExistingValue,
                 },
             )
             .unwrap();
@@ -611,6 +613,7 @@ pool_size = 5
                 FileEdit::Set {
                     path: &path,
                     value: &value,
+                    target: SetTarget::MissingKey,
                 },
             )
             .unwrap();
@@ -631,6 +634,7 @@ pool_size = 5
                 FileEdit::Set {
                     path: &path,
                     value: &value,
+                    target: SetTarget::MissingKey,
                 },
             )
             .unwrap_err();
@@ -666,9 +670,15 @@ pool_size = 5
                 FileEdit::Set {
                     path: &path,
                     value: &value,
+                    target: SetTarget::MissingKey,
                 },
             )
             .unwrap_err();
-        assert!(matches!(err, FormatError::Unsupported(_)));
+        // The refusal names the request's own matrix row, not a blanket
+        // "set".
+        match err {
+            FormatError::Unsupported(u) => assert_eq!(u.operation, Operation::EditCreateKey),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }

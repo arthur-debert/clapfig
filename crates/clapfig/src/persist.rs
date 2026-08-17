@@ -5,12 +5,15 @@
 //! ([`FormatAdapter::edit`]) — for TOML that is lossless
 //! comment-preserving editing. This module owns the format-agnostic half:
 //! key/type validation against the schema, template seeding for missing
-//! files, and the file I/O around each edit.
+//! files, classifying each set request onto its capability-matrix row
+//! ([`SetTarget`] — replace vs create-key vs create-file, so refusals
+//! name the operation actually attempted), and the file I/O around each
+//! edit.
 
 use std::path::Path;
 
 use crate::error::ClapfigError;
-use crate::format::{ConfigPath, FileEdit, FormatAdapter};
+use crate::format::{ConfigPath, FileEdit, FormatAdapter, Operation, SetTarget};
 use crate::ops::ConfigResult;
 use crate::value::Value;
 
@@ -26,6 +29,15 @@ use crate::value::Value;
 ///
 /// If `content` is `None` (file doesn't exist yet), starts from the
 /// adapter's generated template so the new file carries doc comments.
+///
+/// The edit request carries the capability-matrix row actually attempted
+/// ([`SetTarget`]): a missing file is [`Operation::EditCreateFile`]
+/// (required up-front, before template seeding), and an existing document
+/// is parsed to classify replace ([`Operation::EditSet`]) vs create-key
+/// ([`Operation::EditCreateKey`]) — so typed refusals name the operation
+/// the caller attempted, not a blanket "set". Parsing is the edit's own
+/// first step, so a document the adapter cannot parse fails as its parse
+/// error.
 ///
 /// Schema/key validation failures are [`ClapfigError::KeyNotFound`] /
 /// [`ClapfigError::InvalidValue`]; adapter edit failures — including the
@@ -57,9 +69,31 @@ pub fn set_in_document_runtime(
             })?;
     }
 
-    let base = match content {
-        Some(c) => c.to_string(),
-        None => crate::ops::generate_template(adapter, schema, false)?,
+    let (base, target) = match content {
+        Some(c) => {
+            // Replace vs create-key depends on whether the path already
+            // resolves; classification parses the document — the edit's
+            // own first step, so parse failures (including a format that
+            // cannot parse at all) surface as-is.
+            let tree = adapter.parse(c).map_err(ClapfigError::from)?;
+            let target = if dotted_path_exists(&tree, key) {
+                SetTarget::ExistingValue
+            } else {
+                SetTarget::MissingKey
+            };
+            (c.to_string(), target)
+        }
+        None => {
+            // Missing file: require the matrix row before template
+            // seeding, so the refusal names the attempted operation
+            // rather than template generation.
+            adapter
+                .require(Operation::EditCreateFile)
+                .map_err(crate::format::FormatError::from)
+                .map_err(ClapfigError::from)?;
+            let seeded = crate::ops::generate_template(adapter, schema, false)?;
+            (seeded, SetTarget::MissingFile)
+        }
     };
     let base = if base.trim().is_empty() {
         String::new()
@@ -74,6 +108,7 @@ pub fn set_in_document_runtime(
             FileEdit::Set {
                 path: &path,
                 value: &value,
+                target,
             },
         )
         .map_err(ClapfigError::from)
@@ -192,6 +227,24 @@ pub fn unset_value(
     Ok(ConfigResult::ValueUnset { key: key.into() })
 }
 
+/// Whether a dotted persist key resolves to an existing value in a parsed
+/// document tree — the [`SetTarget::ExistingValue`] vs
+/// [`SetTarget::MissingKey`] classification for a set against an existing
+/// file.
+fn dotted_path_exists(tree: &Value, key: &str) -> bool {
+    let mut current = tree;
+    for segment in key.split('.') {
+        match current {
+            Value::Map(map) => match map.get(segment) {
+                Some(next) => current = next,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Build a structured [`ConfigPath`] from a dotted persist key. Persist
 /// keys are schema-validated dotted paths, so every `.` is a nesting
 /// separator (schema field names cannot contain dots).
@@ -238,6 +291,124 @@ mod tests {
     }
 
     // --- validation tests ---
+
+    /// In-test adapter that parses like TOML but declares no edit rows:
+    /// set-target classification succeeds, and every edit refuses with
+    /// the request's own operation — the shape a partially-implemented
+    /// adapter (parse landed, edits not yet) presents.
+    struct ParseOnly;
+
+    impl FormatAdapter for ParseOnly {
+        fn name(&self) -> &'static str {
+            "parseonly"
+        }
+
+        fn extensions(&self) -> &'static [&'static str] {
+            &["po"]
+        }
+
+        fn capabilities(&self) -> &'static [crate::format::Operation] {
+            &[crate::format::Operation::Parse]
+        }
+
+        fn parse(&self, text: &str) -> Result<Value, crate::format::FormatError> {
+            TomlAdapter.parse(text)
+        }
+
+        fn serialize(&self, _value: &Value) -> Result<String, crate::format::FormatError> {
+            Err(self
+                .require(crate::format::Operation::Serialize)
+                .unwrap_err()
+                .into())
+        }
+
+        fn template(
+            &self,
+            _schema: &crate::runtime::Schema,
+        ) -> Result<String, crate::format::FormatError> {
+            Err(self
+                .require(crate::format::Operation::Template)
+                .unwrap_err()
+                .into())
+        }
+
+        fn edit(
+            &self,
+            _source: &str,
+            edit: FileEdit<'_>,
+        ) -> Result<String, crate::format::FormatError> {
+            Err(self.require(edit.operation()).unwrap_err().into())
+        }
+
+        fn span_index(
+            &self,
+            _text: &str,
+        ) -> Result<crate::format::SpanIndex, crate::format::FormatError> {
+            Err(self
+                .require(crate::format::Operation::SpanIndex)
+                .unwrap_err()
+                .into())
+        }
+    }
+
+    /// Unwrap a persist error down to the typed refusal.
+    fn refusal(result: Result<String, ClapfigError>) -> crate::format::UnsupportedByFormat {
+        match result.unwrap_err() {
+            ClapfigError::Format(crate::format::FormatError::Unsupported(u)) => u,
+            other => panic!("expected typed refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_refusals_name_the_attempted_matrix_row() {
+        // The refusal reports the capability-matrix row the caller
+        // actually attempted — replace, create-key, or create-file — not
+        // a blanket "replacing an existing value" for every set.
+        let schema = test_schema();
+
+        // Key exists in the document → replacing an existing value.
+        let u = refusal(set_in_document_runtime(
+            &ParseOnly,
+            &schema,
+            Some("port = 1\n"),
+            "port",
+            "2",
+        ));
+        assert_eq!(u.operation, Operation::EditSet);
+
+        // File exists, key does not → creating a missing key.
+        let u = refusal(set_in_document_runtime(
+            &ParseOnly,
+            &schema,
+            Some("port = 1\n"),
+            "debug",
+            "true",
+        ));
+        assert_eq!(u.operation, Operation::EditCreateKey);
+
+        // No file at all → creating a missing file, refused before any
+        // template seeding (ParseOnly's template also refuses; the
+        // create-file refusal must win).
+        let u = refusal(set_in_document_runtime(
+            &ParseOnly, &schema, None, "port", "1",
+        ));
+        assert_eq!(u.operation, Operation::EditCreateFile);
+    }
+
+    #[test]
+    fn set_on_unparseable_format_fails_at_parse() {
+        // A format that cannot parse at all (the WS03/WS04 stubs) fails
+        // classification at its parse refusal — editing an existing file
+        // begins with reading it, so that is the honest earliest error.
+        let u = refusal(set_in_document_runtime(
+            &crate::format::YamlAdapter,
+            &test_schema(),
+            Some("port: 1\n"),
+            "port",
+            "2",
+        ));
+        assert_eq!(u.operation, Operation::Parse);
+    }
 
     #[test]
     fn set_rejects_unknown_key() {

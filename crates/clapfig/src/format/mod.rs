@@ -290,22 +290,48 @@ impl SpanIndex {
     }
 }
 
+/// Which capability-matrix row a [`FileEdit::Set`] request falls under.
+///
+/// ADR-0002's matrix deliberately keeps three distinct set-family rows —
+/// replacing an existing value ([`Operation::EditSet`]), creating a
+/// missing key path ([`Operation::EditCreateKey`]), and creating a
+/// missing file ([`Operation::EditCreateFile`]) — so a format can
+/// honestly declare, and refuse, each half separately. Only the caller
+/// knows which row applies (it depends on whether the file and the
+/// target path exist), so the classification travels with the request
+/// and refusals name the operation actually attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetTarget {
+    /// The path already holds a value — this set replaces it
+    /// ([`Operation::EditSet`]).
+    ExistingValue,
+    /// The file exists but the path does not — this set creates the key
+    /// path ([`Operation::EditCreateKey`]).
+    MissingKey,
+    /// The file itself did not exist — this set lands in a
+    /// template-seeded document ([`Operation::EditCreateFile`]).
+    MissingFile,
+}
+
 /// One edit request against an existing config file's source text.
 ///
 /// The variants deliberately cover only what the capability matrix rows
-/// express: setting (which replaces an existing value or creates a missing
-/// path — [`Operation::EditSet`] vs [`Operation::EditCreateKey`] declare
-/// which halves a format supports) and unsetting. Creating a missing file
-/// is [`FormatAdapter::template`] plus a set — no separate entry point.
+/// express: setting (whose [`SetTarget`] names which of the three
+/// set-family rows the request falls under) and unsetting. Creating a
+/// missing file is [`FormatAdapter::template`] plus a set carrying
+/// [`SetTarget::MissingFile`] — no separate entry point.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileEdit<'a> {
     /// Set the value at a path, replacing an existing value or creating
-    /// the path.
+    /// the path, per `target`.
     Set {
         /// Structured path of the target node.
         path: &'a ConfigPath,
         /// The value to write.
         value: &'a Value,
+        /// The capability-matrix row this set falls under, classified by
+        /// the caller from whether the file and the path exist.
+        target: SetTarget,
     },
     /// Remove the key at a path.
     Unset {
@@ -316,11 +342,15 @@ pub enum FileEdit<'a> {
 
 impl FileEdit<'_> {
     /// The capability-matrix row this edit request falls under (`Set` →
-    /// [`Operation::EditSet`], `Unset` → [`Operation::EditUnset`]), for
-    /// refusal messages and capability checks.
+    /// its [`SetTarget`]'s operation, `Unset` → [`Operation::EditUnset`]),
+    /// for refusal messages and capability checks.
     pub fn operation(&self) -> Operation {
         match self {
-            FileEdit::Set { .. } => Operation::EditSet,
+            FileEdit::Set { target, .. } => match target {
+                SetTarget::ExistingValue => Operation::EditSet,
+                SetTarget::MissingKey => Operation::EditCreateKey,
+                SetTarget::MissingFile => Operation::EditCreateFile,
+            },
             FileEdit::Unset { .. } => Operation::EditUnset,
         }
     }
@@ -516,8 +546,8 @@ mod tests {
             Err(self.require(Operation::Template).unwrap_err().into())
         }
 
-        fn edit(&self, _source: &str, _edit: FileEdit<'_>) -> Result<String, FormatError> {
-            Err(self.require(Operation::EditSet).unwrap_err().into())
+        fn edit(&self, _source: &str, edit: FileEdit<'_>) -> Result<String, FormatError> {
+            Err(self.require(edit.operation()).unwrap_err().into())
         }
 
         fn span_index(&self, _text: &str) -> Result<SpanIndex, FormatError> {
@@ -737,18 +767,28 @@ mod tests {
                 Operation::Serialize,
             );
             let path = ConfigPath::new().key("port");
-            unsupported(
-                adapter
-                    .edit(
-                        "",
-                        FileEdit::Set {
-                            path: &path,
-                            value: &Value::Integer(1),
-                        },
-                    )
-                    .map(drop),
-                Operation::EditSet,
-            );
+            // Each set-family matrix row refuses under its own name: the
+            // request's SetTarget classifies replace vs create-key vs
+            // create-file, and the refusal reports that operation.
+            for (target, operation) in [
+                (SetTarget::ExistingValue, Operation::EditSet),
+                (SetTarget::MissingKey, Operation::EditCreateKey),
+                (SetTarget::MissingFile, Operation::EditCreateFile),
+            ] {
+                unsupported(
+                    adapter
+                        .edit(
+                            "",
+                            FileEdit::Set {
+                                path: &path,
+                                value: &Value::Integer(1),
+                                target,
+                            },
+                        )
+                        .map(drop),
+                    operation,
+                );
+            }
             unsupported(
                 adapter.edit("", FileEdit::Unset { path: &path }).map(drop),
                 Operation::EditUnset,
