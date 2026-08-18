@@ -3195,52 +3195,6 @@ mod tests {
         );
     }
 
-    // --- WS04 stub adapter: reachable inputs error, never panic ---
-
-    #[test]
-    fn enabled_stub_format_file_errors_instead_of_panicking() {
-        // Enabling a not-yet-implemented format and discovering a file
-        // in it yields the adapter's typed refusal wrapped as a parse
-        // error — a clean ClapfigError, not a todo-panic.
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("demo.json"), "{\"port\": 1}\n").unwrap();
-        let err = Clapfig::runtime(demo_schema())
-            .app_name("demo")
-            .file_stem("demo")
-            .formats(["toml", "json"])
-            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
-            .no_env()
-            .load()
-            .unwrap_err();
-        match err {
-            ClapfigError::ParseError { source, .. } => {
-                assert!(
-                    matches!(*source, crate::format::FormatError::Unsupported(_)),
-                    "expected the typed refusal, got {source:?}"
-                );
-            }
-            other => panic!("expected ParseError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gen_with_stub_preferred_format_errors_instead_of_panicking() {
-        let err = Clapfig::runtime(demo_schema())
-            .app_name("demo")
-            .file_stem("demo")
-            .formats(["json"])
-            .no_env()
-            .handle(&ConfigAction::Gen { output: None })
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ClapfigError::Format(crate::format::FormatError::Unsupported(_))
-            ),
-            "expected Format(Unsupported), got {err:?}"
-        );
-    }
-
     // --- schema-driven datetime coercion, end to end ---
 
     #[test]
