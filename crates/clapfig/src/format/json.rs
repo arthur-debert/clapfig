@@ -207,14 +207,8 @@ fn span_at(text: &str, line: usize, column: usize) -> Option<Span> {
     for (i, line_text) in text.split_inclusive('\n').enumerate() {
         if i + 1 == line {
             let byte_in_line = column.saturating_sub(1).min(line_text.len());
-            let mut start = offset + byte_in_line;
-            while start > offset && !text.is_char_boundary(start) {
-                start -= 1;
-            }
-            let mut end = (start + 1).min(text.len());
-            while end < text.len() && !text.is_char_boundary(end) {
-                end += 1;
-            }
+            let start = text.floor_char_boundary(offset + byte_in_line);
+            let end = text.ceil_char_boundary(start + 1);
             return Some(Span { start, end });
         }
         offset += line_text.len();
