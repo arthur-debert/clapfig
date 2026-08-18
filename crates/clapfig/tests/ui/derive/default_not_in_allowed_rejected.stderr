@@ -1,0 +1,5 @@
+error: `default = ...` is not one of the `allowed = [...]` values, so the default could never validate at load. Add it to `allowed` or pick one of the listed values.
+ --> tests/ui/derive/default_not_in_allowed_rejected.rs:7:62
+  |
+7 |     #[clapfig(allowed = ["debug", "info", "warn"], default = "verbose")]
+  |                                                              ^^^^^^^^^

@@ -724,7 +724,7 @@ fn map_of_nested_struct_emits_map_of_field() {
     let plugins = &s.fields[0];
     assert!(matches!(
         plugins.field,
-        clapfig::static_schema::FieldStatic::MapOf(_)
+        clapfig::static_schema::FieldStatic::MapOf { .. }
     ));
 }
 

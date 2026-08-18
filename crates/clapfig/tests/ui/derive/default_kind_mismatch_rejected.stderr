@@ -1,0 +1,29 @@
+error: literal has TOML type `String` but the field is `Integer`; the value could never pass the field's type check.
+ --> tests/ui/derive/default_kind_mismatch_rejected.rs:9:25
+  |
+9 |     #[clapfig(default = "hello")]
+  |                         ^^^^^^^
+
+error: literal has TOML type `Integer` but the field is `String`; the value could never pass the field's type check.
+  --> tests/ui/derive/default_kind_mismatch_rejected.rs:15:25
+   |
+15 |     #[clapfig(default = 8080)]
+   |                         ^^^^
+
+error: defaults on Vec<T> fields must be array literals (`default = ["a", "b"]`); a scalar default would fail the array type-check at every load
+  --> tests/ui/derive/default_kind_mismatch_rejected.rs:21:25
+   |
+21 |     #[clapfig(default = "a")]
+   |                         ^^^
+
+error: literal has TOML type `Integer` but the field is `String`; the value could never pass the field's type check.
+  --> tests/ui/derive/default_kind_mismatch_rejected.rs:27:31
+   |
+27 |     #[clapfig(default = ["a", 1])]
+   |                               ^
+
+error: `#[clapfig(default = ...)]` is not supported on map-typed fields — there is no literal syntax for a map default, and a scalar or array default would fail the map type-check at every load. Omit the attribute; an absent map is already the empty map.
+  --> tests/ui/derive/default_kind_mismatch_rejected.rs:33:25
+   |
+33 |     #[clapfig(default = 1)]
+   |                         ^
