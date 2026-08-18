@@ -32,8 +32,8 @@ use crate::value::Value;
 /// per-variant `rename`). The converter inspects `enum_variants` when
 /// flattening a `FieldStatic::Nested { .. }` (or `MapOf { .. }`): a
 /// non-empty list becomes a `Field::Leaf` with `LeafType::Enum` (for
-/// `MapOf`, `LeafType::Map(Enum)`), while an empty list keeps the
-/// nested-object shape.
+/// `MapOf`, `LeafType::Map(Enum)`; for `ArrayOf`, `LeafType::Array(Enum)`),
+/// while an empty list keeps the nested-object shape.
 #[derive(Debug)]
 pub struct SchemaStatic {
     pub name: &'static str,
@@ -54,12 +54,12 @@ pub struct NamedFieldStatic {
 
 /// `const`-friendly mirror of [`runtime::Field`](crate::runtime::Field).
 ///
-/// `Nested` and `MapOf` carry the *field-site* doc comment alongside the
-/// referenced schema: the type-level doc describes the type in general,
-/// while the `///` lines written at the field describe this particular
-/// usage. The converter prefers the field-site doc when it is non-empty
-/// (mirroring how `Option<UnitEnum>` leaves keep their field doc) and
-/// falls back to the referenced schema's own doc otherwise.
+/// `Nested`, `ArrayOf`, and `MapOf` carry the *field-site* doc comment
+/// alongside the referenced schema: the type-level doc describes the type
+/// in general, while the `///` lines written at the field describe this
+/// particular usage. The converter prefers the field-site doc when it is
+/// non-empty (mirroring how `Option<UnitEnum>` leaves keep their field
+/// doc) and falls back to the referenced schema's own doc otherwise.
 #[derive(Debug)]
 pub enum FieldStatic {
     Leaf(LeafStatic),
@@ -68,7 +68,16 @@ pub enum FieldStatic {
         /// Field-site `///` doc lines (may be empty).
         doc: &'static [&'static str],
     },
-    ArrayOf(&'static SchemaStatic),
+    /// Arrays of nested objects (TOML `[[name]]`). Emitted by the derive
+    /// macro for `Vec<T>` fields where `T` derives [`Schema`] and is not
+    /// a scalar. When the item type is a unit-only enum the converter
+    /// flattens this to a `Leaf` of `Array(Enum { .. })` — the
+    /// array-shaped sibling of the `MapOf` enum flatten.
+    ArrayOf {
+        schema: &'static SchemaStatic,
+        /// Field-site `///` doc lines (may be empty).
+        doc: &'static [&'static str],
+    },
     /// Maps of nested objects (TOML `[name.<key>]`). Emitted by the
     /// derive macro for `HashMap<String, NestedStruct>` /
     /// `BTreeMap<String, NestedStruct>` fields where the value type
@@ -255,7 +264,27 @@ impl FieldStatic {
                 runtime.doc = effective_doc(doc, s.doc);
                 RuntimeField::Nested(runtime)
             }
-            FieldStatic::ArrayOf(s) => RuntimeField::ArrayOf(s.to_runtime()),
+            // Array-shaped sibling of the `MapOf` enum flatten below: a
+            // `Vec<UnitEnum>` field must surface as `Array(Enum { .. })` —
+            // keeping the `ArrayOf` object shape here would emit a schema
+            // of zero fields that rejects every string entry at load
+            // ("expected map, got string").
+            FieldStatic::ArrayOf { schema: s, doc } if s.is_enum() => {
+                RuntimeField::Leaf(RuntimeLeaf {
+                    doc: effective_doc(doc, s.doc),
+                    ty: RuntimeLeafType::Array(Box::new(RuntimeLeafType::Enum {
+                        values: enum_variant_values(s),
+                    })),
+                    default: None,
+                    optional: false,
+                    env: None,
+                })
+            }
+            FieldStatic::ArrayOf { schema: s, doc } => {
+                let mut runtime = s.to_runtime();
+                runtime.doc = effective_doc(doc, s.doc);
+                RuntimeField::ArrayOf(runtime)
+            }
             // Map-shaped sibling of the `Nested` enum flatten: a
             // `HashMap<String, UnitEnum>` field must surface as
             // `Map(Enum { .. })` — keeping the `MapOf` object shape here
@@ -332,7 +361,28 @@ impl LeafTypeStatic {
             LeafTypeStatic::Float => RuntimeLeafType::Float,
             LeafTypeStatic::Bool => RuntimeLeafType::Bool,
             LeafTypeStatic::DateTime => RuntimeLeafType::DateTime,
-            LeafTypeStatic::Array(elem) => RuntimeLeafType::Array(Box::new(elem.to_runtime())),
+            LeafTypeStatic::Array(elem) => {
+                // Deferred enum-kind check for `Option<Vec<T>>` where `T`
+                // is a nested schema type. The macro can't syntactically
+                // tell a unit enum from a struct, so it emits
+                // `Array(EnumRef)` for both; only the enum kind has a
+                // representation (an optional array-of-enum leaf). The
+                // struct kind lands here — before the generic `EnumRef`
+                // conversion below, whose remediation text (drop attrs /
+                // drop `Option<T>`) would mislead for the `Vec` wrapping.
+                if let LeafTypeStatic::EnumRef { schema, field_name } = elem {
+                    assert!(
+                        schema.is_enum(),
+                        "clapfig: field `{field_name}` is an `Option<Vec<{schema_name}>>` where \
+                         `{schema_name}` is a struct, not a unit-only enum. An absent array of \
+                         nested objects is already the empty array, so the `Option` wrapper adds \
+                         no signal and has no schema representation — drop it and use \
+                         `Vec<{schema_name}>`.",
+                        schema_name = schema.name,
+                    );
+                }
+                RuntimeLeafType::Array(Box::new(elem.to_runtime()))
+            }
             LeafTypeStatic::Map(v) => RuntimeLeafType::Map(Box::new(v.to_runtime())),
             LeafTypeStatic::Enum { values } => RuntimeLeafType::Enum {
                 values: values.iter().map(ValueStatic::to_value).collect(),
@@ -422,8 +472,8 @@ impl ValueStatic {
     message = "`{Self}` is not a field type `#[derive(clapfig::Schema)]` supports",
     label = "no schema shape for this type",
     note = "supported scalars: String, bool, integers (i8–i64, u8–u64, usize, isize), f32/f64, \
-            clapfig::value::Datetime, clapfig::value::Value; wrappers: Option<T>, Vec<scalar>, \
-            HashMap/BTreeMap<String, V>",
+            clapfig::value::Datetime, clapfig::value::Value; wrappers: Option<T>, Vec<T> (scalar \
+            or Schema-deriving element), HashMap/BTreeMap<String, V>",
     note = "other types (PathBuf, Duration, char, newtypes, type aliases, third-party maps, …) \
             have no TOML-faithful schema shape: either add `#[derive(clapfig::Schema)]` to the \
             type (structs with named fields and unit-only enums only), or mark the field \
@@ -538,16 +588,17 @@ pub fn collect_field_paths(schema: &SchemaStatic, prefix: &str, out: &mut Vec<St
         match &field.field {
             FieldStatic::Leaf(_) => out.push(dotted),
             FieldStatic::Nested { schema: child, .. }
+            | FieldStatic::ArrayOf { schema: child, .. }
             | FieldStatic::MapOf { schema: child, .. }
                 if child.is_enum() =>
             {
-                // Enum-kind nested (and map-of-enum) schemas flatten to a
-                // leaf at the runtime layer; surface them here as a single
-                // leaf path, not a section + variant paths.
+                // Enum-kind nested (and array-of / map-of enum) schemas
+                // flatten to a leaf at the runtime layer; surface them here
+                // as a single leaf path, not a section + variant paths.
                 out.push(dotted);
             }
             FieldStatic::Nested { schema: child, .. }
-            | FieldStatic::ArrayOf(child)
+            | FieldStatic::ArrayOf { schema: child, .. }
             | FieldStatic::MapOf { schema: child, .. } => {
                 out.push(dotted.clone());
                 collect_field_paths(child, &dotted, out);
@@ -797,6 +848,111 @@ mod tests {
         let mut out = Vec::new();
         collect_field_paths(&MAP_OF_ENUM_CONTAINER, "", &mut out);
         assert_eq!(out, vec!["levels".to_string()]);
+    }
+
+    static ARRAY_OF_ENUM_CONTAINER: SchemaStatic = SchemaStatic {
+        name: "Sizes",
+        doc: EMPTY_DOC,
+        strict: None,
+        fields: &[NamedFieldStatic {
+            name: "sizes",
+            field: FieldStatic::ArrayOf {
+                schema: &ENUM_PDF_PAGE,
+                doc: &["Accepted page sizes."],
+            },
+        }],
+        enum_variants: &[],
+    };
+
+    #[test]
+    fn array_of_enum_static_flattens_to_runtime_array_of_enum_leaf() {
+        let s = ARRAY_OF_ENUM_CONTAINER.to_runtime();
+        match &s.fields[0].field {
+            RuntimeField::Leaf(leaf) => {
+                // Field-site doc wins over the enum type's doc.
+                assert_eq!(leaf.doc, vec!["Accepted page sizes.".to_string()]);
+                match &leaf.ty {
+                    RuntimeLeafType::Array(inner) => match inner.as_ref() {
+                        RuntimeLeafType::Enum { values } => {
+                            assert_eq!(values.len(), 2);
+                            assert_eq!(values[0], Value::String("a4".into()));
+                        }
+                        other => panic!("expected Enum inside Array, got {other:?}"),
+                    },
+                    other => panic!("expected Array, got {other:?}"),
+                }
+            }
+            other => panic!("expected Leaf (array-of-enum flattened), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_of_enum_contributes_a_single_leaf_path() {
+        let mut out = Vec::new();
+        collect_field_paths(&ARRAY_OF_ENUM_CONTAINER, "", &mut out);
+        assert_eq!(out, vec!["sizes".to_string()]);
+    }
+
+    static ARRAY_OF_STRUCT_CONTAINER: SchemaStatic = SchemaStatic {
+        name: "App",
+        doc: EMPTY_DOC,
+        strict: None,
+        fields: &[NamedFieldStatic {
+            name: "plugins",
+            field: FieldStatic::ArrayOf {
+                schema: &NESTED_INNER,
+                doc: &["Installed plugins."],
+            },
+        }],
+        enum_variants: &[],
+    };
+
+    #[test]
+    fn array_of_struct_static_converts_to_runtime_array_of_with_field_doc() {
+        let s = ARRAY_OF_STRUCT_CONTAINER.to_runtime();
+        match &s.fields[0].field {
+            RuntimeField::ArrayOf(item) => {
+                assert_eq!(item.name, "Inner");
+                // Field-site doc wins over the item type's doc.
+                assert_eq!(item.doc, vec!["Installed plugins.".to_string()]);
+            }
+            other => panic!("expected ArrayOf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_of_struct_contributes_section_and_child_paths() {
+        let mut out = Vec::new();
+        collect_field_paths(&ARRAY_OF_STRUCT_CONTAINER, "", &mut out);
+        assert_eq!(out, vec!["plugins".to_string(), "plugins.url".to_string()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "is a struct, not a unit-only enum")]
+    fn optional_array_of_struct_panics_with_drop_option_guidance() {
+        // `Option<Vec<Struct>>` — the derive emits `Array(EnumRef)` because
+        // it can't tell enum from struct; the struct kind is a deferred
+        // authoring error at the first `schema()` call.
+        static BAD_OPTIONAL_ARRAY: SchemaStatic = SchemaStatic {
+            name: "App",
+            doc: EMPTY_DOC,
+            strict: None,
+            fields: &[NamedFieldStatic {
+                name: "plugins",
+                field: FieldStatic::Leaf(LeafStatic {
+                    doc: EMPTY_DOC,
+                    ty: LeafTypeStatic::Array(&LeafTypeStatic::EnumRef {
+                        schema: &NESTED_INNER,
+                        field_name: "plugins",
+                    }),
+                    default: None,
+                    optional: true,
+                    env: None,
+                }),
+            }],
+            enum_variants: &[],
+        };
+        let _ = BAD_OPTIONAL_ARRAY.to_runtime();
     }
 
     static FIELD_DOC_OUTER: SchemaStatic = SchemaStatic {

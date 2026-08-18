@@ -167,7 +167,9 @@ pub enum Field {
     Leaf(Leaf),
     /// A single nested object — TOML `[section]`.
     Nested(Schema),
-    /// An array of nested objects — TOML `[[plugins]]`.
+    /// An array of nested objects — TOML `[[plugins]]`. Deserializes to
+    /// `Vec<T>` where `T` is a struct deriving [`Schema`](crate::Schema);
+    /// an absent array loads as the empty `Vec`.
     ArrayOf(Schema),
     /// A string-keyed map of nested objects — TOML `[plugins.<key>]` with
     /// arbitrary `<key>` names. Sibling of [`ArrayOf`](Field::ArrayOf) for

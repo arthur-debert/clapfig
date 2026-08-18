@@ -4,10 +4,12 @@
 //! All three formats render the same documented-template shape: per-leaf
 //! doc lines plus an `Allowed:` line for enums, an `Accepts:` line for
 //! any-value leaves, an `Elements:`/`Values:` element-type hint for
-//! array/map leaves, and a `Required.` marker for required-defaultless
-//! leaves; a real assignment for defaulted leaves or a commented
-//! placeholder otherwise; and commented one-entry examples for
-//! array-of/map-of subtrees. That traversal lives here ONCE — the
+//! array/map leaves, and a `Required.` marker for leaves the runtime
+//! rejects when absent (non-optional, defaultless, and neither array-
+//! nor map-typed — an absent array/map materializes as `[]`/`{}`); a
+//! real assignment for defaulted leaves or a commented placeholder
+//! otherwise; and commented one-entry examples for array-of/map-of
+//! subtrees. That traversal lives here ONCE — the
 //! [`walk_level`] driver walks a schema level and dispatches each field to
 //! a per-format [`TemplateRenderer`], which owns only the format-specific
 //! spelling (TOML's `[section]` headers, YAML's indentation, JSON's
@@ -145,22 +147,35 @@ pub(crate) fn doc_lines(doc: &[String]) -> Vec<String> {
 }
 
 /// The comment lines annotating one leaf: its doc prose ([`doc_lines`]),
-/// an `Allowed:` line listing an enum's values, an `Accepts:` line for
-/// any-value leaves, an `Elements:`/`Values:` element-type hint for
-/// array/map leaves (whose placeholders — `[]`/`{}` — carry no type on
-/// their own), and a final `Required.` line for leaves the runtime
-/// rejects when absent (non-optional with no default — exactly the
-/// placeholders the user MUST uncomment). `format_display` names the
-/// format in the `Accepts:` line (`"TOML"`); `inline` renders one value
-/// in the format's inline spelling (fallible for JSON, whose conversion
-/// refuses some values).
+/// an `Allowed:` line listing an enum's (or array-of-enum's per-item)
+/// values, an `Accepts:` line for any-value leaves, an `Elements:`/`Values:`
+/// element-type hint for array/map leaves (whose placeholders — `[]`/`{}`
+/// — carry no type on their own), and a final `Required.` line for leaves
+/// the runtime rejects when absent (non-optional, defaultless, neither
+/// array- nor map-typed — the placeholders the user MUST uncomment).
+/// Absent array/map leaves materialize as `[]`/`{}`, so they do not get
+/// the line; JSON Schema `required` uses the same rule. `format_display`
+/// names the format in the `Accepts:` line (`"TOML"`); `inline` renders
+/// one value in the format's inline spelling (fallible for JSON, whose
+/// conversion refuses some values).
 pub(crate) fn leaf_annotations(
     leaf: &Leaf,
     format_display: &str,
     inline: &mut dyn FnMut(&Value) -> Result<String, FormatError>,
 ) -> Result<Vec<String>, FormatError> {
     let mut lines = doc_lines(&leaf.doc);
-    if let LeafType::Enum { values } = &leaf.ty {
+    // Enum leaves list their value set; array-of-enum leaves
+    // (`Vec<UnitEnum>` flattened to `Array(Enum)`) list the same set —
+    // the constraint applies per item.
+    let enum_values = match &leaf.ty {
+        LeafType::Enum { values } => Some(values),
+        LeafType::Array(item) => match item.as_ref() {
+            LeafType::Enum { values } => Some(values),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(values) = enum_values {
         let mut listed = Vec::with_capacity(values.len());
         for value in values {
             listed.push(inline(value)?);
@@ -175,7 +190,14 @@ pub(crate) fn leaf_annotations(
         LeafType::Map(elem) => lines.push(format!("Values: {}", describe_leaf_type(elem))),
         _ => {}
     }
-    if !leaf.optional && leaf.default.is_none() {
+    // Same absence rule as JSON Schema `required` and `fill_defaults_into`:
+    // an absent non-optional array/map leaf materializes as `[]`/`{}`, so
+    // the runtime does not reject it and the template must not mark it
+    // required.
+    if !leaf.optional
+        && leaf.default.is_none()
+        && !matches!(leaf.ty, LeafType::Array(_) | LeafType::Map(_))
+    {
         lines.push("Required.".to_string());
     }
     Ok(lines)
@@ -296,24 +318,23 @@ mod tests {
 
     #[test]
     fn leaf_annotations_hint_container_element_types() {
-        let mut arr = leaf(LeafType::Array(Box::new(LeafType::String)), &[]);
-        arr.optional = true;
+        // Non-optional, defaultless array/map leaves still skip `Required.`:
+        // absence materializes as `[]`/`{}`, matching JSON Schema `required`.
+        let arr = leaf(LeafType::Array(Box::new(LeafType::String)), &[]);
         let lines = leaf_annotations(&arr, "TOML", &mut |_| unreachable!()).unwrap();
         assert_eq!(lines, ["Elements: string"]);
 
-        let mut nested = leaf(
+        let nested = leaf(
             LeafType::Array(Box::new(LeafType::Array(Box::new(LeafType::Integer {
                 min: None,
                 max: None,
             })))),
             &[],
         );
-        nested.optional = true;
         let lines = leaf_annotations(&nested, "TOML", &mut |_| unreachable!()).unwrap();
         assert_eq!(lines, ["Elements: array of integer"]);
 
-        let mut map = leaf(LeafType::Map(Box::new(LeafType::Float)), &[]);
-        map.optional = true;
+        let map = leaf(LeafType::Map(Box::new(LeafType::Float)), &[]);
         let lines = leaf_annotations(&map, "TOML", &mut |_| unreachable!()).unwrap();
         assert_eq!(lines, ["Values: float"]);
     }

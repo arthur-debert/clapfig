@@ -12,7 +12,9 @@
 //! - **[`fill_defaults_into`]**: every missing leaf with a declared
 //!   `default` is populated in place into the merged table; absent nested
 //!   sections, map-of nodes, and non-optional map leaves materialize as
-//!   empty tables (an absent map is the empty map).
+//!   empty tables (an absent map is the empty map), and absent array-of
+//!   nodes and non-optional array leaves without a default materialize as
+//!   empty arrays (an absent array is the empty array).
 //! - **[`finalize`]**: applies schema-driven coercions (string values in
 //!   TOML's four datetime lexical forms become [`Value::Datetime`] on
 //!   datetime leaves per ADR-0001; integer values become [`Value::Float`]
@@ -122,7 +124,10 @@ fn find_field<'a>(schema: &'a Schema, name: &str) -> Option<&'a NamedField> {
 /// defaults. Absent `Nested` sections, absent `MapOf` nodes, and absent
 /// non-optional map-typed leaves materialize as empty tables (an absent
 /// section/map is the empty one — and the typed path's serde deserialize
-/// needs the table present). Existing values are never overwritten.
+/// needs the table present); absent `ArrayOf` nodes and absent non-optional
+/// array-typed leaves without a declared default materialize as empty
+/// arrays by the same rule (an absent array is the empty array). Existing
+/// values are never overwritten.
 pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
     for nf in &schema.fields {
         match &nf.field {
@@ -142,6 +147,19 @@ pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
                         // Optional (`Option<Map<..>>`) leaves stay absent
                         // and deserialize to `None`.
                         table.insert(nf.name.clone(), Value::Map(Map::new()));
+                    } else if !leaf.optional
+                        && matches!(leaf.ty, crate::runtime::LeafType::Array(_))
+                    {
+                        // A non-optional array leaf without an explicit
+                        // default (bare `Vec<scalar>`, or `Vec<UnitEnum>`
+                        // flattened to `Array(Enum)`) follows the `ArrayOf`
+                        // absence rule the same way map leaves follow
+                        // `MapOf`'s: entries are user-supplied, so an absent
+                        // array is the empty array. Optional
+                        // (`Option<Vec<..>>`) leaves stay absent and
+                        // deserialize to `None`; a declared
+                        // `#[clapfig(default = [...])]` wins (branch above).
+                        table.insert(nf.name.clone(), Value::Array(Vec::new()));
                     }
                 }
             }
@@ -154,9 +172,17 @@ pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
                 }
             }
             Field::ArrayOf(item_schema) => {
-                // Array entries are user-supplied — only push defaults into
+                // Array entries are user-supplied — push defaults into
                 // existing entries, never synthesize missing array items.
-                if let Some(Value::Array(items)) = table.get_mut(&nf.name) {
+                // An absent array-of node itself materializes as the empty
+                // array (same as `MapOf` below): absence means "no
+                // entries", and the typed path's serde deserialize needs
+                // the `[]` to produce an empty `Vec` instead of a
+                // missing-field error.
+                let entry = table
+                    .entry(nf.name.clone())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Value::Array(items) = entry {
                     for item in items {
                         if let Value::Map(t) = item {
                             fill_defaults_into(t, item_schema);
@@ -516,6 +542,67 @@ mod tests {
         assert_eq!(db.get("pool_size"), Some(&Value::Integer(5)));
         // `url` is optional; should stay absent.
         assert!(db.get("url").is_none());
+    }
+
+    #[test]
+    fn fill_defaults_materializes_absent_array_of_as_empty_array() {
+        // Absence means "no entries" — and the typed path's serde
+        // deserialize needs the `[]` present to produce an empty `Vec`
+        // instead of a missing-field error (same rule as `MapOf` → `{}`).
+        let schema = Schema::object("App")
+            .array_of(
+                "plugins",
+                Schema::object("Plugin").field("name", RtField::string().optional()),
+            )
+            .build();
+        let mut table = parse("");
+        fill_defaults_into(&mut table, &schema);
+        assert_eq!(table.get("plugins"), Some(&Value::Array(Vec::new())));
+    }
+
+    #[test]
+    fn fill_defaults_pushes_entry_defaults_into_existing_array_of_entries() {
+        let schema = Schema::object("App")
+            .array_of(
+                "plugins",
+                Schema::object("Plugin").field("priority", RtField::integer().default(10i64)),
+            )
+            .build();
+        let mut table = parse("[[plugins]]\n");
+        fill_defaults_into(&mut table, &schema);
+        let items = table.get("plugins").and_then(Value::as_array).unwrap();
+        let entry = items[0].as_map().unwrap();
+        assert_eq!(entry.get("priority"), Some(&Value::Integer(10)));
+    }
+
+    #[test]
+    fn fill_defaults_materializes_absent_array_leaf_as_empty_array() {
+        // Non-optional array leaves without a declared default follow the
+        // same absence rule as the structural `ArrayOf` (and as map
+        // leaves follow `MapOf`'s): an absent array is the empty array.
+        let schema = Schema::object("App")
+            .field(
+                "tags",
+                RtField::array_of_type(crate::runtime::LeafType::String),
+            )
+            .build();
+        let mut table = parse("");
+        fill_defaults_into(&mut table, &schema);
+        assert_eq!(table.get("tags"), Some(&Value::Array(Vec::new())));
+    }
+
+    #[test]
+    fn fill_defaults_leaves_optional_array_leaf_absent() {
+        // `Option<Vec<..>>` keeps the presence signal: no `[]` synthesis.
+        let schema = Schema::object("App")
+            .field(
+                "tags",
+                RtField::array_of_type(crate::runtime::LeafType::String).optional(),
+            )
+            .build();
+        let mut table = parse("");
+        fill_defaults_into(&mut table, &schema);
+        assert!(!table.contains_key("tags"));
     }
 
     // --- finalize: required-field check ---

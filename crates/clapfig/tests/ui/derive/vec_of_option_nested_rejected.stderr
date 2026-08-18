@@ -1,0 +1,5 @@
+error: Vec<Option<T>> is not supported — an absent element has no TOML representation; use Option<Vec<T>> for an optional list, or `#[clapfig(value)]` with `clapfig::value::Value` for free-form shapes
+  --> tests/ui/derive/vec_of_option_nested_rejected.rs:13:18
+   |
+13 |     entries: Vec<Option<Inner>>,
+   |                  ^^^^^^
