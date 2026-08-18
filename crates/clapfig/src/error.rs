@@ -2,7 +2,8 @@
 //!
 //! All errors are designed to be shown directly to end users. Each variant
 //! includes enough context to diagnose the problem without reaching for a
-//! debugger: file paths and line numbers for unknown keys, the list of
+//! debugger: file paths (and, for TOML sources, line numbers) for unknown
+//! keys, the list of
 //! available scopes when a scope name is wrong, and references to the
 //! builder method that needs to be called when a prerequisite is missing.
 //!
@@ -47,7 +48,8 @@ pub struct UnknownKeyInfo {
     /// Path to the config file that contained the unknown key.
     pub path: PathBuf,
     /// 1-indexed line number where the key was found, or `0` if the line
-    /// could not be located (best-effort heuristic).
+    /// could not be located. The `find_key_line` heuristic only recognizes
+    /// TOML syntax, so keys from YAML/JSON sources are always `0`.
     pub line: usize,
     /// Full contents of the config file, shared across all infos from the
     /// same file. Used by renderers for source snippets.

@@ -333,7 +333,7 @@
 //!
 //! Strict mode is **on by default**. When a config file contains a key that
 //! doesn't match any field in your schema, loading fails with the file path,
-//! key name, and line number:
+//! key name, and — for TOML sources — the line number:
 //!
 //! ```text
 //! Unknown key 'typo_key' in /home/user/.config/myapp/myapp.toml (line 5)
@@ -412,12 +412,14 @@
 //!     .load()?;
 //! ```
 //!
-//! The [`UnknownKeyContext`] carries the dotted path, the raw TOML leaf
+//! The [`UnknownKeyContext`] carries the dotted path, the raw leaf
 //! key (preserves quoted-key semantics — `"acme.task-due-date-missing"`
 //! stays as a single literal even though it contains dots), the parsed
 //! value as `Option<&value::Value>` (`None` in the rare case lookup can't
 //! resolve — out-of-bounds array index, path through a non-table
-//! intermediate), the source file, and the 1-indexed line number.
+//! intermediate), the source file, and the 1-indexed line number
+//! (`Some` on a best-effort match in TOML sources; always `None` for
+//! YAML/JSON and non-file sources).
 //!
 //! # Runtime-defined schemas
 //!
@@ -506,8 +508,8 @@
 //! and mixed forms all resolve to the same `pool_size` field.
 //!
 //! Strict-mode validation still flags genuine unknown keys; the error
-//! message reports the normalized form, but the line-number snippet still
-//! points at the user's original line.
+//! message reports the normalized form, but the line-number snippet (TOML
+//! sources) still points at the user's original line.
 //!
 //! Generated templates ([`ConfigAction::Gen`]) also follow the normalized
 //! presentation: with `.normalize_keys(true)` on, `config gen` emits keys
@@ -707,9 +709,10 @@
 //! # Error handling
 //!
 //! All fallible operations return [`ClapfigError`]. Errors are designed to
-//! be user-facing: unknown keys include file paths and line numbers, unknown
-//! scopes list the available ones, and missing prerequisites reference the
-//! builder method to call. See the [`error`] module for the full set.
+//! be user-facing: unknown keys include file paths (and, for TOML sources,
+//! line numbers), unknown scopes list the available ones, and missing
+//! prerequisites reference the builder method to call. See the [`error`]
+//! module for the full set.
 
 pub mod error;
 pub mod format;

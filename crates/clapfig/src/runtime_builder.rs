@@ -287,8 +287,9 @@ impl RuntimeBuilder {
     /// drops silently and the callback never runs. If strict and a callback
     /// is registered, the callback receives an
     /// [`UnknownKeyContext`](crate::UnknownKeyContext) carrying the dotted
-    /// path, the leaf segment, the parsed value, the source file, and the
-    /// line number — enough to apply a domain-specific decision. Returning
+    /// path, the leaf segment, the parsed value, the source file, and (for
+    /// TOML sources) the line number — enough to apply a domain-specific
+    /// decision. Returning
     /// [`UnknownKeyDecision::Accept`](crate::UnknownKeyDecision::Accept)
     /// drops the key silently;
     /// [`Reject`](crate::UnknownKeyDecision::Reject) produces a

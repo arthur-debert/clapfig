@@ -240,7 +240,7 @@ myapp config unset port       # remove a persisted value
 
 Strict mode is **on by default**. If a config file contains a key that doesn't
 match any field in your struct, loading fails with the file path, key name, and
-line number:
+— for TOML sources — the line number:
 
 ```text
 Unknown key 'typo_key' in /home/user/.config/myapp/myapp.toml (line 5)
