@@ -14,7 +14,8 @@
 //! - **Aliases** resolve at parse, invisible to the model; **custom tags**
 //!   and **merge keys** (`<<`) are typed errors naming the offending key.
 //! - **`null`/`~`** is a typed error advising absence; an empty or
-//!   comments-only document is the empty map (absence, not null).
+//!   comments-only document — bare `---`/`...` document markers included —
+//!   is the empty map (absence, not null).
 //! - **Non-string mapping keys** are typed errors.
 //! - **Integers** outside `i64` are typed errors; **`.inf`/`.nan`** parse
 //!   into the model's non-finite floats.
@@ -74,9 +75,10 @@ impl FormatAdapter for YamlAdapter {
     }
 
     fn parse(&self, text: &str) -> Result<Value, FormatError> {
-        // An empty or comments-only file is an empty config: absence, not
-        // null. (serde_norway parses both to a root Null; only a document
-        // with actual non-comment content gets the null error below.)
+        // An empty or comments-only file (bare document markers included)
+        // is an empty config: absence, not null. serde_norway would read
+        // these as a root Null (or reject a lone `...`); only a document
+        // with actual non-comment content gets the null error below.
         if is_blank_or_comments(text) {
             return Ok(Value::Map(Map::new()));
         }
@@ -128,27 +130,32 @@ impl FormatAdapter for YamlAdapter {
     }
 }
 
-/// `true` when every line is blank or a `#` comment — the "no content"
-/// document that parses to the empty map instead of the null error.
+/// `true` when every line is blank, a `#` comment, or a bare `---`/`...`
+/// document marker — the "no content" document that parses to the empty
+/// map instead of the null error (`serde_norway` reads a lone `---` as a
+/// null document and rejects a lone `...` outright).
 fn is_blank_or_comments(text: &str) -> bool {
     text.lines().all(|line| {
         let trimmed = line.trim();
-        trimmed.is_empty() || trimmed.starts_with('#')
+        trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "---" || trimmed == "..."
     })
 }
 
 /// Map a `serde_norway` parse failure into the shared error, carrying the
-/// reported location as a (single-byte) span when present.
+/// reported location as a single-character span when present (stepping to
+/// the next char boundary, never one byte — a span sliced mid-way through
+/// a multibyte character would panic downstream error reporters).
 fn parse_error(e: &serde_norway::Error, text: &str) -> FormatError {
     FormatError::Parse {
         format: "yaml",
         message: e.to_string(),
         span: e.location().map(|l| {
             let start = l.index().min(text.len());
-            Span {
-                start,
-                end: (start + 1).min(text.len()).max(start),
-            }
+            let end = text
+                .get(start..)
+                .and_then(|rest| rest.chars().next())
+                .map_or(start, |c| start + c.len_utf8());
+            Span { start, end }
         }),
     }
 }
@@ -324,6 +331,12 @@ fn as_parsed(value: &Value) -> Value {
 
 /// Tree equality with `NaN == NaN`, so verification of an edit that writes
 /// a non-finite float does not refuse over IEEE 754 inequality.
+///
+/// Map comparison zips the two entry sequences: [`Map`] is a `BTreeMap`,
+/// so iteration is key-sorted regardless of insertion order — equal
+/// lengths plus pairwise-equal sorted entries is exactly map equality,
+/// and a container re-emitted at the end of the file (remove + add)
+/// still compares equal.
 fn trees_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Float(x), Value::Float(y)) => (x.is_nan() && y.is_nan()) || x == y,
@@ -367,6 +380,18 @@ fn set_in_tree(map: &mut Map, keys: &[&str], value: Value) -> Result<(), FormatE
     }
     current.insert(leaf.to_string(), value);
     Ok(())
+}
+
+/// The mapping at `keys` in `map`, when every segment resolves to one.
+fn map_at<'a>(map: &'a Map, keys: &[&str]) -> Option<&'a Map> {
+    let mut current = map;
+    for key in keys {
+        match current.get(*key) {
+            Some(Value::Map(next)) => current = next,
+            _ => return None,
+        }
+    }
+    Some(current)
 }
 
 /// Remove `keys` from `map`; `false` when the path was already absent.
@@ -495,9 +520,15 @@ fn set_in_source(
     set_in_tree(&mut expected, keys, as_parsed(value))?;
     let display_path = keys.join(".");
 
-    // Nothing in the file yet: append the serialized subtree, preserving
-    // any existing comment lines (the template-seeded create-file case).
-    if original.is_empty() {
+    // A blank or comments-only file (the template-seeded create-file
+    // case): append the serialized subtree after the existing comment
+    // lines. This branch is syntactic, not semantic — a source that
+    // merely PARSES to an empty map, like `{}`, still has a document
+    // root, and appending after it would produce a second one; those
+    // sources ride the patch path below instead. The append carries the
+    // same promise as every patched edit: the result must reparse to
+    // exactly the intended tree, or the edit refuses typed.
+    if is_blank_or_comments(source) {
         let mut fresh = Map::new();
         set_in_tree(&mut fresh, keys, value.clone())?;
         let rendered = YamlAdapter.serialize(&Value::Map(fresh))?;
@@ -506,7 +537,15 @@ fn set_in_source(
             out.push('\n');
         }
         out.push_str(&rendered);
-        return Ok(out);
+        let reparsed = parse_edit_source(&out)?;
+        if trees_equal(&Value::Map(reparsed), &Value::Map(expected)) {
+            return Ok(out);
+        }
+        return Err(UnsupportedByFormat {
+            format: "yaml",
+            operation,
+        }
+        .into());
     }
 
     // Walk the existing tree to find how much of the path is already
@@ -565,17 +604,41 @@ fn set_in_source(
 }
 
 /// Remove `keys` from `source`. A missing path is a no-op — the source is
-/// returned unchanged, mirroring the TOML adapter.
+/// returned unchanged, mirroring the TOML adapter. Removing the sole child
+/// of a nested mapping rewrites the emptied parent to an explicit `{}` —
+/// a bare `parent:` left behind would reparse as null, the value this
+/// adapter rejects — matching the TOML adapter, whose emptied tables keep
+/// their header.
 fn unset_in_source(source: &str, keys: &[&str]) -> Result<String, FormatError> {
     let original = parse_edit_source(source)?;
     let mut expected = original.clone();
     if !remove_from_tree(&mut expected, keys) {
         return Ok(source.to_string());
     }
-    let patches = [yamlpatch::Patch {
-        route: route_for(keys),
-        operation: yamlpatch::Op::Remove,
-    }];
+    let (_, parents) = keys
+        .split_last()
+        .expect("ConfigPath edits always carry at least one segment");
+    // Removing one leaf can empty only its immediate parent. An emptied
+    // non-root parent becomes an explicit `{}` via `Op::Replace` — the
+    // one container value the patcher replaces correctly (non-empty
+    // containers are re-emitted by the set path instead). An emptied
+    // ROOT needs nothing: the leaf's removal leaves a blank document,
+    // which already reparses to the empty map.
+    let emptied_parent =
+        !parents.is_empty() && map_at(&expected, parents).is_some_and(|m| m.is_empty());
+    let patches = if emptied_parent {
+        [yamlpatch::Patch {
+            route: route_for(parents),
+            operation: yamlpatch::Op::Replace(yaml_serde::Value::Mapping(
+                yaml_serde::Mapping::new(),
+            )),
+        }]
+    } else {
+        [yamlpatch::Patch {
+            route: route_for(keys),
+            operation: yamlpatch::Op::Remove,
+        }]
+    };
     apply_and_verify(
         source,
         &patches,
@@ -623,6 +686,10 @@ fn has_active_content(schema: &Schema) -> bool {
     })
 }
 
+/// Emit one schema level of the template. Every schema-derived mapping key
+/// renders through [`inline_scalar`], so field names the parser would
+/// misread bare (`#token`, `a: b`, `*alias`) land quoted and the generated
+/// document stays parseable.
 fn emit_schema(out: &mut String, schema: &Schema, depth: usize) {
     let indent = "  ".repeat(depth);
 
@@ -649,11 +716,16 @@ fn emit_schema(out: &mut String, schema: &Schema, depth: usize) {
         }
         match &leaf.default {
             Some(value) => {
-                let _ = writeln!(out, "{indent}{}: {}", nf.name, format_inline_yaml(value));
+                let _ = writeln!(
+                    out,
+                    "{indent}{}: {}",
+                    inline_scalar(&nf.name),
+                    format_inline_yaml(value)
+                );
             }
             None => {
                 let hint = template_placeholder(&leaf.ty);
-                let _ = writeln!(out, "{indent}#{}: {hint}", nf.name);
+                let _ = writeln!(out, "{indent}#{}: {hint}", inline_scalar(&nf.name));
             }
         }
         out.push('\n');
@@ -667,13 +739,13 @@ fn emit_schema(out: &mut String, schema: &Schema, depth: usize) {
                     push_comment_line(out, &indent, line);
                 }
                 if has_active_content(child) {
-                    let _ = writeln!(out, "{indent}{}:", nf.name);
+                    let _ = writeln!(out, "{indent}{}:", inline_scalar(&nf.name));
                     emit_schema(out, child, depth + 1);
                 } else {
                     // All-commented section: comment the key too, or the
                     // generated document would parse it as null.
                     let mut buf = String::new();
-                    let _ = writeln!(buf, "{indent}{}:", nf.name);
+                    let _ = writeln!(buf, "{indent}{}:", inline_scalar(&nf.name));
                     emit_schema(&mut buf, child, depth + 1);
                     push_commented_block(out, &buf);
                 }
@@ -686,7 +758,7 @@ fn emit_schema(out: &mut String, schema: &Schema, depth: usize) {
                 // item — clapfig can't know how many entries the user
                 // wants.
                 let mut buf = String::new();
-                let _ = writeln!(buf, "{indent}{}:", nf.name);
+                let _ = writeln!(buf, "{indent}{}:", inline_scalar(&nf.name));
                 let mut item = String::new();
                 emit_schema(&mut item, child, depth + 2);
                 buf.push_str(&with_sequence_dash(&item, depth + 1));
@@ -699,7 +771,7 @@ fn emit_schema(out: &mut String, schema: &Schema, depth: usize) {
                 // Map-of-objects: entry keys are user-supplied, so the
                 // example uses a placeholder entry name, fully commented.
                 let mut buf = String::new();
-                let _ = writeln!(buf, "{indent}{}:", nf.name);
+                let _ = writeln!(buf, "{indent}{}:", inline_scalar(&nf.name));
                 let _ = writeln!(buf, "{indent}  <key>:");
                 emit_schema(&mut buf, child, depth + 2);
                 push_commented_block(out, &buf);
@@ -760,13 +832,39 @@ fn format_inline_yaml(value: &Value) -> String {
 
 /// One string scalar in `serde_norway`'s own spelling (quoted only when
 /// the parser needs it). Strings with control characters fall back to a
-/// double-quoted escape, since the library would emit a block scalar —
-/// unusable inline.
+/// JSON string literal — valid YAML escaping, since YAML 1.2's
+/// double-quoted style is a JSON superset — where the library would emit
+/// a block scalar, unusable inline.
 fn inline_scalar(s: &str) -> String {
     if s.chars().any(|c| c.is_control()) {
-        return format!("{s:?}");
+        return json_escaped(s);
     }
     inline_norway(&serde_norway::Value::String(s.to_string()))
+}
+
+/// `s` as a one-line JSON string literal. Rust's `{:?}` escaping is NOT
+/// valid YAML (`\u{1}` vs JSON/YAML's `\u0001`), so this is the inline
+/// spelling for strings whose control characters need escaping. All
+/// control characters are in the Basic Multilingual Plane, so the
+/// four-digit `\uXXXX` form always suffices.
+fn json_escaped(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Single-word placeholder rendered in a commented-out template line for a
@@ -884,6 +982,23 @@ mod tests {
     }
 
     #[test]
+    fn bare_document_markers_are_the_empty_map() {
+        // `---` alone is a null document and `...` alone a parse error in
+        // serde_norway; both are "no content" here — absence, not null.
+        for source in ["---\n", "...\n", "---\n# note\n", "# note\n---\n"] {
+            assert_eq!(
+                YamlAdapter.parse(source).unwrap(),
+                Value::Map(Map::new()),
+                "source: {source:?}"
+            );
+        }
+        // A marker followed by real content is NOT blank: it parses (or
+        // errors) through serde_norway as usual.
+        let map = parse_map("---\nfoo: 1\n");
+        assert_eq!(map["foo"], Value::Integer(1));
+    }
+
+    #[test]
     fn non_string_keys_are_typed_errors() {
         let message = parse_err("section:\n  1: x\n");
         assert!(message.contains("non-string"), "message: {message}");
@@ -898,6 +1013,19 @@ mod tests {
         // i64::MAX itself is fine.
         let map = parse_map("max: 9223372036854775807\n");
         assert_eq!(map["max"], Value::Integer(i64::MAX));
+    }
+
+    #[test]
+    fn integers_beyond_u64_or_below_i64_min_name_the_key() {
+        // These are rejected inside serde_norway, before this adapter's
+        // own range check ever sees them — but its error still carries
+        // the full dotted path to the offending key, plus a span.
+        let message = parse_err("small: -9223372036854775809\n");
+        assert!(message.contains("small"), "message: {message}");
+        let message = parse_err("big: 18446744073709551616\n");
+        assert!(message.contains("big"), "message: {message}");
+        let message = parse_err("section:\n  big: 18446744073709551616\n");
+        assert!(message.contains("section.big"), "message: {message}");
     }
 
     #[test]
@@ -938,6 +1066,31 @@ mod tests {
                 assert!(span.is_some(), "syntax errors report a location");
             }
             other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_error_spans_stay_on_char_boundaries() {
+        // The reported span must be sliceable: start and end land on char
+        // boundaries even when the error location neighbours multibyte
+        // characters.
+        for source in [
+            "é: \"open\n",
+            "aé: [1,\n",
+            "ключ: [1,\n",
+            "a: 1\nя: @x\n",
+            "k:\n\tя: 1\n",
+        ] {
+            let err = YamlAdapter.parse(source).expect_err("fixture must fail");
+            let FormatError::Parse { span, .. } = err else {
+                panic!("expected Parse for {source:?}");
+            };
+            let Some(span) = span else { continue };
+            assert!(span.end <= source.len(), "span past EOF for {source:?}");
+            assert!(
+                source.is_char_boundary(span.start) && source.is_char_boundary(span.end),
+                "span {span:?} splits a character in {source:?}"
+            );
         }
     }
 
@@ -1113,6 +1266,41 @@ db:
         assert_eq!(map.keys().collect::<Vec<_>>(), ["port"]);
     }
 
+    #[test]
+    fn template_escapes_keys_the_parser_would_misread() {
+        // Schema names only forbid empty, `.`, `[`, `]` — a template must
+        // quote names the parser would otherwise read as comments,
+        // aliases, or nested mappings.
+        use crate::runtime::{Field, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .field("#token", Field::string().default("x"))
+            .field("a: b", Field::integer().default(1i64))
+            .field("*alias", Field::string())
+            .nested(
+                "d: b",
+                RtSchema::object("Db").field("pool", Field::integer().default(5i64)),
+            )
+            .build();
+        let text = YamlAdapter.template(&schema).unwrap();
+        let map = parse_map(&text);
+        assert_eq!(map["#token"], Value::String("x".into()));
+        assert_eq!(map["a: b"], Value::Integer(1));
+        assert!(
+            !map.contains_key("*alias"),
+            "defaultless leaf stays a commented placeholder: {text}"
+        );
+        assert_eq!(map["d: b"].as_map().unwrap()["pool"], Value::Integer(5));
+    }
+
+    #[test]
+    fn inline_scalar_control_characters_are_valid_yaml() {
+        for s in ["a\u{1}b", "tab\there", "line\nbreak", "del\u{7f}"] {
+            let doc = format!("k: {}\n", inline_scalar(s));
+            let map = parse_map(&doc);
+            assert_eq!(map["k"], Value::String(s.to_string()), "doc: {doc:?}");
+        }
+    }
+
     // --- edits ---
 
     fn set_edit<'a>(path: &'a ConfigPath, value: &'a Value, target: SetTarget) -> FileEdit<'a> {
@@ -1230,6 +1418,41 @@ db:
     }
 
     #[test]
+    fn edit_set_into_syntactic_empty_map_stays_single_document() {
+        // `{}` parses to an empty map but is NOT a blank document:
+        // appending after it would produce a second root. The patch path
+        // extends the flow mapping instead.
+        let path = ConfigPath::new().key("port");
+        let value = Value::Integer(1);
+        let out = YamlAdapter
+            .edit("{}\n", set_edit(&path, &value, SetTarget::MissingKey))
+            .unwrap();
+        assert_eq!(parse_map(&out)["port"], Value::Integer(1));
+
+        let out = YamlAdapter
+            .edit(
+                "# note\n{}\n",
+                set_edit(&path, &value, SetTarget::MissingKey),
+            )
+            .unwrap();
+        assert!(out.contains("# note"), "out: {out}");
+        assert_eq!(parse_map(&out)["port"], Value::Integer(1));
+
+        // A nested create into `{}` rides the same verified patch path.
+        let deep = ConfigPath::new().key("database").key("url");
+        let value = Value::from("pg://x");
+        match YamlAdapter.edit("{}\n", set_edit(&deep, &value, SetTarget::MissingKey)) {
+            // Either outcome is honest; a corrupt multi-doc file is not.
+            Ok(out) => assert_eq!(
+                parse_map(&out)["database"].as_map().unwrap()["url"],
+                Value::String("pg://x".into())
+            ),
+            Err(FormatError::Unsupported(u)) => assert_eq!(u.operation, Operation::EditCreateKey),
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn edit_set_path_conflict_is_typed_error() {
         let path = ConfigPath::new().key("database").key("url");
         let value = Value::from("pg://x");
@@ -1261,6 +1484,53 @@ db:
             .edit(source, FileEdit::Unset { path: &missing })
             .unwrap();
         assert_eq!(unchanged, source);
+    }
+
+    #[test]
+    fn edit_unset_sole_nested_child_preserves_parent_as_empty_map() {
+        // Removing the last child must not leave `database:` — a null on
+        // reparse. The emptied parent becomes an explicit `{}` (parity
+        // with TOML, whose emptied tables keep their header).
+        let path = ConfigPath::new().key("database").key("url");
+        let out = YamlAdapter
+            .edit(
+                "# keep\ndatabase:\n  url: x\nport: 1\n",
+                FileEdit::Unset { path: &path },
+            )
+            .unwrap();
+        assert!(out.contains("# keep"), "out: {out}");
+        let map = parse_map(&out);
+        assert_eq!(map["database"], Value::Map(Map::new()));
+        assert_eq!(map["port"], Value::Integer(1));
+
+        // Deeper nesting: only the immediate parent empties.
+        let path = ConfigPath::new().key("a").key("b").key("c");
+        let out = YamlAdapter
+            .edit(
+                "a:\n  b:\n    c: 1\n  keep: 2\n",
+                FileEdit::Unset { path: &path },
+            )
+            .unwrap();
+        let a = parse_map(&out)["a"].as_map().unwrap().clone();
+        assert_eq!(a["b"], Value::Map(Map::new()));
+        assert_eq!(a["keep"], Value::Integer(2));
+
+        // The parent emptied at every level above the leaf.
+        let path = ConfigPath::new().key("only").key("child");
+        let out = YamlAdapter
+            .edit("only:\n  child: 1\n", FileEdit::Unset { path: &path })
+            .unwrap();
+        assert_eq!(parse_map(&out)["only"], Value::Map(Map::new()));
+    }
+
+    #[test]
+    fn edit_unset_last_root_key_leaves_an_empty_document() {
+        let path = ConfigPath::new().key("only");
+        let out = YamlAdapter
+            .edit("# note\nonly: 1\n", FileEdit::Unset { path: &path })
+            .unwrap();
+        assert!(out.contains("# note"), "out: {out}");
+        assert_eq!(YamlAdapter.parse(&out).unwrap(), Value::Map(Map::new()));
     }
 
     #[test]
