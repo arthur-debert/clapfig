@@ -218,10 +218,15 @@ fn norway_to_value(
                     "integer {n} at {} is out of range: integers are 64-bit signed",
                     path_label(path)
                 )))
+            } else if let Some(f) = n.as_f64() {
+                Ok(Value::Float(f))
             } else {
-                Ok(Value::Float(
-                    n.as_f64().expect("numbers are i64, u64, or f64"),
-                ))
+                // Unreachable with serde_norway's i64/u64/f64 number repr,
+                // but untrusted input earns a typed error, never a panic.
+                Err(mapping_error(format!(
+                    "number {n} at {} is outside the supported numeric range: expected a 64-bit integer or float",
+                    path_label(path)
+                )))
             }
         }
         serde_norway::Value::String(s) => Ok(Value::String(s)),
