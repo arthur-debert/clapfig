@@ -15,8 +15,10 @@
 use crate::runtime::{Field, LeafType, Schema};
 use crate::value::{Map, Value};
 
+use std::collections::BTreeMap;
+
 use super::{
-    FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span, SpanIndex,
+    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
     UnsupportedByFormat,
 };
 
@@ -120,21 +122,20 @@ impl FormatAdapter for TomlAdapter {
                         end: r.end,
                     }),
                 })?;
-        let operation = edit.operation();
         match edit {
             FileEdit::Set { path, value, .. } => {
-                let keys = key_segments(path, operation)?;
+                let keys = key_segments(path);
                 write_at_path(&mut doc, &keys, value)?;
             }
             FileEdit::Unset { path } => {
-                let keys = key_segments(path, operation)?;
+                let keys = key_segments(path);
                 unset_at_path(&mut doc, &keys);
             }
         }
         Ok(doc.to_string())
     }
 
-    fn span_index(&self, _text: &str) -> Result<SpanIndex, FormatError> {
+    fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
         // Provenance epic: build the path → span index from parser spans.
         Err(UnsupportedByFormat {
             format: self.name(),
@@ -192,20 +193,12 @@ fn value_to_toml(value: &Value) -> toml::Value {
     }
 }
 
-/// Extract the key segments of a [`ConfigPath`](super::ConfigPath),
-/// refusing array-index segments — the TOML edit path addresses map keys
-/// only (no current call site produces indexed edits; the honest answer
-/// until one exists is the typed refusal, not a partial implementation).
-fn key_segments(path: &super::ConfigPath, operation: Operation) -> Result<Vec<&str>, FormatError> {
+/// The key segments of a [`ConfigPath`](super::ConfigPath), for the edit
+/// walkers below.
+fn key_segments(path: &super::ConfigPath) -> Vec<&str> {
     path.segments()
         .iter()
-        .map(|seg| match seg {
-            PathSegment::Key(k) => Ok(k.as_str()),
-            PathSegment::Index(_) => Err(FormatError::Unsupported(UnsupportedByFormat {
-                format: "toml",
-                operation,
-            })),
-        })
+        .map(|PathSegment::Key(k)| k.as_str())
         .collect()
 }
 
@@ -658,27 +651,5 @@ pool_size = 5
             .edit("port = 1\n", FileEdit::Unset { path: &missing })
             .unwrap();
         assert!(unchanged.contains("port = 1"));
-    }
-
-    #[test]
-    fn edit_refuses_array_index_segments() {
-        let path = ConfigPath::new().key("servers").index(0).key("host");
-        let value = Value::from("x");
-        let err = TomlAdapter
-            .edit(
-                "",
-                FileEdit::Set {
-                    path: &path,
-                    value: &value,
-                    target: SetTarget::MissingKey,
-                },
-            )
-            .unwrap_err();
-        // The refusal names the request's own matrix row, not a blanket
-        // "set".
-        match err {
-            FormatError::Unsupported(u) => assert_eq!(u.operation, Operation::EditCreateKey),
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
     }
 }

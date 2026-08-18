@@ -16,8 +16,8 @@
 //!   adapter boundary, never silent wraps.
 //! - **Floats are `f64` including non-finite values** (`inf`, `nan`);
 //!   equality follows IEEE 754, so `nan != nan`.
-//! - **Datetimes** are the owned four-form [`Datetime`], parse/display
-//!   only.
+//! - **Datetimes** are the four-form [`Datetime`] (`toml_datetime`'s — a
+//!   standalone type crate, not a format crate), parse/display only.
 //! - **There is no null variant**: absence expresses unset. Formats with a
 //!   null (YAML, JSON) reject it at their adapter boundary.
 //! - **[`Display`](std::fmt::Display)** renders a deterministic,
@@ -42,7 +42,7 @@ pub use datetime::{Date, Datetime, DatetimeParseError, Offset, Time};
 pub use de::{DeserializeError, from_value};
 pub use ser::{SerializeError, to_value};
 
-pub(crate) use datetime::DATETIME_MARKER;
+pub(crate) use datetime::{DATETIME_FIELD, DATETIME_NAME};
 
 /// The map type the public API traffics in.
 ///

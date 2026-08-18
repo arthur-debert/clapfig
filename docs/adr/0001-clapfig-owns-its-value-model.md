@@ -19,6 +19,9 @@ Shape decisions folded into this ADR:
   `toml::value::Datetime` leaks the type we are evicting; `chrono`/`time` were
   rejected because TOML's local (offset-less) forms don't map onto
   timezone-aware types and would import semantics beyond the baseline.
+  Carried by `toml_datetime`: it is a standalone type crate, not a format
+  crate, so depending on it does not violate the no-format-types rule — the
+  four-forms grammar is unchanged.
 - **Datetime across formats**: schema-driven coercion, never sniffing. YAML and
   JSON deliver datetimes as strings (parsing is schema-blind); for leaves
   declared `DateTime`, the validation/typed pass parses the string against

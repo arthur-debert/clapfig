@@ -17,7 +17,7 @@ use std::fmt;
 
 use serde::de::{self, IntoDeserializer};
 
-use super::{DATETIME_MARKER, Map, Value};
+use super::{DATETIME_FIELD, DATETIME_NAME, Map, Value};
 
 /// Error produced while deserializing a typed value out of a [`Value`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -116,7 +116,7 @@ impl<'de> de::Deserialize<'de> for Value {
                 // map entry (which would re-serialize marker-first and
                 // blow up one round trip later).
                 if let Some(key) = access.next_key::<String>()? {
-                    if key == DATETIME_MARKER {
+                    if key == DATETIME_FIELD {
                         let repr: String = access.next_value()?;
                         let dt = repr.parse().map_err(de::Error::custom)?;
                         if access.next_key::<de::IgnoredAny>()?.is_some() {
@@ -129,7 +129,7 @@ impl<'de> de::Deserialize<'de> for Value {
                     map.insert(key, access.next_value()?);
                 }
                 while let Some((key, value)) = access.next_entry::<String, Value>()? {
-                    if key == DATETIME_MARKER {
+                    if key == DATETIME_FIELD {
                         return Err(de::Error::custom(
                             "datetime marker struct must have exactly one field",
                         ));
@@ -213,7 +213,7 @@ impl<'de> de::Deserializer<'de> for Value {
     where
         V: de::Visitor<'de>,
     {
-        if name == DATETIME_MARKER {
+        if name == DATETIME_NAME {
             match self {
                 Value::Datetime(d) => visitor.visit_map(DatetimeAccess::new(d.to_string())),
                 other => Err(de::Error::custom(format!(
@@ -297,7 +297,7 @@ impl<'de> de::MapAccess<'de> for DatetimeAccess {
             return Ok(None);
         }
         self.key_emitted = true;
-        seed.deserialize(de::value::StrDeserializer::new(DATETIME_MARKER))
+        seed.deserialize(de::value::StrDeserializer::new(DATETIME_FIELD))
             .map(Some)
     }
 
@@ -513,7 +513,7 @@ mod tests {
         // documented reservation that makes Value::Datetime survive
         // self-describing deserialization.
         let mut m = Map::new();
-        m.insert(DATETIME_MARKER.into(), Value::from("1979-05-27"));
+        m.insert(DATETIME_FIELD.into(), Value::from("1979-05-27"));
         let out: Value = from_value(Value::Map(m)).unwrap();
         assert_eq!(out, Value::Datetime("1979-05-27".parse().unwrap()));
     }
@@ -523,7 +523,7 @@ mod tests {
         // Marker-shaped but not the one-field marker struct: an error,
         // never silent loss of the other entries.
         let mut m = Map::new();
-        m.insert(DATETIME_MARKER.into(), Value::from("1979-05-27"));
+        m.insert(DATETIME_FIELD.into(), Value::from("1979-05-27"));
         m.insert("other".into(), Value::Integer(1));
         let err = from_value::<Value>(Value::Map(m)).unwrap_err();
         assert!(err.to_string().contains("exactly one field"), "{err}");
@@ -537,7 +537,7 @@ mod tests {
         // reservation.
         let pairs = vec![
             ("other".to_string(), Value::Integer(1)),
-            (DATETIME_MARKER.to_string(), Value::from("1979-05-27")),
+            (DATETIME_FIELD.to_string(), Value::from("1979-05-27")),
         ];
         let deserializer = de::value::MapDeserializer::new(pairs.into_iter());
         let err: DeserializeError = <Value as de::Deserialize>::deserialize(deserializer)

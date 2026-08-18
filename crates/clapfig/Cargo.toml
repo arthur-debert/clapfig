@@ -34,6 +34,10 @@ serde = { version = "1", features = ["derive"] }
 # never a silent float — and untouched numbers survive edits verbatim.
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 toml = "0.8"
+# The value model's Datetime (ADR-0001): a standalone type crate (not a
+# format crate) carrying TOML's four lexical forms. Pinned to the series
+# `toml` 0.8 uses so the types stay identical across the boundary.
+toml_datetime = { version = "0.6", features = ["serde"] }
 toml_edit = "0.22"
 directories = "6"
 percent-encoding = { version = "2", optional = true }
