@@ -239,7 +239,15 @@ rewrite:
 
 If the target file doesn't exist, `config set` creates a new one seeded from
 the generated template — so the user gets doc comments for every field out of
-the box, in whichever format the scope resolves to.
+the box, in whichever format the scope resolves to. The template is rendered
+with the builder's `normalize_keys` setting, so a seeded file spells its keys
+the same way `config gen` does. With `normalize_keys(true)`, `set`, `unset`,
+and `get` (merged and scoped alike) also accept the action key in either dash
+or underscore spelling; edits land on the spelling already present in the
+file. A file that already contains both equivalent spellings of a key —
+anywhere in the file, even at a key the operation does not touch — is
+ambiguous and fails with the same key-collision error loading it reports —
+`set`, `unset`, and scoped `get` never operate on a file loading refuses.
 
 ## Handling results programmatically
 

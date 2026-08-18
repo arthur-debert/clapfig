@@ -23,7 +23,9 @@ use std::collections::BTreeMap;
 use crate::value::{Map, Value};
 
 /// Two distinct keys in the same table collapsed to the same normalized form.
-/// Surfaced from [`normalize_table`] and wrapped at the call site with the
+/// Surfaced from [`check_collisions`] — the whole-document detection pass
+/// shared by load ([`normalize_table`]), persistence (set/unset), and
+/// scoped get — and wrapped via [`KeyCollision::into_error`] with the
 /// owning file's path.
 #[derive(Debug, Clone)]
 pub struct KeyCollision {
@@ -36,36 +38,67 @@ pub struct KeyCollision {
     pub originals: Vec<String>,
 }
 
+impl KeyCollision {
+    /// Wrap into [`ClapfigError::NormalizedKeyCollision`], stamping the
+    /// owning file's path. Every surfacing site — load, persistence,
+    /// scoped get — goes through this one constructor.
+    pub(crate) fn into_error(self, path: &std::path::Path) -> crate::error::ClapfigError {
+        crate::error::ClapfigError::NormalizedKeyCollision {
+            path: path.to_path_buf(),
+            section: self.section,
+            normalized_key: self.normalized_key,
+            originals: self.originals,
+        }
+    }
+}
+
 /// Replace every `-` with `_` in a single key string.
 ///
 /// Used for dotted CLI/URL override paths (`"database.pool-size"`
 /// → `"database.pool_size"`) — `.` segment separators are preserved because
-/// only `-` is rewritten. Skips the allocation entirely when the key has no
-/// `-` characters (the common case once a struct's snake_case fields are
-/// being used directly).
+/// only `-` is rewritten.
 pub fn normalize_key(key: &str) -> String {
-    if key.contains('-') {
-        key.replace('-', "_")
-    } else {
-        key.to_owned()
-    }
+    key.replace('-', "_")
 }
 
-/// Recursively normalize every key in `table`, including nested tables and
-/// tables nested inside arrays. Operates in place.
+/// Replace every `_` with `-` in a single key string — the inverse of
+/// [`normalize_key`], producing the spelling clapfig EMITS when
+/// normalization is enabled (template keys, and keys the persistence path
+/// writes for paths not already present in a document).
+pub fn kebab_key(key: &str) -> String {
+    key.replace('_', "-")
+}
+
+/// Resolve one canonical snake_case path segment against a table's keys
+/// under dash/underscore equivalence, returning the matching key's
+/// concrete spelling (`None` when no key matches).
 ///
-/// Detects collisions before mutating: if two distinct keys at the same
-/// table level would normalize to the same name, returns
-/// `Err(KeyCollision)` with the table's dotted section path and the
-/// offending source keys. On success, all dash-bearing keys have been
-/// rewritten with `-` → `_`.
-pub fn normalize_table(table: &mut Map) -> Result<(), KeyCollision> {
-    normalize_at(table, "")
+/// Callers have already validated the whole document with
+/// [`check_collisions`], so at most one key can match — this function
+/// only chooses the concrete spelling, it does not arbitrate between
+/// equivalent keys.
+pub(crate) fn resolve_table_key<'a>(table: &'a Map, segment: &str) -> Option<&'a String> {
+    table.keys().find(|k| normalize_key(k) == segment)
 }
 
-fn normalize_at(table: &mut Map, section: &str) -> Result<(), KeyCollision> {
-    // First pass: detect collisions before mutating anything. BTreeMap so
-    // the iteration that picks an offending bucket is deterministic.
+/// Non-mutating whole-document collision check: every table at every
+/// depth (including tables nested inside arrays) must hold at most one
+/// spelling per normalized key. The single detection pass behind the
+/// never-silently-compete rule: load ([`normalize_table`]) runs it before
+/// rewriting, and normalized set/unset (`persist::resolve_document_path`)
+/// and scoped get (`ops::table_get_normalized`) run it
+/// before resolving the requested path — so an ambiguous document fails
+/// those operations even when the collision sits at a key or table the
+/// requested path never touches. A document the load path refuses is
+/// never edited or queried.
+pub(crate) fn check_collisions(table: &Map) -> Result<(), KeyCollision> {
+    check_at(table, "")
+}
+
+fn check_at(table: &Map, section: &str) -> Result<(), KeyCollision> {
+    // Bucket this level's keys by normalized form. BTreeMap so the
+    // iteration that picks an offending bucket is deterministic, and
+    // `originals` (fed in BTreeMap key order) comes out sorted.
     let mut buckets: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for k in table.keys() {
         buckets.entry(normalize_key(k)).or_default().push(k.clone());
@@ -81,34 +114,63 @@ fn normalize_at(table: &mut Map, section: &str) -> Result<(), KeyCollision> {
         }
     }
 
-    // Second pass: rewrite in place. `mem::take` lets us iterate the table
-    // by-value (no key cloning, no transient remove+insert per entry); the
-    // empty table we leave behind is then refilled with normalized keys.
-    let old = std::mem::take(table);
-    for (key, mut value) in old {
-        let new_key = normalize_key(&key);
+    for (key, value) in table {
+        let normalized = normalize_key(key);
         let nested_section = if section.is_empty() {
-            new_key.clone()
+            normalized
         } else {
-            format!("{section}.{new_key}")
+            format!("{section}.{normalized}")
         };
-        normalize_value(&mut value, &nested_section)?;
-        table.insert(new_key, value);
+        check_value(value, &nested_section)?;
     }
     Ok(())
 }
 
-fn normalize_value(value: &mut Value, section: &str) -> Result<(), KeyCollision> {
+fn check_value(value: &Value, section: &str) -> Result<(), KeyCollision> {
     match value {
-        Value::Map(t) => normalize_at(t, section),
+        Value::Map(t) => check_at(t, section),
         Value::Array(arr) => {
-            for (i, item) in arr.iter_mut().enumerate() {
+            for (i, item) in arr.iter().enumerate() {
                 let nested = format!("{section}[{i}]");
-                normalize_value(item, &nested)?;
+                check_value(item, &nested)?;
             }
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// Recursively normalize every key in `table`, including nested tables and
+/// tables nested inside arrays. Operates in place.
+///
+/// Runs [`check_collisions`] over the whole tree before mutating
+/// anything: if two distinct keys at any table level would normalize to
+/// the same name, returns `Err(KeyCollision)` with the table's dotted
+/// section path and the offending source keys, and the table is left in
+/// its original state at every depth. On success, all dash-bearing keys
+/// have been rewritten with `-` → `_`.
+pub fn normalize_table(table: &mut Map) -> Result<(), KeyCollision> {
+    check_collisions(table)?;
+    rewrite_table(table);
+    Ok(())
+}
+
+fn rewrite_table(table: &mut Map) {
+    // `mem::take` lets us iterate the table by-value (no key cloning, no
+    // transient remove+insert per entry); the empty table we leave behind
+    // is then refilled with normalized keys.
+    let old = std::mem::take(table);
+    for (key, mut value) in old {
+        rewrite_value(&mut value);
+        table.insert(normalize_key(&key), value);
+    }
+}
+
+fn rewrite_value(value: &mut Value) {
+    match value {
+        Value::Map(t) => rewrite_table(t),
+        Value::Array(arr) => arr.iter_mut().for_each(rewrite_value),
+        _ => {}
     }
 }
 
@@ -118,6 +180,68 @@ mod tests {
 
     fn table(toml_str: &str) -> Map {
         crate::fixtures::test::parse_toml(toml_str)
+    }
+
+    #[test]
+    fn resolve_table_key_picks_the_concrete_spelling() {
+        let t = table("pool-size = 1\nother = 2\n");
+        // Single equivalent spelling: resolves to the concrete key.
+        assert_eq!(resolve_table_key(&t, "pool_size").unwrap(), "pool-size");
+        // Exact spelling resolves to itself.
+        assert_eq!(resolve_table_key(&t, "other").unwrap(), "other");
+        // No match.
+        assert!(resolve_table_key(&t, "missing").is_none());
+    }
+
+    #[test]
+    fn check_collisions_accepts_a_clean_tree() {
+        let t = table(
+            r#"
+            pool-size = 1
+            other_key = 2
+
+            [nested-section]
+            leaf-key = 3
+            "#,
+        );
+        check_collisions(&t).unwrap();
+    }
+
+    #[test]
+    fn check_collisions_finds_collision_in_any_table() {
+        // The check is whole-document: a collision inside a nested table
+        // is found without any requested path steering traversal there,
+        // reported with the normalized section path.
+        let t = table(
+            r#"
+            host = "h"
+
+            [data-base]
+            pool-size = 5
+            pool_size = 6
+            "#,
+        );
+        let err = check_collisions(&t).unwrap_err();
+        assert_eq!(err.section, "data_base");
+        assert_eq!(err.normalized_key, "pool_size");
+        assert_eq!(err.originals, vec!["pool-size", "pool_size"]);
+    }
+
+    #[test]
+    fn check_collisions_reaches_tables_inside_arrays() {
+        let t = table(
+            r#"
+            [[items]]
+            fine = 1
+
+            [[items]]
+            kebab-key = 1
+            kebab_key = 2
+            "#,
+        );
+        let err = check_collisions(&t).unwrap_err();
+        assert_eq!(err.section, "items[1]");
+        assert_eq!(err.normalized_key, "kebab_key");
     }
 
     #[test]
@@ -146,6 +270,13 @@ mod tests {
     #[test]
     fn normalize_key_no_dashes_is_noop() {
         assert_eq!(normalize_key("plain"), "plain");
+    }
+
+    #[test]
+    fn kebab_key_is_the_inverse_spelling() {
+        assert_eq!(kebab_key("pool_size"), "pool-size");
+        assert_eq!(kebab_key("plain"), "plain");
+        assert_eq!(kebab_key("already-kebab"), "already-kebab");
     }
 
     // -- Table walking ---------------------------------------------------------
@@ -282,9 +413,9 @@ mod tests {
 
     #[test]
     fn normalize_table_collision_does_not_partially_mutate() {
-        // Regression: collision detection is pre-flight, so callers that
-        // catch the error can rely on the table still being in its original
-        // state (no half-normalized aftermath to clean up).
+        // Regression: collision detection is a whole-tree pre-flight, so
+        // callers that catch the error can rely on the table still being
+        // in its original state (no half-normalized aftermath to clean up).
         let mut t = table(
             r#"
             unrelated-ok = 1
@@ -295,6 +426,21 @@ mod tests {
         assert!(normalize_table(&mut t).is_err());
         // The dash-bearing sibling key should still be in kebab form.
         assert!(t.contains_key("unrelated-ok"));
+
+        // Same guarantee when the collision is nested: keys at shallower
+        // depths are untouched too.
+        let mut t = table(
+            r#"
+            unrelated-ok = 1
+
+            [my-section]
+            kebab-key = 1
+            kebab_key = 2
+            "#,
+        );
+        assert!(normalize_table(&mut t).is_err());
+        assert!(t.contains_key("unrelated-ok"));
+        assert!(t.contains_key("my-section"));
     }
 
     #[test]

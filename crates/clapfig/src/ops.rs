@@ -86,7 +86,7 @@ fn kebab_rename_fields(schema: &mut crate::runtime::Schema) {
     use crate::runtime::Field;
     for nf in &mut schema.fields {
         if nf.name.contains('_') {
-            nf.name = nf.name.replace('_', "-");
+            nf.name = crate::normalize::kebab_key(&nf.name);
         }
         match &mut nf.field {
             Field::Nested(child) | Field::ArrayOf(child) | Field::MapOf(child) => {
@@ -182,6 +182,42 @@ fn flatten_value_map(table: &Map, prefix: &str, entries: &mut Vec<(String, Strin
             _ => entries.push((full_key, format_value(value))),
         }
     }
+}
+
+/// Navigate a value [`Map`] by a canonical snake_case dotted path using
+/// dash/underscore key equivalence. The whole document is first validated
+/// with [`check_collisions`](crate::normalize::check_collisions), so a
+/// table holding more than one equivalent spelling ANYWHERE — even off
+/// the requested path — errs as a
+/// [`KeyCollision`](crate::normalize::KeyCollision) instead of the lookup
+/// answering from a document the load path refuses; each segment then
+/// resolves through
+/// [`resolve_table_key`](crate::normalize::resolve_table_key). The
+/// raw-file counterpart of the load path's key normalization — scoped
+/// `config get` reads un-normalized documents, so a normalized
+/// (kebab-case) file must still answer for its canonical key. `Ok(None)`
+/// when the path doesn't resolve.
+pub(crate) fn table_get_normalized<'a>(
+    table: &'a Map,
+    canonical: &str,
+) -> Result<Option<&'a Value>, crate::normalize::KeyCollision> {
+    crate::normalize::check_collisions(table)?;
+    let mut current = table;
+    let mut segments = canonical.split('.').peekable();
+    while let Some(seg) = segments.next() {
+        let Some(key) = crate::normalize::resolve_table_key(current, seg) else {
+            return Ok(None);
+        };
+        let value = &current[key];
+        if segments.peek().is_none() {
+            return Ok(Some(value));
+        }
+        match value.as_map() {
+            Some(map) => current = map,
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 /// Navigate a value [`Map`] by dotted key path (e.g. `"database.url"`).

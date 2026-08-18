@@ -804,12 +804,19 @@ impl RuntimeBuilder {
             ConfigAction::Get { key, scope } => match scope {
                 None => {
                     let spec = Arc::clone(&self.spec);
+                    let normalize_keys = self.normalize_keys;
                     let table = self.load()?;
-                    get_from_table(&spec.schema, &table, key)
+                    get_from_table(&spec.schema, &table, key, normalize_keys)
                 }
                 Some(name) => {
                     let (path, adapter) = self.resolve_scope_persist_path(Some(name))?;
-                    get_scope_runtime(adapter.as_ref(), &self.spec.schema, &path, key)
+                    get_scope_runtime(
+                        adapter.as_ref(),
+                        &self.spec.schema,
+                        &path,
+                        key,
+                        self.normalize_keys,
+                    )
                 }
             },
             ConfigAction::Set { key, value, scope } => {
@@ -820,11 +827,12 @@ impl RuntimeBuilder {
                     &path,
                     key,
                     value,
+                    self.normalize_keys,
                 )
             }
             ConfigAction::Unset { key, scope } => {
                 let (path, adapter) = self.resolve_scope_persist_path(scope.as_deref())?;
-                crate::persist::unset_value(adapter.as_ref(), &path, key)
+                crate::persist::unset_value(adapter.as_ref(), &path, key, self.normalize_keys)
             }
         }
     }
@@ -1069,9 +1077,25 @@ fn format_runtime_value(value: &Value) -> String {
     }
 }
 
-fn get_from_table(schema: &Schema, table: &Map, key: &str) -> Result<ConfigResult, ClapfigError> {
-    let value = ops::table_get(table, key).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
-    let doc = crate::meta::doc_for_runtime(schema, key).unwrap_or_default();
+/// `config get` against the merged table. The merged table's keys are
+/// canonical snake_case (the load path normalized them), so with
+/// `normalize_keys` the action key is normalized before lookup — a kebab
+/// action key finds its snake entry. The reported key keeps the caller's
+/// spelling.
+fn get_from_table(
+    schema: &Schema,
+    table: &Map,
+    key: &str,
+    normalize_keys: bool,
+) -> Result<ConfigResult, ClapfigError> {
+    let canonical = if normalize_keys {
+        crate::normalize::normalize_key(key)
+    } else {
+        key.to_owned()
+    };
+    let value =
+        ops::table_get(table, &canonical).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
+    let doc = crate::meta::doc_for_runtime(schema, &canonical).unwrap_or_default();
     Ok(ConfigResult::KeyValue {
         key: key.into(),
         value: format_runtime_value(value),
@@ -1079,11 +1103,21 @@ fn get_from_table(schema: &Schema, table: &Map, key: &str) -> Result<ConfigResul
     })
 }
 
+/// Scoped `config get`: reads one scope's raw (un-normalized) file. With
+/// `normalize_keys`, the action key is normalized to the canonical
+/// snake_case path and looked up by dash/underscore equivalence
+/// ([`ops::table_get_normalized`]), so a kebab-case document answers for
+/// either action-key spelling — and a document holding BOTH equivalent
+/// spellings anywhere (even at keys the lookup never touches) fails as
+/// [`ClapfigError::NormalizedKeyCollision`] instead of answering from a
+/// document the load path refuses. The reported key keeps the caller's
+/// spelling.
 fn get_scope_runtime(
     adapter: &dyn FormatAdapter,
     schema: &Schema,
     file_path: &std::path::Path,
     key: &str,
+    normalize_keys: bool,
 ) -> Result<ConfigResult, ClapfigError> {
     let content = match std::fs::read_to_string(file_path) {
         Ok(c) => c,
@@ -1117,8 +1151,16 @@ fn get_scope_runtime(
         }
     };
 
-    let value = ops::table_get(&table, key).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
-    let doc = crate::meta::doc_for_runtime(schema, key).unwrap_or_default();
+    let (canonical, value) = if normalize_keys {
+        let canonical = crate::normalize::normalize_key(key);
+        let value =
+            ops::table_get_normalized(&table, &canonical).map_err(|c| c.into_error(file_path))?;
+        (canonical, value)
+    } else {
+        (key.to_owned(), ops::table_get(&table, key))
+    };
+    let value = value.ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
+    let doc = crate::meta::doc_for_runtime(schema, &canonical).unwrap_or_default();
     Ok(ConfigResult::KeyValue {
         key: key.into(),
         value: format_runtime_value(value),
@@ -2387,6 +2429,212 @@ mod tests {
 
         let db = table.get("db").and_then(Value::as_map).unwrap();
         assert_eq!(db.get("pool_size"), Some(&Value::Integer(42)));
+    }
+
+    #[test]
+    fn handle_set_normalized_roundtrip_has_no_collision() {
+        // End-to-end regression for #122: with normalize_keys on, set
+        // seeds a kebab file, later sets in EITHER spelling edit that
+        // same key, and the file stays loadable (no
+        // NormalizedKeyCollision from a snake/kebab duplicate).
+        use crate::format::FormatAdapter as _;
+        use crate::format::TomlAdapter;
+
+        let dir = TempDir::new().unwrap();
+        let builder = || {
+            Clapfig::runtime(demo_schema())
+                .app_name("demo")
+                .file_name("demo.toml")
+                .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+                .no_env()
+                .normalize_keys(true)
+        };
+        let file = dir.path().join("demo.toml");
+        let db_map = || {
+            let content = fs::read_to_string(&file).unwrap();
+            let tree = TomlAdapter.parse(&content).unwrap();
+            tree.as_map().unwrap()["db"].as_map().unwrap().clone()
+        };
+
+        // Missing file: seeded from the kebab template, snake action key.
+        builder()
+            .handle(&ConfigAction::Set {
+                key: "db.pool_size".into(),
+                value: "10".into(),
+                scope: None,
+            })
+            .unwrap();
+        let db = db_map();
+        assert_eq!(db.get("pool-size"), Some(&Value::Integer(10)));
+        assert!(!db.contains_key("pool_size"));
+
+        // Existing kebab file: both spellings edit the same key.
+        builder()
+            .handle(&ConfigAction::Set {
+                key: "db.pool-size".into(),
+                value: "11".into(),
+                scope: None,
+            })
+            .unwrap();
+        builder()
+            .handle(&ConfigAction::Set {
+                key: "db.pool_size".into(),
+                value: "12".into(),
+                scope: None,
+            })
+            .unwrap();
+        let db = db_map();
+        assert_eq!(db.get("pool-size"), Some(&Value::Integer(12)));
+        assert!(!db.contains_key("pool_size"));
+
+        // The file the persistence path wrote loads cleanly.
+        let table = builder().load().unwrap();
+        let db = table.get("db").and_then(Value::as_map).unwrap();
+        assert_eq!(db.get("pool_size"), Some(&Value::Integer(12)));
+
+        // Unset in the snake spelling removes the kebab entry; the
+        // default shows through again on load.
+        builder()
+            .handle(&ConfigAction::Unset {
+                key: "db.pool_size".into(),
+                scope: None,
+            })
+            .unwrap();
+        let db = db_map();
+        assert!(!db.contains_key("pool-size") && !db.contains_key("pool_size"));
+        let table = builder().load().unwrap();
+        let db = table.get("db").and_then(Value::as_map).unwrap();
+        assert_eq!(db.get("pool_size"), Some(&Value::Integer(5)));
+    }
+
+    #[test]
+    fn scoped_get_accepts_both_spellings_on_normalized_files() {
+        // Scoped get reads the raw (un-normalized) file, so a kebab
+        // document must answer for either action-key spelling — across
+        // all three formats.
+        use crate::format::{FormatAdapter, JsonAdapter, TomlAdapter, YamlAdapter};
+
+        let dir = TempDir::new().unwrap();
+        let files: [(&str, &dyn FormatAdapter, &str); 3] = [
+            ("demo.toml", &TomlAdapter, "[db]\npool-size = 42\n"),
+            ("demo.yaml", &YamlAdapter, "db:\n  pool-size: 42\n"),
+            ("demo.json", &JsonAdapter, "{\"db\": {\"pool-size\": 42}}"),
+        ];
+        for (name, adapter, content) in files {
+            let path = dir.path().join(name);
+            fs::write(&path, content).unwrap();
+            for key in ["db.pool-size", "db.pool_size"] {
+                let result = get_scope_runtime(adapter, &demo_schema(), &path, key, true).unwrap();
+                match result {
+                    ConfigResult::KeyValue {
+                        key: reported,
+                        value,
+                        ..
+                    } => {
+                        assert_eq!(value, "42", "{name} / {key}");
+                        assert_eq!(reported, key, "reported key keeps the caller's spelling");
+                    }
+                    other => panic!("expected KeyValue, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_get_rejects_ambiguous_spellings_as_collision() {
+        // A raw file holding BOTH equivalent spellings is ambiguous — the
+        // load path refuses it — so scoped get errors with the same
+        // collision (stamped with the scope file's path) instead of one
+        // spelling silently answering.
+        use crate::format::TomlAdapter;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("demo.toml");
+        fs::write(&path, "[db]\npool-size = 5\npool_size = 6\n").unwrap();
+        for key in ["db.pool-size", "db.pool_size"] {
+            let err =
+                get_scope_runtime(&TomlAdapter, &demo_schema(), &path, key, true).unwrap_err();
+            match err {
+                ClapfigError::NormalizedKeyCollision {
+                    path: reported,
+                    section,
+                    normalized_key,
+                    originals,
+                } => {
+                    assert_eq!(reported, path, "{key}");
+                    assert_eq!(section, "db");
+                    assert_eq!(normalized_key, "pool_size");
+                    assert_eq!(originals, vec!["pool-size", "pool_size"]);
+                }
+                other => panic!("expected NormalizedKeyCollision, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_get_rejects_collision_off_the_requested_path() {
+        // Whole-document validation: `host` itself is unambiguous, but
+        // the file holds both spellings in the untraversed `db` table —
+        // scoped get still fails, because a document the load path
+        // refuses is never queried.
+        use crate::format::TomlAdapter;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("demo.toml");
+        fs::write(
+            &path,
+            "host = \"h\"\n\n[db]\npool-size = 5\npool_size = 6\n",
+        )
+        .unwrap();
+        let err = get_scope_runtime(&TomlAdapter, &demo_schema(), &path, "host", true).unwrap_err();
+        match err {
+            ClapfigError::NormalizedKeyCollision {
+                path: reported,
+                section,
+                normalized_key,
+                ..
+            } => {
+                assert_eq!(reported, path);
+                assert_eq!(section, "db");
+                assert_eq!(normalized_key, "pool_size");
+            }
+            other => panic!("expected NormalizedKeyCollision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_get_missing_file_is_key_not_found_for_both_spellings() {
+        use crate::format::TomlAdapter;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent.toml");
+        for key in ["db.pool-size", "db.pool_size"] {
+            let result = get_scope_runtime(&TomlAdapter, &demo_schema(), &path, key, true);
+            assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))), "{key}");
+        }
+    }
+
+    #[test]
+    fn handle_get_merged_accepts_kebab_key_with_normalization() {
+        // The merged table's keys are canonical snake_case after the
+        // load-path normalization; the action key follows the same
+        // acceptance, so `get pool-size` answers from the merged view.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "[db]\npool-size = 42\n").unwrap();
+
+        let result = Clapfig::runtime(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .normalize_keys(true)
+            .handle(&ConfigAction::Get {
+                key: "db.pool-size".into(),
+                scope: None,
+            })
+            .unwrap();
+
+        match result {
+            ConfigResult::KeyValue { value, .. } => assert_eq!(value, "42"),
+            other => panic!("expected KeyValue, got {other:?}"),
+        }
     }
 
     // --- handle: template + schema output variants ---

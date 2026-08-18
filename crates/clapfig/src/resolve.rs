@@ -186,12 +186,7 @@ pub(crate) fn resolve<S: ConfigSpec>(
                 }
             };
             if input.normalize_keys {
-                normalize_table(&mut table).map_err(|c| ClapfigError::NormalizedKeyCollision {
-                    path: path.clone(),
-                    section: c.section,
-                    normalized_key: c.normalized_key,
-                    originals: c.originals,
-                })?;
+                normalize_table(&mut table).map_err(|c| c.into_error(path))?;
             }
             if cascade_active {
                 let mut per_file =

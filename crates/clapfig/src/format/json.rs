@@ -1401,6 +1401,7 @@ mod tests {
             None,
             "port",
             "9090",
+            false,
         )
         .unwrap();
         assert!(

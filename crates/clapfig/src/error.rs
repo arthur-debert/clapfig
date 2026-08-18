@@ -130,7 +130,10 @@ pub enum ClapfigError {
     /// table collapse to the same normalized name (e.g. `pool-size` and
     /// `pool_size` both become `pool_size`). Surfacing this as an error
     /// avoids the silent-drop ambiguity where one entry would win based on
-    /// the table's key iteration order. Fix by keeping only one spelling.
+    /// the table's key iteration order. Raised at load (whole-table check)
+    /// and whenever `config set`/`unset`/scoped `get` traverses an
+    /// ambiguous table — equivalent spellings never silently compete on
+    /// any path. Fix by keeping only one spelling.
     #[error(
         "Conflicting keys in {}: '{normalized_key}'{} is defined by [{}], which normalize to the same name",
         path.display(),
