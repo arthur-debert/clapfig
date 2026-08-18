@@ -675,9 +675,18 @@ mod tests {
             r#""server.host": localhost"#
         );
         // …and a runtime-schema key with JSON-special characters is
-        // escaped, not interpolated between bare quotes.
+        // escaped, not interpolated between bare quotes. Control
+        // characters stay one-line (`\n`/`\r`/`\t`/`\uXXXX`), matching
+        // the YAML adapter's display contract.
         assert_eq!(JsonAdapter.display_entry(r#"a"b"#, "1"), r#""a\"b": 1"#);
         assert_eq!(JsonAdapter.display_entry(r"a\b", "1"), r#""a\\b": 1"#);
+        assert_eq!(JsonAdapter.display_entry("a\nb", "1"), r#""a\nb": 1"#);
+        assert_eq!(JsonAdapter.display_entry("a\rb", "1"), r#""a\rb": 1"#);
+        assert_eq!(JsonAdapter.display_entry("a\tb", "1"), r#""a\tb": 1"#);
+        assert_eq!(
+            JsonAdapter.display_entry("a\u{1}b", "1"),
+            r#""a\u0001b": 1"#
+        );
     }
 
     // --- capabilities ----------------------------------------------------

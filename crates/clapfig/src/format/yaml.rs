@@ -81,16 +81,14 @@ impl FormatAdapter for YamlAdapter {
     }
 
     fn display_entry(&self, key: &str, value: &str) -> String {
-        // Spell the key through YAML's own scalar rules: a plain dotted
-        // path stays bare, but runtime-schema key names that YAML cannot
-        // carry as a plain scalar (embedded `: `, `#`, quotes, leading
-        // indicators…) come out quoted/escaped instead of rendering a
-        // misleading line.
-        let encoded = serde_norway::to_string(key)
-            .expect("serializing a string to YAML cannot fail")
-            .trim_end()
-            .to_string();
-        format!("{encoded}: {value}")
+        // One-line YAML scalar: a plain dotted path stays bare, but
+        // runtime-schema names YAML cannot carry as a plain scalar
+        // (embedded `: `, `#`, quotes, leading indicators, control
+        // characters) come out quoted. Control characters take JSON
+        // string encoding — valid YAML — because serde_norway would
+        // emit a block scalar (`|-\n  a\n  b`) and appending `: {value}`
+        // would put the assignment on the block's last content line.
+        format!("{}: {value}", inline_scalar(key))
     }
 
     fn parse(&self, text: &str) -> Result<Value, FormatError> {
@@ -932,11 +930,27 @@ mod tests {
             YamlAdapter.display_entry("server.host", "localhost"),
             "server.host: localhost"
         );
-        // …and a key YAML cannot carry as a plain scalar comes out in
-        // the encoder's quoted spelling: the rendered key half must
-        // round-trip back to the original name.
-        for key in ["a: b", "a # b", "'a'", "\"a\"", "- a"] {
+        // …and a key YAML cannot carry as a plain scalar comes out in a
+        // one-line quoted spelling: the rendered key half must
+        // round-trip back to the original name, and the assignment
+        // stays on a single line (serde_norway would emit a block
+        // scalar for a newline, which would swallow the `: value`).
+        for key in [
+            "a: b",
+            "a # b",
+            "'a'",
+            "\"a\"",
+            "- a",
+            "a\nb",
+            "a\rb",
+            "a\tb",
+            "a\u{1}b",
+        ] {
             let rendered = YamlAdapter.display_entry(key, "1");
+            assert!(
+                !rendered.contains('\n') && !rendered.contains('\r'),
+                "display must stay one line, got {rendered:?}"
+            );
             let encoded = rendered
                 .strip_suffix(": 1")
                 .unwrap_or_else(|| panic!("no value half in {rendered:?}"));

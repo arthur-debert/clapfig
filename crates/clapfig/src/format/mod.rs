@@ -412,9 +412,9 @@ pub trait FormatAdapter: Send + Sync {
     /// is not an [`Operation`] row. The default is the TOML-baseline
     /// spelling (`key = value`); formats whose assignment syntax differs
     /// override, and overrides that quote the key (JSON) or promise a
-    /// scalar spelling (YAML) escape it through their own encoder so a
-    /// runtime-schema key with special characters cannot render a
-    /// misleading line.
+    /// one-line scalar spelling (YAML) escape it through their own
+    /// encoder so a runtime-schema key with special characters cannot
+    /// render a misleading line.
     fn display_entry(&self, key: &str, value: &str) -> String {
         format!("{key} = {value}")
     }
