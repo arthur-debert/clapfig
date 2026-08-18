@@ -75,8 +75,9 @@ pool_size = 10
 Fields with defaults are real assignments; fields without one are commented
 placeholders. Enum-typed fields additionally carry an `Allowed:` line;
 array/map fields carry an `Elements:`/`Values:` line naming the element
-type; required fields with no default carry a `Required.` line so users
-know which placeholders they must uncomment.
+type. A `Required.` line marks a placeholder the runtime rejects if left
+commented (a non-optional scalar with no default). Absent arrays and maps
+load as empty, so they do not get that line.
 
 Write to a file with `--output` — the path's **extension selects the
 format**, independent of the enabled-formats list:

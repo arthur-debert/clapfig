@@ -556,11 +556,13 @@ mod tests {
 
     #[test]
     fn required_lists_defaultless_leaves_and_sections_containing_them() {
-        use crate::runtime::{Field, Schema as RtSchema};
+        use crate::runtime::{Field, LeafType, Schema as RtSchema};
         let s = generate_schema(
             &RtSchema::object("App")
                 .field("name", Field::string()) // required, no default
                 .field("host", Field::string().default("localhost"))
+                .field("tags", Field::array_of_type(LeafType::String))
+                .field("labels", Field::map_of(LeafType::String))
                 .nested(
                     "auth",
                     RtSchema::object("Auth").field("token", Field::string()),
@@ -568,6 +570,10 @@ mod tests {
                 .nested(
                     "limits",
                     RtSchema::object("Limits").field("max", Field::integer().default(10i64)),
+                )
+                .nested(
+                    "meta",
+                    RtSchema::object("Meta").field("tags", Field::array_of_type(LeafType::String)),
                 )
                 .build(),
         );
@@ -580,9 +586,13 @@ mod tests {
         // The defaultless leaf and the section transitively containing one.
         assert!(required.contains(&"name"));
         assert!(required.contains(&"auth"));
-        // Defaulted leaf and all-satisfiable section are absence-safe.
+        // Defaulted leaf, all-satisfiable section, and array/map leaves
+        // (absence materializes as []/{}) are absence-safe.
         assert!(!required.contains(&"host"));
         assert!(!required.contains(&"limits"));
+        assert!(!required.contains(&"tags"));
+        assert!(!required.contains(&"labels"));
+        assert!(!required.contains(&"meta"));
         // Inside `auth`, the defaultless leaf is required.
         let auth_required: Vec<&str> = s["properties"]["auth"]["required"]
             .as_array()

@@ -351,6 +351,10 @@ fn vec_of_unit_enum_template_emits_allowed_line() {
         t.contains("# Allowed: \"a4\" | \"letter\""),
         "array-of-enum leaf must list its per-item value set, got:\n{t}"
     );
+    assert!(
+        !t.contains("Required."),
+        "array leaf materializes as [] when absent, so the template must not mark it required, got:\n{t}"
+    );
 }
 
 // -- Option<Vec<UnitEnum>> keeps the presence signal ------------------------
