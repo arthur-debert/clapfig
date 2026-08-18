@@ -80,6 +80,17 @@ impl FormatAdapter for YamlAdapter {
         ]
     }
 
+    fn display_entry(&self, key: &str, value: &str) -> String {
+        // One-line YAML scalar: a plain dotted path stays bare, but
+        // runtime-schema names YAML cannot carry as a plain scalar
+        // (embedded `: `, `#`, quotes, leading indicators, control
+        // characters) come out quoted. Control characters take JSON
+        // string encoding — valid YAML — because serde_norway would
+        // emit a block scalar (`|-\n  a\n  b`) and appending `: {value}`
+        // would put the assignment on the block's last content line.
+        format!("{}: {value}", inline_scalar(key))
+    }
+
     fn parse(&self, text: &str) -> Result<Value, FormatError> {
         // An empty or comments-only file (bare document markers included)
         // is an empty config: absence, not null. serde_norway would read
@@ -909,6 +920,37 @@ fn json_escaped(s: &str) -> String {
 mod tests {
     use super::super::SetTarget;
     use super::*;
+
+    // --- display spelling ------------------------------------------------
+
+    #[test]
+    fn display_entry_yaml_quotes_non_plain_keys() {
+        // The ordinary dotted path stays a bare plain scalar…
+        assert_eq!(
+            YamlAdapter.display_entry("server.host", "localhost"),
+            "server.host: localhost"
+        );
+        // …and a key YAML cannot carry as a plain scalar comes out in a
+        // one-line quoted spelling: the rendered key half must
+        // round-trip back to the original name, and the assignment
+        // stays on a single line (serde_norway would emit a block
+        // scalar for a newline, which would swallow the `: value`).
+        for key in [
+            "a: b", "a # b", "'a'", "\"a\"", "- a", "a\nb", "a\rb", "a\tb", "a\u{1}b",
+        ] {
+            let rendered = YamlAdapter.display_entry(key, "1");
+            assert!(
+                !rendered.contains('\n') && !rendered.contains('\r'),
+                "display must stay one line, got {rendered:?}"
+            );
+            let encoded = rendered
+                .strip_suffix(": 1")
+                .unwrap_or_else(|| panic!("no value half in {rendered:?}"));
+            let round_tripped: String =
+                serde_norway::from_str(encoded).expect("encoded key must parse as one scalar");
+            assert_eq!(round_tripped, key, "key {key:?} rendered as {rendered:?}");
+        }
+    }
 
     fn parse_map(text: &str) -> Map {
         match YamlAdapter.parse(text).expect("fixture must parse") {

@@ -11,6 +11,17 @@ use crate::format::FormatAdapter;
 use crate::value::{Map, Value};
 
 /// Result of a config operation. Returned to the caller for display.
+///
+/// Variants that show config data (`KeyValue`, `Listing`, `ValueSet`)
+/// carry both the structured fields (for programmatic consumers) and a
+/// pre-`rendered` display form spelled by the active format's adapter
+/// ([`FormatAdapter::display_entry`] / [`display_comment`]) — `key = value`
+/// under TOML, `key: value` under YAML, `"key": value` under JSON — which
+/// is what [`Display`](fmt::Display) prints. The active format is the
+/// scope file's format for scoped operations and the preferred
+/// (first-enabled) format for merged views.
+///
+/// [`display_comment`]: FormatAdapter::display_comment
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigResult {
     /// A generated config template string, in the requested format.
@@ -26,13 +37,72 @@ pub enum ConfigResult {
         key: String,
         value: String,
         doc: Vec<String>,
+        /// The display block (comment lines + assignment) in the active
+        /// format's spelling; what `Display` prints.
+        rendered: String,
     },
     /// Confirmation that a value was persisted.
-    ValueSet { key: String, value: String },
+    ValueSet {
+        key: String,
+        value: String,
+        /// The `key = value` assignment in the active format's spelling.
+        rendered: String,
+    },
     /// Confirmation that a value was removed.
     ValueUnset { key: String },
     /// All resolved configuration key-value pairs.
-    Listing { entries: Vec<(String, String)> },
+    Listing {
+        entries: Vec<(String, String)>,
+        /// One assignment line per entry in the active format's spelling,
+        /// newline-joined; what `Display` prints.
+        rendered: String,
+    },
+}
+
+impl ConfigResult {
+    /// Build a [`ConfigResult::KeyValue`], rendering the display block
+    /// (doc-comment lines, then the assignment) through `adapter`.
+    pub(crate) fn key_value(
+        adapter: &dyn FormatAdapter,
+        key: String,
+        value: String,
+        doc: Vec<String>,
+    ) -> Self {
+        let mut rendered = String::new();
+        for line in &doc {
+            rendered.push_str(&adapter.display_comment(line));
+            rendered.push('\n');
+        }
+        rendered.push_str(&adapter.display_entry(&key, &value));
+        ConfigResult::KeyValue {
+            key,
+            value,
+            doc,
+            rendered,
+        }
+    }
+
+    /// Build a [`ConfigResult::ValueSet`], rendering the confirmed
+    /// assignment through `adapter`.
+    pub(crate) fn value_set(adapter: &dyn FormatAdapter, key: String, value: String) -> Self {
+        let rendered = adapter.display_entry(&key, &value);
+        ConfigResult::ValueSet {
+            key,
+            value,
+            rendered,
+        }
+    }
+
+    /// Build a [`ConfigResult::Listing`], rendering one assignment line
+    /// per entry through `adapter`.
+    pub(crate) fn listing(adapter: &dyn FormatAdapter, entries: Vec<(String, String)>) -> Self {
+        let rendered = entries
+            .iter()
+            .map(|(key, value)| adapter.display_entry(key, value))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ConfigResult::Listing { entries, rendered }
+    }
 }
 
 impl fmt::Display for ConfigResult {
@@ -46,23 +116,10 @@ impl fmt::Display for ConfigResult {
             ConfigResult::SchemaWritten { path } => {
                 write!(f, "Config schema written to {}", path.display())
             }
-            ConfigResult::KeyValue { key, value, doc } => {
-                for line in doc {
-                    writeln!(f, "# {line}")?;
-                }
-                write!(f, "{key} = {value}")
-            }
-            ConfigResult::ValueSet { key, value } => write!(f, "Set {key} = {value}"),
+            ConfigResult::KeyValue { rendered, .. } => write!(f, "{rendered}"),
+            ConfigResult::ValueSet { rendered, .. } => write!(f, "Set {rendered}"),
             ConfigResult::ValueUnset { key } => write!(f, "Unset {key}"),
-            ConfigResult::Listing { entries } => {
-                for (i, (key, value)) in entries.iter().enumerate() {
-                    if i > 0 {
-                        writeln!(f)?;
-                    }
-                    write!(f, "{key} = {value}")?;
-                }
-                Ok(())
-            }
+            ConfigResult::Listing { rendered, .. } => write!(f, "{rendered}"),
         }
     }
 }
@@ -131,9 +188,7 @@ pub(crate) fn list_scope_file(
     let content = match std::fs::read_to_string(file_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ConfigResult::Listing {
-                entries: Vec::new(),
-            });
+            return Ok(ConfigResult::listing(adapter, Vec::new()));
         }
         Err(e) => {
             return Err(ClapfigError::IoError {
@@ -166,7 +221,7 @@ pub(crate) fn list_scope_file(
     let mut entries = Vec::new();
     flatten_value_map(&table, "", &mut entries);
 
-    Ok(ConfigResult::Listing { entries })
+    Ok(ConfigResult::listing(adapter, entries))
 }
 
 /// Recursively flatten a value map into dotted key-value pairs.
@@ -408,14 +463,54 @@ mod tests {
 
     #[test]
     fn listing_display_format() {
-        let result = ConfigResult::Listing {
-            entries: vec![
+        let result = ConfigResult::listing(
+            &TomlAdapter,
+            vec![
                 ("host".into(), "localhost".into()),
                 ("port".into(), "8080".into()),
             ],
-        };
+        );
         let display = format!("{result}");
         assert_eq!(display, "host = localhost\nport = 8080");
+    }
+
+    #[test]
+    fn listing_display_is_format_aware() {
+        // The active format spells the assignment lines: TOML `k = v`,
+        // YAML `k: v`, JSON `"k": v`.
+        use crate::format::{JsonAdapter, YamlAdapter};
+        let entries = |a: &dyn FormatAdapter| {
+            format!(
+                "{}",
+                ConfigResult::listing(a, vec![("database.url".into(), "pg://".into())])
+            )
+        };
+        assert_eq!(entries(&TomlAdapter), "database.url = pg://");
+        assert_eq!(entries(&YamlAdapter), "database.url: pg://");
+        assert_eq!(entries(&JsonAdapter), "\"database.url\": pg://");
+    }
+
+    #[test]
+    fn key_value_display_is_format_aware() {
+        // Doc lines follow the format's comment spelling; JSON (no real
+        // comments) uses its `//` convention.
+        use crate::format::{JsonAdapter, YamlAdapter};
+        let get = |a: &dyn FormatAdapter| {
+            format!(
+                "{}",
+                ConfigResult::key_value(a, "port".into(), "8080".into(), vec!["The port.".into()])
+            )
+        };
+        assert_eq!(get(&TomlAdapter), "# The port.\nport = 8080");
+        assert_eq!(get(&YamlAdapter), "# The port.\nport: 8080");
+        assert_eq!(get(&JsonAdapter), "// The port.\n\"port\": 8080");
+    }
+
+    #[test]
+    fn value_set_display_is_format_aware() {
+        use crate::format::YamlAdapter;
+        let result = ConfigResult::value_set(&YamlAdapter, "port".into(), "8080".into());
+        assert_eq!(format!("{result}"), "Set port: 8080");
     }
 
     // --- scope file operations ---
@@ -428,7 +523,7 @@ mod tests {
 
         let result = list_scope_file(&TomlAdapter, &path).unwrap();
         match result {
-            ConfigResult::Listing { entries } => {
+            ConfigResult::Listing { entries, .. } => {
                 assert_eq!(entries.len(), 2);
                 assert!(entries.contains(&("host".into(), "localhost".into())));
                 assert!(entries.contains(&("port".into(), "3000".into())));
@@ -445,7 +540,7 @@ mod tests {
 
         let result = list_scope_file(&TomlAdapter, &path).unwrap();
         match result {
-            ConfigResult::Listing { entries } => {
+            ConfigResult::Listing { entries, .. } => {
                 assert!(entries.contains(&("database.pool_size".into(), "10".into())));
                 assert!(entries.contains(&("database.url".into(), "pg://".into())));
             }
@@ -460,7 +555,7 @@ mod tests {
 
         let result = list_scope_file(&TomlAdapter, &path).unwrap();
         match result {
-            ConfigResult::Listing { entries } => assert!(entries.is_empty()),
+            ConfigResult::Listing { entries, .. } => assert!(entries.is_empty()),
             other => panic!("Expected empty Listing, got {other:?}"),
         }
     }

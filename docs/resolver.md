@@ -31,13 +31,29 @@ let resolver = Clapfig::builder(site_schema())
     .build_resolver()?;
 ```
 
-Each `resolve_at()` call returns the merged `clapfig::value::Map`;
-deserialize it into your typed struct where you need one via
-`clapfig::value::from_value(Value::Map(map))`.
+Each `resolve_at()` call returns the merged `clapfig::value::Map`.
 
 `build_resolver()` captures the builder's state — search paths, env vars,
 overrides, strict mode, post_validate hook — into a reusable handle. The
 builder is consumed, just like `load()`.
+
+The typed path mirrors this: `Clapfig::typed::<C>() … .build_resolver()`
+returns a `TypedResolver<C>` wrapping the same machinery, whose
+`resolve_at()` deserializes each merged map into a typed `C` and runs the
+typed `post_validate(&C)` hook per call:
+
+```rust
+let resolver = Clapfig::typed::<SiteConfig>()
+    .app_name("myssg")
+    .file_name(".myssg.toml")
+    .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
+    .build_resolver()?;
+
+for leaf in walk_content_tree("./site") {
+    let config: SiteConfig = resolver.resolve_at(&leaf)?;
+    render_page(&leaf, &config);
+}
+```
 
 ## Resolving per directory
 

@@ -153,15 +153,37 @@ database.pool_size = 10
 ### `config set <key> <value>`
 
 Persists a value to the config file. The key is validated against the struct
-and the value is type-checked before writing:
+and the value is **parsed according to the leaf's declared type** before
+writing — a string field takes `123` verbatim (no way needed to "force a
+string"), a numeric or bool field refuses non-matching input naming the
+expected type:
 
 ```sh
 $ myapp config set port 9090
 Set port = 9090
 
 $ myapp config set port hello
-# Error: invalid type for key 'port'
+# Error: Invalid value for 'port': expected integer, got 'hello'
+
+$ myapp config set host 123        # host is a String field
+Set host = 123                     # persists as the string "123"
 ```
+
+Array and map leaves take TOML inline syntax — the value model's baseline
+vocabulary, whatever format the target file uses; the parsed value is
+written through that file's own adapter:
+
+```sh
+myapp config set tags '["a", "b"]'
+myapp config set limits '{cpu = 2, mem = 8}'
+```
+
+Keys inside `ArrayOf`/`MapOf` sections (arrays or maps **of sections**,
+e.g. `servers.web.host` where `servers` is a `HashMap<String, Server>`)
+are not addressable with a dotted CLI key — the entry key is user data,
+not a schema field, so `set` refuses with a targeted error telling you to
+edit the config file directly. (An indexed path syntax is a possible
+future extension.)
 
 With `--scope`:
 
@@ -267,10 +289,10 @@ use clapfig::ConfigResult;
 
 let result = builder.handle(&action)?;
 match result {
-    ConfigResult::KeyValue { key, value, doc } => {
+    ConfigResult::KeyValue { key, value, doc, .. } => {
         // custom rendering
     }
-    ConfigResult::Listing { entries } => {
+    ConfigResult::Listing { entries, .. } => {
         for (key, value) in entries {
             // ...
         }
@@ -278,6 +300,14 @@ match result {
     _ => println!("{result}"),
 }
 ```
+
+The `KeyValue`, `Listing`, and `ValueSet` variants also carry a
+`rendered` field — the display block spelled in the **active format**
+(the scope file's format for scoped operations, the preferred format for
+merged views): `key = value` under TOML, `key: value` under YAML,
+`"key": value` under JSON. `Display` (and therefore `handle_and_print` /
+`handle_to_string`) prints that spelling, so `config get`/`list` output
+matches the format your users actually write.
 
 ## ConfigCommand (runtime builder)
 

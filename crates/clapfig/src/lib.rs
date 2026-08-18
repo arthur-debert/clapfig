@@ -266,6 +266,12 @@
 //! flags, URLs). If you need exact control over how a value is interpreted,
 //! use serde's `#[serde(deserialize_with = ...)]` on the field.
 //!
+//! If the environment sets the same key both flat and nested
+//! (`MYAPP__DATABASE` and `MYAPP__DATABASE__URL`), the last-processed
+//! variable wins — and since environment iteration order is unspecified,
+//! which one that is is not guaranteed. Don't mix the two shapes for one
+//! key.
+//!
 //! Disable env loading entirely with [`.no_env()`](Builder::no_env)
 //! when you don't want environment variables in the mix (e.g. in tests or
 //! embedded contexts).
@@ -632,8 +638,12 @@
 //! - **The `post_validate` hook composes naturally.** Registered once on the
 //!   builder, captured into the resolver, fired on every `resolve_at` call —
 //!   so per-leaf invariants get the same enforcement as top-level `load()`.
+//! - **The typed path mirrors it.** [`TypedBuilder::build_resolver`]
+//!   returns a [`TypedResolver<C>`] wrapping the same machinery; each
+//!   `resolve_at` call deserializes the merged map into a typed `C` and
+//!   runs the typed `post_validate` hook.
 //!
-//! See [`Resolver`] for the full API.
+//! See [`Resolver`] and [`TypedResolver`] for the full API.
 //!
 //! # Normalizing values
 //!
@@ -725,9 +735,13 @@
 //!   from the generated template, so the user gets doc comments for every
 //!   field out of the box.
 //! - **Validation before write**: `config set` validates that the key exists
-//!   and the value matches the leaf's declared type before touching the
-//!   file. A typo in the key name or a string where an integer is expected
-//!   fails fast.
+//!   and parses the value according to the leaf's declared type — a string
+//!   leaf takes `123` verbatim, an integer leaf refuses `abc` naming the
+//!   expected type, and array/map leaves accept TOML inline syntax
+//!   (`["a", "b"]`, `{cpu = 2}`) whatever the file's format — before
+//!   touching the file. Keys inside `ArrayOf`/`MapOf` sections are not
+//!   addressable by dotted CLI key (entry keys are user data, not schema
+//!   fields) and refuse with a targeted error pointing at the config file.
 //! - **Scoped reads**: `config list --scope global` and `config get key
 //!   --scope local` read from a single scope's file rather than the merged
 //!   view, letting users inspect where values come from.
@@ -781,7 +795,7 @@ pub use error::{ClapfigError, UnknownKeyInfo};
 pub use ops::ConfigResult;
 pub use static_schema::Schema;
 pub use strict::{CollectedUnknown, UnknownKeyContext, UnknownKeyDecision};
-pub use typed_builder::TypedBuilder;
+pub use typed_builder::{TypedBuilder, TypedResolver};
 pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};
 
 /// Entry point for building a clapfig configuration.
