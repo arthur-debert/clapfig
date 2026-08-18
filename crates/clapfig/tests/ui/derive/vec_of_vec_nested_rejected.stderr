@@ -1,0 +1,5 @@
+error: nested arrays (Vec<Vec<...>>) are not supported by clapfig::Schema. Use `#[clapfig(value)]` with `clapfig::value::Value` for free-form nested shapes.
+  --> tests/ui/derive/vec_of_vec_nested_rejected.rs:13:15
+   |
+13 |     grid: Vec<Vec<Inner>>,
+   |               ^^^

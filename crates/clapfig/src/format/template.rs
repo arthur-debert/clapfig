@@ -145,12 +145,12 @@ pub(crate) fn doc_lines(doc: &[String]) -> Vec<String> {
 }
 
 /// The comment lines annotating one leaf: its doc prose ([`doc_lines`]),
-/// an `Allowed:` line listing an enum's values, an `Accepts:` line for
-/// any-value leaves, an `Elements:`/`Values:` element-type hint for
-/// array/map leaves (whose placeholders — `[]`/`{}` — carry no type on
-/// their own), and a final `Required.` line for leaves the runtime
-/// rejects when absent (non-optional with no default — exactly the
-/// placeholders the user MUST uncomment). `format_display` names the
+/// an `Allowed:` line listing an enum's (or array-of-enum's per-item)
+/// values, an `Accepts:` line for any-value leaves, an `Elements:`/`Values:`
+/// element-type hint for array/map leaves (whose placeholders — `[]`/`{}`
+/// — carry no type on their own), and a final `Required.` line for leaves
+/// the runtime rejects when absent (non-optional with no default — exactly
+/// the placeholders the user MUST uncomment). `format_display` names the
 /// format in the `Accepts:` line (`"TOML"`); `inline` renders one value
 /// in the format's inline spelling (fallible for JSON, whose conversion
 /// refuses some values).
@@ -160,7 +160,18 @@ pub(crate) fn leaf_annotations(
     inline: &mut dyn FnMut(&Value) -> Result<String, FormatError>,
 ) -> Result<Vec<String>, FormatError> {
     let mut lines = doc_lines(&leaf.doc);
-    if let LeafType::Enum { values } = &leaf.ty {
+    // Enum leaves list their value set; array-of-enum leaves
+    // (`Vec<UnitEnum>` flattened to `Array(Enum)`) list the same set —
+    // the constraint applies per item.
+    let enum_values = match &leaf.ty {
+        LeafType::Enum { values } => Some(values),
+        LeafType::Array(item) => match item.as_ref() {
+            LeafType::Enum { values } => Some(values),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(values) = enum_values {
         let mut listed = Vec::with_capacity(values.len());
         for value in values {
             listed.push(inline(value)?);

@@ -15,10 +15,11 @@
 //!   `properties`.
 //! - **Required**: `required` mirrors what the runtime actually rejects
 //!   when absent — a leaf is required only if it is non-optional AND has
-//!   no default (defaults are synthesized during finalization), and a
-//!   nested section is required only if it transitively contains such a
-//!   leaf. An external validator therefore accepts exactly the documents
-//!   clapfig loads.
+//!   no default AND is neither map-typed nor array-typed (defaults are
+//!   synthesized during finalization; an absent map/array materializes as
+//!   the empty one), and a nested section is required only if it
+//!   transitively contains such a leaf. An external validator therefore
+//!   accepts exactly the documents clapfig loads.
 //! - **Docs**: schema and field doc lines become `description`.
 //! - **Types**: converted recursively from each leaf's declared
 //!   [`LeafType`] — including leaves without defaults. String →
@@ -167,10 +168,10 @@ fn schema_to_object(schema: &Schema) -> Value {
 /// Convert a [`NamedField`] into a `(name, schema, required)` triple.
 ///
 /// `required` mirrors the runtime's absence rules: `true` for a leaf that
-/// is non-optional AND defaultless AND not map-typed (an absent
-/// non-optional map leaf materializes as the empty map, like structural
-/// `MapOf`/`ArrayOf` nodes), and for a nested struct that transitively
-/// contains such a leaf ([`schema_requires_presence`]).
+/// is non-optional AND defaultless AND neither map-typed nor array-typed
+/// (an absent non-optional map/array leaf materializes as the empty
+/// map/array, like structural `MapOf`/`ArrayOf` nodes), and for a nested
+/// struct that transitively contains such a leaf ([`schema_requires_presence`]).
 fn field_to_property(field: &NamedField) -> (String, Value, bool) {
     match &field.field {
         Field::Nested(nested) => {
@@ -221,10 +222,12 @@ fn field_to_property(field: &NamedField) -> (String, Value, bool) {
             }
             populate_leaf(&mut prop, leaf);
             // Required only when the runtime rejects the absence:
-            // non-optional AND defaultless AND not map-typed — an absent
-            // non-optional map leaf materializes as the empty map.
-            let required =
-                !leaf.optional && leaf.default.is_none() && !matches!(leaf.ty, LeafType::Map(_));
+            // non-optional AND defaultless AND neither map- nor
+            // array-typed — an absent non-optional map/array leaf
+            // materializes as the empty map/array.
+            let required = !leaf.optional
+                && leaf.default.is_none()
+                && !matches!(leaf.ty, LeafType::Map(_) | LeafType::Array(_));
             (field.name.clone(), Value::Object(prop), required)
         }
     }
@@ -236,12 +239,15 @@ fn field_to_property(field: &NamedField) -> (String, Value, bool) {
 /// section whose required leaves all carry defaults is satisfiable when
 /// absent — exporting it `required` would make external validators reject
 /// configs clapfig loads fine. `ArrayOf`/`MapOf` subtrees never require
-/// presence (absent means the empty list/map), and neither do map-typed
-/// leaves (an absent non-optional map leaf materializes as the empty map).
+/// presence (absent means the empty list/map), and neither do map- or
+/// array-typed leaves (an absent non-optional map/array leaf materializes
+/// as the empty map/array).
 fn schema_requires_presence(schema: &Schema) -> bool {
     schema.fields.iter().any(|nf| match &nf.field {
         Field::Leaf(leaf) => {
-            !leaf.optional && leaf.default.is_none() && !matches!(leaf.ty, LeafType::Map(_))
+            !leaf.optional
+                && leaf.default.is_none()
+                && !matches!(leaf.ty, LeafType::Map(_) | LeafType::Array(_))
         }
         Field::Nested(nested) => schema_requires_presence(nested),
         Field::ArrayOf(_) | Field::MapOf(_) => false,

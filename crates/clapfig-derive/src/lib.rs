@@ -36,6 +36,15 @@ use syn::{
 ///   `u128` are rejected at derive time.
 /// - `Option<T>`: marks the leaf optional
 /// - `Vec<T>` where `T` is a scalar: maps to `LeafType::Array(T)`
+/// - `Vec<T>` where `T` derives `clapfig::Schema`: produces a
+///   `FieldStatic::ArrayOf { .. }` (TOML `[[name]]` array of tables) for a
+///   struct element type; a unit-only-enum element type flattens to a
+///   `LeafType::Array(Enum)` leaf (allowed-values on items). Support is
+///   trait-resolved — the compiler, not a syntactic guess, decides
+///   whether `T` qualifies. An absent array loads as the empty `Vec`;
+///   `Option<Vec<T>>` keeps the presence signal (absent → `None`) and is
+///   supported for unit-only-enum element types only (an absent array of
+///   nested *objects* is already the empty array — spell it `Vec<T>`).
 /// - Nested struct: assumed to also derive `clapfig::Schema`; produces a
 ///   `FieldStatic::Nested { .. }`
 ///
@@ -59,7 +68,8 @@ use syn::{
 ///   field's `allowed = [...]` set is likewise a derive error. Defaults on
 ///   enum-typed fields are checked against the variant set at the first
 ///   `schema()` call (the variant list lives on another type the macro
-///   can't see). Map-typed fields do not accept defaults.
+///   can't see). Map-typed fields and array-of-nested-schema fields do
+///   not accept defaults (entries are user-supplied).
 ///
 ///   **Datetime caveat:** datetime defaults are *not* parsed at derive
 ///   time — the macro intentionally avoids pulling a datetime parser
@@ -1079,6 +1089,17 @@ enum TypeShape {
     /// enum, flattens it to a `LeafType::Map(Enum)` leaf (the map-shaped
     /// sibling of the `Nested` enum flatten).
     MapOfNested(TokenStream2),
+    /// `Vec<NestedType>` where the element derives [`Schema`] — emits
+    /// `FieldStatic::ArrayOf { schema: <T as Schema>::STATIC, .. }`.
+    /// Support is trait-resolved, not syntactic: the emitted
+    /// `<T as Schema>::STATIC` reference makes the *compiler* decide
+    /// whether the element type qualifies (a non-`Schema` element fails
+    /// with the trait's `on_unimplemented` guidance). The converter routes
+    /// it into a `Field::ArrayOf` at the runtime layer — or, when the
+    /// element type is a unit-only enum, flattens it to a
+    /// `LeafType::Array(Enum)` leaf (the array-shaped sibling of the
+    /// `MapOf` enum flatten).
+    ArrayOfNested(TokenStream2),
     /// Nested type referencing another struct's `clapfig::Schema` impl.
     Nested(TokenStream2),
     /// `clapfig::value::Value` — emits `LeafType::Value`.
@@ -1149,26 +1170,25 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
     }
     if name == "Vec" {
         let inner = single_generic_argument(&last.arguments, "Vec")?;
-        // Vec<T>: T must be a scalar shape for the leaf-array case. Nested
-        // arrays-of-structs would be `Field::ArrayOf` but we defer that to
-        // a follow-up (the macro would need to know whether T derives
-        // Schema, which we can't tell syntactically without name
-        // resolution).
+        // Vec<T>: a scalar T is a leaf array; any other type path is
+        // treated as a nested schema type and emitted as an `ArrayOf`
+        // reference — the *compiler* resolves whether T actually derives
+        // `Schema` (trait-resolved support, not a syntactic guess).
         let inner_shape = classify_type(inner)?;
         return match inner_shape {
             TypeShape::Scalar(kind, tok) => Ok(TypeShape::Array(kind, tok)),
+            TypeShape::Nested(expr) => Ok(TypeShape::ArrayOfNested(expr)),
             TypeShape::Optional(_) => Err(syn::Error::new(
                 inner.span(),
-                "Vec<Option<T>> is not supported; use Option<Vec<T>> instead",
+                "Vec<Option<T>> is not supported — an absent element has no TOML \
+                 representation; use Option<Vec<T>> for an optional list, or \
+                 `#[clapfig(value)]` with `clapfig::value::Value` for free-form shapes",
             )),
-            TypeShape::Array(_, _) => Err(syn::Error::new(
+            TypeShape::Array(_, _) | TypeShape::ArrayOfNested(_) => Err(syn::Error::new(
                 inner.span(),
-                "nested arrays (Vec<Vec<...>>) are not supported by clapfig::Schema",
-            )),
-            TypeShape::Nested(_) => Err(syn::Error::new(
-                inner.span(),
-                "Vec<NestedStruct> is not yet supported by clapfig::Schema (planned: \
-                 Field::ArrayOf). Use the runtime path or `#[clapfig(value)]` for now.",
+                "nested arrays (Vec<Vec<...>>) are not supported by clapfig::Schema. \
+                 Use `#[clapfig(value)]` with `clapfig::value::Value` for free-form \
+                 nested shapes.",
             )),
             TypeShape::Value => Err(syn::Error::new(
                 inner.span(),
@@ -1205,6 +1225,14 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
             )),
             TypeShape::Array(_, elem) => Ok(TypeShape::Map(
                 quote! { ::clapfig::static_schema::LeafTypeStatic::Array(&#elem) },
+            )),
+            TypeShape::ArrayOfNested(_) => Err(syn::Error::new(
+                value_ty.span(),
+                format!(
+                    "{name}<String, Vec<NestedType>> (map of arrays of nested schema types) \
+                     is not supported by clapfig::Schema. Use `#[clapfig(value)]` with \
+                     `clapfig::value::Value` for free-form nested shapes."
+                ),
             )),
             TypeShape::Optional(_) => Err(syn::Error::new(
                 value_ty.span(),
@@ -1798,6 +1826,84 @@ fn expand_field(field: &syn::Field, rename_all: Option<&str>) -> syn::Result<Exp
         });
     }
 
+    // `Vec<T>` where `T` is a nested schema type — bare fields emit the
+    // structural `FieldStatic::ArrayOf` (the converter flattens a
+    // unit-only-enum element type to an `Array(Enum)` leaf);
+    // `Option<Vec<T>>` fields emit an optional `Array(EnumRef)` leaf,
+    // representable only for the enum kind. Leaf attrs are a hard error
+    // either way — same rule as map-of-nested fields below.
+    let array_inner_expr: Option<(&TokenStream2, bool)> = match &shape {
+        TypeShape::ArrayOfNested(inner) => Some((inner, false)),
+        TypeShape::Optional(inner) => match inner.as_ref() {
+            TypeShape::ArrayOfNested(expr) => Some((expr, true)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((inner_expr, is_optional_wrapped)) = array_inner_expr {
+        if attrs.default.is_some()
+            || attrs.env.is_some()
+            || attrs.allowed.is_some()
+            || attrs.optional
+        {
+            return Err(syn::Error::new(
+                field.span(),
+                "leaf attributes (default, env, allowed, optional) are not \
+                 valid on array-of-nested-schema fields — array entries are \
+                 user-supplied (an absent array is the empty array), and a \
+                 per-field scalar attribute has no meaning across a list of \
+                 entries. For an optional list of a unit-only enum, use \
+                 `Option<Vec<T>>`.",
+            ));
+        }
+        if is_optional_wrapped {
+            // `Option<Vec<T>>` is representable only when `T` is a
+            // unit-only enum (an optional array-of-enum leaf; absent →
+            // `None`). The macro can't tell enum from struct at the
+            // field site, so it routes through `Array(EnumRef)`; the
+            // converter checks the kind at the first `schema()` call
+            // and panics with drop-the-`Option` guidance for structs
+            // (an absent array of nested objects is already the empty
+            // array). Same deferred-error pattern as `Option<Nested>`.
+            return Ok(ExpandedField {
+                name: name.clone(),
+                entry: quote! {
+                    ::clapfig::static_schema::NamedFieldStatic {
+                        name: #name,
+                        field: ::clapfig::static_schema::FieldStatic::Leaf(
+                            ::clapfig::static_schema::LeafStatic {
+                                doc: #doc_expr,
+                                ty: ::clapfig::static_schema::LeafTypeStatic::Array(
+                                    &::clapfig::static_schema::LeafTypeStatic::EnumRef {
+                                        schema: #inner_expr,
+                                        field_name: #name,
+                                    },
+                                ),
+                                default: None,
+                                optional: true,
+                                env: None,
+                            }
+                        ),
+                    }
+                },
+                claim_asserts,
+            });
+        }
+        return Ok(ExpandedField {
+            name: name.clone(),
+            entry: quote! {
+                ::clapfig::static_schema::NamedFieldStatic {
+                    name: #name,
+                    field: ::clapfig::static_schema::FieldStatic::ArrayOf {
+                        schema: #inner_expr,
+                        doc: #doc_expr,
+                    },
+                }
+            },
+            claim_asserts,
+        });
+    }
+
     // `Option<{Hash,BTree}Map<String, NestedStruct>>` — no representation:
     // an absent MapOf is already the empty map (the natural optional
     // state), so wrapping in Option adds no signal and there's no
@@ -2027,6 +2133,7 @@ fn shape_accepts_allowed(shape: &TypeShape) -> bool {
         TypeShape::Scalar(_, _) => true,
         TypeShape::Optional(inner) => shape_accepts_allowed(inner),
         TypeShape::Array(_, _)
+        | TypeShape::ArrayOfNested(_)
         | TypeShape::Map(_)
         | TypeShape::MapOfNested(_)
         | TypeShape::Value
@@ -2053,8 +2160,10 @@ fn inner_leaf_type(shape: &TypeShape) -> syn::Result<(TokenStream2, bool)> {
             quote! { ::clapfig::static_schema::LeafTypeStatic::Value },
             false,
         )),
-        TypeShape::Nested(_) | TypeShape::MapOfNested(_) => {
-            unreachable!("nested / map-of-nested handled before leaf-type dispatch")
+        TypeShape::Nested(_) | TypeShape::MapOfNested(_) | TypeShape::ArrayOfNested(_) => {
+            unreachable!(
+                "nested / map-of-nested / array-of-nested handled before leaf-type dispatch"
+            )
         }
     }
 }
@@ -2206,8 +2315,13 @@ fn expr_to_value_static(expr: &Expr, shape: &TypeShape) -> syn::Result<TokenStre
              default would fail the map type-check at every load. Omit the \
              attribute; an absent map is already the empty map.",
         )),
-        TypeShape::Optional(_) | TypeShape::Nested(_) | TypeShape::MapOfNested(_) => {
-            unreachable!("Optional unwrapped above; Nested/MapOf handled before leaf emission")
+        TypeShape::Optional(_)
+        | TypeShape::Nested(_)
+        | TypeShape::MapOfNested(_)
+        | TypeShape::ArrayOfNested(_) => {
+            unreachable!(
+                "Optional unwrapped above; Nested/MapOf/ArrayOf handled before leaf emission"
+            )
         }
     }
 }
