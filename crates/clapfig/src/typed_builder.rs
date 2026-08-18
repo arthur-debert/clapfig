@@ -3,12 +3,13 @@
 //! Entry point: [`crate::Clapfig::typed::<C>()`](crate::Clapfig::typed).
 //!
 //! Internally this wraps a [`Builder`](crate::Builder)
-//! constructed from `C::schema()` (the cached [`runtime::Schema`] view
-//! of the macro-emitted `SchemaStatic`). Every method forwards through
-//! to the Map-out builder so both paths share one resolve pipeline. The
-//! only added work is the final `Map → C` deserialize step on `load()`
-//! (through the value model's serde bridge) and the typed
-//! `post_validate(&C)` hook.
+//! constructed from `C::schema_arc()` (the cached [`runtime::Schema`]
+//! view of the macro-emitted `SchemaStatic`, shared clone-free). Every
+//! method forwards through to the Map-out builder so both paths share
+//! one resolve pipeline. The only added work is the final `Map → C`
+//! deserialize step — on `load()` and on every
+//! [`TypedResolver::resolve_at`] (through the value model's serde
+//! bridge) — and the typed `post_validate(&C)` hook.
 //!
 //! [`runtime::Schema`]: crate::runtime::Schema
 
@@ -17,7 +18,7 @@ use std::marker::PhantomData;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::builder::Builder;
+use crate::builder::{Builder, Resolver};
 use crate::error::ClapfigError;
 use crate::ops::ConfigResult;
 use crate::static_schema::Schema;
@@ -28,8 +29,10 @@ use crate::value::{Map, Value, from_value};
 ///
 /// Same surface as [`Builder`](crate::Builder) — `app_name`,
 /// `search_paths`, `env_prefix`, `cli_override`, `post_validate`, `load`,
-/// `handle` — but `load()` returns the typed `C` and `post_validate`
-/// receives a typed `&C`.
+/// `build_resolver`, `handle` — but `load()` returns the typed `C`,
+/// `post_validate` receives a typed `&C`, and
+/// [`build_resolver`](Self::build_resolver) returns a
+/// [`TypedResolver<C>`] whose `resolve_at` yields a typed `C` per call.
 pub struct TypedBuilder<C: Schema> {
     inner: Builder,
     _phantom: PhantomData<fn() -> C>,
@@ -218,6 +221,28 @@ impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
         Ok((typed, unknowns))
     }
 
+    /// Build a reusable [`TypedResolver<C>`] for tree-walk resolution —
+    /// the typed counterpart of
+    /// [`Builder::build_resolver`](crate::Builder::build_resolver).
+    ///
+    /// The captured state, per-call [`SearchPath::Cwd`] /
+    /// [`SearchPath::Ancestors`] anchoring, and file caching are the
+    /// Map-out resolver's (this wraps one); each
+    /// [`resolve_at`](TypedResolver::resolve_at) call additionally
+    /// deserializes the merged [`Map`] into a typed `C`. Any typed
+    /// [`post_validate`](Self::post_validate) hook registered on this
+    /// builder fires on every `resolve_at` call. See the
+    /// [crate-level "Tree-walk resolution" section](crate#tree-walk-resolution--the-resolver-handle).
+    ///
+    /// Returns [`ClapfigError::AppNameRequired`] if `.app_name()` was not
+    /// called on the builder.
+    pub fn build_resolver(self) -> Result<TypedResolver<C>, ClapfigError> {
+        Ok(TypedResolver {
+            inner: self.inner.build_resolver()?,
+            _phantom: PhantomData,
+        })
+    }
+
     /// Dispatch a [`ConfigAction`] and return the rendered output.
     ///
     /// The action surface is identical to the Map-out path —
@@ -235,6 +260,48 @@ impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
     /// `String`.
     pub fn handle_to_string(self, action: &ConfigAction) -> Result<String, ClapfigError> {
         self.inner.handle_to_string(action)
+    }
+}
+
+/// Typed tree-walk resolution handle — the typed-out counterpart of
+/// [`Resolver`](crate::Resolver), built by
+/// [`TypedBuilder::build_resolver`].
+///
+/// Wraps the Map-out resolver, so anchoring semantics, the per-resolver
+/// file cache (including its no-mtime-check contract), and the captured
+/// `post_validate` hook are identical; each call adds only the final
+/// `Map → C` deserialize through the value model's serde bridge.
+pub struct TypedResolver<C> {
+    inner: Resolver,
+    _phantom: PhantomData<fn() -> C>,
+}
+
+impl<C: Schema + DeserializeOwned> TypedResolver<C> {
+    /// Resolve the configuration anchored at `start_dir`, returning a
+    /// typed `C`. See [`Resolver::resolve_at`](crate::Resolver::resolve_at)
+    /// for the anchoring and caching semantics.
+    pub fn resolve_at(&self, start_dir: impl AsRef<std::path::Path>) -> Result<C, ClapfigError> {
+        deserialize_table::<C>(self.inner.resolve_at(start_dir)?)
+    }
+
+    /// Same as [`resolve_at`](Self::resolve_at) but also returns any keys
+    /// the [`on_unknown_key`](TypedBuilder::on_unknown_key) callback
+    /// elected to
+    /// [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect).
+    pub fn resolve_at_with_unknowns(
+        &self,
+        start_dir: impl AsRef<std::path::Path>,
+    ) -> Result<(C, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
+        let (table, unknowns) = self.inner.resolve_at_with_unknowns(start_dir)?;
+        Ok((deserialize_table::<C>(table)?, unknowns))
+    }
+
+    /// Number of files currently held in the wrapped resolver's cache.
+    /// Intended for tests and diagnostics; production code should not
+    /// branch on this.
+    #[doc(hidden)]
+    pub fn cache_size(&self) -> usize {
+        self.inner.cache_size()
     }
 }
 

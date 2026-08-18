@@ -404,6 +404,24 @@ pub trait FormatAdapter: Send + Sync {
         }
     }
 
+    /// Spell one resolved `config get`/`config list` entry line in this
+    /// format's assignment syntax. `key` is the flat dotted display path
+    /// and `value` the value model's plain rendering — human-oriented CLI
+    /// output, not a parseable document fragment (strings stay unquoted,
+    /// dotted keys stay flat). Infallible presentation, so it is not an
+    /// [`Operation`] row. The default is the TOML-baseline spelling
+    /// (`key = value`); formats whose assignment syntax differs override.
+    fn display_entry(&self, key: &str, value: &str) -> String {
+        format!("{key} = {value}")
+    }
+
+    /// Spell one doc-comment line for `config get` display output. The
+    /// default is the `#` comment spelling TOML and YAML share; JSON
+    /// overrides with its `//` comment-key convention.
+    fn display_comment(&self, line: &str) -> String {
+        format!("# {line}")
+    }
+
     /// Parse source text into a [`Value`] tree, applying the format's
     /// baseline mapping rules (ADR-0002's table).
     fn parse(&self, text: &str) -> Result<Value, FormatError>;

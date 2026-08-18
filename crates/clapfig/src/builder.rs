@@ -712,8 +712,16 @@ impl Builder {
         match action {
             ConfigAction::List { scope } => match scope {
                 None => {
+                    // The merged view spans formats; display renders in
+                    // the preferred (first-enabled) format's spelling.
+                    let registry = self.effective_registry()?;
                     let table = self.load()?;
-                    Ok(list_from_table(&table))
+                    Ok(list_from_table(
+                        &table,
+                        registry
+                            .preferred()
+                            .expect("effective_registry always registers an adapter"),
+                    ))
                 }
                 Some(name) => {
                     let (path, adapter) = self.resolve_scope_persist_path(Some(name))?;
@@ -794,8 +802,19 @@ impl Builder {
                 None => {
                     let schema = Arc::clone(&self.schema);
                     let normalize_keys = self.normalize_keys;
+                    // Merged view: display renders in the preferred
+                    // (first-enabled) format's spelling.
+                    let registry = self.effective_registry()?;
                     let table = self.load()?;
-                    get_from_table(&schema, &table, key, normalize_keys)
+                    get_from_table(
+                        &schema,
+                        &table,
+                        key,
+                        normalize_keys,
+                        registry
+                            .preferred()
+                            .expect("effective_registry always registers an adapter"),
+                    )
                 }
                 Some(name) => {
                     let (path, adapter) = self.resolve_scope_persist_path(Some(name))?;
@@ -1033,12 +1052,13 @@ fn adapter_for_explicit_path(path: &Path) -> Result<Box<dyn FormatAdapter>, Clap
     }
 }
 
-/// Render every leaf in a resolved table as `dotted.key = value`
-/// entries — the `config list` output shape.
-fn list_from_table(table: &Map) -> ConfigResult {
+/// Render every leaf in a resolved table as flat dotted-key entries — the
+/// `config list` output shape. Display lines are spelled by `adapter`
+/// (the active format).
+fn list_from_table(table: &Map, adapter: &dyn FormatAdapter) -> ConfigResult {
     let mut entries = Vec::new();
     flatten_table(table, "", &mut entries);
-    ConfigResult::Listing { entries }
+    ConfigResult::listing(adapter, entries)
 }
 
 fn flatten_table(table: &Map, prefix: &str, out: &mut Vec<(String, String)>) {
@@ -1072,12 +1092,14 @@ fn format_leaf_value(value: &Value) -> String {
 /// canonical snake_case (the load path normalized them), so with
 /// `normalize_keys` the action key is normalized before lookup — a kebab
 /// action key finds its snake entry. The reported key keeps the caller's
-/// spelling.
+/// spelling; the display block is spelled by `adapter` (the active
+/// format).
 fn get_from_table(
     schema: &Schema,
     table: &Map,
     key: &str,
     normalize_keys: bool,
+    adapter: &dyn FormatAdapter,
 ) -> Result<ConfigResult, ClapfigError> {
     let canonical = if normalize_keys {
         crate::normalize::normalize_key(key)
@@ -1087,11 +1109,12 @@ fn get_from_table(
     let value =
         ops::table_get(table, &canonical).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
     let doc = crate::meta::doc_for(schema, &canonical).unwrap_or_default();
-    Ok(ConfigResult::KeyValue {
-        key: key.into(),
-        value: format_leaf_value(value),
+    Ok(ConfigResult::key_value(
+        adapter,
+        key.into(),
+        format_leaf_value(value),
         doc,
-    })
+    ))
 }
 
 /// Scoped `config get`: reads one scope's raw (un-normalized) file. With
@@ -1102,7 +1125,8 @@ fn get_from_table(
 /// spellings anywhere (even at keys the lookup never touches) fails as
 /// [`ClapfigError::NormalizedKeyCollision`] instead of answering from a
 /// document the load path refuses. The reported key keeps the caller's
-/// spelling.
+/// spelling; the display block is spelled by `adapter` (the scope file's
+/// format).
 fn get_scope(
     adapter: &dyn FormatAdapter,
     schema: &Schema,
@@ -1152,11 +1176,12 @@ fn get_scope(
     };
     let value = value.ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
     let doc = crate::meta::doc_for(schema, &canonical).unwrap_or_default();
-    Ok(ConfigResult::KeyValue {
-        key: key.into(),
-        value: format_leaf_value(value),
+    Ok(ConfigResult::key_value(
+        adapter,
+        key.into(),
+        format_leaf_value(value),
         doc,
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -1271,6 +1296,66 @@ mod tests {
             .load()
             .unwrap();
         assert_eq!(table.get("port"), Some(&Value::Integer(11111)));
+    }
+
+    // --- search-path composition (guards from the FIXME.md audit) ---
+
+    /// Guard (FIXME.md #1/#10, test deleted by #105): `add_search_path`
+    /// as the FIRST path call must start from the default `[Platform]`,
+    /// not an empty list — "append without replacing" includes the
+    /// implicit default.
+    #[test]
+    fn add_search_path_first_call_preserves_platform_default() {
+        let builder = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .add_search_path(SearchPath::Cwd);
+        assert_eq!(
+            builder.effective_search_paths(),
+            vec![SearchPath::Platform, SearchPath::Cwd]
+        );
+    }
+
+    /// Guard (FIXME.md #10): `add_search_path` after an explicit
+    /// `search_paths` list appends to that list.
+    #[test]
+    fn add_search_path_appends_to_explicit_list() {
+        let builder = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .search_paths(vec![SearchPath::Home(".demo")])
+            .add_search_path(SearchPath::Cwd);
+        assert_eq!(
+            builder.effective_search_paths(),
+            vec![SearchPath::Home(".demo"), SearchPath::Cwd]
+        );
+    }
+
+    /// Guard (FIXME.md #13, test dropped by an earlier resolver
+    /// refactor): an unreadable (permission-denied) config file is a hard
+    /// IO error naming the file — only a MISSING file is silently
+    /// skipped.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_config_file_errors_instead_of_being_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("demo.toml");
+        fs::write(&path, "port = 9090\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_to_string(&path).is_ok() {
+            // Running as root: permissions don't bind, nothing to test.
+            return;
+        }
+
+        let result = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load();
+        match result {
+            Err(ClapfigError::IoError { path: reported, .. }) => assert_eq!(reported, path),
+            other => panic!("expected IoError, got {other:?}"),
+        }
     }
 
     // --- strict / unknown keys ---
@@ -1777,9 +1862,10 @@ mod tests {
         // persist path builds nested tables (not arrays-of-tables), so
         // writing `plugins.id` would produce `[plugins] id = "..."` and
         // then runtime validation would reject the result with
-        // "expected array, got map". The fix excludes ArrayOf subtrees
-        // from `valid_keys`; the user-facing symptom is a clean
-        // `KeyNotFound` instead of a corrupted file.
+        // "expected array, got map". ArrayOf subtrees stay excluded from
+        // `valid_keys`; the user-facing symptom is the targeted
+        // `UnaddressableKey` refusal pointing at the config file — never
+        // a corrupted file, and no longer a bare `KeyNotFound`.
         let dir = TempDir::new().unwrap();
         let schema = Schema::object("Top").array_of(
             "plugins",
@@ -1795,10 +1881,13 @@ mod tests {
                 value: "x".into(),
                 scope: None,
             });
-        assert!(
-            matches!(result, Err(ClapfigError::KeyNotFound(_))),
-            "expected KeyNotFound for ArrayOf-internal key, got {result:?}"
-        );
+        match result {
+            Err(ClapfigError::UnaddressableKey { section, kind, .. }) => {
+                assert_eq!(section, "plugins");
+                assert_eq!(kind, "an array");
+            }
+            other => panic!("expected UnaddressableKey for ArrayOf-internal key, got {other:?}"),
+        }
         // File must not have been written.
         assert!(!dir.path().join("demo.toml").exists());
     }
@@ -2809,7 +2898,7 @@ mod tests {
             .unwrap();
 
         match result {
-            ConfigResult::Listing { entries } => {
+            ConfigResult::Listing { entries, .. } => {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0], ("port".into(), "3000".into()));
             }
@@ -2888,7 +2977,7 @@ mod tests {
             })
             .unwrap();
         match local_list {
-            ConfigResult::Listing { entries } => {
+            ConfigResult::Listing { entries, .. } => {
                 assert!(entries.iter().any(|(k, v)| k == "port" && v == "3000"));
             }
             other => panic!("Expected Listing, got {other:?}"),
@@ -2899,7 +2988,7 @@ mod tests {
             .handle(&ConfigAction::List { scope: None })
             .unwrap();
         match merged_list {
-            ConfigResult::Listing { entries } => {
+            ConfigResult::Listing { entries, .. } => {
                 let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
                 assert!(keys.contains(&"port"));
                 assert!(keys.contains(&"host"));

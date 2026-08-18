@@ -97,6 +97,14 @@ impl FormatAdapter for JsonAdapter {
         ]
     }
 
+    fn display_entry(&self, key: &str, value: &str) -> String {
+        format!("\"{key}\": {value}")
+    }
+
+    fn display_comment(&self, line: &str) -> String {
+        format!("// {line}")
+    }
+
     fn parse(&self, text: &str) -> Result<Value, FormatError> {
         // An empty (or whitespace-only) file is "no config", matching
         // TOML's empty document — not a JSON syntax error.

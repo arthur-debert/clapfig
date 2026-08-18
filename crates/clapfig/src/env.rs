@@ -15,6 +15,15 @@ use crate::value::{Map, Value};
 ///
 /// Values are parsed heuristically: bool > integer > float > string.
 ///
+/// When the environment sets the same key both flat and nested
+/// (`MYAPP__DATABASE=x` AND `MYAPP__DATABASE__URL=y`), the shapes
+/// conflict and the **last-processed variable wins** — a nested var
+/// replaces an earlier flat scalar with a table, and a flat var replaces
+/// an earlier nested table with its scalar. Environment iteration order
+/// is unspecified, so which variable is "last" is not guaranteed; the
+/// semantics are last-writer, not an ordering promise. Don't mix the two
+/// shapes for one key.
+///
 /// Takes an iterator so tests can pass synthetic data instead of `std::env::vars()`.
 pub fn env_to_table(prefix: &str, vars: impl IntoIterator<Item = (String, String)>) -> Map {
     let needle = format!("{prefix}__");
@@ -181,8 +190,10 @@ mod tests {
 
     #[test]
     fn flat_key_replaced_by_nested() {
-        // If MYAPP__DATABASE (flat) and MYAPP__DATABASE__URL (nested) both exist,
-        // the nested key should win — the flat value is replaced by a table.
+        // Flat vs nested on the same key is last-writer-wins (env
+        // iteration order is unspecified; this iterator fixes it): here
+        // the nested var is processed last, so it replaces the flat
+        // scalar with a table.
         let table = env_to_table(
             "MYAPP",
             vars(&[
@@ -196,7 +207,8 @@ mod tests {
 
     #[test]
     fn nested_key_then_flat_overwrites() {
-        // Reverse order: nested first, then flat. Flat replaces the table.
+        // Reverse order: nested first, then flat. The flat var is last,
+        // so it replaces the table — same last-writer rule, other winner.
         let table = env_to_table(
             "MYAPP",
             vars(&[

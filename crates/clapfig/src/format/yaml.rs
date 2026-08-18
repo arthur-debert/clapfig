@@ -80,6 +80,10 @@ impl FormatAdapter for YamlAdapter {
         ]
     }
 
+    fn display_entry(&self, key: &str, value: &str) -> String {
+        format!("{key}: {value}")
+    }
+
     fn parse(&self, text: &str) -> Result<Value, FormatError> {
         // An empty or comments-only file (bare document markers included)
         // is an empty config: absence, not null. serde_norway would read
