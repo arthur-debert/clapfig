@@ -20,8 +20,8 @@
 //! branches.
 //!
 //! This module holds the contract and its pure data structures; the
-//! adapters themselves live in [`toml`], [`yaml`], and [`json`]
-//! (implemented across the value-model epic's later workstreams).
+//! adapters themselves live in [`toml`], [`yaml`], and [`json`] ([`yaml`]
+//! lands with its value-model workstream).
 
 pub mod json;
 pub mod toml;
@@ -734,13 +734,14 @@ mod tests {
 
     #[test]
     fn stub_adapters_declare_nothing_and_refuse_typed() {
-        // Until WS03/WS04 implement them, the YAML/JSON adapters carry
-        // contract data only: capabilities are empty and every operation
-        // returns the typed refusal — reachable inputs (an enabled
-        // `app.yaml`, `gen --output x.json`, a persist edit) get a clean
-        // `ClapfigError`, never a panic. The workstreams flip the matrix
-        // rows on as they land the bodies.
-        for adapter in [&yaml::YamlAdapter as &dyn FormatAdapter, &json::JsonAdapter] {
+        // Until WS03 implements it, the YAML adapter carries contract
+        // data only: capabilities are empty and every operation returns
+        // the typed refusal — reachable inputs (an enabled `app.yaml`, a
+        // persist edit) get a clean `ClapfigError`, never a panic. The
+        // workstream flips the matrix rows on as it lands the bodies.
+        // (The TOML and JSON adapters are implemented; their matrix-row
+        // tests live with each adapter.)
+        for adapter in [&yaml::YamlAdapter as &dyn FormatAdapter] {
             for operation in ALL_OPERATIONS {
                 assert!(
                     !adapter.supports(operation),

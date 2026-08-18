@@ -612,9 +612,10 @@
 //! persist scopes. Key design decisions:
 //!
 //! - **Comment preservation**: edits go through the format adapter's
-//!   comment-preserving editor (lossless for TOML), so existing
-//!   comments and formatting are preserved. Users won't lose their
-//!   annotations.
+//!   comment-preserving editor, so users won't lose their annotations.
+//!   Lossless for TOML; in JSON, comments are `"//"`-keyed data
+//!   (ADR-0002) and survive edits for free, though formatting is
+//!   normalized (pretty-printed, document key order preserved).
 //! - **Seeded files**: if the target file doesn't exist, a new one is created
 //!   from the generated template, so the user gets doc comments for every
 //!   field out of the box.
