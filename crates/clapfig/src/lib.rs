@@ -62,8 +62,9 @@
 //!   `[section]`, YAML/JSON nesting), dotted keys, and double-underscore
 //!   env var separators.
 //! - **Unit-only enums** deriving `Schema` become constrained value sets:
-//!   out-of-set values error at load, templates carry an `# Allowed: ...`
-//!   line, and the JSON Schema emits `enum: [...]`.
+//!   out-of-set values error at load, templates document the allowed set
+//!   with an `Allowed: ...` annotation (native comments in TOML/YAML,
+//!   `"//"` comment keys in JSON), and the JSON Schema emits `enum: [...]`.
 //! - **`Option<T>` fields** are truly optional — omitting them in every source
 //!   is valid. Fields without `Option` and without a default must be provided
 //!   by at least one layer or loading fails.
@@ -93,8 +94,10 @@
 //!   TOML's; formats that could express more (YAML custom tags, merge
 //!   keys, ordered maps) do not get to, and formats that express less map into
 //!   the baseline by explicit adapter rules. A config file means the same
-//!   thing in every format: identical validation, strictness, and error
-//!   behavior.
+//!   thing in every format: identical schema validation and strict-mode
+//!   accept/reject decisions. (Unknown-key line numbers and source
+//!   snippets are TOML-only today — YAML/JSON strict errors name the key
+//!   and file but carry no source line.)
 //! - **Datetimes cross formats by schema, not by sniffing.** TOML has
 //!   first-class datetimes; in YAML and JSON they are written as strings
 //!   in TOML's four datetime spellings (offset date-time, local
@@ -210,8 +213,8 @@
 //!   is a hard error naming both files
 //!   ([`ClapfigError::AmbiguousConfigFiles`]) — across directories, normal
 //!   layering applies. Explicit paths (exact-name persist scopes,
-//!   `gen --output`, direct file arguments) select their adapter by
-//!   extension, independent of the enabled list.
+//!   `gen --output`) select their adapter by extension, independent of
+//!   the enabled list.
 //!
 //! ## Resolution — what to do with found files
 //!

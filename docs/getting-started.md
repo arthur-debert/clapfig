@@ -9,7 +9,7 @@ Add clapfig to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-clapfig = "0.22"
+clapfig = "0.23"
 ```
 
 This pulls in the `clap` feature by default, which gives you the `config`
@@ -18,7 +18,7 @@ subcommand integration, and the `derive` feature for
 
 ```toml
 [dependencies]
-clapfig = { version = "0.22", default-features = false, features = ["derive"] }
+clapfig = { version = "0.23", default-features = false, features = ["derive"] }
 ```
 
 ## Define your config struct
@@ -68,8 +68,9 @@ Key points:
   config-file section (a TOML `[section]`, a YAML/JSON nested object),
   addressable via dotted keys and `__` env var separators.
 - **Unit-only enums** deriving `Schema` become constrained value sets:
-  out-of-set values error at load, and generated templates carry an
-  `# Allowed: ...` line.
+  out-of-set values error at load, and generated templates document the
+  allowed set with an `Allowed: ...` annotation — a native comment in TOML
+  and YAML, a `"//"` comment key in JSON.
 - **`Option<T>`** fields are truly optional — omitting them everywhere is
   valid. Non-optional fields without a default must be provided by at least
   one layer.

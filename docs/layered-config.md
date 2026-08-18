@@ -115,17 +115,19 @@ every search directory (`myapp.toml`, `myapp.yaml`/`myapp.yml`,
   file creates `<stem>.<preferred extension>` seeded from the generated
   template. When exactly one same-stem file exists, `set` edits that file in
   its own format.
-- **Explicit paths pick by extension.** Persist scopes with exact names,
-  `config gen --output`, and direct file arguments select their format by
-  the path's extension, independent of the enabled list.
+- **Explicit paths pick by extension.** Persist scopes with exact names
+  and `config gen --output` select their format by the path's extension,
+  independent of the enabled list.
 
 `.file_name()` and `.file_stem()` are mutually exclusive — the last call
 wins.
 
 ### One meaning across formats
 
-A config file means the same thing whatever its format: identical
-validation, strict-mode, and error behavior. Values follow the TOML
+A config file means the same thing whatever its format: identical schema
+validation and strict-mode accept/reject decisions. (One current
+limitation: unknown-key line numbers and source snippets are TOML-only —
+YAML/JSON strict errors name the key and file but carry no source line.) Values follow the TOML
 baseline; notably, **datetimes in YAML and JSON are written as strings**
 using TOML's four datetime spellings (offset date-time, local date-time,
 local date, local time). Parsing never guesses at types — a string becomes a
