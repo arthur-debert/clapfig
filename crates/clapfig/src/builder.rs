@@ -387,19 +387,6 @@ impl Builder {
         self
     }
 
-    /// Internal variant of [`post_validate`](Self::post_validate) whose
-    /// hook returns a full [`ClapfigError`]. Lets the typed wrapper
-    /// ([`TypedBuilder::post_validate`](crate::TypedBuilder::post_validate))
-    /// report its `Map → C` deserialize failure as the type error it is
-    /// instead of a `PostValidationFailed` wearing a bare serde message.
-    pub(crate) fn post_validate_raw<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&Map) -> Result<(), ClapfigError> + Send + Sync + 'static,
-    {
-        self.post_validate = Some(Box::new(f));
-        self
-    }
-
     /// Add URL query parameters as a config layer.
     ///
     /// Parses the query string (e.g. `"port=9090&database.url=pg://prod"`)

@@ -481,7 +481,7 @@ fn parse_raw_value(raw: &str, ty: Option<&crate::runtime::LeafType>) -> Result<V
     };
     match ty {
         LeafType::String => Ok(Value::String(raw.to_owned())),
-        LeafType::Integer => raw
+        LeafType::Integer { .. } => raw
             .parse::<i64>()
             .map(Value::Integer)
             .map_err(|_| format!("expected integer, got '{raw}'")),
@@ -905,7 +905,14 @@ mod tests {
             Value::String("123".into())
         );
         assert_eq!(
-            parse_raw_value("123", Some(&LeafType::Integer)).unwrap(),
+            parse_raw_value(
+                "123",
+                Some(&LeafType::Integer {
+                    min: None,
+                    max: None,
+                }),
+            )
+            .unwrap(),
             Value::Integer(123)
         );
         assert_eq!(
@@ -922,7 +929,14 @@ mod tests {
     fn value_parsing_errors_name_the_expected_type() {
         use crate::runtime::LeafType;
         for (raw, ty, expected) in [
-            ("abc", LeafType::Integer, "expected integer"),
+            (
+                "abc",
+                LeafType::Integer {
+                    min: None,
+                    max: None,
+                },
+                "expected integer",
+            ),
             ("abc", LeafType::Float, "expected float"),
             ("yes", LeafType::Bool, "expected bool"),
             (
@@ -932,7 +946,10 @@ mod tests {
             ),
             (
                 "a=1",
-                LeafType::Map(Box::new(LeafType::Integer)),
+                LeafType::Map(Box::new(LeafType::Integer {
+                    min: None,
+                    max: None,
+                })),
                 "expected map",
             ),
         ] {
@@ -1004,7 +1021,11 @@ mod tests {
         let schema = Schema::object("T")
             .field(
                 "limits",
-                Field::map_of(crate::runtime::LeafType::Integer).optional(),
+                Field::map_of(crate::runtime::LeafType::Integer {
+                    min: None,
+                    max: None,
+                })
+                .optional(),
             )
             .build();
         let result = set_in_document(
