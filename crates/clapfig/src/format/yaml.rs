@@ -936,15 +936,7 @@ mod tests {
         // stays on a single line (serde_norway would emit a block
         // scalar for a newline, which would swallow the `: value`).
         for key in [
-            "a: b",
-            "a # b",
-            "'a'",
-            "\"a\"",
-            "- a",
-            "a\nb",
-            "a\rb",
-            "a\tb",
-            "a\u{1}b",
+            "a: b", "a # b", "'a'", "\"a\"", "- a", "a\nb", "a\rb", "a\tb", "a\u{1}b",
         ] {
             let rendered = YamlAdapter.display_entry(key, "1");
             assert!(
