@@ -115,7 +115,7 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
             "clapfig::Schema does not support generic types — the emitted \
              `static SchemaStatic = ...` cannot reference type parameters. \
              Concretize the type, or build the schema dynamically via \
-             `Clapfig::runtime(Schema::object(...))`.",
+             `Clapfig::builder(Schema::object(...))`.",
         ));
     }
     if input.generics.where_clause.is_some() {

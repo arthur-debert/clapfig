@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::error::{ClapfigError, UnknownKeyInfo};
 use crate::normalize::normalize_key;
-use crate::spec::{FieldKindRef, SchemaRef};
+use crate::runtime::Schema;
 use crate::strict::{
     CollectedUnknown, StrictnessOverrides, UnknownKeyContext, UnknownKeyDecision, UnknownKeyHook,
 };
@@ -20,12 +20,12 @@ use crate::value::{Map, Value};
 /// Per-resolution strictness configuration passed into the validate path.
 ///
 /// Bundles the cascade overrides, the builder-level default ([Knob 1]),
-/// and the optional [`on_unknown_key`](crate::RuntimeBuilder::on_unknown_key)
+/// and the optional [`on_unknown_key`](crate::Builder::on_unknown_key)
 /// callback. The `normalize_keys` flag is forwarded to the line-number
 /// heuristic so error snippets still point at the user's original line
 /// when keys round-trip through kebab → snake normalization.
 ///
-/// [Knob 1]: crate::RuntimeBuilder::strict
+/// [Knob 1]: crate::Builder::strict
 pub(crate) struct ValidateContext<'a> {
     pub overrides: &'a StrictnessOverrides,
     pub default_strict: bool,
@@ -47,88 +47,32 @@ pub(crate) struct UnknownKey {
     pub leaf: String,
 }
 
-/// Schema-driven unknown-key walker that works against any
-/// [`SchemaRef`]. The walker recurses through
-/// [`FieldKindRef::Nested`] and [`FieldKindRef::MapOf`] subtrees; arrays-
-/// of-tables don't show up in non-file layers (env / CLI / URL), so
-/// `ArrayOf` is skipped at this layer.
+/// Detect unknown keys in a parsed config table: walk `table` against
+/// `schema` ([`crate::schema_walk::collect_unknown_paths`]), then resolve
+/// every hit through the strictness cascade and the optional
+/// `on_unknown_key` callback ([`filter_through_cascade`]).
 ///
-/// Used by the env-layer validator: env vars are merged after the
-/// per-file validate pass, so an `MYAPP__ROGUE_KEY=...` would otherwise
-/// slip into the merged result without ever reaching the cascade or the
-/// `on_unknown_key` callback. The same walker can be reused for any
-/// layer whose values are already a `Table` without source text — the
-/// caller threads the resulting `UnknownKey` list through
-/// [`filter_through_cascade`].
-pub(crate) fn collect_unknown_paths_ref(
+/// One entry point serves every layer. The per-file pass supplies the
+/// file's source text and path (for line-number rendering); the env-layer
+/// pass supplies empty source text and a synthesized `<env>` path — env
+/// vars are merged after the per-file pass, so without this call an
+/// `MYAPP__ROGUE_KEY=...` would slip into the merged result without ever
+/// reaching the cascade or the `on_unknown_key` callback.
+///
+/// Returns the keys the callback opted to
+/// [`UnknownKeyDecision::Collect`] — empty for callers that don't use
+/// the collect path. Reject decisions surface as
+/// `ClapfigError::UnknownKeys`.
+pub(crate) fn validate_unknown(
     table: &Map,
-    schema: SchemaRef<'_>,
-    prefix: &str,
-) -> Vec<UnknownKey> {
-    let mut out = Vec::new();
-    walk_against_schema(table, schema, prefix, &mut out);
-    out
-}
-
-fn walk_against_schema<'a>(
-    table: &Map,
-    schema: SchemaRef<'a>,
-    prefix: &str,
-    out: &mut Vec<UnknownKey>,
-) {
-    // Snapshot the schema's fields into a `Vec` of `&str`-borrowed
-    // entries up front, so we can iterate `table` (a borrow) without
-    // re-running the schema iterator's setup on every key. Schemas in
-    // practice are small enough that a linear `iter().find(...)` per
-    // key is fast; if a hot path appears with a wide schema we can
-    // switch to `HashMap<&str, ...>` here without touching callers.
-    let fields: Vec<(&'a str, FieldKindRef<'a>)> =
-        schema.fields().map(|f| (f.name, f.kind)).collect();
-    for (key, value) in table {
-        let full = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        let kind = fields
-            .iter()
-            .find(|(n, _)| *n == key.as_str())
-            .map(|(_, k)| *k);
-        match kind {
-            None => {
-                out.push(UnknownKey {
-                    path: full,
-                    leaf: key.clone(),
-                });
-            }
-            Some(FieldKindRef::Leaf(_)) => {
-                // Leaf — type checking is the merged-table's job, not ours.
-            }
-            Some(FieldKindRef::Nested { schema: nested }) => {
-                if let Value::Map(t) = value {
-                    walk_against_schema(t, nested, &full, out);
-                }
-            }
-            Some(FieldKindRef::MapOf {
-                schema: item_schema,
-            }) => {
-                if let Value::Map(entries) = value {
-                    for (entry_key, entry_value) in entries {
-                        if let Value::Map(t) = entry_value {
-                            let entry_path = format!("{full}.{entry_key}");
-                            walk_against_schema(t, item_schema, &entry_path, out);
-                        }
-                    }
-                }
-            }
-            Some(FieldKindRef::ArrayOf { .. }) => {
-                // Arrays-of-tables can't be expressed via env / CLI / URL
-                // dotted-key syntax; nothing to recurse into for non-file
-                // layers. If the value happens to be a table here, the
-                // type check at finalize will surface the mismatch.
-            }
-        }
-    }
+    schema: &Schema,
+    source: &str,
+    path: &Path,
+    ctx: &ValidateContext<'_>,
+) -> Result<Vec<CollectedUnknown>, ClapfigError> {
+    let mut unknown: Vec<UnknownKey> = Vec::new();
+    crate::schema_walk::collect_unknown_paths(table, schema, "", &mut unknown);
+    filter_through_cascade(table, source, path, unknown, ctx)
 }
 
 /// Resolve an already-collected list of unknown paths against the cascade
@@ -385,7 +329,6 @@ fn keys_match(a: &str, b: &str, normalize_keys: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::ConfigSpec;
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
@@ -405,8 +348,13 @@ mod tests {
         path: &Path,
         ctx: &ValidateContext<'_>,
     ) -> Result<Vec<CollectedUnknown>, ClapfigError> {
-        let spec = crate::runtime_spec::DynamicSpec::new(crate::fixtures::test::test_schema());
-        spec.validate_unknown(table, source, path, ctx)
+        validate_unknown(
+            table,
+            &crate::fixtures::test::test_schema(),
+            source,
+            path,
+            ctx,
+        )
     }
 
     /// Default validate context: strict on, no overrides, no callback.

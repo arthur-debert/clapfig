@@ -259,13 +259,13 @@ mod tests {
     use crate::fixtures::test::test_schema;
     use crate::format::TomlAdapter;
 
-    fn generate_template_from_runtime(schema: &crate::runtime::Schema, kebab: bool) -> String {
+    fn template_for(schema: &crate::runtime::Schema, kebab: bool) -> String {
         generate_template(&TomlAdapter, schema, kebab).unwrap()
     }
 
     #[test]
     fn generate_template_contains_keys() {
-        let template = generate_template_from_runtime(&test_schema(), false);
+        let template = template_for(&test_schema(), false);
         assert!(template.contains("host"));
         assert!(template.contains("port"));
         assert!(template.contains("database"));
@@ -274,14 +274,14 @@ mod tests {
 
     #[test]
     fn generate_template_contains_doc_comments() {
-        let template = generate_template_from_runtime(&test_schema(), false);
+        let template = template_for(&test_schema(), false);
         assert!(template.contains("application host"));
         assert!(template.contains("port number"));
     }
 
     #[test]
     fn generate_template_kebab_rewrites_snake_keys() {
-        let template = generate_template_from_runtime(&test_schema(), true);
+        let template = template_for(&test_schema(), true);
         // The nested `pool_size` field should be emitted as `pool-size`.
         assert!(
             template.contains("pool-size"),
@@ -299,7 +299,7 @@ mod tests {
         // as keys) should not be rewritten. The fixture's docs include
         // "Connection pool size."—lowercase plain English—but we also want
         // the structural guarantee that `# ` lines pass through verbatim.
-        let template = generate_template_from_runtime(&test_schema(), true);
+        let template = template_for(&test_schema(), true);
         assert!(template.contains("Connection pool size."));
     }
 
@@ -307,7 +307,7 @@ mod tests {
     fn generate_template_kebab_off_is_default_behavior() {
         // Sanity: with the flag off, snake keys pass through untouched
         // (kebab path is opt-in).
-        let raw = generate_template_from_runtime(&test_schema(), false);
+        let raw = template_for(&test_schema(), false);
         assert!(raw.contains("pool_size"));
         assert!(!raw.contains("pool-size"));
     }

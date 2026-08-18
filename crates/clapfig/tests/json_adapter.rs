@@ -31,8 +31,8 @@ fn parity_schema() -> Schema {
         .build()
 }
 
-fn builder(schema: Schema, dir: &TempDir, file_name: &str) -> clapfig::RuntimeBuilder {
-    Clapfig::runtime(schema)
+fn builder(schema: Schema, dir: &TempDir, file_name: &str) -> clapfig::Builder {
+    Clapfig::builder(schema)
         .app_name("parity-demo")
         .file_name(file_name)
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])

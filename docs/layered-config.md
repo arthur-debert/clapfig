@@ -29,7 +29,7 @@ Unset keys fall through to the layer below.
 ```rust
 use clapfig::{Clapfig, Layer};
 
-let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+let config: AppConfig = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .layer_order(vec![Layer::Env, Layer::Files, Layer::Cli])
     .load()?;
@@ -90,7 +90,7 @@ default mode (`{app_name}.toml`), so TOML-only apps need no configuration.
 ### Stem + enabled formats — `.file_stem("myapp")` and `.formats([...])`
 
 ```rust
-let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+let config: AppConfig = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .file_stem("myapp")
     .formats(["toml", "yaml", "json"])
@@ -200,7 +200,7 @@ exactly (`pool_size`, not `pool-size`). Opt into kebab-case acceptance with
 `.normalize_keys(true)`:
 
 ```rust
-let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+let config: AppConfig = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .normalize_keys(true)
     .load()?;
@@ -242,7 +242,7 @@ separator.
 `persist_scope()` names a target for `config set` and `config unset`:
 
 ```rust
-let builder = Clapfig::schema_builder::<AppConfig>()
+let builder = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .persist_scope("local", SearchPath::Cwd)
     .persist_scope("global", SearchPath::Platform);
@@ -264,7 +264,7 @@ by the schema's type checks and strict mode. For semantic constraints that
 need the final merged config, use `post_validate`:
 
 ```rust
-let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+let config: AppConfig = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .post_validate(|c| {
         if c.port < 1024 {
@@ -286,7 +286,7 @@ become `ClapfigError::PostValidationFailed`.
 ### Global + local config
 
 ```rust
-Clapfig::schema_builder::<AppConfig>()
+Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .search_paths(vec![
         SearchPath::Platform,   // ~/.config/myapp/myapp.toml (global)
@@ -300,7 +300,7 @@ Clapfig::schema_builder::<AppConfig>()
 ### No env vars, no files — just defaults + overrides
 
 ```rust
-Clapfig::schema_builder::<AppConfig>()
+Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .no_env()
     .search_paths(vec![])
@@ -311,7 +311,7 @@ Clapfig::schema_builder::<AppConfig>()
 ### Per-project config with repo boundary
 
 ```rust
-Clapfig::schema_builder::<AppConfig>()
+Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .search_paths(vec![
         SearchPath::Platform,

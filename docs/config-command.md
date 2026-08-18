@@ -25,7 +25,7 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let builder = Clapfig::schema_builder::<AppConfig>()
+    let builder = Clapfig::typed::<AppConfig>()
         .app_name("myapp")
         .persist_scope("local", SearchPath::Cwd)
         .persist_scope("global", SearchPath::Platform);
@@ -201,7 +201,7 @@ Scopes name where `config set` and `config unset` write. The first scope
 added to the builder is the default; users select others with `--scope`:
 
 ```rust
-let builder = Clapfig::schema_builder::<AppConfig>()
+let builder = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .persist_scope("local", SearchPath::Cwd)       // default
     .persist_scope("global", SearchPath::Platform);
