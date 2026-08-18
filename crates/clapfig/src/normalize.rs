@@ -51,6 +51,19 @@ pub fn normalize_key(key: &str) -> String {
     }
 }
 
+/// Replace every `_` with `-` in a single key string — the inverse of
+/// [`normalize_key`], producing the spelling clapfig EMITS when
+/// normalization is enabled (template keys, and keys the persistence path
+/// writes for paths not already present in a document). Skips the
+/// allocation when the key has no `_` characters.
+pub fn kebab_key(key: &str) -> String {
+    if key.contains('_') {
+        key.replace('_', "-")
+    } else {
+        key.to_owned()
+    }
+}
+
 /// Recursively normalize every key in `table`, including nested tables and
 /// tables nested inside arrays. Operates in place.
 ///
@@ -146,6 +159,13 @@ mod tests {
     #[test]
     fn normalize_key_no_dashes_is_noop() {
         assert_eq!(normalize_key("plain"), "plain");
+    }
+
+    #[test]
+    fn kebab_key_is_the_inverse_spelling() {
+        assert_eq!(kebab_key("pool_size"), "pool-size");
+        assert_eq!(kebab_key("plain"), "plain");
+        assert_eq!(kebab_key("already-kebab"), "already-kebab");
     }
 
     // -- Table walking ---------------------------------------------------------

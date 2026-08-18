@@ -7,13 +7,16 @@
 //! key/type validation against the schema, template seeding for missing
 //! files, classifying each set request onto its capability-matrix row
 //! ([`SetTarget`] — replace vs create-key vs create-file, so refusals
-//! name the operation actually attempted), and the file I/O around each
-//! edit.
+//! name the operation actually attempted), key-spelling resolution under
+//! [`normalize_keys`](crate::RuntimeBuilder::normalize_keys) (dash and
+//! underscore spellings are equivalent; the spelling already present in
+//! the document is the one edited), and the file I/O around each edit.
 
 use std::path::Path;
 
 use crate::error::ClapfigError;
 use crate::format::{ConfigPath, FileEdit, FormatAdapter, Operation, SetTarget};
+use crate::normalize::{kebab_key, normalize_key};
 use crate::ops::ConfigResult;
 use crate::value::Value;
 
@@ -27,8 +30,19 @@ use crate::value::Value;
 /// or a string where an integer is expected fails before the file is
 /// touched.
 ///
+/// With `normalize_keys`, the action key follows the load path's
+/// acceptance: dash and underscore spellings are equivalent. The key is
+/// normalized to the canonical snake_case path before schema validation,
+/// paths already present in the document are resolved by that equivalence
+/// and edited under the spelling actually present (so setting `pool_size`
+/// against a kebab-case document edits `pool-size` instead of creating a
+/// colliding sibling), and paths not present are emitted kebab-case —
+/// matching what `config gen` emits.
+///
 /// If `content` is `None` (file doesn't exist yet), starts from the
-/// adapter's generated template so the new file carries doc comments.
+/// adapter's generated template — rendered with the same `normalize_keys`
+/// setting, so the seeded file and `config gen` agree on key spelling —
+/// so the new file carries doc comments.
 ///
 /// The edit request carries the capability-matrix row actually attempted
 /// ([`SetTarget`]): a missing file is [`Operation::EditCreateFile`]
@@ -52,14 +66,16 @@ pub fn set_in_document_runtime(
     content: Option<&str>,
     key: &str,
     raw_value: &str,
+    normalize_keys: bool,
 ) -> Result<String, ClapfigError> {
+    let canonical = canonical_key(key, normalize_keys);
     let valid_keys = crate::overrides::valid_keys(crate::spec::SchemaRef::from_dynamic(schema));
-    if !valid_keys.contains(key) {
+    if !valid_keys.contains(&canonical) {
         return Err(ClapfigError::KeyNotFound(key.into()));
     }
 
     let mut value = parse_raw_value(raw_value);
-    if let Some(leaf_ty) = lookup_leaf_type(schema, key) {
+    if let Some(leaf_ty) = lookup_leaf_type(schema, &canonical) {
         crate::runtime_spec::coerce_datetime_value(&mut value, leaf_ty);
         leaf_ty
             .check(&value)
@@ -69,19 +85,21 @@ pub fn set_in_document_runtime(
             })?;
     }
 
-    let (base, target) = match content {
+    let (base, target, path) = match content {
         Some(c) => {
             // Replace vs create-key depends on whether the path already
             // resolves; classification parses the document — the edit's
             // own first step, so parse failures (including a format that
-            // cannot parse at all) surface as-is.
+            // cannot parse at all) surface as-is. The same parsed tree
+            // resolves the concrete key spellings the edit targets.
             let tree = adapter.parse(c).map_err(ClapfigError::from)?;
-            let target = if dotted_path_exists(&tree, key) {
+            let (segments, exists) = resolve_document_path(&tree, &canonical, normalize_keys);
+            let target = if exists {
                 SetTarget::ExistingValue
             } else {
                 SetTarget::MissingKey
             };
-            (c.to_string(), target)
+            (c.to_string(), target, config_path(&segments))
         }
         None => {
             // Missing file: require the matrix row before template
@@ -91,8 +109,16 @@ pub fn set_in_document_runtime(
                 .require(Operation::EditCreateFile)
                 .map_err(crate::format::FormatError::from)
                 .map_err(ClapfigError::from)?;
-            let seeded = crate::ops::generate_template(adapter, schema, false)?;
-            (seeded, SetTarget::MissingFile)
+            let seeded = crate::ops::generate_template(adapter, schema, normalize_keys)?;
+            // The seeded template spells every key the way the enabled
+            // normalization emits (kebab-case when on), so the edit path
+            // uses that emitted spelling and lands on the template's own
+            // keys instead of creating colliding siblings.
+            let segments: Vec<String> = canonical
+                .split('.')
+                .map(|seg| emitted_spelling(seg, normalize_keys))
+                .collect();
+            (seeded, SetTarget::MissingFile, config_path(&segments))
         }
     };
     let base = if base.trim().is_empty() {
@@ -101,7 +127,6 @@ pub fn set_in_document_runtime(
         base
     };
 
-    let path = dotted_config_path(key);
     adapter
         .edit(
             &base,
@@ -123,6 +148,7 @@ pub fn persist_value_runtime(
     file_path: &Path,
     key: &str,
     value: &str,
+    normalize_keys: bool,
 ) -> Result<ConfigResult, ClapfigError> {
     let content = match std::fs::read_to_string(file_path) {
         Ok(c) => Some(c),
@@ -135,7 +161,14 @@ pub fn persist_value_runtime(
         }
     };
 
-    let new_content = set_in_document_runtime(adapter, schema, content.as_deref(), key, value)?;
+    let new_content = set_in_document_runtime(
+        adapter,
+        schema,
+        content.as_deref(),
+        key,
+        value,
+        normalize_keys,
+    )?;
 
     if let Some(parent) = file_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
@@ -181,17 +214,27 @@ fn lookup_leaf_type<'a>(
 /// `adapter`.
 ///
 /// If the key doesn't exist, returns the document unchanged.
-/// Navigates dotted key paths (e.g. `"database.pool_size"`). Comment
-/// preservation is per the adapter's declared edit capability; adapter
-/// failures propagate as [`ClapfigError::Format`].
+/// Navigates dotted key paths (e.g. `"database.pool_size"`). With
+/// `normalize_keys`, the document is parsed first and the key is resolved
+/// by dash/underscore equivalence, so `unset pool_size` removes an
+/// existing `pool-size` entry (and vice versa) — parse failures propagate
+/// in that mode. Comment preservation is per the adapter's declared edit
+/// capability; adapter failures propagate as [`ClapfigError::Format`].
 ///
 /// Returns the modified document string.
 pub fn unset_in_document(
     adapter: &dyn FormatAdapter,
     content: &str,
     key: &str,
+    normalize_keys: bool,
 ) -> Result<String, ClapfigError> {
-    let path = dotted_config_path(key);
+    let path = if normalize_keys {
+        let tree = adapter.parse(content).map_err(ClapfigError::from)?;
+        let (segments, _) = resolve_document_path(&tree, &normalize_key(key), true);
+        config_path(&segments)
+    } else {
+        dotted_config_path(key)
+    };
     adapter
         .edit(content, FileEdit::Unset { path: &path })
         .map_err(ClapfigError::from)
@@ -203,6 +246,7 @@ pub fn unset_value(
     adapter: &dyn FormatAdapter,
     file_path: &Path,
     key: &str,
+    normalize_keys: bool,
 ) -> Result<ConfigResult, ClapfigError> {
     let content = match std::fs::read_to_string(file_path) {
         Ok(c) => c,
@@ -217,7 +261,7 @@ pub fn unset_value(
         }
     };
 
-    let new_content = unset_in_document(adapter, &content, key)?;
+    let new_content = unset_in_document(adapter, &content, key, normalize_keys)?;
 
     std::fs::write(file_path, &new_content).map_err(|e| ClapfigError::IoError {
         path: file_path.to_path_buf(),
@@ -227,22 +271,87 @@ pub fn unset_value(
     Ok(ConfigResult::ValueUnset { key: key.into() })
 }
 
-/// Whether a dotted persist key resolves to an existing value in a parsed
-/// document tree — the [`SetTarget::ExistingValue`] vs
-/// [`SetTarget::MissingKey`] classification for a set against an existing
-/// file.
-fn dotted_path_exists(tree: &Value, key: &str) -> bool {
-    let mut current = tree;
-    for segment in key.split('.') {
-        match current {
-            Value::Map(map) => match map.get(segment) {
-                Some(next) => current = next,
-                None => return false,
-            },
-            _ => return false,
+/// The canonical snake_case form of a user-supplied action key: with
+/// `normalize_keys`, dashes rewrite to underscores (the schema's spelling);
+/// without it, the key passes through untouched (exact spelling required,
+/// matching the load path's acceptance).
+fn canonical_key(key: &str, normalize_keys: bool) -> String {
+    if normalize_keys {
+        normalize_key(key)
+    } else {
+        key.to_owned()
+    }
+}
+
+/// The spelling emitted into a document for a path segment that is not
+/// already present: kebab-case when normalization is enabled (matching
+/// `config gen` output), the canonical snake_case otherwise.
+fn emitted_spelling(segment: &str, normalize_keys: bool) -> String {
+    if normalize_keys {
+        kebab_key(segment)
+    } else {
+        segment.to_owned()
+    }
+}
+
+/// Resolve a canonical snake_case dotted path against a parsed document
+/// tree: the concrete per-segment spellings an edit must target, plus
+/// whether the full path already resolves to a value — the
+/// [`SetTarget::ExistingValue`] vs [`SetTarget::MissingKey`]
+/// classification for a set against an existing file.
+///
+/// With `normalize_keys`, each segment matches an existing key by
+/// dash/underscore equivalence (exact spelling preferred when both exist),
+/// so the edit lands on the spelling actually present instead of creating
+/// a colliding sibling; segments with no match resolve to their emitted
+/// (kebab-case) spelling. Without normalization, matching is exact and
+/// missing segments keep their canonical spelling.
+fn resolve_document_path(
+    tree: &Value,
+    canonical: &str,
+    normalize_keys: bool,
+) -> (Vec<String>, bool) {
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = Some(tree);
+    let mut exists = true;
+    for seg in canonical.split('.') {
+        let matched = match current {
+            Some(Value::Map(map)) => {
+                if map.contains_key(seg) {
+                    Some(seg.to_owned())
+                } else if normalize_keys {
+                    map.keys().find(|k| normalize_key(k) == seg).cloned()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        match matched {
+            Some(spelling) => {
+                current = match current {
+                    Some(Value::Map(map)) => map.get(&spelling),
+                    _ => None,
+                };
+                segments.push(spelling);
+            }
+            None => {
+                exists = false;
+                current = None;
+                segments.push(emitted_spelling(seg, normalize_keys));
+            }
         }
     }
-    true
+    (segments, exists)
+}
+
+/// Build a structured [`ConfigPath`] from already-resolved path segments.
+fn config_path(segments: &[String]) -> ConfigPath {
+    let mut path = ConfigPath::new();
+    for segment in segments {
+        path = path.key(segment);
+    }
+    path
 }
 
 /// Build a structured [`ConfigPath`] from a dotted persist key. Persist
@@ -279,7 +388,7 @@ mod tests {
         key: &str,
         value: &str,
     ) -> Result<String, ClapfigError> {
-        set_in_document_runtime(&TomlAdapter, &test_schema(), content, key, value)
+        set_in_document_runtime(&TomlAdapter, &test_schema(), content, key, value, false)
     }
 
     fn persist_value(
@@ -287,7 +396,7 @@ mod tests {
         key: &str,
         value: &str,
     ) -> Result<ConfigResult, ClapfigError> {
-        persist_value_runtime(&TomlAdapter, &test_schema(), path, key, value)
+        persist_value_runtime(&TomlAdapter, &test_schema(), path, key, value, false)
     }
 
     // --- validation tests ---
@@ -376,6 +485,7 @@ mod tests {
             Some("port = 1\n"),
             "port",
             "2",
+            false,
         ));
         assert_eq!(u.operation, Operation::EditSet);
 
@@ -386,6 +496,7 @@ mod tests {
             Some("port = 1\n"),
             "debug",
             "true",
+            false,
         ));
         assert_eq!(u.operation, Operation::EditCreateKey);
 
@@ -393,7 +504,7 @@ mod tests {
         // template seeding (ParseOnly's template also refuses; the
         // create-file refusal must win).
         let u = refusal(set_in_document_runtime(
-            &ParseOnly, &schema, None, "port", "1",
+            &ParseOnly, &schema, None, "port", "1", false,
         ));
         assert_eq!(u.operation, Operation::EditCreateFile);
     }
@@ -473,6 +584,7 @@ mod tests {
             Some("port = 1\n"),
             "port",
             "2",
+            false,
         ));
         assert_eq!(u.operation, Operation::Parse);
     }
@@ -485,8 +597,14 @@ mod tests {
 
     #[test]
     fn set_rejects_invalid_enum_value() {
-        let result =
-            set_in_document_runtime(&TomlAdapter, &enum_schema(), Some(""), "mode", "garbage");
+        let result = set_in_document_runtime(
+            &TomlAdapter,
+            &enum_schema(),
+            Some(""),
+            "mode",
+            "garbage",
+            false,
+        );
         match result {
             Err(ClapfigError::InvalidValue { key, reason }) => {
                 assert_eq!(key, "mode");
@@ -501,8 +619,14 @@ mod tests {
 
     #[test]
     fn set_accepts_valid_enum_value() {
-        let result =
-            set_in_document_runtime(&TomlAdapter, &enum_schema(), Some(""), "mode", "fast");
+        let result = set_in_document_runtime(
+            &TomlAdapter,
+            &enum_schema(),
+            Some(""),
+            "mode",
+            "fast",
+            false,
+        );
         assert!(result.is_ok());
     }
 
@@ -538,7 +662,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
-        let result = persist_value_runtime(&TomlAdapter, &enum_schema(), &path, "mode", "garbage");
+        let result = persist_value_runtime(
+            &TomlAdapter,
+            &enum_schema(),
+            &path,
+            "mode",
+            "garbage",
+            false,
+        );
         assert!(matches!(result, Err(ClapfigError::InvalidValue { .. })));
         // File should NOT have been created
         assert!(!path.exists());
@@ -604,6 +735,7 @@ mod tests {
             Some(""),
             "stamp",
             "2024-01-02T03:04:05Z",
+            false,
         )
         .unwrap();
         assert!(
@@ -611,8 +743,15 @@ mod tests {
             "datetime must persist unquoted (typed), got: {result}"
         );
 
-        let err = set_in_document_runtime(&TomlAdapter, &schema, Some(""), "stamp", "not-a-date")
-            .unwrap_err();
+        let err = set_in_document_runtime(
+            &TomlAdapter,
+            &schema,
+            Some(""),
+            "stamp",
+            "not-a-date",
+            false,
+        )
+        .unwrap_err();
         assert!(matches!(err, ClapfigError::InvalidValue { .. }));
     }
 
@@ -650,10 +789,232 @@ mod tests {
         assert!(path.exists());
     }
 
+    // --- normalize_keys tests ---
+    //
+    // The persistence path must match the load path's acceptance: with
+    // normalization on, dash and underscore action-key spellings are
+    // equivalent, edits land on the spelling the document already uses,
+    // and missing paths/files come out kebab-case. Format-agnostic by
+    // construction (the logic lives before the adapter seam), so every
+    // scenario runs against all three adapters.
+
+    use crate::format::{JsonAdapter, YamlAdapter};
+
+    /// Per-adapter document with the schema's `database.pool_size` leaf
+    /// spelled in the given (kebab or snake) form.
+    fn docs(leaf: &str) -> [(&'static dyn FormatAdapter, String); 3] {
+        [
+            (&TomlAdapter, format!("[database]\n{leaf} = 5\n")),
+            (&YamlAdapter, format!("database:\n  {leaf}: 5\n")),
+            (
+                &JsonAdapter,
+                format!("{{\n  \"database\": {{\n    \"{leaf}\": 5\n  }}\n}}\n"),
+            ),
+        ]
+    }
+
+    fn doc_map(adapter: &dyn FormatAdapter, text: &str) -> crate::value::Map {
+        match adapter.parse(text).unwrap() {
+            Value::Map(m) => m,
+            other => panic!("expected map root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalized_set_edits_kebab_document_for_both_spellings() {
+        // The collision scenario from #122: setting the snake key against
+        // a kebab document must edit the existing kebab entry, never
+        // create a snake sibling (which would NormalizedKeyCollision on
+        // the next load). The kebab action key must work too.
+        for (adapter, doc) in docs("pool-size") {
+            for action_key in ["database.pool-size", "database.pool_size"] {
+                let out = set_in_document_runtime(
+                    adapter,
+                    &test_schema(),
+                    Some(&doc),
+                    action_key,
+                    "20",
+                    true,
+                )
+                .unwrap();
+                let map = doc_map(adapter, &out);
+                let db = map["database"].as_map().unwrap();
+                assert_eq!(
+                    db.get("pool-size"),
+                    Some(&Value::Integer(20)),
+                    "{} / {action_key}:\n{out}",
+                    adapter.name()
+                );
+                assert!(
+                    !db.contains_key("pool_size"),
+                    "{} / {action_key} created a colliding snake sibling:\n{out}",
+                    adapter.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_set_edits_snake_document_for_both_spellings() {
+        // Equivalence is symmetric: a document still spelled snake_case
+        // keeps its spelling — the edit targets what is present, it does
+        // not rewrite the document to kebab.
+        for (adapter, doc) in docs("pool_size") {
+            for action_key in ["database.pool-size", "database.pool_size"] {
+                let out = set_in_document_runtime(
+                    adapter,
+                    &test_schema(),
+                    Some(&doc),
+                    action_key,
+                    "20",
+                    true,
+                )
+                .unwrap();
+                let map = doc_map(adapter, &out);
+                let db = map["database"].as_map().unwrap();
+                assert_eq!(
+                    db.get("pool_size"),
+                    Some(&Value::Integer(20)),
+                    "{} / {action_key}:\n{out}",
+                    adapter.name()
+                );
+                assert!(
+                    !db.contains_key("pool-size"),
+                    "{} / {action_key} created a colliding kebab sibling:\n{out}",
+                    adapter.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_set_emits_kebab_for_missing_paths() {
+        // A path not present in the document is created in the emitted
+        // (kebab) spelling — the same spelling `config gen` produces.
+        let bases: [(&dyn FormatAdapter, &str); 3] = [
+            (&TomlAdapter, "host = \"h\"\n"),
+            (&YamlAdapter, "host: h\n"),
+            (&JsonAdapter, "{\n  \"host\": \"h\"\n}\n"),
+        ];
+        for (adapter, base) in bases {
+            let out = set_in_document_runtime(
+                adapter,
+                &test_schema(),
+                Some(base),
+                "database.pool_size",
+                "20",
+                true,
+            )
+            .unwrap();
+            let map = doc_map(adapter, &out);
+            let db = map["database"].as_map().unwrap();
+            assert_eq!(
+                db.get("pool-size"),
+                Some(&Value::Integer(20)),
+                "{}:\n{out}",
+                adapter.name()
+            );
+            assert!(!db.contains_key("pool_size"), "{}:\n{out}", adapter.name());
+        }
+    }
+
+    #[test]
+    fn normalized_set_seeds_missing_file_with_normalized_template() {
+        // Missing files seed from the template rendered with the SAME
+        // normalization setting, so the seeded file and `config gen`
+        // agree on key spelling — and the set lands on the template's own
+        // kebab key instead of adding a snake duplicate.
+        let adapters: [&dyn FormatAdapter; 3] = [&TomlAdapter, &YamlAdapter, &JsonAdapter];
+        for adapter in adapters {
+            for action_key in ["database.pool-size", "database.pool_size"] {
+                let out =
+                    set_in_document_runtime(adapter, &test_schema(), None, action_key, "20", true)
+                        .unwrap();
+                let map = doc_map(adapter, &out);
+                let db = map["database"].as_map().unwrap();
+                assert_eq!(
+                    db.get("pool-size"),
+                    Some(&Value::Integer(20)),
+                    "{} / {action_key}:\n{out}",
+                    adapter.name()
+                );
+                assert!(
+                    !db.contains_key("pool_size"),
+                    "{} / {action_key} seeded a snake key:\n{out}",
+                    adapter.name()
+                );
+                assert!(
+                    !out.contains("pool_size"),
+                    "{} / {action_key} snake spelling leaked into seeded file:\n{out}",
+                    adapter.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_set_validates_kebab_key_against_canonical_schema() {
+        // The kebab action key is accepted (normalized before the
+        // valid-keys check) and its value is still type-checked against
+        // the canonical leaf.
+        let result = set_in_document_runtime(
+            &TomlAdapter,
+            &test_schema(),
+            Some(""),
+            "database.pool-size",
+            "not_a_number",
+            true,
+        );
+        assert!(matches!(result, Err(ClapfigError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn kebab_action_key_still_rejected_without_normalization() {
+        // Acceptance boundary: with normalization off, the load path
+        // rejects kebab keys, so the persistence path does too.
+        let result = set_in_document(Some(""), "database.pool-size", "20");
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
+    }
+
+    #[test]
+    fn normalized_unset_removes_equivalent_spelling() {
+        for (adapter, doc) in docs("pool-size") {
+            for action_key in ["database.pool-size", "database.pool_size"] {
+                let out = unset_in_document(adapter, &doc, action_key, true).unwrap();
+                let map = doc_map(adapter, &out);
+                let db = map
+                    .get("database")
+                    .map(|d| d.as_map().unwrap().clone())
+                    .unwrap_or_default();
+                assert!(
+                    !db.contains_key("pool-size") && !db.contains_key("pool_size"),
+                    "{} / {action_key} left the key behind:\n{out}",
+                    adapter.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_unset_missing_key_is_noop() {
+        let out =
+            unset_in_document(&TomlAdapter, "host = \"h\"\n", "database.pool_size", true).unwrap();
+        assert!(out.contains("host = \"h\""));
+    }
+
+    #[test]
+    fn unset_without_normalization_requires_exact_spelling() {
+        // With normalization off there is no equivalence: a kebab entry
+        // is not touched by the snake key (and would be an unknown key at
+        // load time anyway).
+        let out = unset_doc("[database]\npool-size = 5\n", "database.pool_size").unwrap();
+        assert!(out.contains("pool-size = 5"));
+    }
+
     // --- unset tests ---
 
     fn unset_doc(content: &str, key: &str) -> Result<String, ClapfigError> {
-        unset_in_document(&TomlAdapter, content, key)
+        unset_in_document(&TomlAdapter, content, key, false)
     }
 
     #[test]
@@ -701,7 +1062,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "port = 8080\nhost = \"localhost\"\n").unwrap();
 
-        let result = unset_value(&TomlAdapter, &path, "port").unwrap();
+        let result = unset_value(&TomlAdapter, &path, "port", false).unwrap();
         assert!(matches!(result, ConfigResult::ValueUnset { .. }));
 
         let content = fs::read_to_string(&path).unwrap();
@@ -714,7 +1075,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.toml");
 
-        let result = unset_value(&TomlAdapter, &path, "port").unwrap();
+        let result = unset_value(&TomlAdapter, &path, "port", false).unwrap();
         assert!(matches!(result, ConfigResult::ValueUnset { .. }));
     }
 }
