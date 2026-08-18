@@ -47,11 +47,12 @@
 
 use serde_json::{Map as JsonMap, Value as Json};
 
-use crate::runtime::{Field, LeafType, Schema};
+use crate::runtime::{Field, Leaf, LeafType, Schema};
 use crate::value::{Map, Value};
 
 use std::collections::BTreeMap;
 
+use super::template::{TemplateRenderer, doc_lines, leaf_annotations, walk_level};
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
     UnsupportedByFormat, WalkSegment, walk_label,
@@ -114,7 +115,8 @@ impl FormatAdapter for JsonAdapter {
     }
 
     fn template(&self, schema: &Schema) -> Result<String, FormatError> {
-        let object = template_object(schema)?;
+        let mut object = JsonMap::new();
+        walk_level(&mut JsonTemplate, schema, &(), &mut object)?;
         Ok(render(&Json::Object(object)))
     }
 
@@ -136,11 +138,11 @@ impl FormatAdapter for JsonAdapter {
                     .map(|PathSegment::Key(k)| WalkSegment::Key(k.clone()))
                     .collect();
                 let json_value = value_to_json(value, &mut value_path)?;
-                write_at_path(&mut doc, &keys, json_value)?;
+                super::edit::write_at_path(&mut doc, &keys, json_value)?;
             }
             FileEdit::Unset { path } => {
                 let keys = key_segments(path)?;
-                unset_at_path(&mut doc, &keys);
+                super::edit::unset_at_path(&mut doc, &keys);
             }
         }
         Ok(render(&doc))
@@ -374,48 +376,44 @@ fn key_segments(path: &ConfigPath) -> Result<Vec<&str>, FormatError> {
         .collect()
 }
 
-/// Walk `keys` through `doc`, creating intermediate objects when missing,
-/// and assign `value` at the leaf. Errors when an existing intermediate is
-/// a non-object — the same conflict contract as the TOML adapter (a
-/// pre-existing on-disk shape the schema never saw).
-fn write_at_path(doc: &mut Json, keys: &[&str], value: Json) -> Result<(), FormatError> {
-    let (leaf, parents) = keys
-        .split_last()
-        .expect("ConfigPath edits always carry at least one segment");
-    let display_path = keys.join(".");
-    let mut current: &mut Json = doc;
-    for segment in parents {
-        let Some(obj) = current.as_object_mut() else {
-            return Err(FormatError::Edit {
-                format: FORMAT,
-                message: format!(
-                    "path conflict: existing document has a non-object value at the path before '{segment}' (setting '{display_path}')"
-                ),
-            });
-        };
-        let next = obj
-            .entry(segment.to_string())
-            .or_insert_with(|| Json::Object(JsonMap::new()));
-        if !next.is_object() {
-            return Err(FormatError::Edit {
-                format: FORMAT,
-                message: format!(
-                    "path conflict: existing document has a non-object value at '{segment}' (setting '{display_path}')"
-                ),
-            });
-        }
-        current = next;
+/// The JSON document tree behind the shared edit walkers (`format::edit`)
+/// — the same conflict contract as the TOML adapter (a pre-existing
+/// on-disk shape the schema never saw refuses typed).
+impl super::edit::EditDoc for Json {
+    type Value = Json;
+
+    const FORMAT: &'static str = FORMAT;
+    const CONTAINER: &'static str = "object";
+    const CONTAINER_WITH_ARTICLE: &'static str = "an object";
+    const SOURCE: &'static str = "document";
+
+    fn is_container(&self) -> bool {
+        self.is_object()
     }
-    let Some(obj) = current.as_object_mut() else {
-        return Err(FormatError::Edit {
-            format: FORMAT,
-            message: format!(
-                "path conflict: leaf parent is not an object (setting '{display_path}')"
-            ),
-        });
-    };
-    insert_adjacent_to_comment(obj, leaf, value);
-    Ok(())
+
+    fn has_child(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn child_mut(&mut self, key: &str) -> Option<&mut Self> {
+        self.get_mut(key)
+    }
+
+    fn insert_container(&mut self, key: &str) {
+        self.as_object_mut()
+            .expect("callers guarantee a container")
+            .insert(key.to_string(), Json::Object(JsonMap::new()));
+    }
+
+    fn insert_value(&mut self, key: &str, value: Json) {
+        let obj = self.as_object_mut().expect("callers guarantee a container");
+        insert_adjacent_to_comment(obj, key, value);
+    }
+
+    fn remove_key(&mut self, key: &str) -> bool {
+        self.as_object_mut()
+            .is_some_and(|obj| obj.remove(key).is_some())
+    }
 }
 
 /// Insert `leaf` into `obj`, keeping comment keys adjacent to the fields
@@ -440,113 +438,121 @@ fn insert_adjacent_to_comment(obj: &mut JsonMap<String, Json>, leaf: &str, value
     }
 }
 
-/// Remove the key at `keys`. A missing parent or leaf is a no-op — the
-/// document is returned unchanged.
-fn unset_at_path(doc: &mut Json, keys: &[&str]) {
-    let (leaf, parents) = keys
-        .split_last()
-        .expect("ConfigPath edits always carry at least one segment");
-    let mut current: &mut Json = doc;
-    for segment in parents {
-        match current.get_mut(segment) {
-            Some(item) => current = item,
-            None => return, // parent doesn't exist, nothing to unset
-        }
-    }
-    if let Some(obj) = current.as_object_mut() {
-        obj.remove(*leaf);
-    }
-}
-
 // --- template emission ---------------------------------------------------
 
-/// Render one schema node as a template object: a `"//"` object comment
-/// (when the node has docs), then each field in declaration order with its
-/// `"//field-name"` comment. Unlike the TOML emitter, leaves and nested
-/// objects are NOT reordered — JSON has no section-header rule forcing
-/// leaves first.
-fn template_object(schema: &Schema) -> Result<JsonMap<String, Json>, FormatError> {
-    let mut obj = JsonMap::new();
-    if !schema.doc.is_empty() {
-        obj.insert(COMMENT_PREFIX.into(), comment_value(doc_lines(&schema.doc)));
-    }
-    for nf in &schema.fields {
-        // A `//`-prefixed schema field name would render as a comment key
-        // and vanish at the next parse — refuse it here, where the name
-        // first meets JSON text.
-        if nf.name.starts_with(COMMENT_PREFIX) {
+/// The JSON template renderer: each level is an object carrying a `"//"`
+/// comment for its own prose and `"//field-name"` comments per field.
+/// Unlike the text-format emitters, leaves and nested objects are NOT
+/// reordered — JSON has no section-header rule forcing leaves first.
+struct JsonTemplate;
+
+impl TemplateRenderer for JsonTemplate {
+    type Ctx = ();
+    type Out = JsonMap<String, Json>;
+
+    const LEAVES_FIRST: bool = false;
+
+    /// A `//`-prefixed schema field name would render as a comment key and
+    /// vanish at the next parse — refuse it here, where the name first
+    /// meets JSON text.
+    fn check_field_name(&self, name: &str) -> Result<(), FormatError> {
+        if name.starts_with(COMMENT_PREFIX) {
             return Err(FormatError::Serialize {
                 format: FORMAT,
-                message: reserved_key_message(&format!("'{}'", nf.name)),
+                message: reserved_key_message(&format!("'{name}'")),
             });
         }
-        match &nf.field {
-            Field::Leaf(leaf) => {
-                let mut lines = doc_lines(&leaf.doc);
-                if let LeafType::Enum { values } = &leaf.ty {
-                    let mut listed = Vec::with_capacity(values.len());
-                    for value in values {
-                        listed.push(inline_json(value, &nf.name)?);
-                    }
-                    lines.push(format!("Allowed: {}", listed.join(" | ")));
-                }
-                if matches!(&leaf.ty, LeafType::Value) {
-                    lines.push("Accepts: any JSON value".to_string());
-                }
-                match &leaf.default {
-                    Some(default) => {
-                        if !lines.is_empty() {
-                            obj.insert(comment_key(&nf.name), comment_value(lines));
-                        }
-                        let mut path = vec![WalkSegment::Key(nf.name.clone())];
-                        obj.insert(nf.name.clone(), value_to_json(default, &mut path)?);
-                    }
-                    None => {
-                        // JSON cannot comment out a real key, so the
-                        // assignment snippet rides inside the comment —
-                        // the counterpart of TOML's `#name = ""` line.
-                        lines.push(assignment_snippet(
-                            &nf.name,
-                            placeholder_json(&leaf.ty).to_string(),
-                        ));
-                        obj.insert(comment_key(&nf.name), comment_value(lines));
-                    }
-                }
-            }
-            Field::Nested(child) => {
-                // The child's prose lands in the child object's own "//"
-                // slot (template_object emits it from `child.doc`), not
-                // as a sibling "//name" comment — one home per comment.
-                obj.insert(nf.name.clone(), Json::Object(template_object(child)?));
-            }
-            Field::ArrayOf(child) => {
-                // Entry count is the user's call, so no real key is
-                // emitted (an absent array-of resolves to the empty
-                // list); the comment carries a one-entry example.
-                let mut lines = doc_lines(&child.doc);
-                let example = Json::Array(vec![Json::Object(example_object(child, &nf.name)?)]);
-                lines.push(assignment_snippet(&nf.name, compact(&example)));
-                obj.insert(comment_key(&nf.name), comment_value(lines));
-            }
-            Field::MapOf(child) => {
-                // Entry keys are user-supplied, so no real key is emitted
-                // (an absent map-of resolves to the empty map); the
-                // comment carries a placeholder-keyed example.
-                let mut lines = doc_lines(&child.doc);
-                let mut example = JsonMap::new();
-                example.insert(
-                    "<key>".to_string(),
-                    Json::Object(example_object(child, &nf.name)?),
-                );
-                lines.push(assignment_snippet(
-                    &nf.name,
-                    compact(&Json::Object(example)),
-                ));
-                obj.insert(comment_key(&nf.name), comment_value(lines));
-            }
+        Ok(())
+    }
+
+    /// The level's prose lands in its own object's `"//"` slot, not as a
+    /// sibling `"//name"` comment — one home per comment.
+    fn level_doc(&mut self, out: &mut Self::Out, doc: &[String]) {
+        if !doc.is_empty() {
+            out.insert(COMMENT_PREFIX.into(), comment_value(doc_lines(doc)));
         }
     }
-    Ok(obj)
+
+    fn leaf(
+        &mut self,
+        out: &mut Self::Out,
+        _ctx: &(),
+        name: &str,
+        leaf: &Leaf,
+    ) -> Result<(), FormatError> {
+        let mut lines = leaf_annotations(leaf, "JSON", &mut |v| inline_json(v, name))?;
+        match &leaf.default {
+            Some(default) => {
+                if !lines.is_empty() {
+                    out.insert(comment_key(name), comment_value(lines));
+                }
+                let mut path = vec![WalkSegment::Key(name.to_string())];
+                out.insert(name.to_string(), value_to_json(default, &mut path)?);
+            }
+            None => {
+                // JSON cannot comment out a real key, so the assignment
+                // snippet rides inside the comment — the counterpart of
+                // TOML's `#name = ""` line.
+                lines.push(assignment_snippet(
+                    name,
+                    placeholder_json(&leaf.ty).to_string(),
+                ));
+                out.insert(comment_key(name), comment_value(lines));
+            }
+        }
+        Ok(())
+    }
+
+    fn nested(
+        &mut self,
+        out: &mut Self::Out,
+        ctx: &(),
+        name: &str,
+        child: &Schema,
+    ) -> Result<(), FormatError> {
+        let mut obj = JsonMap::new();
+        walk_level(self, child, ctx, &mut obj)?;
+        out.insert(name.to_string(), Json::Object(obj));
+        Ok(())
+    }
+
+    fn array_of(
+        &mut self,
+        out: &mut Self::Out,
+        _ctx: &(),
+        name: &str,
+        child: &Schema,
+    ) -> Result<(), FormatError> {
+        // Entry count is the user's call, so no real key is emitted (an
+        // absent array-of resolves to the empty list); the comment carries
+        // a one-entry example.
+        let mut lines = doc_lines(&child.doc);
+        let example = Json::Array(vec![Json::Object(example_object(child, name)?)]);
+        lines.push(assignment_snippet(name, compact(&example)));
+        out.insert(comment_key(name), comment_value(lines));
+        Ok(())
+    }
+
+    fn map_of(
+        &mut self,
+        out: &mut Self::Out,
+        _ctx: &(),
+        name: &str,
+        child: &Schema,
+    ) -> Result<(), FormatError> {
+        // Entry keys are user-supplied, so no real key is emitted (an
+        // absent map-of resolves to the empty map); the comment carries a
+        // placeholder-keyed example.
+        let mut lines = doc_lines(&child.doc);
+        let mut example = JsonMap::new();
+        example.insert(
+            "<key>".to_string(),
+            Json::Object(example_object(child, name)?),
+        );
+        lines.push(assignment_snippet(name, compact(&Json::Object(example))));
+        out.insert(comment_key(name), comment_value(lines));
+        Ok(())
+    }
 }
 
 /// Example object for an array-of / map-of entry, shown inside a comment:
@@ -608,12 +614,6 @@ fn comment_value(lines: Vec<String>) -> Json {
     }
 }
 
-/// Doc lines for a comment payload: trailing whitespace trimmed, blank
-/// lines kept as empty strings (paragraph breaks).
-fn doc_lines(doc: &[String]) -> Vec<String> {
-    doc.iter().map(|line| line.trim_end().to_string()).collect()
-}
-
 /// The `"key": value` snippet a defaultless field's comment shows — what
 /// the user pastes (uncommented) to set the field.
 fn assignment_snippet(field_name: &str, value_json: String) -> String {
@@ -636,20 +636,10 @@ fn inline_json(value: &Value, key: &str) -> Result<String, FormatError> {
 }
 
 /// Placeholder rendered in an assignment snippet for a leaf without a
-/// default, hinting the expected value shape (the JSON counterpart of the
-/// TOML template's placeholders).
+/// default, hinting the expected value shape: the shared table with JSON's
+/// quoted spellings for the string and datetime arms.
 fn placeholder_json(ty: &LeafType) -> &'static str {
-    match ty {
-        LeafType::String => "\"\"",
-        LeafType::Integer => "0",
-        LeafType::Float => "0.0",
-        LeafType::Bool => "false",
-        LeafType::DateTime => "\"1970-01-01T00:00:00Z\"",
-        LeafType::Array(_) => "[]",
-        LeafType::Map(_) => "{}",
-        LeafType::Enum { .. } => "\"\"",
-        LeafType::Value => "\"\"",
-    }
+    super::template::placeholder(ty, "\"\"", "\"1970-01-01T00:00:00Z\"")
 }
 
 /// [`placeholder_json`] as a `serde_json::Value`, for example objects.
