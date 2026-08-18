@@ -1,0 +1,5 @@
+error: unsupported rename_all rule "Train-Case"; supported: lowercase, UPPERCASE, PascalCase, camelCase, snake_case, SCREAMING_SNAKE_CASE, kebab-case, SCREAMING-KEBAB-CASE
+ --> tests/ui/derive/struct_rename_all_unknown_rule_rejected.rs:8:8
+  |
+8 | struct Bad {
+  |        ^^^
