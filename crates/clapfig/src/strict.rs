@@ -33,23 +33,23 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use toml::Value;
-
 use crate::spec::{FieldKindRef, SchemaRef};
+use crate::value::Value;
 
 /// Context handed to an [`on_unknown_key`](crate::RuntimeBuilder::on_unknown_key)
 /// callback. Carries every signal the callback needs to make a per-key
 /// decision: where the key lives in the merged tree, what it was, what
-/// file produced it, and which line.
+/// file produced it, and — for TOML sources — which line.
 #[derive(Debug)]
 pub struct UnknownKeyContext<'a> {
     /// Full dotted path with every segment unquoted, e.g.
     /// `diagnostics.rules.acme.task-due-date-missing`.
     pub path: &'a str,
 
-    /// The single TOML key at the leaf position, as it reached the merge
-    /// step — i.e. the final element of the path as TOML parsed it, not
-    /// the trailing piece of `path` split on `.`. A bare key like
+    /// The single raw key at the leaf position, as it reached the merge
+    /// step — i.e. the final element of the path as the source format
+    /// parsed it, not the trailing piece of `path` split on `.`. A bare
+    /// key like
     /// `missing_footote` gives `leaf = "missing_footote"`; a quoted key
     /// like `"acme.task-due-date-missing"` gives
     /// `leaf = "acme.task-due-date-missing"` (the dots are part of the
@@ -81,8 +81,10 @@ pub struct UnknownKeyContext<'a> {
     pub file: Option<&'a Path>,
 
     /// 1-indexed line number in `file` where the key appears. `None` when
-    /// the `find_key_line` heuristic could not locate it (rare; quoted
-    /// keys, inline tables).
+    /// the `find_key_line` heuristic could not locate it. The heuristic
+    /// only recognizes TOML `key = value` / `[section]` syntax, so this is
+    /// always `None` for YAML/JSON and non-file sources, and `None` in
+    /// rare TOML cases (quoted keys, inline tables).
     pub line: Option<usize>,
 }
 
@@ -116,7 +118,7 @@ pub enum UnknownKeyDecision {
 pub struct CollectedUnknown {
     /// Full dotted path, e.g. `diagnostics.rules.acme.task-due-date`.
     pub path: String,
-    /// Raw TOML key at the leaf position. See
+    /// Raw key at the leaf position. See
     /// [`UnknownKeyContext::leaf`] for the quoted-key semantics.
     pub leaf: String,
     /// Parsed value cloned out of the source table. `None` when the
@@ -127,7 +129,7 @@ pub struct CollectedUnknown {
     /// File the key came from, when sourced from a config file.
     pub file: Option<std::path::PathBuf>,
     /// 1-indexed line number in `file`, if the `find_key_line` heuristic
-    /// located the key.
+    /// located the key. TOML-only — see [`UnknownKeyContext::line`].
     pub line: Option<usize>,
 }
 

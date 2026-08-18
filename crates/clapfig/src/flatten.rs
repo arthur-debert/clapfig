@@ -3,12 +3,13 @@
 //! `#[serde(skip_serializing_if)]`.
 
 use serde::ser::{self, Serialize};
-use toml::Value;
+
+use crate::value::Value;
 
 /// Flatten a `Serialize` value into dotted key-value pairs.
 ///
 /// `None` values (from `Option::None` fields) are represented as `(key, None)`.
-/// Present values are `(key, Some(toml::Value))`.
+/// Present values are `(key, Some(Value))`.
 ///
 /// Structs and maps are recursed into, building dotted key paths:
 /// `Outer { database: Inner { url: "pg://" } }` → `[("database.url", Some(String("pg://")))]`
@@ -338,7 +339,7 @@ impl<'a> ser::SerializeSeq for FlattenSeqSerializer<'a> {
     type Error = FlattenError;
 
     fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
-        let v = toml::Value::try_from(value)
+        let v = crate::value::to_value(value)
             .map_err(|e| FlattenError(format!("array element: {e}")))?;
         self.items.push(v);
         Ok(())

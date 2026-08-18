@@ -2,8 +2,8 @@
 
 Strict mode is **on by default**. When a config file contains a key that
 doesn't match any field in your schema, loading fails with the file
-path, key name, and line number. This catches typos and stale keys
-early.
+path, key name, and — for TOML sources — the line number. This catches
+typos and stale keys early.
 
 Some apps want one uniform answer ("strict everywhere" or "lenient
 everywhere"). Others want a mix: typed fields catch typos, a plugin
@@ -73,10 +73,12 @@ Clapfig::schema_builder::<AppConfig>()
 
 The callback runs **only on cascade-strict keys** — keys the cascade
 already decided are lenient never reach it. It receives an
-`UnknownKeyContext` with the dotted path, the raw TOML leaf key, the
-parsed value as `Option<&toml::Value>` (`None` in the rare case lookup
+`UnknownKeyContext` with the dotted path, the raw leaf key, the
+parsed value as `Option<&clapfig::value::Value>` (`None` in the rare case lookup
 can't resolve — out-of-bounds array index, path through a non-table
-intermediate), the source file, and the 1-indexed line number, and
+intermediate), the source file, and the 1-indexed line number (`Some`
+on a best-effort match in TOML sources; always `None` for YAML/JSON
+and non-file sources), and
 returns `Accept` (drop silently) or `Reject` (the default — error as
 today).
 

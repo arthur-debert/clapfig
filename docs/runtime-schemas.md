@@ -83,7 +83,7 @@ surface as `Clapfig::schema_builder::<C>()`:
 ```rust,ignore
 use clapfig::{Clapfig, types::SearchPath};
 
-let table: toml::Table = Clapfig::runtime(schema)
+let table: clapfig::value::Map = Clapfig::runtime(schema)
     .app_name("myapp")
     .file_name("myapp.toml")
     .search_paths(vec![SearchPath::Cwd, SearchPath::Platform])
@@ -93,8 +93,8 @@ let table: toml::Table = Clapfig::runtime(schema)
 
 Differences from the typed path:
 
-- `load()` returns `toml::Table`, not a typed struct.
-- `post_validate` receives `&Table` instead of `&C`.
+- `load()` returns `clapfig::value::Map`, not a typed struct.
+- `post_validate` receives `&clapfig::value::Map` instead of `&C`.
 - `build_resolver()` returns a `RuntimeResolver` for tree-walk use
   cases (see the [Resolver Guide](./resolver.md)).
 

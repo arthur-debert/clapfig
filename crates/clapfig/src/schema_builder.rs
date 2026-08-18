@@ -6,20 +6,21 @@
 //! constructed from `C::schema()` (the cached runtime view of the
 //! macro-emitted `SchemaStatic`). Every method forwards through to the
 //! runtime builder so the typed and runtime paths share one resolve
-//! pipeline. The only added work is the final `Table → C` deserialize
-//! step on `load()` and the typed `post_validate(&C)` hook.
+//! pipeline. The only added work is the final `Map → C` deserialize
+//! step on `load()` (through the value model's serde bridge) and the
+//! typed `post_validate(&C)` hook.
 
 use std::marker::PhantomData;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use toml::{Table, Value};
 
 use crate::error::ClapfigError;
 use crate::ops::ConfigResult;
 use crate::runtime_builder::RuntimeBuilder;
 use crate::static_schema::Schema;
 use crate::types::{ConfigAction, Layer, SearchMode, SearchPath};
+use crate::value::{Map, Value, from_value};
 
 /// Typed-config builder driven by a `#[derive(clapfig::Schema)]` struct.
 ///
@@ -54,6 +55,24 @@ impl<C: Schema> SchemaConfigBuilder<C> {
     /// [`RuntimeBuilder::file_name`](crate::RuntimeBuilder::file_name).
     pub fn file_name(mut self, name: &str) -> Self {
         self.inner = self.inner.file_name(name);
+        self
+    }
+
+    /// Discover config files by stem across the enabled formats. See
+    /// [`RuntimeBuilder::file_stem`](crate::RuntimeBuilder::file_stem).
+    pub fn file_stem(mut self, stem: &str) -> Self {
+        self.inner = self.inner.file_stem(stem);
+        self
+    }
+
+    /// Set the ordered enabled-formats list. See
+    /// [`RuntimeBuilder::formats`](crate::RuntimeBuilder::formats).
+    pub fn formats<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inner = self.inner.formats(names);
         self
     }
 
@@ -164,19 +183,15 @@ impl<C: Schema + DeserializeOwned> SchemaConfigBuilder<C> {
     ///
     /// Conceptually the same as
     /// [`RuntimeBuilder::post_validate`](crate::RuntimeBuilder::post_validate)
-    /// — internally we deserialize the merged `toml::Table` into `C`
+    /// — internally we deserialize the merged value [`Map`] into `C`
     /// inside the runtime builder's hook so the user's closure stays
     /// typed.
     pub fn post_validate<F>(mut self, f: F) -> Self
     where
         F: Fn(&C) -> Result<(), String> + Send + Sync + 'static,
     {
-        self.inner = self.inner.post_validate(move |t: &Table| {
-            // Match `load()`'s datetime-safe round-trip — see
-            // `deserialize_table` for why try_into isn't enough.
-            let text = toml::to_string(&Value::Table(t.clone()))
-                .map_err(|e: toml::ser::Error| e.to_string())?;
-            let typed: C = toml::from_str(&text).map_err(|e: toml::de::Error| e.to_string())?;
+        self.inner = self.inner.post_validate(move |t: &Map| {
+            let typed: C = from_value(Value::Map(t.clone())).map_err(|e| e.to_string())?;
             f(&typed)
         });
         self
@@ -221,22 +236,11 @@ impl<C: Schema + DeserializeOwned> SchemaConfigBuilder<C> {
     }
 }
 
-fn deserialize_table<C: DeserializeOwned>(table: Table) -> Result<C, ClapfigError> {
-    // `toml::Value::try_into` goes through a value-tree deserializer that
-    // doesn't preserve `toml::value::Datetime`'s special-struct marker —
-    // a `Value::Datetime` in the table arrives at the field's
-    // `Deserialize` impl as a plain string and the deserialize fails with
-    // "expected a TOML datetime". Serializing back to text and re-parsing
-    // routes through the TOML lexer, which keeps datetimes typed all the
-    // way to the field. One extra alloc on load is fine; correctness
-    // wins.
-    let text = toml::to_string(&Value::Table(table)).map_err(|e: toml::ser::Error| {
-        ClapfigError::InvalidValue {
-            key: "<merged>".into(),
-            reason: e.to_string(),
-        }
-    })?;
-    toml::from_str(&text).map_err(|e: toml::de::Error| ClapfigError::InvalidValue {
+fn deserialize_table<C: DeserializeOwned>(table: Map) -> Result<C, ClapfigError> {
+    // The value model's serde bridge carries datetimes through its
+    // private marker struct, so this deserializes directly — no
+    // serialize-reparse round trip (the hack the owned model retired).
+    from_value(Value::Map(table)).map_err(|e| ClapfigError::InvalidValue {
         key: "<merged>".into(),
         reason: e.to_string(),
     })

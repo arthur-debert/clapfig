@@ -14,10 +14,9 @@
 
 use std::path::Path;
 
-use toml::Table;
-
 use crate::error::ClapfigError;
 use crate::runtime::{self, LeafType, Schema};
+use crate::value::{Map, Value};
 
 /// Borrowed, read-only view of a config schema node.
 ///
@@ -149,7 +148,7 @@ pub(crate) enum FieldKindRef<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct LeafRef<'a> {
     /// Default value for the leaf, when declared.
-    pub default: Option<&'a toml::Value>,
+    pub default: Option<&'a Value>,
     pub env: Option<&'a str>,
     pub optional: bool,
     /// Declared leaf type. Always present: every schema leaf carries an
@@ -162,7 +161,7 @@ pub(crate) struct LeafRef<'a> {
 impl<'a> LeafRef<'a> {
     /// Allowed-value constraint for the leaf: the value set of a
     /// [`LeafType::Enum`] leaf, `None` for every other leaf type.
-    pub fn allowed_values(&self) -> Option<&'a [toml::Value]> {
+    pub fn allowed_values(&self) -> Option<&'a [Value]> {
         match self.ty {
             LeafType::Enum { values } => Some(values.as_slice()),
             _ => None,
@@ -181,7 +180,7 @@ impl<'a> LeafRef<'a> {
 /// for consumers that need to walk the structure independently.
 pub(crate) trait ConfigSpec {
     /// The final, typed output produced by [`finalize`](Self::finalize).
-    /// `DynamicSpec` returns `toml::Table`.
+    /// `DynamicSpec` returns a value [`Map`].
     type Output;
 
     /// The schema as a borrowed view. Consumed by the env-layer
@@ -201,7 +200,7 @@ pub(crate) trait ConfigSpec {
     /// decisions surface as `ClapfigError::UnknownKeys`.
     fn validate_unknown(
         &self,
-        table: &Table,
+        table: &Map,
         source: &str,
         path: &Path,
         ctx: &crate::validate::ValidateContext<'_>,
@@ -211,8 +210,8 @@ pub(crate) trait ConfigSpec {
     ///
     /// Walks the schema and populates missing leaves from their `default`
     /// values directly into the table.
-    fn fill_defaults(&self, table: &mut Table) -> Result<(), ClapfigError>;
+    fn fill_defaults(&self, table: &mut Map) -> Result<(), ClapfigError>;
 
     /// Finalize a merged table into the spec's `Output`.
-    fn finalize(&self, merged: Table) -> Result<Self::Output, ClapfigError>;
+    fn finalize(&self, merged: Map) -> Result<Self::Output, ClapfigError>;
 }

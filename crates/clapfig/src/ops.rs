@@ -7,11 +7,13 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::error::ClapfigError;
+use crate::format::FormatAdapter;
+use crate::value::{Map, Value};
 
 /// Result of a config operation. Returned to the caller for display.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigResult {
-    /// A generated TOML template string.
+    /// A generated config template string, in the requested format.
     Template(String),
     /// Confirmation that a template was written to a file.
     TemplateWritten { path: PathBuf },
@@ -65,311 +67,67 @@ impl fmt::Display for ConfigResult {
     }
 }
 
-/// Rewrite snake_case keys to kebab-case in a generated TOML template.
+/// Recursively rewrite every field name in `schema` from snake_case to
+/// kebab-case, at every nesting depth (nested objects, array-of, map-of).
 ///
-/// Walks the template line by line and rewrites:
-/// - `[section]` / `[parent.section]` / `[[array]]` headers
-/// - `key = value` lines
-/// - `#key = value` commented-default lines (single or multi-hash prefix)
-///
-/// Doc-comment lines (a `#` followed by a space or end-of-line) and the
-/// value portion of any line are left untouched. The disambiguation between
-/// a doc comment and a commented-default line is the template convention
-/// used by [`generate_template_from_runtime`]: `# <text>` is documentation,
-/// `#key = ...` (no space after the hashes) is a commented key.
-fn rewrite_keys_to_kebab(template: &str) -> String {
-    let mut out = String::with_capacity(template.len());
-    let ends_with_newline = template.ends_with('\n');
-
-    for (i, line) in template.lines().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str(&rewrite_template_line(line));
-    }
-    if ends_with_newline {
-        out.push('\n');
-    }
-    out
+/// Only field NAMES change: docs, defaults, enum values, and leaf types
+/// pass through untouched, so prose and value text can never be
+/// accidentally rewritten. The renamed clone exists solely for template
+/// rendering — every adapter derives keys, section headers, comment keys,
+/// and assignment snippets from these names, which is what makes the
+/// rename format-agnostic where a textual rewrite could not be.
+fn kebab_renamed(schema: &crate::runtime::Schema) -> crate::runtime::Schema {
+    let mut renamed = schema.clone();
+    kebab_rename_fields(&mut renamed);
+    renamed
 }
 
-fn rewrite_template_line(line: &str) -> String {
-    let indent_len = line.len() - line.trim_start().len();
-    let indent = &line[..indent_len];
-    let stripped = &line[indent_len..];
-
-    // [[array.of.tables]] — must be checked before [section] since the
-    // shorter prefix `[` is a substring of `[[`.
-    if let Some(rest) = stripped.strip_prefix("[[")
-        && let Some(end) = rest.find("]]")
-    {
-        let name = rest[..end].trim();
-        let tail = &rest[end + 2..];
-        return format!("{indent}[[{}]]{tail}", swap_underscores_to_dashes(name));
-    }
-
-    // [section] / [parent.section]
-    if let Some(rest) = stripped.strip_prefix('[')
-        && let Some(end) = rest.find(']')
-    {
-        let name = rest[..end].trim();
-        let tail = &rest[end + 1..];
-        return format!("{indent}[{}]{tail}", swap_underscores_to_dashes(name));
-    }
-
-    // Commented-out key (#key = ...) vs. doc comment (# <text>).
-    let (hashes, body) = if stripped.starts_with('#') {
-        let count = stripped.bytes().take_while(|&b| b == b'#').count();
-        let after = &stripped[count..];
-        // Template convention: hashes + whitespace (or EOL) = doc comment;
-        // hashes + bareword = commented-out default. Only rewrite the latter.
-        if after.is_empty() || after.starts_with(|c: char| c.is_whitespace()) {
-            return line.to_string();
+fn kebab_rename_fields(schema: &mut crate::runtime::Schema) {
+    use crate::runtime::Field;
+    for nf in &mut schema.fields {
+        if nf.name.contains('_') {
+            nf.name = nf.name.replace('_', "-");
         }
-        (&stripped[..count], after)
-    } else {
-        ("", stripped)
-    };
-
-    // Plain or commented "key = value" line.
-    if let Some(eq_idx) = body.find('=') {
-        let key_part = &body[..eq_idx];
-        let key_trimmed = key_part.trim();
-        if is_bareword_dotted_key(key_trimmed) {
-            // Preserve whitespace around the key exactly.
-            let leading_ws_in_key = &key_part[..key_part.len() - key_part.trim_start().len()];
-            let trailing_ws_in_key = &key_part[leading_ws_in_key.len() + key_trimmed.len()..];
-            let rest = &body[eq_idx..];
-            return format!(
-                "{indent}{hashes}{leading_ws_in_key}{}{trailing_ws_in_key}{rest}",
-                swap_underscores_to_dashes(key_trimmed),
-            );
+        match &mut nf.field {
+            Field::Nested(child) | Field::ArrayOf(child) | Field::MapOf(child) => {
+                kebab_rename_fields(child);
+            }
+            Field::Leaf(_) => {}
         }
     }
-
-    line.to_string()
 }
 
-fn is_bareword_dotted_key(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-}
-
-fn swap_underscores_to_dashes(dotted: &str) -> String {
-    if !dotted.contains('_') {
-        return dotted.to_string();
-    }
-    dotted.replace('_', "-")
-}
-
-/// Template generator: walks a runtime [`Schema`] and emits a commented
-/// TOML template.
+/// Template generator: renders the documented config template for a
+/// schema through the given format adapter. With `kebab` set, the schema's
+/// field names are structurally renamed to kebab-case first (see
+/// [`kebab_renamed`]) so the rendered keys — in any format — match what a
+/// `normalize_keys(true)` builder accepts.
 ///
-/// - Top-level `///`-equivalent doc lines render as `# <line>` at file head.
-/// - Each leaf field renders its doc lines as `# <line>`, then either
-///   `key = <default>` when a default is set, or `#key = <type-hint>` when
-///   the field is required / has no default.
-/// - Enum leaves get an extra `# Allowed: "a" | "b" | "c"` line so users
-///   don't have to look the set up elsewhere.
-/// - Nested sections render as `[parent.child]` headers; array-of-objects
-///   render as `[[parent.child]]`.
-/// - `kebab=true` applies the [`rewrite_keys_to_kebab`] rewriter, so
-///   the rendered template matches what a `normalize_keys(true)` builder
-///   accepts.
-///
-/// [`Schema`]: crate::runtime::Schema
-pub(crate) fn generate_template_from_runtime(
+/// The template body — doc comments, `Allowed:` enum lines, commented
+/// placeholders for defaultless leaves — is the adapter's
+/// [`template`](crate::format::FormatAdapter::template) output; this
+/// function is the routing seam every template consumer (`config gen`,
+/// file seeding) goes through.
+pub(crate) fn generate_template(
+    adapter: &dyn FormatAdapter,
     schema: &crate::runtime::Schema,
     kebab: bool,
-) -> String {
-    use std::fmt::Write;
-
-    let mut out = String::new();
-    for line in &schema.doc {
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
-            out.push_str("#\n");
-        } else {
-            let _ = writeln!(out, "# {trimmed}");
-        }
-    }
-    if !schema.doc.is_empty() {
-        out.push('\n');
-    }
-    emit_schema(&mut out, schema, "");
-
-    if kebab {
-        rewrite_keys_to_kebab(&out)
+) -> Result<String, ClapfigError> {
+    Ok(if kebab {
+        adapter.template(&kebab_renamed(schema))?
     } else {
-        out
-    }
-}
-
-fn emit_schema(out: &mut String, schema: &crate::runtime::Schema, prefix: &str) {
-    use crate::runtime::Field;
-    use std::fmt::Write;
-
-    // TOML rule: once a [section] header is emitted, every following key
-    // belongs to that section until the next header. Emit local leaves
-    // first, then sections — otherwise a sibling leaf declared after a
-    // nested field in the schema would land inside the wrong section.
-    for nf in &schema.fields {
-        let Field::Leaf(leaf) = &nf.field else {
-            continue;
-        };
-        for line in &leaf.doc {
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                out.push_str("#\n");
-            } else {
-                let _ = writeln!(out, "# {trimmed}");
-            }
-        }
-        if let crate::runtime::LeafType::Enum { values } = &leaf.ty {
-            let listed = values
-                .iter()
-                .map(format_inline_toml)
-                .collect::<Vec<_>>()
-                .join(" | ");
-            let _ = writeln!(out, "# Allowed: {listed}");
-        }
-        if matches!(&leaf.ty, crate::runtime::LeafType::Value) {
-            let _ = writeln!(out, "# Accepts: any TOML value");
-        }
-        match &leaf.default {
-            Some(value) => {
-                let _ = writeln!(out, "{} = {}", nf.name, format_inline_toml(value));
-            }
-            None => {
-                let hint = leaf.ty.template_placeholder();
-                let _ = writeln!(out, "#{} = {hint}", nf.name);
-            }
-        }
-        out.push('\n');
-    }
-
-    for nf in &schema.fields {
-        match &nf.field {
-            Field::Leaf(_) => {} // already emitted above
-            Field::Nested(child) => {
-                let path = if prefix.is_empty() {
-                    nf.name.clone()
-                } else {
-                    format!("{prefix}.{}", nf.name)
-                };
-                for line in &child.doc {
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        out.push_str("#\n");
-                    } else {
-                        let _ = writeln!(out, "# {trimmed}");
-                    }
-                }
-                let _ = writeln!(out, "[{path}]");
-                emit_schema(out, child, &path);
-            }
-            Field::ArrayOf(child) => {
-                let path = if prefix.is_empty() {
-                    nf.name.clone()
-                } else {
-                    format!("{prefix}.{}", nf.name)
-                };
-                for line in &child.doc {
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        out.push_str("#\n");
-                    } else {
-                        let _ = writeln!(out, "# {trimmed}");
-                    }
-                }
-                // Array-of-objects is rendered commented — clapfig can't
-                // know how many entries the user wants; show one example.
-                let _ = writeln!(out, "#[[{path}]]");
-                let mut buf = String::new();
-                emit_schema(&mut buf, child, &path);
-                for line in buf.lines() {
-                    if line.is_empty() {
-                        out.push('\n');
-                    } else {
-                        let _ = writeln!(out, "#{line}");
-                    }
-                }
-            }
-            Field::MapOf(child) => {
-                let path = if prefix.is_empty() {
-                    nf.name.clone()
-                } else {
-                    format!("{prefix}.{}", nf.name)
-                };
-                for line in &child.doc {
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        out.push_str("#\n");
-                    } else {
-                        let _ = writeln!(out, "# {trimmed}");
-                    }
-                }
-                // Map-of-objects: entry keys are user-supplied so emit a
-                // commented example using a placeholder entry name.
-                let _ = writeln!(out, "#[{path}.<key>]");
-                let mut buf = String::new();
-                emit_schema(&mut buf, child, &format!("{path}.<key>"));
-                for line in buf.lines() {
-                    if line.is_empty() {
-                        out.push('\n');
-                    } else {
-                        let _ = writeln!(out, "#{line}");
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Format a `toml::Value` as it would appear inline in a TOML file (no
-/// surrounding whitespace, no trailing newline).
-fn format_inline_toml(value: &toml::Value) -> String {
-    // toml::to_string handles inline encoding for primitives correctly;
-    // for arrays/tables it produces a TOML fragment we trim.
-    toml::to_string(&toml::Value::Table({
-        let mut t = toml::Table::new();
-        t.insert("v".into(), value.clone());
-        t
-    }))
-    .map(|s| {
-        // Output looks like `v = <inline>\n`. Strip the `v = ` prefix.
-        let trimmed = s.trim_end();
-        trimmed
-            .strip_prefix("v = ")
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| trimmed.to_string())
+        adapter.template(schema)?
     })
-    .unwrap_or_else(|_| format!("{value:?}"))
-}
-
-impl crate::runtime::LeafType {
-    /// Single-word placeholder rendered in a commented-out template line
-    /// for a leaf without a default, hinting the expected value shape.
-    pub(crate) fn template_placeholder(&self) -> &'static str {
-        match self {
-            crate::runtime::LeafType::String => "\"\"",
-            crate::runtime::LeafType::Integer => "0",
-            crate::runtime::LeafType::Float => "0.0",
-            crate::runtime::LeafType::Bool => "false",
-            crate::runtime::LeafType::DateTime => "1970-01-01T00:00:00Z",
-            crate::runtime::LeafType::Array(_) => "[]",
-            crate::runtime::LeafType::Map(_) => "{}",
-            crate::runtime::LeafType::Enum { .. } => "\"\"",
-            crate::runtime::LeafType::Value => "\"\"",
-        }
-    }
 }
 
 /// List entries from a single scope's config file (raw file content, not merged).
 ///
-/// If the file does not exist, returns an empty listing.
-pub fn list_scope_file(file_path: &Path) -> Result<ConfigResult, ClapfigError> {
+/// The file is parsed through `adapter` — the routing seam for scoped
+/// reads. If the file does not exist, returns an empty listing.
+pub(crate) fn list_scope_file(
+    adapter: &dyn FormatAdapter,
+    file_path: &Path,
+) -> Result<ConfigResult, ClapfigError> {
     let content = match std::fs::read_to_string(file_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -385,23 +143,34 @@ pub fn list_scope_file(file_path: &Path) -> Result<ConfigResult, ClapfigError> {
         }
     };
 
-    let table: toml::Table =
-        content
-            .parse()
-            .map_err(|e: toml::de::Error| ClapfigError::ParseError {
-                path: file_path.to_path_buf(),
-                source: Box::new(e),
-                source_text: Some(std::sync::Arc::from(content.as_str())),
-            })?;
+    let parsed = adapter
+        .parse(&content)
+        .map_err(|e| ClapfigError::ParseError {
+            path: file_path.to_path_buf(),
+            source: Box::new(e),
+            source_text: Some(std::sync::Arc::from(content.as_str())),
+        })?;
+    let table = match parsed {
+        Value::Map(map) => map,
+        other => {
+            return Err(ClapfigError::InvalidValue {
+                key: file_path.display().to_string(),
+                reason: format!(
+                    "config documents must be maps at the root, got {}",
+                    other.type_str()
+                ),
+            });
+        }
+    };
 
     let mut entries = Vec::new();
-    flatten_toml_table(&table, "", &mut entries);
+    flatten_value_map(&table, "", &mut entries);
 
     Ok(ConfigResult::Listing { entries })
 }
 
-/// Recursively flatten a TOML table into dotted key-value pairs.
-fn flatten_toml_table(table: &toml::Table, prefix: &str, entries: &mut Vec<(String, String)>) {
+/// Recursively flatten a value map into dotted key-value pairs.
+fn flatten_value_map(table: &Map, prefix: &str, entries: &mut Vec<(String, String)>) {
     for (key, value) in table {
         let full_key = if prefix.is_empty() {
             key.clone()
@@ -409,14 +178,14 @@ fn flatten_toml_table(table: &toml::Table, prefix: &str, entries: &mut Vec<(Stri
             format!("{prefix}.{key}")
         };
         match value {
-            toml::Value::Table(t) => flatten_toml_table(t, &full_key, entries),
+            Value::Map(t) => flatten_value_map(t, &full_key, entries),
             _ => entries.push((full_key, format_value(value))),
         }
     }
 }
 
-/// Navigate a `toml::Table` by dotted key path (e.g. `"database.url"`).
-pub fn table_get<'a>(table: &'a toml::Table, dotted_key: &str) -> Option<&'a toml::Value> {
+/// Navigate a value [`Map`] by dotted key path (e.g. `"database.url"`).
+pub(crate) fn table_get<'a>(table: &'a Map, dotted_key: &str) -> Option<&'a Value> {
     let (path, leaf) = match dotted_key.rsplit_once('.') {
         Some((p, l)) => (Some(p), l),
         None => (None, dotted_key),
@@ -426,7 +195,7 @@ pub fn table_get<'a>(table: &'a toml::Table, dotted_key: &str) -> Option<&'a tom
         Some(path) => {
             let mut current = table;
             for segment in path.split('.') {
-                current = current.get(segment)?.as_table()?;
+                current = current.get(segment)?.as_map()?;
             }
             current
         }
@@ -436,16 +205,15 @@ pub fn table_get<'a>(table: &'a toml::Table, dotted_key: &str) -> Option<&'a tom
     tbl.get(leaf)
 }
 
-/// Format a TOML value for display.
-fn format_value(value: &toml::Value) -> String {
+/// Format a config value for display in listings and `config get` output.
+fn format_value(value: &Value) -> String {
     match value {
-        toml::Value::String(s) => s.clone(),
-        toml::Value::Integer(i) => i.to_string(),
-        toml::Value::Float(f) => f.to_string(),
-        toml::Value::Boolean(b) => b.to_string(),
-        toml::Value::Array(a) => toml::to_string(&a).unwrap_or_else(|_| format!("{a:?}")),
-        toml::Value::Table(t) => toml::to_string(&t).unwrap_or_else(|_| format!("{t:?}")),
-        _ => format!("{value:?}"),
+        Value::String(s) => s.clone(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Datetime(d) => crate::value::lexical_string(d),
+        Value::Array(_) | Value::Map(_) => value.to_string(),
     }
 }
 
@@ -453,6 +221,11 @@ fn format_value(value: &toml::Value) -> String {
 mod tests {
     use super::*;
     use crate::fixtures::test::test_schema;
+    use crate::format::TomlAdapter;
+
+    fn generate_template_from_runtime(schema: &crate::runtime::Schema, kebab: bool) -> String {
+        generate_template(&TomlAdapter, schema, kebab).unwrap()
+    }
 
     #[test]
     fn generate_template_contains_keys() {
@@ -503,89 +276,97 @@ mod tests {
         assert!(!raw.contains("pool-size"));
     }
 
-    // -- rewrite_keys_to_kebab unit tests -----------------------------------
+    // -- kebab rename (structural, format-agnostic) -------------------------
 
     #[test]
-    fn rewriter_handles_section_headers() {
-        let input = "[my_section]\n[parent.my_child]\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert!(out.contains("[my-section]"));
-        assert!(out.contains("[parent.my-child]"));
+    fn kebab_rename_leaves_values_and_prose_alone() {
+        // Only field NAMES are renamed — a string default keeps its
+        // underscores, and doc prose mentioning the snake form survives.
+        use crate::runtime::{Field as RtField, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .field(
+                "db_url",
+                RtField::string()
+                    .doc("Set db_url to a postgres URL.")
+                    .default("postgres://my_user@host"),
+            )
+            .build();
+        let template = generate_template(&TomlAdapter, &schema, true).unwrap();
+        assert!(template.contains("db-url = "), "{template}");
+        assert!(
+            template.contains(r#""postgres://my_user@host""#),
+            "{template}"
+        );
+        assert!(
+            template.contains("Set db_url to a postgres URL."),
+            "{template}"
+        );
     }
 
     #[test]
-    fn rewriter_handles_array_of_tables_headers() {
-        let input = "[[my_list]]\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, "[[my-list]]\n");
+    fn kebab_renames_toml_section_headers_and_commented_defaults() {
+        // Nested objects become renamed [section] headers; a defaultless
+        // leaf's commented placeholder carries the renamed key too.
+        use crate::runtime::{Field as RtField, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .nested(
+                "my_section",
+                RtSchema::object("Section").field("api_key", RtField::string()),
+            )
+            .build();
+        let template = generate_template(&TomlAdapter, &schema, true).unwrap();
+        assert!(template.contains("[my-section]"), "{template}");
+        assert!(template.contains("#api-key"), "{template}");
+        assert!(!template.contains('_'), "no snake leak:\n{template}");
     }
 
     #[test]
-    fn rewriter_handles_commented_default_keys() {
-        let input = "#pool_size = 10\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, "#pool-size = 10\n");
-    }
-
-    #[test]
-    fn rewriter_handles_uncommented_keys() {
-        let input = "pool_size = 10\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, "pool-size = 10\n");
-    }
-
-    #[test]
-    fn rewriter_skips_doc_comments() {
-        // `#` followed by a space is a doc comment in the template
-        // convention — any `_` in prose must survive the rewriter untouched.
-        let input = "# Set pool_size to a positive integer.\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, input);
-    }
-
-    #[test]
-    fn rewriter_leaves_value_underscores_alone() {
-        // Underscores in the value portion (e.g. inside string defaults)
-        // must not be touched — only the key gets rewritten.
-        let input = r#"db_url = "postgres://my_user@host""#.to_string() + "\n";
-        let out = rewrite_keys_to_kebab(&input);
-        assert!(out.contains("db-url = "));
-        assert!(out.contains(r#""postgres://my_user@host""#));
-    }
-
-    #[test]
-    fn rewriter_preserves_blank_lines() {
-        let input = "key_one = 1\n\nkey_two = 2\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, "key-one = 1\n\nkey-two = 2\n");
-    }
-
-    #[test]
-    fn rewriter_preserves_trailing_newline_absence() {
-        // If the original lacks a trailing newline, the rewritten output
-        // shouldn't sprout one.
-        let input = "pool_size = 10";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, "pool-size = 10");
+    fn kebab_renames_json_template_keys_at_every_depth() {
+        // The rename is structural, so it reaches JSON object keys, the
+        // "//field" comment keys, and the assignment snippet inside a
+        // defaultless field's comment — none of which a TOML-line textual
+        // rewrite could see.
+        use crate::format::json::JsonAdapter;
+        use crate::runtime::{Field as RtField, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .field("api_key", RtField::string().doc("Required API key."))
+            .nested(
+                "my_section",
+                RtSchema::object("Section").field("pool_size", RtField::integer().default(5i64)),
+            )
+            .build();
+        let template = generate_template(&JsonAdapter, &schema, true).unwrap();
+        assert!(template.contains(r#""//api-key""#), "{template}");
+        assert!(
+            template.contains(r#"\"api-key\": \"\""#),
+            "snippet:\n{template}"
+        );
+        assert!(template.contains(r#""my-section""#), "{template}");
+        assert!(template.contains(r#""pool-size": 5"#), "{template}");
+        assert!(!template.contains("api_key"), "no snake leak:\n{template}");
+        assert!(
+            !template.contains("pool_size"),
+            "no snake leak:\n{template}"
+        );
     }
 
     #[test]
     fn table_get_flat() {
-        let table: toml::Table = toml::from_str("port = 8080").unwrap();
+        let table = crate::fixtures::test::parse_toml("port = 8080");
         let val = table_get(&table, "port").unwrap();
         assert_eq!(val.as_integer().unwrap(), 8080);
     }
 
     #[test]
     fn table_get_nested() {
-        let table: toml::Table = toml::from_str("[database]\npool_size = 5").unwrap();
+        let table = crate::fixtures::test::parse_toml("[database]\npool_size = 5");
         let val = table_get(&table, "database.pool_size").unwrap();
         assert_eq!(val.as_integer().unwrap(), 5);
     }
 
     #[test]
     fn table_get_missing() {
-        let table: toml::Table = toml::from_str("port = 8080").unwrap();
+        let table = crate::fixtures::test::parse_toml("port = 8080");
         assert!(table_get(&table, "nope").is_none());
     }
 
@@ -609,7 +390,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "port = 3000\nhost = \"localhost\"\n").unwrap();
 
-        let result = list_scope_file(&path).unwrap();
+        let result = list_scope_file(&TomlAdapter, &path).unwrap();
         match result {
             ConfigResult::Listing { entries } => {
                 assert_eq!(entries.len(), 2);
@@ -626,7 +407,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[database]\npool_size = 10\nurl = \"pg://\"\n").unwrap();
 
-        let result = list_scope_file(&path).unwrap();
+        let result = list_scope_file(&TomlAdapter, &path).unwrap();
         match result {
             ConfigResult::Listing { entries } => {
                 assert!(entries.contains(&("database.pool_size".into(), "10".into())));
@@ -641,7 +422,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.toml");
 
-        let result = list_scope_file(&path).unwrap();
+        let result = list_scope_file(&TomlAdapter, &path).unwrap();
         match result {
             ConfigResult::Listing { entries } => assert!(entries.is_empty()),
             other => panic!("Expected empty Listing, got {other:?}"),

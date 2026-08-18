@@ -2,7 +2,7 @@
 //! `#[derive(clapfig::Schema)]` proc macro.
 //!
 //! The runtime-side [`Schema`](crate::runtime::Schema) holds owned
-//! `String` / `Vec` / `toml::Value` data. That shape is convenient for a
+//! `String` / `Vec` / [`Value`](crate::value::Value) data. That shape is convenient for a
 //! builder-built schema but unfit for a `const SCHEMA: ... = ...` form, so
 //! the macro emits a parallel tree whose every field is `&'static`. At
 //! first call, [`Schema::schema`] caches a converted
@@ -17,7 +17,7 @@ use crate::runtime::{
     Field as RuntimeField, Leaf as RuntimeLeaf, LeafType as RuntimeLeafType,
     NamedField as RuntimeNamedField, Schema as RuntimeSchema,
 };
-use toml::Value as TomlValue;
+use crate::value::Value;
 
 /// `const`-friendly mirror of [`runtime::Schema`](crate::runtime::Schema).
 ///
@@ -130,10 +130,11 @@ pub enum LeafTypeStatic {
     Value,
 }
 
-/// `const`-friendly mirror of `toml::Value` for default-value emission.
+/// `const`-friendly mirror of [`Value`] for default-value emission.
 ///
 /// Datetimes are stored as their string form and parsed on conversion,
-/// since `toml::value::Datetime` is not `const`-constructible.
+/// since the owned [`Datetime`](crate::value::Datetime) is not
+/// `const`-constructible.
 #[derive(Debug)]
 pub enum ValueStatic {
     String(&'static str),
@@ -193,7 +194,7 @@ impl FieldStatic {
                     values: s
                         .enum_variants
                         .iter()
-                        .map(|v| TomlValue::String((*v).to_string()))
+                        .map(|v| Value::String((*v).to_string()))
                         .collect(),
                 },
                 default: None,
@@ -212,7 +213,7 @@ impl LeafStatic {
         RuntimeLeaf {
             doc: self.doc.iter().map(|s| (*s).to_string()).collect(),
             ty: self.ty.to_runtime(),
-            default: self.default.as_ref().map(ValueStatic::to_toml),
+            default: self.default.as_ref().map(ValueStatic::to_value),
             optional: self.optional,
             env: self.env.map(|s| s.to_string()),
         }
@@ -230,7 +231,7 @@ impl LeafTypeStatic {
             LeafTypeStatic::Array(elem) => RuntimeLeafType::Array(Box::new(elem.to_runtime())),
             LeafTypeStatic::Map(v) => RuntimeLeafType::Map(Box::new(v.to_runtime())),
             LeafTypeStatic::Enum { values } => RuntimeLeafType::Enum {
-                values: values.iter().map(ValueStatic::to_toml).collect(),
+                values: values.iter().map(ValueStatic::to_value).collect(),
             },
             LeafTypeStatic::EnumRef { schema, field_name } => {
                 // Deferred enum-kind check. The macro can't syntactically
@@ -264,7 +265,7 @@ impl LeafTypeStatic {
                     values: schema
                         .enum_variants
                         .iter()
-                        .map(|v| TomlValue::String((*v).to_string()))
+                        .map(|v| Value::String((*v).to_string()))
                         .collect(),
                 }
             }
@@ -274,25 +275,25 @@ impl LeafTypeStatic {
 }
 
 impl ValueStatic {
-    pub fn to_toml(&self) -> TomlValue {
+    pub fn to_value(&self) -> Value {
         match self {
-            ValueStatic::String(s) => TomlValue::String((*s).to_string()),
-            ValueStatic::Integer(i) => TomlValue::Integer(*i),
-            ValueStatic::Float(f) => TomlValue::Float(*f),
-            ValueStatic::Bool(b) => TomlValue::Boolean(*b),
-            ValueStatic::Datetime(s) => TomlValue::Datetime(
+            ValueStatic::String(s) => Value::String((*s).to_string()),
+            ValueStatic::Integer(i) => Value::Integer(*i),
+            ValueStatic::Float(f) => Value::Float(*f),
+            ValueStatic::Bool(b) => Value::Boolean(*b),
+            ValueStatic::Datetime(s) => Value::Datetime(
                 s.parse()
                     .expect("clapfig: invalid datetime literal in static schema default"),
             ),
             ValueStatic::Array(items) => {
-                TomlValue::Array(items.iter().map(ValueStatic::to_toml).collect())
+                Value::Array(items.iter().map(ValueStatic::to_value).collect())
             }
             ValueStatic::Table(entries) => {
-                let mut t = toml::map::Map::new();
+                let mut t = crate::value::Map::new();
                 for (k, v) in entries.iter() {
-                    t.insert((*k).to_string(), v.to_toml());
+                    t.insert((*k).to_string(), v.to_value());
                 }
-                TomlValue::Table(t)
+                Value::Map(t)
             }
         }
     }
@@ -451,7 +452,7 @@ mod tests {
         match &s.fields[0].field {
             RuntimeField::Leaf(leaf) => {
                 assert!(matches!(leaf.ty, RuntimeLeafType::Integer));
-                assert_eq!(leaf.default, Some(TomlValue::Integer(8080)));
+                assert_eq!(leaf.default, Some(Value::Integer(8080)));
                 assert!(!leaf.optional);
             }
             other => panic!("expected Leaf, got {other:?}"),
@@ -465,12 +466,12 @@ mod tests {
             ValueStatic::String("b"),
             ValueStatic::Integer(1),
         ]);
-        let toml = v.to_toml();
-        match toml {
-            TomlValue::Array(items) => {
+        let value = v.to_value();
+        match value {
+            Value::Array(items) => {
                 assert_eq!(items.len(), 3);
-                assert_eq!(items[0], TomlValue::String("a".into()));
-                assert_eq!(items[2], TomlValue::Integer(1));
+                assert_eq!(items[0], Value::String("a".into()));
+                assert_eq!(items[2], Value::Integer(1));
             }
             other => panic!("expected Array, got {other:?}"),
         }
@@ -482,12 +483,12 @@ mod tests {
             ("name", ValueStatic::String("x")),
             ("count", ValueStatic::Integer(3)),
         ]);
-        match v.to_toml() {
-            TomlValue::Table(t) => {
+        match v.to_value() {
+            Value::Map(t) => {
                 assert_eq!(t.get("name").unwrap().as_str(), Some("x"));
                 assert_eq!(t.get("count").unwrap().as_integer(), Some(3));
             }
-            other => panic!("expected Table, got {other:?}"),
+            other => panic!("expected Map, got {other:?}"),
         }
     }
 
@@ -504,7 +505,7 @@ mod tests {
         match lt.to_runtime() {
             RuntimeLeafType::Enum { values } => {
                 assert_eq!(values.len(), 4);
-                assert_eq!(values[0], TomlValue::String("debug".into()));
+                assert_eq!(values[0], Value::String("debug".into()));
             }
             other => panic!("expected Enum, got {other:?}"),
         }
@@ -565,8 +566,8 @@ mod tests {
             RuntimeField::Leaf(leaf) => match &leaf.ty {
                 RuntimeLeafType::Enum { values } => {
                     assert_eq!(values.len(), 2);
-                    assert_eq!(values[0], TomlValue::String("a4".into()));
-                    assert_eq!(values[1], TomlValue::String("letter".into()));
+                    assert_eq!(values[0], Value::String("a4".into()));
+                    assert_eq!(values[1], Value::String("letter".into()));
                 }
                 other => panic!("expected Enum, got {other:?}"),
             },
