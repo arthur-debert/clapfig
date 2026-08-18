@@ -106,15 +106,22 @@ use syn::{
 ///   no explicit rename through a serde-compatible rule (`lowercase`,
 ///   `UPPERCASE`, `PascalCase`, `camelCase`, `snake_case`,
 ///   `SCREAMING_SNAKE_CASE`, `kebab-case`, `SCREAMING-KEBAB-CASE`; any
-///   other rule is a derive-time error). `#[serde(rename_all = "rule")]`
-///   alone also works, and serde's directional
-///   `rename_all(deserialize = "rule", ...)` form contributes its
-///   `deserialize` rule (a serialize-only `rename_all(serialize = ...)`
-///   is accepted and leaves the schema on the Rust identifiers, matching
-///   serde). If both spellings are present they must name the same rule —
-///   a differing pair is a derive-time error. The conversion is
-///   serde-exact (`serde_derive`'s `RenameRule::apply_to_field`), so the
-///   schema's names are identical to what serde's deserialize expects;
+///   other rule is a derive-time error). Like `#[clapfig(rename)]`, the
+///   clapfig spelling converts the *schema only* — the macro cannot
+///   change serde's separately generated `Deserialize` impl, so on a
+///   typed struct the clapfig spelling alone makes validation accept
+///   converted keys that serde's deserialize then fails to find. For
+///   typed configurations use `#[serde(rename_all = "rule")]` (or pair
+///   both attributes with the same rule); the clapfig spelling on its
+///   own is for schema-only types that don't derive `Deserialize`.
+///   Serde's directional `rename_all(deserialize = "rule", ...)` form
+///   contributes its `deserialize` rule (a serialize-only
+///   `rename_all(serialize = ...)` is accepted and leaves the schema on
+///   the Rust identifiers, matching serde). If both spellings are
+///   present they must name the same rule — a differing pair is a
+///   derive-time error. The conversion is serde-exact (`serde_derive`'s
+///   `RenameRule::apply_to_field`), so the schema's names are identical
+///   to serde's converted deserialize names;
 ///   explicit field renames win over the rule, and the duplicate-name /
 ///   rename-conflict diagnostics apply to the converted names. Note that
 ///   a `kebab-case` schema is incompatible with the builder's
@@ -153,9 +160,10 @@ use syn::{
 ///
 /// `rename_all` (clapfig or serde spelling, including serde's directional
 /// `rename_all(deserialize = "...")` form) rewrites field names on structs
-/// and variant names on unit-only enums, keeping the schema identical to
-/// what serde's deserialize expects; see *Struct attributes* for the rule
-/// set and precedence.
+/// and variant names on unit-only enums. The serde spelling (or a
+/// matching pair) keeps the schema identical to what serde's deserialize
+/// expects; the clapfig spelling alone converts only the schema. See
+/// *Struct attributes* for the rule set and precedence.
 #[proc_macro_derive(Schema, attributes(clapfig))]
 pub fn derive_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -203,9 +211,12 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
                 // Struct-level `rename_all` (either spelling, serde's
                 // directional `rename_all(deserialize = "...")` included):
                 // schema field names follow serde's converted spelling, so
-                // the schema and serde's deserialize agree on one set of
-                // names. A differing clapfig/serde pair is a hard error —
-                // same contract as field-level renames.
+                // with the serde attribute (or a matching pair) the schema
+                // and serde's deserialize agree on one set of names. The
+                // clapfig spelling alone converts only the schema — the
+                // macro can't touch serde's generated `Deserialize`. A
+                // differing clapfig/serde pair is a hard error — same
+                // contract as field-level renames.
                 let serde_rename_all = find_serde_string_meta(&input.attrs, "rename_all");
                 let rename_all = match (&struct_attrs.rename_all, &serde_rename_all) {
                     (Some(c), Some(s)) if c != s => {
@@ -910,10 +921,11 @@ struct StructAttrs {
     strict: Option<bool>,
     /// `#[clapfig(rename_all = "...")]` — rewrites every field name of a
     /// struct (fields without an explicit rename) or every variant of a
-    /// unit-only enum, with serde-exact conversion semantics so the schema
-    /// and serde's deserialize agree on the converted spellings. On
-    /// structs a serde spelling that names a different rule is a
-    /// derive-time error; on enums the clapfig spelling wins.
+    /// unit-only enum, with serde-exact conversion semantics. Schema-side
+    /// only: pairing it with the same serde rule is what makes serde's
+    /// deserialize agree on the converted spellings. On structs a serde
+    /// spelling that names a different rule is a derive-time error; on
+    /// enums the clapfig spelling wins.
     rename_all: Option<String>,
 }
 

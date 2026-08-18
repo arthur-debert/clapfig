@@ -407,7 +407,8 @@ fn serialize_only_rename_all_is_accepted_and_inert() {
 }
 
 /// The clapfig spelling works alone — the schema-only case, no serde
-/// derive involved.
+/// derive involved. This is the spelling's intended use: it converts the
+/// *schema only* and cannot change a serde-generated `Deserialize`.
 #[derive(Schema, Debug)]
 #[clapfig(rename_all = "camelCase")]
 struct ClapfigSpelling {
@@ -421,7 +422,41 @@ fn clapfig_rename_all_spelling_converts_field_names() {
     assert_eq!(s.fields[0].name, "connectTimeout");
 }
 
-/// Both spellings naming the same rule agree — no conflict.
+/// The clapfig spelling on a struct that ALSO derives serde `Deserialize`
+/// (without the matching serde attribute): the schema converts but serde
+/// still expects the Rust identifiers, so a typed load of the converted
+/// spelling fails — the documented reason typed structs must use
+/// `#[serde(rename_all)]` (or a matching pair).
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
+#[clapfig(rename_all = "camelCase")]
+struct ClapfigOnlyTyped {
+    connect_timeout: u32,
+}
+
+#[test]
+fn clapfig_only_rule_on_typed_struct_converts_schema_but_not_deserialize() {
+    // The schema side converts...
+    let s = ClapfigOnlyTyped::schema_static();
+    assert_eq!(s.fields[0].name, "connectTimeout");
+    // ...but serde's generated Deserialize is untouched: validation
+    // accepts the converted spelling, then typed deserialization looks
+    // for `connect_timeout` and fails. Pinned so the docs' schema-only
+    // caveat can't drift from reality.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("test.toml"), "connectTimeout = 7\n").unwrap();
+    let result: Result<ClapfigOnlyTyped, _> = Clapfig::typed::<ClapfigOnlyTyped>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load();
+    assert!(
+        result.is_err(),
+        "clapfig-only rename_all must not make the typed path accept converted keys"
+    );
+}
+
+/// Both spellings naming the same rule agree — no conflict, and the pair
+/// is the documented way to keep the clapfig spelling on a typed struct.
 #[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
 #[clapfig(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
@@ -433,4 +468,17 @@ struct AgreeingPair {
 fn agreeing_clapfig_and_serde_rules_coexist() {
     let s = AgreeingPair::schema_static();
     assert_eq!(s.fields[0].name, "connectTimeout");
+}
+
+#[test]
+fn agreeing_pair_loads_converted_spelling_end_to_end() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("test.toml"), "connectTimeout = 7\n").unwrap();
+    let cfg: AgreeingPair = Clapfig::typed::<AgreeingPair>()
+        .app_name("test")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.connect_timeout, 7);
 }
