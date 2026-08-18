@@ -10,13 +10,15 @@
 //! name the operation actually attempted), key-spelling resolution under
 //! [`normalize_keys`](crate::RuntimeBuilder::normalize_keys) (dash and
 //! underscore spellings are equivalent; the spelling already present in
-//! the document is the one edited), and the file I/O around each edit.
+//! the document is the one edited, and a document holding both
+//! equivalent spellings errors as a collision rather than one spelling
+//! silently winning), and the file I/O around each edit.
 
 use std::path::Path;
 
 use crate::error::ClapfigError;
 use crate::format::{ConfigPath, FileEdit, FormatAdapter, Operation, SetTarget};
-use crate::normalize::{kebab_key, normalize_key};
+use crate::normalize::{KeyCollision, kebab_key, normalize_key, resolve_table_key};
 use crate::ops::ConfigResult;
 use crate::value::Value;
 
@@ -37,7 +39,12 @@ use crate::value::Value;
 /// and edited under the spelling actually present (so setting `pool_size`
 /// against a kebab-case document edits `pool-size` instead of creating a
 /// colliding sibling), and paths not present are emitted kebab-case —
-/// matching what `config gen` emits.
+/// matching what `config gen` emits. A document already holding BOTH
+/// equivalent spellings at a traversed table is ambiguous — such a file
+/// fails to load — so the edit fails with
+/// [`ClapfigError::NormalizedKeyCollision`] instead of silently picking
+/// one spelling (the I/O wrapper stamps the file path; from this pure
+/// function the error's path is empty).
 ///
 /// If `content` is `None` (file doesn't exist yet), starts from the
 /// adapter's generated template — rendered with the same `normalize_keys`
@@ -93,7 +100,8 @@ pub fn set_in_document_runtime(
             // cannot parse at all) surface as-is. The same parsed tree
             // resolves the concrete key spellings the edit targets.
             let tree = adapter.parse(c).map_err(ClapfigError::from)?;
-            let (segments, exists) = resolve_document_path(&tree, &canonical, normalize_keys);
+            let (segments, exists) = resolve_document_path(&tree, &canonical, normalize_keys)
+                .map_err(|c| c.into_error(Path::new("")))?;
             let target = if exists {
                 SetTarget::ExistingValue
             } else {
@@ -139,9 +147,29 @@ pub fn set_in_document_runtime(
         .map_err(ClapfigError::from)
 }
 
+/// Stamp `file_path` onto a collision error raised by a document-level
+/// (pure, pathless) persist function, so the reported error names the
+/// file actually edited — the same shape the load path reports.
+fn stamp_collision_path(err: ClapfigError, file_path: &Path) -> ClapfigError {
+    match err {
+        ClapfigError::NormalizedKeyCollision {
+            path,
+            section,
+            normalized_key,
+            originals,
+        } if path.as_os_str().is_empty() => ClapfigError::NormalizedKeyCollision {
+            path: file_path.to_path_buf(),
+            section,
+            normalized_key,
+            originals,
+        },
+        other => other,
+    }
+}
+
 /// Wrapper around [`set_in_document_runtime`] with file I/O: reads the file
 /// (if it exists), patches it, writes back. Creates parent directories if
-/// needed.
+/// needed. Collision errors from the document layer get this file's path.
 pub fn persist_value_runtime(
     adapter: &dyn FormatAdapter,
     schema: &crate::runtime::Schema,
@@ -168,7 +196,8 @@ pub fn persist_value_runtime(
         key,
         value,
         normalize_keys,
-    )?;
+    )
+    .map_err(|e| stamp_collision_path(e, file_path))?;
 
     if let Some(parent) = file_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
@@ -218,8 +247,11 @@ fn lookup_leaf_type<'a>(
 /// `normalize_keys`, the document is parsed first and the key is resolved
 /// by dash/underscore equivalence, so `unset pool_size` removes an
 /// existing `pool-size` entry (and vice versa) — parse failures propagate
-/// in that mode. Comment preservation is per the adapter's declared edit
-/// capability; adapter failures propagate as [`ClapfigError::Format`].
+/// in that mode, and a document holding both equivalent spellings fails
+/// with [`ClapfigError::NormalizedKeyCollision`] (empty path here; the
+/// I/O wrapper stamps the file) rather than removing one of two
+/// ambiguous entries. Comment preservation is per the adapter's declared
+/// edit capability; adapter failures propagate as [`ClapfigError::Format`].
 ///
 /// Returns the modified document string.
 pub fn unset_in_document(
@@ -230,7 +262,8 @@ pub fn unset_in_document(
 ) -> Result<String, ClapfigError> {
     let path = if normalize_keys {
         let tree = adapter.parse(content).map_err(ClapfigError::from)?;
-        let (segments, _) = resolve_document_path(&tree, &normalize_key(key), true);
+        let (segments, _) = resolve_document_path(&tree, &normalize_key(key), true)
+            .map_err(|c| c.into_error(Path::new("")))?;
         config_path(&segments)
     } else {
         dotted_config_path(key)
@@ -261,7 +294,8 @@ pub fn unset_value(
         }
     };
 
-    let new_content = unset_in_document(adapter, &content, key, normalize_keys)?;
+    let new_content = unset_in_document(adapter, &content, key, normalize_keys)
+        .map_err(|e| stamp_collision_path(e, file_path))?;
 
     std::fs::write(file_path, &new_content).map_err(|e| ClapfigError::IoError {
         path: file_path.to_path_buf(),
@@ -301,26 +335,29 @@ fn emitted_spelling(segment: &str, normalize_keys: bool) -> String {
 /// classification for a set against an existing file.
 ///
 /// With `normalize_keys`, each segment matches an existing key by
-/// dash/underscore equivalence (exact spelling preferred when both exist),
-/// so the edit lands on the spelling actually present instead of creating
-/// a colliding sibling; segments with no match resolve to their emitted
-/// (kebab-case) spelling. Without normalization, matching is exact and
-/// missing segments keep their canonical spelling.
+/// dash/underscore equivalence ([`resolve_table_key`]); a table holding
+/// more than one equivalent spelling (`pool-size` AND `pool_size`) is
+/// ambiguous and errors with [`KeyCollision`] — the same
+/// never-silently-compete rule the load path enforces, so an edit can
+/// never pick one spelling of a document the load path refuses. Segments
+/// with no match resolve to their emitted (kebab-case) spelling. Without
+/// normalization, matching is exact and missing segments keep their
+/// canonical spelling.
 fn resolve_document_path(
     tree: &Value,
     canonical: &str,
     normalize_keys: bool,
-) -> (Vec<String>, bool) {
+) -> Result<(Vec<String>, bool), KeyCollision> {
     let mut segments: Vec<String> = Vec::new();
     let mut current = Some(tree);
     let mut exists = true;
     for seg in canonical.split('.') {
         let matched = match current {
             Some(Value::Map(map)) => {
-                if map.contains_key(seg) {
+                if normalize_keys {
+                    resolve_table_key(map, seg, &segments.join("."))?.cloned()
+                } else if map.contains_key(seg) {
                     Some(seg.to_owned())
-                } else if normalize_keys {
-                    map.keys().find(|k| normalize_key(k) == seg).cloned()
                 } else {
                     None
                 }
@@ -342,7 +379,7 @@ fn resolve_document_path(
             }
         }
     }
-    (segments, exists)
+    Ok((segments, exists))
 }
 
 /// Build a structured [`ConfigPath`] from already-resolved path segments.
@@ -993,6 +1030,135 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Per-adapter document with BOTH spellings of the pool-size leaf —
+    /// a file the load path refuses as a NormalizedKeyCollision.
+    fn colliding_docs() -> [(&'static dyn FormatAdapter, &'static str); 3] {
+        [
+            (&TomlAdapter, "[database]\npool-size = 5\npool_size = 6\n"),
+            (&YamlAdapter, "database:\n  pool-size: 5\n  pool_size: 6\n"),
+            (
+                &JsonAdapter,
+                "{\n  \"database\": {\n    \"pool-size\": 5,\n    \"pool_size\": 6\n  }\n}\n",
+            ),
+        ]
+    }
+
+    /// Unwrap a persist error down to the collision, asserting its shape.
+    fn assert_collision(
+        result: Result<String, ClapfigError>,
+        section: &str,
+        normalized_key: &str,
+        originals: &[&str],
+        context: &str,
+    ) {
+        match result.unwrap_err() {
+            ClapfigError::NormalizedKeyCollision {
+                section: s,
+                normalized_key: n,
+                originals: o,
+                ..
+            } => {
+                assert_eq!(s, section, "{context}");
+                assert_eq!(n, normalized_key, "{context}");
+                assert_eq!(o, originals, "{context}");
+            }
+            other => panic!("{context}: expected NormalizedKeyCollision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalized_set_rejects_ambiguous_leaf_spellings() {
+        // A document holding BOTH equivalent spellings fails to load, so
+        // set must refuse with the same collision instead of silently
+        // editing one of the two entries and leaving the file unloadable.
+        for (adapter, doc) in colliding_docs() {
+            for action_key in ["database.pool-size", "database.pool_size"] {
+                let result = set_in_document_runtime(
+                    adapter,
+                    &test_schema(),
+                    Some(doc),
+                    action_key,
+                    "20",
+                    true,
+                );
+                assert_collision(
+                    result,
+                    "database",
+                    "pool_size",
+                    &["pool-size", "pool_size"],
+                    &format!("{} / {action_key}", adapter.name()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_set_rejects_ambiguous_intermediate_table() {
+        // The collision check runs at EVERY traversed table, not just the
+        // leaf: two spellings of an intermediate section are just as
+        // ambiguous. Section is empty for a root-level collision.
+        use crate::runtime::{Field, Schema};
+        let schema = Schema::object("T")
+            .nested(
+                "my_db",
+                Schema::object("D").field("size", Field::integer().optional()),
+            )
+            .build();
+        let doc = "[my-db]\nsize = 1\n\n[my_db]\nsize = 2\n";
+        let result =
+            set_in_document_runtime(&TomlAdapter, &schema, Some(doc), "my_db.size", "3", true);
+        assert_collision(result, "", "my_db", &["my-db", "my_db"], "intermediate");
+    }
+
+    #[test]
+    fn normalized_unset_rejects_ambiguous_spellings() {
+        // Unset resolves through the same collision-aware traversal.
+        for (adapter, doc) in colliding_docs() {
+            for action_key in ["database.pool-size", "database.pool_size"] {
+                let result = unset_in_document(adapter, doc, action_key, true);
+                assert_collision(
+                    result,
+                    "database",
+                    "pool_size",
+                    &["pool-size", "pool_size"],
+                    &format!("{} / {action_key}", adapter.name()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn persist_collision_error_carries_file_path() {
+        // The document-level functions have no file path; the I/O
+        // wrappers stamp the edited file onto the collision so the error
+        // matches the load path's shape.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[database]\npool-size = 5\npool_size = 6\n").unwrap();
+
+        for result in [
+            persist_value_runtime(
+                &TomlAdapter,
+                &test_schema(),
+                &path,
+                "database.pool_size",
+                "20",
+                true,
+            ),
+            unset_value(&TomlAdapter, &path, "database.pool_size", true),
+        ] {
+            match result.unwrap_err() {
+                ClapfigError::NormalizedKeyCollision { path: reported, .. } => {
+                    assert_eq!(reported, path);
+                }
+                other => panic!("expected NormalizedKeyCollision, got {other:?}"),
+            }
+        }
+        // The ambiguous file was not modified.
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("pool-size = 5") && content.contains("pool_size = 6"));
     }
 
     #[test]

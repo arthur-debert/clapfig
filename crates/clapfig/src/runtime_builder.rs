@@ -1107,8 +1107,10 @@ fn get_from_table(
 /// `normalize_keys`, the action key is normalized to the canonical
 /// snake_case path and looked up by dash/underscore equivalence
 /// ([`ops::table_get_normalized`]), so a kebab-case document answers for
-/// either action-key spelling. The reported key keeps the caller's
-/// spelling.
+/// either action-key spelling — and a document holding BOTH equivalent
+/// spellings fails as [`ClapfigError::NormalizedKeyCollision`] instead
+/// of one spelling silently answering. The reported key keeps the
+/// caller's spelling.
 fn get_scope_runtime(
     adapter: &dyn FormatAdapter,
     schema: &Schema,
@@ -1150,7 +1152,8 @@ fn get_scope_runtime(
 
     let (canonical, value) = if normalize_keys {
         let canonical = crate::normalize::normalize_key(key);
-        let value = ops::table_get_normalized(&table, &canonical);
+        let value =
+            ops::table_get_normalized(&table, &canonical).map_err(|c| c.into_error(file_path))?;
         (canonical, value)
     } else {
         (key.to_owned(), ops::table_get(&table, key))
@@ -2532,6 +2535,36 @@ mod tests {
                     }
                     other => panic!("expected KeyValue, got {other:?}"),
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_get_rejects_ambiguous_spellings_as_collision() {
+        // A raw file holding BOTH equivalent spellings is ambiguous — the
+        // load path refuses it — so scoped get errors with the same
+        // collision (stamped with the scope file's path) instead of one
+        // spelling silently answering.
+        use crate::format::TomlAdapter;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("demo.toml");
+        fs::write(&path, "[db]\npool-size = 5\npool_size = 6\n").unwrap();
+        for key in ["db.pool-size", "db.pool_size"] {
+            let err =
+                get_scope_runtime(&TomlAdapter, &demo_schema(), &path, key, true).unwrap_err();
+            match err {
+                ClapfigError::NormalizedKeyCollision {
+                    path: reported,
+                    section,
+                    normalized_key,
+                    originals,
+                } => {
+                    assert_eq!(reported, path, "{key}");
+                    assert_eq!(section, "db");
+                    assert_eq!(normalized_key, "pool_size");
+                    assert_eq!(originals, vec!["pool-size", "pool_size"]);
+                }
+                other => panic!("expected NormalizedKeyCollision, got {other:?}"),
             }
         }
     }

@@ -85,7 +85,9 @@ fn kebab_renamed(schema: &crate::runtime::Schema) -> crate::runtime::Schema {
 fn kebab_rename_fields(schema: &mut crate::runtime::Schema) {
     use crate::runtime::Field;
     for nf in &mut schema.fields {
-        nf.name = crate::normalize::kebab_key(&nf.name);
+        if nf.name.contains('_') {
+            nf.name = crate::normalize::kebab_key(&nf.name);
+        }
         match &mut nf.field {
             Field::Nested(child) | Field::ArrayOf(child) | Field::MapOf(child) => {
                 kebab_rename_fields(child);
@@ -183,30 +185,39 @@ fn flatten_value_map(table: &Map, prefix: &str, entries: &mut Vec<(String, Strin
 }
 
 /// Navigate a value [`Map`] by a canonical snake_case dotted path using
-/// dash/underscore key equivalence: each segment matches an existing key
-/// exactly first, then by [`normalize_key`](crate::normalize::normalize_key)
-/// equivalence. The raw-file counterpart of the load path's key
-/// normalization — scoped `config get` reads un-normalized documents, so
-/// a normalized (kebab-case) file must still answer for its canonical
-/// key.
-pub(crate) fn table_get_normalized<'a>(table: &'a Map, canonical: &str) -> Option<&'a Value> {
+/// dash/underscore key equivalence: each segment resolves through
+/// [`resolve_table_key`](crate::normalize::resolve_table_key), so a table
+/// holding more than one equivalent spelling errs as a
+/// [`KeyCollision`](crate::normalize::KeyCollision) instead of one
+/// spelling silently answering. The raw-file counterpart of the load
+/// path's key normalization — scoped `config get` reads un-normalized
+/// documents, so a normalized (kebab-case) file must still answer for
+/// its canonical key. `Ok(None)` when the path doesn't resolve.
+pub(crate) fn table_get_normalized<'a>(
+    table: &'a Map,
+    canonical: &str,
+) -> Result<Option<&'a Value>, crate::normalize::KeyCollision> {
     let mut current = table;
+    let mut resolved: Vec<&str> = Vec::new();
     let mut segments = canonical.split('.').peekable();
     while let Some(seg) = segments.next() {
-        let (_, value) = current
-            .iter()
-            .find(|(k, _)| k.as_str() == seg)
-            .or_else(|| {
-                current
-                    .iter()
-                    .find(|(k, _)| crate::normalize::normalize_key(k) == seg)
-            })?;
+        let section = resolved.join(".");
+        let Some(key) = crate::normalize::resolve_table_key(current, seg, &section)? else {
+            return Ok(None);
+        };
+        let value = &current[key];
         if segments.peek().is_none() {
-            return Some(value);
+            return Ok(Some(value));
         }
-        current = value.as_map()?;
+        match value.as_map() {
+            Some(map) => {
+                resolved.push(key);
+                current = map;
+            }
+            None => return Ok(None),
+        }
     }
-    None
+    Ok(None)
 }
 
 /// Navigate a value [`Map`] by dotted key path (e.g. `"database.url"`).

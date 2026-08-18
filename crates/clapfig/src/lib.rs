@@ -517,14 +517,17 @@
 //! template matches what users will type. Doc comments and values are
 //! never touched.
 //!
-//! The persistence path (`config set`/`unset` and scoped `get`) follows
-//! the same acceptance: the action key may be written in either spelling
-//! (it is normalized to the canonical snake_case field for validation),
-//! edits land on the spelling already present in the file (so setting
-//! `pool_size` against a kebab-case file edits `pool-size` rather than
-//! creating a colliding duplicate), and paths not yet present — including
-//! whole files seeded by `config set` — are emitted kebab-case, matching
-//! `config gen` output.
+//! The persistence path (`config set`/`unset`) and `config get` (merged
+//! and scoped alike) follow the same acceptance: the action key may be
+//! written in either spelling (it is normalized to the canonical
+//! snake_case field for validation), edits land on the spelling already
+//! present in the file (so setting `pool_size` against a kebab-case file
+//! edits `pool-size` rather than creating a colliding duplicate), and
+//! paths not yet present — including whole files seeded by `config set` —
+//! are emitted kebab-case, matching `config gen` output. A file already
+//! holding both equivalent spellings of a key is ambiguous: `set`,
+//! `unset`, and scoped `get` fail with the same collision error loading
+//! it reports, never silently picking one spelling.
 //!
 //! Environment variables are unaffected — shells dislike `-` in variable
 //! names, and the env layer already lower-cases segments and treats `__` as

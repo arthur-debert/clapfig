@@ -242,8 +242,11 @@ the generated template — so the user gets doc comments for every field out of
 the box, in whichever format the scope resolves to. The template is rendered
 with the builder's `normalize_keys` setting, so a seeded file spells its keys
 the same way `config gen` does. With `normalize_keys(true)`, `set`, `unset`,
-and scoped `get` also accept the action key in either dash or underscore
-spelling and edit the spelling already present in the file.
+and `get` (merged and scoped alike) also accept the action key in either dash
+or underscore spelling; edits land on the spelling already present in the
+file. A file that already contains both equivalent spellings of a key is
+ambiguous and fails with the same key-collision error loading it reports —
+`set`, `unset`, and scoped `get` never silently pick one spelling.
 
 ## Handling results programmatically
 

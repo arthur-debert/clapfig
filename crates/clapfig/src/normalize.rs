@@ -23,8 +23,9 @@ use std::collections::BTreeMap;
 use crate::value::{Map, Value};
 
 /// Two distinct keys in the same table collapsed to the same normalized form.
-/// Surfaced from [`normalize_table`] and wrapped at the call site with the
-/// owning file's path.
+/// Surfaced from [`normalize_table`] (whole-table, at load) and
+/// [`resolve_table_key`] (per-segment, during persistence and scoped get)
+/// and wrapped via [`KeyCollision::into_error`] with the owning file's path.
 #[derive(Debug, Clone)]
 pub struct KeyCollision {
     /// Dotted path to the table that contains the collision. Empty for the
@@ -36,31 +37,66 @@ pub struct KeyCollision {
     pub originals: Vec<String>,
 }
 
+impl KeyCollision {
+    /// Wrap into [`ClapfigError::NormalizedKeyCollision`], stamping the
+    /// owning file's path. Every surfacing site — load, persistence,
+    /// scoped get — goes through this one constructor.
+    pub(crate) fn into_error(self, path: &std::path::Path) -> crate::error::ClapfigError {
+        crate::error::ClapfigError::NormalizedKeyCollision {
+            path: path.to_path_buf(),
+            section: self.section,
+            normalized_key: self.normalized_key,
+            originals: self.originals,
+        }
+    }
+}
+
 /// Replace every `-` with `_` in a single key string.
 ///
 /// Used for dotted CLI/URL override paths (`"database.pool-size"`
 /// → `"database.pool_size"`) — `.` segment separators are preserved because
-/// only `-` is rewritten. Skips the allocation entirely when the key has no
-/// `-` characters (the common case once a struct's snake_case fields are
-/// being used directly).
+/// only `-` is rewritten.
 pub fn normalize_key(key: &str) -> String {
-    if key.contains('-') {
-        key.replace('-', "_")
-    } else {
-        key.to_owned()
-    }
+    key.replace('-', "_")
 }
 
 /// Replace every `_` with `-` in a single key string — the inverse of
 /// [`normalize_key`], producing the spelling clapfig EMITS when
 /// normalization is enabled (template keys, and keys the persistence path
-/// writes for paths not already present in a document). Skips the
-/// allocation when the key has no `_` characters.
+/// writes for paths not already present in a document).
 pub fn kebab_key(key: &str) -> String {
-    if key.contains('_') {
-        key.replace('_', "-")
-    } else {
-        key.to_owned()
+    key.replace('_', "-")
+}
+
+/// Resolve one canonical snake_case path segment against a table's keys
+/// under dash/underscore equivalence: the per-segment traversal
+/// counterpart of [`normalize_table`]'s whole-table rule, shared by the
+/// persistence path (set/unset) and scoped `get`.
+///
+/// Returns the matching key's concrete spelling, `Ok(None)` when no key
+/// matches, and [`KeyCollision`] when more than one distinct key
+/// normalizes to the segment — equivalent spellings must never silently
+/// compete, so an ambiguous document errors instead of one spelling
+/// winning by iteration order. `section` is the dotted path of the table
+/// being searched (empty at the root), reported in the collision.
+pub(crate) fn resolve_table_key<'a>(
+    table: &'a Map,
+    segment: &str,
+    section: &str,
+) -> Result<Option<&'a String>, KeyCollision> {
+    // BTreeMap iteration is key-ordered, so `originals` comes out sorted.
+    let matches: Vec<&String> = table
+        .keys()
+        .filter(|k| normalize_key(k) == segment)
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only)),
+        many => Err(KeyCollision {
+            section: section.to_owned(),
+            normalized_key: segment.to_owned(),
+            originals: many.iter().map(|k| (*k).clone()).collect(),
+        }),
     }
 }
 
@@ -131,6 +167,25 @@ mod tests {
 
     fn table(toml_str: &str) -> Map {
         crate::fixtures::test::parse_toml(toml_str)
+    }
+
+    #[test]
+    fn resolve_table_key_matches_and_collides() {
+        let t = table("pool-size = 1\nother = 2\n");
+        // Single equivalent spelling: resolves to the concrete key.
+        assert_eq!(
+            resolve_table_key(&t, "pool_size", "").unwrap().unwrap(),
+            "pool-size"
+        );
+        // No match.
+        assert!(resolve_table_key(&t, "missing", "").unwrap().is_none());
+
+        // Both spellings present: ambiguous, reported with the section.
+        let t = table("pool-size = 1\npool_size = 2\n");
+        let err = resolve_table_key(&t, "pool_size", "database").unwrap_err();
+        assert_eq!(err.section, "database");
+        assert_eq!(err.normalized_key, "pool_size");
+        assert_eq!(err.originals, vec!["pool-size", "pool_size"]);
     }
 
     #[test]
