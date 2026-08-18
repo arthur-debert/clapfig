@@ -330,7 +330,7 @@ pub trait Schema {
     fn schema() -> &'static RuntimeSchema;
 
     /// `Arc`-flavored access to the same cached runtime view. Used by the
-    /// macro-driven builder ([`crate::SchemaConfigBuilder`]) to avoid
+    /// macro-driven builder ([`crate::TypedBuilder`]) to avoid
     /// cloning the schema tree per builder construction — the runtime
     /// spec stores an `Arc<Schema>` and the cache hands out cheap
     /// reference-counted handles to it. Cost: one `Arc::clone` per call

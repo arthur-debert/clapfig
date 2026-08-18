@@ -9,9 +9,9 @@
 //! | **Resolution** | [`search_mode()`] | Whether to merge all found files or pick one |
 //! | **Persistence** | [`persist_scope()`] | Named targets for `config set` writes |
 //!
-//! [`search_paths()`]: crate::RuntimeBuilder::search_paths
-//! [`search_mode()`]: crate::RuntimeBuilder::search_mode
-//! [`persist_scope()`]: crate::RuntimeBuilder::persist_scope
+//! [`search_paths()`]: crate::Builder::search_paths
+//! [`search_mode()`]: crate::Builder::search_mode
+//! [`persist_scope()`]: crate::Builder::persist_scope
 //!
 //! # Discovery: [`SearchPath`]
 //!
@@ -64,7 +64,7 @@ use std::path::PathBuf;
 
 /// A configuration layer in the merge pipeline.
 ///
-/// Used with [`layer_order()`](crate::RuntimeBuilder::layer_order)
+/// Used with [`layer_order()`](crate::Builder::layer_order)
 /// to customize the precedence of configuration sources.
 ///
 /// The default order is `[Files, Env, Url, Cli]` (lowest to highest priority).
@@ -76,7 +76,7 @@ use std::path::PathBuf;
 /// use clapfig::{Clapfig, Layer};
 ///
 /// // Make files override env vars instead of the default
-/// let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+/// let config: AppConfig = Clapfig::typed::<AppConfig>()
 ///     .app_name("myapp")
 ///     .layer_order(vec![Layer::Env, Layer::Files, Layer::Cli])
 ///     .load()?;
@@ -123,7 +123,7 @@ pub enum SearchPath {
     ///
     /// # Note
     ///
-    /// This variant is not valid as a [`persist_scope`](crate::RuntimeBuilder::persist_scope)
+    /// This variant is not valid as a [`persist_scope`](crate::Builder::persist_scope)
     /// path because it resolves to multiple directories. Using it there produces an error.
     Ancestors(Boundary),
 }

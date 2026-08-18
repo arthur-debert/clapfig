@@ -2,13 +2,11 @@
 //! fluent builder, for callers without a compile-time
 //! `#[derive(clapfig::Schema)]` struct.
 //!
-//! Pairs with a crate-private schema abstraction introduced in Phase 1
-//! (a borrowed `SchemaRef` view). The runtime-side `Schema` is converted
-//! to that view internally, and every consumer that already walks the
-//! borrowed view — strict-mode validation, doc lookup, valid-key
-//! enumeration, JSON Schema generation, template generation, persistence
-//! validation — works over either source without a recompile-time
-//! struct.
+//! This is the crate's one schema model: every consumer — strict-mode
+//! validation, doc lookup, valid-key enumeration, JSON Schema
+//! generation, template generation, persistence validation — walks
+//! `&Schema` directly, whether it was built here or emitted by
+//! `#[derive(clapfig::Schema)]`.
 //!
 //! # Example
 //!
@@ -42,7 +40,7 @@ use crate::value::Value;
 /// Constructed via [`Schema::object`] and the fluent builder, or directly
 /// as a plain data struct. The clapfig resolve pipeline borrows from
 /// this internally — callers normally only need to build it and hand it
-/// to [`Clapfig::runtime`](crate::Clapfig::runtime).
+/// to [`Clapfig::builder`](crate::Clapfig::builder).
 #[derive(Debug, Clone)]
 pub struct Schema {
     pub name: String,
@@ -54,8 +52,8 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// Start building a schema with the given object name (analogous to the
-    /// struct name in the static path).
+    /// Start building a schema with the given object name (the derive
+    /// macro emits the struct's name here).
     pub fn object(name: impl Into<String>) -> SchemaBuilder {
         SchemaBuilder {
             schema: Schema {
@@ -233,7 +231,7 @@ impl Field {
     /// `#[serde(untagged)]` enums). Clapfig will not type-check the value
     /// at this layer; the caller is responsible for any further validation
     /// or deserialization, typically inside a `post_validate` hook or
-    /// after `RuntimeResolver::resolve`.
+    /// after `load()` / `Resolver::resolve_at`.
     ///
     /// Strict mode is unaffected — `Value` is about *value shape* on a
     /// known key, not about whether unknown sibling keys are allowed.

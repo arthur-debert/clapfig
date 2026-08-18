@@ -8,7 +8,7 @@
 //! files, classifying each set request onto its capability-matrix row
 //! ([`SetTarget`] — replace vs create-key vs create-file, so refusals
 //! name the operation actually attempted), key-spelling resolution under
-//! [`normalize_keys`](crate::RuntimeBuilder::normalize_keys) (dash and
+//! [`normalize_keys`](crate::Builder::normalize_keys) (dash and
 //! underscore spellings are equivalent; the spelling already present in
 //! the document is the one edited, and a document holding both
 //! equivalent spellings anywhere errors as a collision rather than one
@@ -69,7 +69,7 @@ use crate::value::Value;
 /// preserving the full [`FormatError`](crate::format::FormatError).
 ///
 /// Returns the modified document string.
-pub fn set_in_document_runtime(
+pub fn set_in_document(
     adapter: &dyn FormatAdapter,
     schema: &crate::runtime::Schema,
     content: Option<&str>,
@@ -78,14 +78,14 @@ pub fn set_in_document_runtime(
     normalize_keys: bool,
 ) -> Result<String, ClapfigError> {
     let canonical = canonical_key(key, normalize_keys);
-    let valid_keys = crate::overrides::valid_keys(crate::spec::SchemaRef::from_dynamic(schema));
+    let valid_keys = crate::overrides::valid_keys(schema);
     if !valid_keys.contains(&canonical) {
         return Err(ClapfigError::KeyNotFound(key.into()));
     }
 
     let mut value = parse_raw_value(raw_value);
     if let Some(leaf_ty) = lookup_leaf_type(schema, &canonical) {
-        crate::runtime_spec::coerce_datetime_value(&mut value, leaf_ty);
+        crate::schema_walk::coerce_datetime_value(&mut value, leaf_ty);
         leaf_ty
             .check(&value)
             .map_err(|reason| ClapfigError::InvalidValue {
@@ -169,10 +169,10 @@ fn stamp_collision_path(err: ClapfigError, file_path: &Path) -> ClapfigError {
     }
 }
 
-/// Wrapper around [`set_in_document_runtime`] with file I/O: reads the file
+/// Wrapper around [`set_in_document`] with file I/O: reads the file
 /// (if it exists), patches it, writes back. Creates parent directories if
 /// needed. Collision errors from the document layer get this file's path.
-pub fn persist_value_runtime(
+pub fn persist_value(
     adapter: &dyn FormatAdapter,
     schema: &crate::runtime::Schema,
     file_path: &Path,
@@ -191,7 +191,7 @@ pub fn persist_value_runtime(
         }
     };
 
-    let new_content = set_in_document_runtime(
+    let new_content = set_in_document(
         adapter,
         schema,
         content.as_deref(),
@@ -427,20 +427,16 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn set_in_document(
-        content: Option<&str>,
-        key: &str,
-        value: &str,
-    ) -> Result<String, ClapfigError> {
-        set_in_document_runtime(&TomlAdapter, &test_schema(), content, key, value, false)
+    fn set_toml(content: Option<&str>, key: &str, value: &str) -> Result<String, ClapfigError> {
+        set_in_document(&TomlAdapter, &test_schema(), content, key, value, false)
     }
 
-    fn persist_value(
+    fn persist_toml(
         path: &std::path::Path,
         key: &str,
         value: &str,
     ) -> Result<ConfigResult, ClapfigError> {
-        persist_value_runtime(&TomlAdapter, &test_schema(), path, key, value, false)
+        persist_value(&TomlAdapter, &test_schema(), path, key, value, false)
     }
 
     // --- validation tests ---
@@ -523,7 +519,7 @@ mod tests {
         let schema = test_schema();
 
         // Key exists in the document → replacing an existing value.
-        let u = refusal(set_in_document_runtime(
+        let u = refusal(set_in_document(
             &ParseOnly,
             &schema,
             Some("port = 1\n"),
@@ -534,7 +530,7 @@ mod tests {
         assert_eq!(u.operation, Operation::EditSet);
 
         // File exists, key does not → creating a missing key.
-        let u = refusal(set_in_document_runtime(
+        let u = refusal(set_in_document(
             &ParseOnly,
             &schema,
             Some("port = 1\n"),
@@ -547,7 +543,7 @@ mod tests {
         // No file at all → creating a missing file, refused before any
         // template seeding (ParseOnly's template also refuses; the
         // create-file refusal must win).
-        let u = refusal(set_in_document_runtime(
+        let u = refusal(set_in_document(
             &ParseOnly, &schema, None, "port", "1", false,
         ));
         assert_eq!(u.operation, Operation::EditCreateFile);
@@ -622,7 +618,7 @@ mod tests {
         // A format that cannot parse at all fails classification at its
         // parse refusal — editing an existing file begins with reading
         // it, so that is the honest earliest error.
-        let u = refusal(set_in_document_runtime(
+        let u = refusal(set_in_document(
             &RefusesAll,
             &test_schema(),
             Some("port = 1\n"),
@@ -635,13 +631,13 @@ mod tests {
 
     #[test]
     fn set_rejects_unknown_key() {
-        let result = set_in_document(Some(""), "nonexistent", "value");
+        let result = set_toml(Some(""), "nonexistent", "value");
         assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
     }
 
     #[test]
     fn set_rejects_invalid_enum_value() {
-        let result = set_in_document_runtime(
+        let result = set_in_document(
             &TomlAdapter,
             &enum_schema(),
             Some(""),
@@ -663,7 +659,7 @@ mod tests {
 
     #[test]
     fn set_accepts_valid_enum_value() {
-        let result = set_in_document_runtime(
+        let result = set_in_document(
             &TomlAdapter,
             &enum_schema(),
             Some(""),
@@ -676,7 +672,7 @@ mod tests {
 
     #[test]
     fn set_rejects_wrong_type() {
-        let result = set_in_document(Some(""), "port", "not_a_number");
+        let result = set_toml(Some(""), "port", "not_a_number");
         assert!(matches!(result, Err(ClapfigError::InvalidValue { .. })));
     }
 
@@ -689,7 +685,7 @@ mod tests {
         // propagates as ClapfigError::Format (never collapsed into
         // InvalidValue — that variant is for schema/type validation).
         let content = "database = \"oops\"\n";
-        let result = set_in_document(Some(content), "database.url", "pg://x");
+        let result = set_toml(Some(content), "database.url", "pg://x");
         match result {
             Err(ClapfigError::Format(crate::format::FormatError::Edit {
                 format, message, ..
@@ -706,7 +702,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
-        let result = persist_value_runtime(
+        let result = persist_value(
             &TomlAdapter,
             &enum_schema(),
             &path,
@@ -722,7 +718,7 @@ mod tests {
     #[test]
     fn set_existing_key() {
         let content = "port = 8080\nhost = \"localhost\"\n";
-        let result = set_in_document(Some(content), "port", "3000").unwrap();
+        let result = set_toml(Some(content), "port", "3000").unwrap();
         assert!(result.contains("port = 3000"));
         assert!(result.contains("host = \"localhost\""));
     }
@@ -730,28 +726,28 @@ mod tests {
     #[test]
     fn set_nested_key() {
         let content = "[database]\npool_size = 5\n";
-        let result = set_in_document(Some(content), "database.pool_size", "20").unwrap();
+        let result = set_toml(Some(content), "database.pool_size", "20").unwrap();
         assert!(result.contains("pool_size = 20"));
     }
 
     #[test]
     fn set_new_key_in_existing_file() {
         let content = "port = 8080\n";
-        let result = set_in_document(Some(content), "debug", "true").unwrap();
+        let result = set_toml(Some(content), "debug", "true").unwrap();
         assert!(result.contains("debug = true"));
         assert!(result.contains("port = 8080"));
     }
 
     #[test]
     fn set_creates_from_template_when_none() {
-        let result = set_in_document(None, "port", "3000").unwrap();
+        let result = set_toml(None, "port", "3000").unwrap();
         assert!(result.contains("port = 3000"));
     }
 
     #[test]
     fn preserves_comments() {
         let content = "# This is my config\nport = 8080\n# end\n";
-        let result = set_in_document(Some(content), "port", "3000").unwrap();
+        let result = set_toml(Some(content), "port", "3000").unwrap();
         assert!(result.contains("# This is my config"));
         assert!(result.contains("port = 3000"));
     }
@@ -773,7 +769,7 @@ mod tests {
         let schema = Schema::object("T")
             .field("stamp", Field::datetime().optional())
             .build();
-        let result = set_in_document_runtime(
+        let result = set_in_document(
             &TomlAdapter,
             &schema,
             Some(""),
@@ -787,7 +783,7 @@ mod tests {
             "datetime must persist unquoted (typed), got: {result}"
         );
 
-        let err = set_in_document_runtime(
+        let err = set_in_document(
             &TomlAdapter,
             &schema,
             Some(""),
@@ -804,7 +800,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
-        let result = persist_value(&path, "port", "3000").unwrap();
+        let result = persist_toml(&path, "port", "3000").unwrap();
         assert!(matches!(result, ConfigResult::ValueSet { .. }));
 
         let content = fs::read_to_string(&path).unwrap();
@@ -817,7 +813,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "port = 8080\n").unwrap();
 
-        persist_value(&path, "port", "3000").unwrap();
+        persist_toml(&path, "port", "3000").unwrap();
 
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("port = 3000"));
@@ -829,7 +825,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sub").join("dir").join("config.toml");
 
-        persist_value(&path, "port", "3000").unwrap();
+        persist_toml(&path, "port", "3000").unwrap();
         assert!(path.exists());
     }
 
@@ -872,15 +868,9 @@ mod tests {
         // the next load). The kebab action key must work too.
         for (adapter, doc) in docs("pool-size") {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let out = set_in_document_runtime(
-                    adapter,
-                    &test_schema(),
-                    Some(&doc),
-                    action_key,
-                    "20",
-                    true,
-                )
-                .unwrap();
+                let out =
+                    set_in_document(adapter, &test_schema(), Some(&doc), action_key, "20", true)
+                        .unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -905,15 +895,9 @@ mod tests {
         // not rewrite the document to kebab.
         for (adapter, doc) in docs("pool_size") {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let out = set_in_document_runtime(
-                    adapter,
-                    &test_schema(),
-                    Some(&doc),
-                    action_key,
-                    "20",
-                    true,
-                )
-                .unwrap();
+                let out =
+                    set_in_document(adapter, &test_schema(), Some(&doc), action_key, "20", true)
+                        .unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -941,7 +925,7 @@ mod tests {
             (&JsonAdapter, "{\n  \"host\": \"h\"\n}\n"),
         ];
         for (adapter, base) in bases {
-            let out = set_in_document_runtime(
+            let out = set_in_document(
                 adapter,
                 &test_schema(),
                 Some(base),
@@ -972,8 +956,7 @@ mod tests {
         for adapter in adapters {
             for action_key in ["database.pool-size", "database.pool_size"] {
                 let out =
-                    set_in_document_runtime(adapter, &test_schema(), None, action_key, "20", true)
-                        .unwrap();
+                    set_in_document(adapter, &test_schema(), None, action_key, "20", true).unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -1001,7 +984,7 @@ mod tests {
         // The kebab action key is accepted (normalized before the
         // valid-keys check) and its value is still type-checked against
         // the canonical leaf.
-        let result = set_in_document_runtime(
+        let result = set_in_document(
             &TomlAdapter,
             &test_schema(),
             Some(""),
@@ -1016,7 +999,7 @@ mod tests {
     fn kebab_action_key_still_rejected_without_normalization() {
         // Acceptance boundary: with normalization off, the load path
         // rejects kebab keys, so the persistence path does too.
-        let result = set_in_document(Some(""), "database.pool-size", "20");
+        let result = set_toml(Some(""), "database.pool-size", "20");
         assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
     }
 
@@ -1082,14 +1065,8 @@ mod tests {
         // editing one of the two entries and leaving the file unloadable.
         for (adapter, doc) in colliding_docs() {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let result = set_in_document_runtime(
-                    adapter,
-                    &test_schema(),
-                    Some(doc),
-                    action_key,
-                    "20",
-                    true,
-                );
+                let result =
+                    set_in_document(adapter, &test_schema(), Some(doc), action_key, "20", true);
                 assert_collision(
                     result,
                     "database",
@@ -1114,8 +1091,7 @@ mod tests {
             )
             .build();
         let doc = "[my-db]\nsize = 1\n\n[my_db]\nsize = 2\n";
-        let result =
-            set_in_document_runtime(&TomlAdapter, &schema, Some(doc), "my_db.size", "3", true);
+        let result = set_in_document(&TomlAdapter, &schema, Some(doc), "my_db.size", "3", true);
         assert_collision(result, "", "my_db", &["my-db", "my_db"], "intermediate");
     }
 
@@ -1128,8 +1104,7 @@ mod tests {
         // edited.
         for (adapter, doc) in colliding_docs() {
             let doc = with_host(adapter, doc);
-            let result =
-                set_in_document_runtime(adapter, &test_schema(), Some(&doc), "host", "h2", true);
+            let result = set_in_document(adapter, &test_schema(), Some(&doc), "host", "h2", true);
             assert_collision(
                 result,
                 "database",
@@ -1195,7 +1170,7 @@ mod tests {
         fs::write(&path, "[database]\npool-size = 5\npool_size = 6\n").unwrap();
 
         for result in [
-            persist_value_runtime(
+            persist_value(
                 &TomlAdapter,
                 &test_schema(),
                 &path,

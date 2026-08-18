@@ -81,12 +81,10 @@ pub mod test {
 
     #[test]
     fn test_schema_loads_defaults() {
-        use crate::spec::ConfigSpec;
-
-        let spec = crate::runtime_spec::DynamicSpec::new(test_schema());
+        let schema = test_schema();
         let mut table = Map::new();
-        spec.fill_defaults(&mut table).unwrap();
-        let table = spec.finalize(table).unwrap();
+        crate::schema_walk::fill_defaults_into(&mut table, &schema);
+        let table = crate::schema_walk::finalize(table, &schema).unwrap();
         assert_eq!(table["host"].as_str(), Some("localhost"));
         assert_eq!(table["port"].as_integer(), Some(8080));
         assert_eq!(table["debug"].as_bool(), Some(false));

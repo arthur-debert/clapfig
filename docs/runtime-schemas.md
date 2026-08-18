@@ -4,11 +4,11 @@ Some apps don't have a single compile-time config struct. Plugin hosts
 assemble their schema from loaded plugins. Scripting hosts read it from
 a config descriptor file. Generated apps build it programmatically. For
 those cases, clapfig exposes a runtime-schema entry point next to the
-typed `Clapfig::schema_builder::<C>()` one.
+typed `Clapfig::typed::<C>()` one.
 
 ## When to reach for it
 
-Use `Clapfig::runtime(schema)` when **the set of valid keys is not known
+Use `Clapfig::builder(schema)` when **the set of valid keys is not known
 at compile time**. Examples:
 
 - A linter whose rule keys come from a directory of plugin manifests.
@@ -20,7 +20,7 @@ at compile time**. Examples:
   combination of fields without writing a Rust type for it.
 
 If your config schema is known at compile time, use
-`Clapfig::schema_builder::<C>()` instead — the typed path is simpler,
+`Clapfig::typed::<C>()` instead — the typed path is simpler,
 gives you typed access to the result, and benefits from
 `#[derive(clapfig::Schema)]` ergonomics. Both paths produce identical
 schema metadata and share one resolve pipeline.
@@ -77,13 +77,13 @@ consumer.
 
 ## Using a schema
 
-`Clapfig::runtime(schema)` returns a `RuntimeBuilder` with the same
-surface as `Clapfig::schema_builder::<C>()`:
+`Clapfig::builder(schema)` returns a `Builder` with the same
+surface as `Clapfig::typed::<C>()`:
 
 ```rust,ignore
 use clapfig::{Clapfig, types::SearchPath};
 
-let table: clapfig::value::Map = Clapfig::runtime(schema)
+let table: clapfig::value::Map = Clapfig::builder(schema)
     .app_name("myapp")
     .file_name("myapp.toml")
     .search_paths(vec![SearchPath::Cwd, SearchPath::Platform])
@@ -95,7 +95,7 @@ Differences from the typed path:
 
 - `load()` returns `clapfig::value::Map`, not a typed struct.
 - `post_validate` receives `&clapfig::value::Map` instead of `&C`.
-- `build_resolver()` returns a `RuntimeResolver` for tree-walk use
+- `build_resolver()` returns a `Resolver` for tree-walk use
   cases (see the [Resolver Guide](./resolver.md)).
 
 Everything else — `search_paths`, `search_mode`, `env_prefix`,
@@ -105,7 +105,7 @@ Everything else — `search_paths`, `search_mode`, `env_prefix`,
 
 ## Subcommand support
 
-`RuntimeBuilder::handle(&ConfigAction)` drives the same
+`Builder::handle(&ConfigAction)` drives the same
 `config gen|list|get|set|unset|schema` actions the typed path
 supports. Doc comments and enum allowed-value lists are read straight
 off the schema:
@@ -114,9 +114,9 @@ off the schema:
   `# Allowed: "debug" | "info" | "warn" | "error"`.
 - `config schema` emits a JSON Schema document with the same enum
   values as `enum: [...]` on the property.
-- `meta::doc_for_runtime(&schema, "db.pool_size")` reads doc-comment
-  lines from the schema the same way `meta::doc_for::<C>(...)` reads
-  them from `C::META`.
+- `meta::doc_for(&schema, "db.pool_size")` reads doc-comment
+  lines from the schema; derive users pass `C::schema()` for the same
+  lookup.
 
 ## What's not yet supported
 

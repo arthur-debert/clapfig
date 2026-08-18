@@ -1,6 +1,6 @@
 //! # Runtime-schema demo
 //!
-//! Demonstrates [`Clapfig::runtime(schema)`](clapfig::Clapfig::runtime) — the
+//! Demonstrates [`Clapfig::builder(schema)`](clapfig::Clapfig::builder) — the
 //! Phase 2 entry point for callers without a compile-time `Config` derive.
 //! Builds a schema at runtime, loads layered config from file + env + a
 //! programmatic CLI override, and exercises every `config gen|list|get|set`
@@ -35,7 +35,7 @@
 
 use clapfig::runtime::{Field, Schema};
 use clapfig::types::{ConfigAction, SearchPath};
-use clapfig::{Clapfig, RuntimeBuilder};
+use clapfig::{Builder, Clapfig};
 
 fn app_schema() -> Schema {
     Schema::object("RuntimeDemo")
@@ -64,8 +64,8 @@ fn app_schema() -> Schema {
         .build()
 }
 
-fn make_builder() -> RuntimeBuilder {
-    Clapfig::runtime(app_schema())
+fn make_builder() -> Builder {
+    Clapfig::builder(app_schema())
         .app_name("runtime-demo")
         .file_name("runtime-demo.toml")
         .search_paths(vec![SearchPath::Cwd, SearchPath::Platform])

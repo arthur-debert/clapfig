@@ -6,13 +6,13 @@
 //!
 //! 1. Build each layer independently (files, env, URL, CLI)
 //! 2. Merge layers in the configured order (default: files < env < URL < CLI)
-//! 3. Hand the merged table to a [`ConfigSpec`] for finalization (defaults +
-//!    required-field and type checks)
+//! 3. Finalize the merged table against the schema (defaults +
+//!    required-field and type checks, via [`crate::schema_walk`])
 //!
-//! The layer order is configurable via [`ResolveInput::layer_order`]. The
-//! spec parameter decouples this pipeline from the schema source: both
-//! `Clapfig::runtime(schema)` and the derive-driven
-//! `Clapfig::schema_builder::<C>()` thread in a `DynamicSpec`.
+//! The layer order is configurable via [`ResolveInput::layer_order`]. Both
+//! entry points — `Clapfig::builder(schema)` and the derive-driven
+//! `Clapfig::typed::<C>()` — thread in the same [`Schema`]; the typed path
+//! deserializes the returned [`Map`] afterwards.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,20 +23,17 @@ use crate::format::{self, FormatRegistry};
 use crate::merge::deep_merge;
 use crate::normalize::{normalize_key, normalize_table};
 use crate::overrides;
-use crate::spec::ConfigSpec;
+use crate::runtime::Schema;
+use crate::schema_walk;
 use crate::strict::{CollectedUnknown, StrictnessOverrides, UnknownKeyHook};
 use crate::types::Layer;
-use crate::validate::ValidateContext;
+use crate::validate::{ValidateContext, validate_unknown};
 use crate::value::{Map, Value};
 
 /// All pre-loaded data needed to resolve a config. No I/O happens here.
-///
-/// Generic over [`ConfigSpec`], keeping the pipeline decoupled from how the
-/// schema was produced (runtime builder or derive macro).
-pub(crate) struct ResolveInput<'a, S: ConfigSpec> {
-    /// Schema-walking strategy: validate unknown keys, finalize the merged
-    /// table into the spec's `Output`.
-    pub spec: &'a S,
+pub(crate) struct ResolveInput<'a> {
+    /// The schema every layer is validated and finalized against.
+    pub schema: &'a Schema,
     /// Enabled format adapters — the routing seam every file parse goes
     /// through. Per-file adapter selection is by extension; extensionless
     /// files (rc-style names) fall back to the preferred
@@ -107,15 +104,15 @@ pub(crate) fn default_layer_order() -> Vec<Layer> {
 /// Resolve configuration from pre-loaded inputs.
 ///
 /// Builds each layer independently, merges them in the configured order
-/// (default: files < env < URL < CLI), then hands the merged table to the
-/// spec for finalization. Returns the typed output plus any keys the
+/// (default: files < env < URL < CLI), then finalizes the merged table
+/// against the schema. Returns the merged [`Map`] plus any keys the
 /// `on_unknown_key` callback elected to
 /// [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect);
 /// callers that don't need the collected list (the plain `load()`
 /// surface) simply discard it via `let (out, _) = resolve(...)?;`.
-pub(crate) fn resolve<S: ConfigSpec>(
-    input: ResolveInput<'_, S>,
-) -> Result<(S::Output, Vec<CollectedUnknown>), ClapfigError> {
+pub(crate) fn resolve(
+    input: ResolveInput<'_>,
+) -> Result<(Map, Vec<CollectedUnknown>), ClapfigError> {
     // Build each layer independently, then merge in the configured order.
 
     let validate_ctx = ValidateContext {
@@ -190,9 +187,7 @@ pub(crate) fn resolve<S: ConfigSpec>(
             }
             if cascade_active {
                 let mut per_file =
-                    input
-                        .spec
-                        .validate_unknown(&table, content, path, &validate_ctx)?;
+                    validate_unknown(&table, input.schema, content, path, &validate_ctx)?;
                 collected_unknowns.append(&mut per_file);
             }
             t = deep_merge(t, table);
@@ -219,16 +214,9 @@ pub(crate) fn resolve<S: ConfigSpec>(
     // "1.5" for an integer field) don't fail validation — that's
     // still the job of the final-merge type check inside `finalize`.
     if cascade_active && let Some(env_table_ref) = env_table.as_ref() {
-        let env_unknowns =
-            crate::validate::collect_unknown_paths_ref(env_table_ref, input.spec.schema(), "");
         let env_path = std::path::PathBuf::from("<env>");
-        let mut env_filtered = crate::validate::filter_through_cascade(
-            env_table_ref,
-            "",
-            &env_path,
-            env_unknowns,
-            &validate_ctx,
-        )?;
+        let mut env_filtered =
+            validate_unknown(env_table_ref, input.schema, "", &env_path, &validate_ctx)?;
         collected_unknowns.append(&mut env_filtered);
     }
 
@@ -272,11 +260,11 @@ pub(crate) fn resolve<S: ConfigSpec>(
         }
     }
 
-    // Spec-driven default injection: populate the table from the schema's
+    // Schema-driven default injection: populate the table from the schema's
     // declared defaults so `finalize` only has to check required fields.
-    input.spec.fill_defaults(&mut merged)?;
+    schema_walk::fill_defaults_into(&mut merged, input.schema);
 
-    let output = input.spec.finalize(merged)?;
+    let output = schema_walk::finalize(merged, input.schema)?;
     Ok((output, collected_unknowns))
 }
 
@@ -284,10 +272,9 @@ pub(crate) fn resolve<S: ConfigSpec>(
 mod tests {
     use super::*;
     use crate::fixtures::test::test_schema;
-    use crate::runtime_spec::DynamicSpec;
 
-    fn test_spec() -> DynamicSpec {
-        DynamicSpec::new(test_schema())
+    fn test_spec() -> Schema {
+        test_schema()
     }
 
     fn toml_only_registry() -> &'static FormatRegistry {
@@ -300,9 +287,9 @@ mod tests {
         })
     }
 
-    fn empty_input<S: ConfigSpec>(spec: &S) -> ResolveInput<'_, S> {
+    fn empty_input(schema: &Schema) -> ResolveInput<'_> {
         ResolveInput {
-            spec,
+            schema,
             registry: toml_only_registry(),
             files: vec![],
             env_vars: vec![],
