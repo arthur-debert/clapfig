@@ -395,15 +395,76 @@ mod tests {
         assert_eq!(u.operation, Operation::EditCreateFile);
     }
 
+    /// In-test adapter that declares nothing at all — the shape a
+    /// not-yet-implemented format presents (every built-in adapter is
+    /// implemented now, so the shape only exists in-test).
+    struct RefusesAll;
+
+    impl FormatAdapter for RefusesAll {
+        fn name(&self) -> &'static str {
+            "refusesall"
+        }
+
+        fn extensions(&self) -> &'static [&'static str] {
+            &["ra"]
+        }
+
+        fn capabilities(&self) -> &'static [crate::format::Operation] {
+            &[]
+        }
+
+        fn parse(&self, _text: &str) -> Result<Value, crate::format::FormatError> {
+            Err(self
+                .require(crate::format::Operation::Parse)
+                .unwrap_err()
+                .into())
+        }
+
+        fn serialize(&self, _value: &Value) -> Result<String, crate::format::FormatError> {
+            Err(self
+                .require(crate::format::Operation::Serialize)
+                .unwrap_err()
+                .into())
+        }
+
+        fn template(
+            &self,
+            _schema: &crate::runtime::Schema,
+        ) -> Result<String, crate::format::FormatError> {
+            Err(self
+                .require(crate::format::Operation::Template)
+                .unwrap_err()
+                .into())
+        }
+
+        fn edit(
+            &self,
+            _source: &str,
+            edit: FileEdit<'_>,
+        ) -> Result<String, crate::format::FormatError> {
+            Err(self.require(edit.operation()).unwrap_err().into())
+        }
+
+        fn span_index(
+            &self,
+            _text: &str,
+        ) -> Result<crate::format::SpanIndex, crate::format::FormatError> {
+            Err(self
+                .require(crate::format::Operation::SpanIndex)
+                .unwrap_err()
+                .into())
+        }
+    }
+
     #[test]
     fn set_on_unparseable_format_fails_at_parse() {
-        // A format that cannot parse at all (the WS03/WS04 stubs) fails
-        // classification at its parse refusal — editing an existing file
-        // begins with reading it, so that is the honest earliest error.
+        // A format that cannot parse at all fails classification at its
+        // parse refusal — editing an existing file begins with reading
+        // it, so that is the honest earliest error.
         let u = refusal(set_in_document_runtime(
-            &crate::format::YamlAdapter,
+            &RefusesAll,
             &test_schema(),
-            Some("port: 1\n"),
+            Some("port = 1\n"),
             "port",
             "2",
         ));

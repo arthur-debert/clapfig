@@ -20,8 +20,7 @@
 //! branches.
 //!
 //! This module holds the contract and its pure data structures; the
-//! adapters themselves live in [`toml`], [`yaml`], and [`json`] ([`yaml`]
-//! lands with its value-model workstream).
+//! adapters themselves live in [`toml`], [`yaml`], and [`json`].
 
 pub mod json;
 pub mod toml;
@@ -733,73 +732,28 @@ mod tests {
     }
 
     #[test]
-    fn stub_adapters_declare_nothing_and_refuse_typed() {
-        // Until WS03 implements it, the YAML adapter carries contract
-        // data only: capabilities are empty and every operation returns
-        // the typed refusal — reachable inputs (an enabled `app.yaml`, a
-        // persist edit) get a clean `ClapfigError`, never a panic. The
-        // workstream flips the matrix rows on as it lands the bodies.
-        // (The TOML and JSON adapters are implemented; their matrix-row
-        // tests live with each adapter.)
-        for adapter in [&yaml::YamlAdapter as &dyn FormatAdapter] {
-            for operation in ALL_OPERATIONS {
+    fn yaml_adapter_declares_its_matrix_rows() {
+        // YAML's ADR-0002 matrix row declares every operation (its known
+        // refusals are shape-level, inside the declared edits). SpanIndex
+        // stays undeclared until the provenance epic builds the index.
+        for operation in ALL_OPERATIONS {
+            if operation == Operation::SpanIndex {
+                assert!(!yaml::YamlAdapter.supports(operation));
+                assert!(matches!(
+                    yaml::YamlAdapter.span_index("").unwrap_err(),
+                    FormatError::Unsupported(_)
+                ));
+            } else {
                 assert!(
-                    !adapter.supports(operation),
-                    "{} must not declare {operation} before its workstream lands",
-                    adapter.name()
+                    yaml::YamlAdapter.supports(operation),
+                    "yaml should declare {operation}"
                 );
             }
-            let name = adapter.name();
-            let unsupported =
-                |result: Result<(), FormatError>, operation: Operation| match result.unwrap_err() {
-                    FormatError::Unsupported(u) => {
-                        assert_eq!(u.format, name);
-                        assert_eq!(u.operation, operation);
-                    }
-                    other => panic!("{name} must refuse typed, got {other:?}"),
-                };
-            unsupported(adapter.parse("x = 1").map(drop), Operation::Parse);
-            unsupported(
-                adapter.template(&Schema::object("T").build()).map(drop),
-                Operation::Template,
-            );
-            unsupported(
-                adapter.serialize(&Value::Boolean(true)).map(drop),
-                Operation::Serialize,
-            );
-            let path = ConfigPath::new().key("port");
-            // Each set-family matrix row refuses under its own name: the
-            // request's SetTarget classifies replace vs create-key vs
-            // create-file, and the refusal reports that operation.
-            for (target, operation) in [
-                (SetTarget::ExistingValue, Operation::EditSet),
-                (SetTarget::MissingKey, Operation::EditCreateKey),
-                (SetTarget::MissingFile, Operation::EditCreateFile),
-            ] {
-                unsupported(
-                    adapter
-                        .edit(
-                            "",
-                            FileEdit::Set {
-                                path: &path,
-                                value: &Value::Integer(1),
-                                target,
-                            },
-                        )
-                        .map(drop),
-                    operation,
-                );
-            }
-            unsupported(
-                adapter.edit("", FileEdit::Unset { path: &path }).map(drop),
-                Operation::EditUnset,
-            );
-            unsupported(adapter.span_index("").map(drop), Operation::SpanIndex);
         }
     }
 
     #[test]
-    fn stub_adapters_carry_names_and_extensions() {
+    fn adapters_carry_names_and_extensions() {
         assert_eq!(toml::TomlAdapter.name(), "toml");
         assert_eq!(toml::TomlAdapter.extensions(), ["toml"]);
         assert_eq!(yaml::YamlAdapter.name(), "yaml");
