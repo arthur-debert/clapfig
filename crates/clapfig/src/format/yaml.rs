@@ -141,19 +141,38 @@ fn is_blank_or_comments(text: &str) -> bool {
     })
 }
 
+/// Byte offset of the line carrying the first `...` end-of-document
+/// marker, if any. Content inserted into a blank-or-comments source must
+/// land before this line: text after `...` sits outside the document.
+fn end_marker_offset(text: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim() == "..." {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
 /// Map a `serde_norway` parse failure into the shared error, carrying the
-/// reported location as a single-character span when present (stepping to
-/// the next char boundary, never one byte — a span sliced mid-way through
-/// a multibyte character would panic downstream error reporters).
+/// reported location as a single-character span when present. Both ends
+/// are held to char boundaries — the reported byte offset is snapped back
+/// to the boundary it sits past, and the span steps to the next boundary,
+/// never one raw byte — because a span sliced mid-way through a multibyte
+/// character would panic downstream error reporters.
 fn parse_error(e: &serde_norway::Error, text: &str) -> FormatError {
     FormatError::Parse {
         format: "yaml",
         message: e.to_string(),
         span: e.location().map(|l| {
-            let start = l.index().min(text.len());
-            let end = text
-                .get(start..)
-                .and_then(|rest| rest.chars().next())
+            let mut start = l.index().min(text.len());
+            while !text.is_char_boundary(start) {
+                start -= 1;
+            }
+            let end = text[start..]
+                .chars()
+                .next()
                 .map_or(start, |c| start + c.len_utf8());
             Span { start, end }
         }),
@@ -521,22 +540,30 @@ fn set_in_source(
     let display_path = keys.join(".");
 
     // A blank or comments-only file (the template-seeded create-file
-    // case): append the serialized subtree after the existing comment
-    // lines. This branch is syntactic, not semantic — a source that
-    // merely PARSES to an empty map, like `{}`, still has a document
-    // root, and appending after it would produce a second one; those
-    // sources ride the patch path below instead. The append carries the
-    // same promise as every patched edit: the result must reparse to
-    // exactly the intended tree, or the edit refuses typed.
+    // case): insert the serialized subtree into the document body. This
+    // branch is syntactic, not semantic — a source that merely PARSES to
+    // an empty map, like `{}`, still has a document root, and appending
+    // after it would produce a second one; those sources ride the patch
+    // path below instead. Content must land INSIDE the document: after
+    // any `---` start marker but before a `...` end marker — text after
+    // `...` sits outside the document and fails to parse. The insert
+    // carries the same promise as every patched edit: the result must
+    // reparse to exactly the intended tree, or the edit refuses typed.
     if is_blank_or_comments(source) {
         let mut fresh = Map::new();
         set_in_tree(&mut fresh, keys, value.clone())?;
-        let rendered = YamlAdapter.serialize(&Value::Map(fresh))?;
-        let mut out = source.to_string();
+        let mut rendered = YamlAdapter.serialize(&Value::Map(fresh))?;
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        let insert_at = end_marker_offset(source).unwrap_or(source.len());
+        let mut out = String::with_capacity(source.len() + rendered.len() + 1);
+        out.push_str(&source[..insert_at]);
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
         out.push_str(&rendered);
+        out.push_str(&source[insert_at..]);
         let reparsed = parse_edit_source(&out)?;
         if trees_equal(&Value::Map(reparsed), &Value::Map(expected)) {
             return Ok(out);
@@ -1415,6 +1442,37 @@ db:
             map["database"].as_map().unwrap()["url"],
             Value::String("pg://x".into())
         );
+    }
+
+    #[test]
+    fn edit_set_inserts_before_end_of_document_marker() {
+        // Marker-only documents: content must land INSIDE the document —
+        // after `---`, before `...` — never after the end marker, where
+        // it would sit outside the document and fail to parse.
+        let path = ConfigPath::new().key("port");
+        let value = Value::Integer(1);
+
+        let out = YamlAdapter
+            .edit("...\n", set_edit(&path, &value, SetTarget::MissingKey))
+            .unwrap();
+        assert_eq!(out, "port: 1\n...\n");
+        assert_eq!(parse_map(&out)["port"], Value::Integer(1));
+
+        let out = YamlAdapter
+            .edit("---\n...\n", set_edit(&path, &value, SetTarget::MissingKey))
+            .unwrap();
+        assert_eq!(out, "---\nport: 1\n...\n");
+        assert_eq!(parse_map(&out)["port"], Value::Integer(1));
+
+        // Comments around and between the markers survive in place.
+        let out = YamlAdapter
+            .edit(
+                "# top\n---\n# body\n...\n",
+                set_edit(&path, &value, SetTarget::MissingFile),
+            )
+            .unwrap();
+        assert_eq!(out, "# top\n---\n# body\nport: 1\n...\n");
+        assert_eq!(parse_map(&out)["port"], Value::Integer(1));
     }
 
     #[test]
