@@ -9,7 +9,7 @@ Add clapfig to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-clapfig = "0.23"
+clapfig = "0.22"
 ```
 
 This pulls in the `clap` feature by default, which gives you the `config`
@@ -18,7 +18,7 @@ subcommand integration, and the `derive` feature for
 
 ```toml
 [dependencies]
-clapfig = { version = "0.23", default-features = false, features = ["derive"] }
+clapfig = { version = "0.22", default-features = false, features = ["derive"] }
 ```
 
 ## Define your config struct
@@ -65,7 +65,8 @@ Key points:
   layer, always present. Works with scalars, strings, and collections
   (`default = []` for an empty vec).
 - **Nested structs** — a field whose type also derives `Schema` becomes a
-  TOML section, addressable via dotted keys and `__` env var separators.
+  config-file section (a TOML `[section]`, a YAML/JSON nested object),
+  addressable via dotted keys and `__` env var separators.
 - **Unit-only enums** deriving `Schema` become constrained value sets:
   out-of-set values error at load, and generated templates carry an
   `# Allowed: ...` line.
@@ -105,6 +106,39 @@ That `app_name("myapp")` call sets sensible defaults:
 - Searches for `myapp.toml` in the platform config directory
 - Merges env vars prefixed with `MYAPP__`
 - Fills in `#[clapfig(default)]` values for anything not provided
+
+## Accept YAML and JSON files
+
+By default clapfig looks for TOML only. To let users pick their format,
+switch from an exact file name to a **stem** plus an ordered list of enabled
+formats:
+
+```rust
+let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+    .app_name("myapp")
+    .file_stem("myapp")
+    .formats(["toml", "yaml", "json"])
+    .load()?;
+```
+
+This discovers `myapp.toml`, `myapp.yaml` (or `myapp.yml`), or `myapp.json`
+in every search directory. The rules:
+
+- **Formats are opt-in and ordered.** Without a `.formats(...)` call the
+  default is TOML only — never inferred from compiled-in cargo features.
+- **The first enabled format is the preferred format.** `config gen` renders
+  it, and `config set` creates `<stem>.<preferred extension>` when no config
+  file exists yet.
+- **One file per directory.** Finding more than one same-stem file in the
+  same directory (say `myapp.toml` *and* `myapp.json`) is a hard error
+  naming both files — no silent precedence. Across directories, normal
+  layering applies.
+- **Same meaning everywhere.** Validation, strict mode, and error behavior
+  are identical whatever format the file is in.
+
+The exact-name form `.file_name("myapp.toml")` remains available: only files
+with that precise name are considered, and the name's extension selects the
+single enabled format.
 
 ## Override from the environment
 
@@ -194,7 +228,7 @@ fn main() -> anyhow::Result<()> {
 This gives your users:
 
 ```sh
-myapp config gen              # print a commented TOML template
+myapp config gen              # print a documented template (preferred format)
 myapp config list             # show all resolved values
 myapp config get server.port  # show a single key with its doc comment
 myapp config set port 9090    # persist a value to the config file

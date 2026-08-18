@@ -75,6 +75,63 @@ SearchPath::Ancestors(Boundary::Marker(".git"))
 SearchPath::Ancestors(Boundary::Root)
 ```
 
+## File names and formats — the file-name contract
+
+Within each search directory, what clapfig looks *for* is controlled by the
+naming mode and the enabled formats:
+
+### Exact name — `.file_name("myapp.toml")`
+
+Only files with this precise name are considered, and the name's extension
+selects the single enabled format. An extensionless name (an rc file) parses
+as TOML; an extension no format claims errors at load time. This is the
+default mode (`{app_name}.toml`), so TOML-only apps need no configuration.
+
+### Stem + enabled formats — `.file_stem("myapp")` and `.formats([...])`
+
+```rust
+let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+    .app_name("myapp")
+    .file_stem("myapp")
+    .formats(["toml", "yaml", "json"])
+    .load()?;
+```
+
+Discovery probes `<stem>.<ext>` across the enabled formats' extensions in
+every search directory (`myapp.toml`, `myapp.yaml`/`myapp.yml`,
+`myapp.json` above). The contract:
+
+- **Formats are opt-in and ordered** (canonical names: `"toml"`, `"yaml"`,
+  `"json"`). With no `.formats(...)` call the default is TOML only — never
+  inferred from compiled-in cargo features. An unknown name, an empty list,
+  or a repeated name errors at load time.
+- **Same-directory conflicts are hard errors.** More than one same-stem
+  match in one directory (e.g. `myapp.toml` and `myapp.json` side by side)
+  fails with an error naming both files — no silent precedence, no merging
+  of same-stem siblings. Across directories, normal layering applies: each
+  directory contributes at most one file.
+- **The first enabled format is the preferred format.** `config gen` with no
+  output path renders it, and `config set` against a scope with no existing
+  file creates `<stem>.<preferred extension>` seeded from the generated
+  template. When exactly one same-stem file exists, `set` edits that file in
+  its own format.
+- **Explicit paths pick by extension.** Persist scopes with exact names,
+  `config gen --output`, and direct file arguments select their format by
+  the path's extension, independent of the enabled list.
+
+`.file_name()` and `.file_stem()` are mutually exclusive — the last call
+wins.
+
+### One meaning across formats
+
+A config file means the same thing whatever its format: identical
+validation, strict-mode, and error behavior. Values follow the TOML
+baseline; notably, **datetimes in YAML and JSON are written as strings**
+using TOML's four datetime spellings (offset date-time, local date-time,
+local date, local time). Parsing never guesses at types — a string becomes a
+datetime only when the schema declares the field as one (so YAML's implicit
+typing folklore, like `no` becoming a boolean, does not apply).
+
 ## File resolution — search modes
 
 `search_mode()` controls what happens when multiple config files are found:
@@ -147,7 +204,7 @@ let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
     .load()?;
 ```
 
-With this enabled, every key clapfig sees — TOML keys in files, dotted keys in
+With this enabled, every key clapfig sees — keys in config files, dotted keys in
 `cli_override()` / `cli_overrides_from()`, URL query parameter keys — has its
 `-` characters rewritten to `_` before validation, merging, and deserialization.
 So all of the following map to the same `database.pool_size` field:

@@ -47,30 +47,78 @@ fn main() -> anyhow::Result<()> {
 
 ### `config gen`
 
-Generates a commented TOML template derived from the struct's `///` doc
-comments and `#[clapfig(default)]` values:
+Generates a documented config template derived from the struct's `///` doc
+comments and `#[clapfig(default)]` values, rendered in the app's **preferred
+format** (the first enabled format — TOML unless the builder enables
+others):
 
 ```sh
 $ myapp config gen
-## The host address to bind to.
-#host = "127.0.0.1"
+# The host address to bind to.
+host = "127.0.0.1"
 
-## The port number.
-#port = 8080
+# The port number.
+port = 8080
 
+# Enable debug mode.
+debug = false
+
+# Database settings.
 [database]
-## Connection string URL.
-#url =
+# Connection string URL.
+#url = ""
 
-## Connection pool size.
-#pool_size = 10
+# Connection pool size.
+pool_size = 10
 ```
 
-Write to a file with `--output`:
+Fields with defaults are real assignments; fields without one are commented
+placeholders. Enum-typed fields additionally carry an `Allowed:` line.
+
+Write to a file with `--output` — the path's **extension selects the
+format**, independent of the enabled-formats list:
 
 ```sh
 myapp config gen --output myapp.toml
+myapp config gen --output myapp.yaml   # YAML template
+myapp config gen --output myapp.json   # JSON template
 ```
+
+YAML templates use native comments, same shape as the TOML one. JSON has no
+comment syntax, so JSON templates carry documentation as **`"//"` comment
+keys** — the npm-blessed community convention:
+
+```json
+{
+  "//host": "The host address to bind to.",
+  "host": "127.0.0.1",
+  "//port": "The port number.",
+  "port": 8080,
+  "//debug": "Enable debug mode.",
+  "debug": false,
+  "database": {
+    "//": "Database settings.",
+    "//url": [
+      "Connection string URL.",
+      "\"url\": \"\""
+    ],
+    "//pool_size": "Connection pool size.",
+    "pool_size": 10
+  }
+}
+```
+
+The convention's rules: at most one bare `"//"` per object (the object's own
+doc), suffixed `"//field-name"` keys for per-field docs, and an array of
+strings for multi-line prose. Since JSON cannot comment out a real key,
+defaultless fields show their assignment snippet *inside* the comment (the
+`"\"url\": \"\""` line above). Comment keys are format syntax owned by the
+JSON parser: every `//`-prefixed member is stripped at parse time, at any
+nesting depth, so a generated template passes strict validation as-is. The
+flip side is that the `//` key namespace is **reserved** — a `//`-prefixed
+member in a JSON config file is always a comment, never a configuration
+key. The exported JSON Schema (`config schema`) allowlists the `^//`
+pattern so third-party validators accept documented templates too.
 
 ### `config list`
 
@@ -121,6 +169,14 @@ With `--scope`:
 myapp config set port 9090 --scope global
 ```
 
+Which file `set` writes depends on the scope's naming mode. An exact
+`.file_name(...)` scope always targets that name. A `.file_stem(...)` scope
+follows the preferred-format rules: exactly one same-stem file exists →
+edit that file **in its own format**; none → create
+`<stem>.<preferred extension>` seeded from the generated template; several
+same-stem files → the same hard ambiguity error discovery raises. See
+[Per-format editing](#per-format-editing) for what each format preserves.
+
 ### `config unset <key>`
 
 Removes a key from the config file:
@@ -154,15 +210,36 @@ let builder = Clapfig::schema_builder::<AppConfig>()
 Scope paths are automatically added to the search path list, so persisted
 values are always discoverable during `load()`.
 
-## Comment preservation
+## Per-format editing
 
-`config set` and `config unset` use `toml_edit` under the hood, so existing
-comments and formatting in the config file are preserved. Users won't lose
-their annotations when clapfig writes to the file.
+`config set` and `config unset` edit files through each format's adapter,
+and every format declares only what it can support **honestly** — asking for
+more yields one typed "unsupported by this format" error instead of a lossy
+rewrite:
+
+- **TOML** — lossless editing via `toml_edit`: existing comments and
+  formatting are fully preserved.
+- **JSON** — comments are `"//"`-keyed data, so they survive edits for
+  free. Formatting is normalized (pretty-printed, two-space indent);
+  document key order is preserved, so comments stay adjacent to the fields
+  they document.
+- **YAML** — targeted span patching via `yamlpatch`: the edit rewrites only
+  the target value's bytes and is byte-preserving (comments included)
+  outside that span. Shapes the patch stack cannot rewrite honestly —
+  replacing a sequence item, appending to a flow-style (`[a, b]`) list —
+  **refuse with the typed error** rather than risking corruption:
+
+  ```text
+  replacing an existing value is unsupported by the yaml format
+  ```
+
+  Every YAML edit is verified after patching: the result must reparse to
+  exactly the intended tree, so a refusal is always safe — the file is
+  never left mangled.
 
 If the target file doesn't exist, `config set` creates a new one seeded from
 the generated template — so the user gets doc comments for every field out of
-the box.
+the box, in whichever format the scope resolves to.
 
 ## Handling results programmatically
 
