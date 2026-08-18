@@ -1,0 +1,5 @@
+error: duplicate schema field name "port" — two fields (after `rename`) would collide in the schema, making lookups and unknown-key validation order-dependent. Rename one of them.
+  --> tests/ui/derive/duplicate_field_name_rejected.rs:16:5
+   |
+16 |     port: u16,
+   |     ^^^^

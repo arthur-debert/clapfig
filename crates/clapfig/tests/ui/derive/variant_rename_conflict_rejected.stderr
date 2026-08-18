@@ -1,0 +1,5 @@
+error: #[clapfig(rename = "quick")] conflicts with #[serde(rename = "fast")] on this variant — the schema would accept one spelling and serde's deserialize the other. Use the same name in both, or drop the clapfig one (the schema follows serde's rename when only serde has one).
+  --> tests/ui/derive/variant_rename_conflict_rejected.rs:10:5
+   |
+10 |     Fast,
+   |     ^^^^

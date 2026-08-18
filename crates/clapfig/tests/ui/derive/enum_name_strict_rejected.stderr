@@ -1,0 +1,11 @@
+error: #[clapfig(name = "...")] has no effect on a unit-only enum — the enum flattens to a value-level `LeafType::Enum` at each use site and the schema name is discarded there. Remove the attribute.
+ --> tests/ui/derive/enum_name_strict_rejected.rs:8:6
+  |
+8 | enum NamedEnum {
+  |      ^^^^^^^^^
+
+error: #[clapfig(strict = ...)] has no effect on a unit-only enum — strictness governs nested-section schemas, and the enum flattens to a leaf whose flag is discarded. Remove the attribute (set strictness on the struct that owns the field instead).
+  --> tests/ui/derive/enum_name_strict_rejected.rs:15:6
+   |
+15 | enum StrictEnum {
+   |      ^^^^^^^^^^

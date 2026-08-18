@@ -724,7 +724,7 @@ fn map_of_nested_struct_emits_map_of_field() {
     let plugins = &s.fields[0];
     assert!(matches!(
         plugins.field,
-        clapfig::static_schema::FieldStatic::MapOf(_)
+        clapfig::static_schema::FieldStatic::MapOf { .. }
     ));
 }
 
@@ -965,6 +965,13 @@ fn option_of_struct_typed_field_panic_mentions_option_wrapper() {
 // applies to values from every source — files, env, CLI overrides, and
 // schema defaults (defaults are injected into the merged table before the
 // typed deserialize, so they pass through the deserializer too).
+//
+// The contract is *shape-preserving* normalization: the schema keeps
+// advertising the field's inferred shape and validates the merged table
+// against it BEFORE serde runs. A deserializer expecting a different wire
+// shape never sees its input — schema validation rejects it loudly first
+// (pinned below) — and `#[clapfig(value)]` is the opt-out that hands the
+// wire shape to the deserializer.
 
 fn normalize_lowercase<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -1033,4 +1040,79 @@ fn deserialize_with_applies_to_schema_defaults_too() {
         .unwrap();
 
     assert_eq!(cfg.color, "red");
+}
+
+/// A shape-*changing* deserializer: accepts a TOML string and parses it
+/// into the numeric field. The schema still declares the field as an
+/// integer, so its string wire shape disagrees with what validation checks.
+fn port_from_string<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum PortRepr {
+        Num(u16),
+        Str(String),
+    }
+
+    match PortRepr::deserialize(deserializer)? {
+        PortRepr::Num(n) => Ok(n),
+        PortRepr::Str(s) => s.parse().map_err(D::Error::custom),
+    }
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
+struct ShapeChangingConfig {
+    /// Port, permissively parsed.
+    #[serde(deserialize_with = "port_from_string")]
+    port: u16,
+}
+
+#[test]
+fn shape_changing_deserializer_input_is_rejected_loudly_before_serde() {
+    // The schema advertises `port` as an integer; schema validation runs
+    // before the typed deserialize, so the deserializer's extra string
+    // shape is rejected with a loud type error — a load failure, never a
+    // silently mis-typed value.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("shape.toml"), "port = \"8080\"\n").unwrap();
+
+    let result: Result<ShapeChangingConfig, _> = Clapfig::typed::<ShapeChangingConfig>()
+        .app_name("shape")
+        .file_name("shape.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load();
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("expected integer, got string"),
+        "expected the schema type-check error, got: {msg}"
+    );
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
+struct ValueOptOutConfig {
+    /// Port, permissively parsed; `value` hands the wire shape to the
+    /// deserializer (the schema declares a free-form leaf).
+    #[serde(deserialize_with = "port_from_string")]
+    #[clapfig(value)]
+    port: u16,
+}
+
+#[test]
+fn clapfig_value_opts_a_shape_changing_deserializer_out_of_the_type_check() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("shape.toml"), "port = \"8080\"\n").unwrap();
+
+    let cfg: ValueOptOutConfig = Clapfig::typed::<ValueOptOutConfig>()
+        .app_name("shape")
+        .file_name("shape.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.port, 8080);
 }

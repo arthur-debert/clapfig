@@ -1,0 +1,29 @@
+error: #[serde(default)] on a field deriving clapfig::Schema is not supported: the schema does not read serde defaults, so it would still report the field as missing/required on configs serde itself accepts. Use `#[clapfig(default = ...)]` (injected before the typed deserialize) or an `Option<T>` field. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+ --> tests/ui/derive/serde_field_attrs_rejected.rs:8:13
+  |
+8 |     #[serde(default)]
+  |             ^^^^^^^
+
+error: #[serde(flatten)] on a field deriving clapfig::Schema is not supported: the schema keeps this as a nested key while serde inlines the inner fields at this level, so schema validation and the typed deserialize disagree about the entire subtree. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+  --> tests/ui/derive/serde_field_attrs_rejected.rs:14:13
+   |
+14 |     #[serde(flatten)]
+   |             ^^^^^^^
+
+error: #[serde(alias)] on a field deriving clapfig::Schema is not supported: the schema knows exactly one spelling per field; a config written with the alias spelling would pass serde but be rejected by schema validation as an unknown key. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+  --> tests/ui/derive/serde_field_attrs_rejected.rs:20:13
+   |
+20 |     #[serde(alias = "hostname")]
+   |             ^^^^^
+
+error: #[serde(skip)] on a field deriving clapfig::Schema is not supported: the schema would still declare (and possibly require) a field that serde never populates — templates and required-field checks would demand a key the deserialize then ignores. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+  --> tests/ui/derive/serde_field_attrs_rejected.rs:26:13
+   |
+26 |     #[serde(skip)]
+   |             ^^^^
+
+error: #[serde(skip_deserializing)] on a field deriving clapfig::Schema is not supported: the schema would still declare (and possibly require) a field that serde never populates — templates and required-field checks would demand a key the deserialize then ignores. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+  --> tests/ui/derive/serde_field_attrs_rejected.rs:32:13
+   |
+32 |     #[serde(skip_deserializing)]
+   |             ^^^^^^^^^^^^^^^^^^

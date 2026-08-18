@@ -95,11 +95,11 @@ struct L1 {
 fn three_level_nesting_produces_three_level_schema() {
     let s = <L1 as Schema>::STATIC;
     let mid = match &s.fields[0].field {
-        FieldStatic::Nested(m) => m,
+        FieldStatic::Nested { schema: m, .. } => m,
         other => panic!("expected Nested at L1.mid, got {other:?}"),
     };
     let deep = match &mid.fields[0].field {
-        FieldStatic::Nested(d) => d,
+        FieldStatic::Nested { schema: d, .. } => d,
         other => panic!("expected Nested at L2.deep, got {other:?}"),
     };
     assert_eq!(deep.fields[0].name, "name");
@@ -142,11 +142,11 @@ fn two_parents_share_one_nested_static() {
     // copy of the child schema in each parent, those addresses would
     // diverge.
     let a_inner = match &<ParentA as Schema>::STATIC.fields[0].field {
-        FieldStatic::Nested(s) => *s,
+        FieldStatic::Nested { schema: s, .. } => *s,
         _ => unreachable!(),
     };
     let b_inner = match &<ParentB as Schema>::STATIC.fields[0].field {
-        FieldStatic::Nested(s) => *s,
+        FieldStatic::Nested { schema: s, .. } => *s,
         _ => unreachable!(),
     };
     assert!(

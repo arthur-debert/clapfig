@@ -1,0 +1,23 @@
+error: #[serde(deny_unknown_fields)] on a struct deriving clapfig::Schema is not supported: unknown-key policy is owned by clapfig's strictness cascade; serde would reject keys a non-strict schema accepts. Use `#[clapfig(strict = true)]` instead. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+ --> tests/ui/derive/serde_container_attrs_rejected.rs:7:9
+  |
+7 | #[serde(deny_unknown_fields)]
+  |         ^^^^^^^^^^^^^^^^^^^
+
+error: #[serde(default)] on a struct deriving clapfig::Schema is not supported: the schema does not read serde defaults, so it would still report the field as missing/required on configs serde itself accepts. Use `#[clapfig(default = ...)]` (injected before the typed deserialize) or an `Option<T>` field. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+  --> tests/ui/derive/serde_container_attrs_rejected.rs:13:9
+   |
+13 | #[serde(default)]
+   |         ^^^^^^^
+
+error: #[serde(untagged)] on a enum deriving clapfig::Schema is not supported: it changes the value shape serde deserializes, and the schema has no representation for tagged/untagged unions — use `#[clapfig(value)]` on the field that holds the union type instead. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+  --> tests/ui/derive/serde_container_attrs_rejected.rs:19:9
+   |
+19 | #[serde(untagged)]
+   |         ^^^^^^^^
+
+error: #[serde(tag)] on a enum deriving clapfig::Schema is not supported: it changes the value shape serde deserializes, and the schema has no representation for tagged/untagged unions — use `#[clapfig(value)]` on the field that holds the union type instead. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+  --> tests/ui/derive/serde_container_attrs_rejected.rs:26:9
+   |
+26 | #[serde(tag = "kind")]
+   |         ^^^
