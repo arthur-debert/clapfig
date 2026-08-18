@@ -28,11 +28,12 @@ use syn::{
 ///
 /// - Scalars: `String`, `bool`, every Rust integer type
 ///   (`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`usize`/`isize` — all
-///   mapped to TOML's signed 64-bit integer; see the
-///   `LeafTypeStatic::Integer` doc comment for the `i64::MAX` caveat on
-///   the unsigned variants), `f32`, `f64`, `clapfig::value::Datetime`,
-///   `clapfig::value::Value`. `i128` and `u128` are rejected at derive
-///   time.
+///   mapped to TOML's signed 64-bit integer, carrying the source width's
+///   bounds so out-of-range values fail schema validation with the key
+///   path; see the `LeafTypeStatic::Integer` doc comment for the
+///   `i64::MAX` caveat on the unsigned variants), `f32`, `f64`,
+///   `clapfig::value::Datetime`, `clapfig::value::Value`. `i128` and
+///   `u128` are rejected at derive time.
 /// - `Option<T>`: marks the leaf optional
 /// - `Vec<T>` where `T` is a scalar: maps to `LeafType::Array(T)`
 /// - Nested struct: assumed to also derive `clapfig::Schema`; produces a
@@ -1261,13 +1262,22 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
             ScalarKind::Bool,
             quote! { ::clapfig::static_schema::LeafTypeStatic::Bool },
         )),
-        // Every Rust integer maps to TOML's single Integer width.
-        // `u64` / `usize` / `isize` values that exceed `i64::MAX` cannot be
-        // represented in TOML; documented on `LeafTypeStatic::Integer`.
-        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => Some((
-            ScalarKind::Integer,
-            quote! { ::clapfig::static_schema::LeafTypeStatic::Integer },
-        )),
+        // Every Rust integer maps to TOML's single Integer width, carrying
+        // the source width's bounds so out-of-range values fail the schema
+        // check with the key path (and export as JSON Schema
+        // `minimum`/`maximum`). `i64` is unbounded; `isize` emits
+        // `isize::MIN/MAX as i64` (full value-model range on 64-bit,
+        // signed 32-bit range on 32-bit). `u64` is min 0 with an open
+        // top; `usize` is min 0 with a maximum only when
+        // `usize::BITS < 64` (`usize::MAX as i64` wraps to -1 on
+        // 64-bit) — documented on `LeafTypeStatic::Integer`.
+        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
+            let (min, max) = integer_bounds_tokens(&name);
+            Some((
+                ScalarKind::Integer,
+                quote! { ::clapfig::static_schema::LeafTypeStatic::Integer { min: #min, max: #max } },
+            ))
+        }
         "f32" | "f64" => Some((
             ScalarKind::Float,
             quote! { ::clapfig::static_schema::LeafTypeStatic::Float },
@@ -1284,6 +1294,54 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
     // context — trait fns are not callable from const on stable Rust.
     let nested = quote! { <#ty as ::clapfig::Schema>::STATIC };
     Ok(TypeShape::Nested(nested))
+}
+
+/// The `(min, max)` bound tokens for a Rust integer type name, as
+/// `Option<i64>` expressions for `LeafTypeStatic::Integer`.
+///
+/// Fixed-width types emit their exact range via `as i64` casts on the
+/// width's own `MIN`/`MAX` consts (evaluated in the emitted code, so they
+/// are always faithful). `i64` is unbounded. `isize` emits
+/// `isize::MIN/MAX as i64` so a 32-bit target rejects values the `i64`
+/// value model can hold but `isize` cannot. `u64` is min 0 with an open
+/// top (`u64::MAX` exceeds `i64`). `usize` is min 0 with a maximum only
+/// when `usize::BITS < 64`; on 64-bit, `usize::MAX as i64` wraps to -1
+/// so the top stays open.
+fn integer_bounds_tokens(name: &str) -> (TokenStream2, TokenStream2) {
+    match name {
+        "i8" => (
+            quote! { Some(i8::MIN as i64) },
+            quote! { Some(i8::MAX as i64) },
+        ),
+        "i16" => (
+            quote! { Some(i16::MIN as i64) },
+            quote! { Some(i16::MAX as i64) },
+        ),
+        "i32" => (
+            quote! { Some(i32::MIN as i64) },
+            quote! { Some(i32::MAX as i64) },
+        ),
+        "i64" => (quote! { None }, quote! { None }),
+        "isize" => (
+            quote! { Some(isize::MIN as i64) },
+            quote! { Some(isize::MAX as i64) },
+        ),
+        "u8" => (quote! { Some(0) }, quote! { Some(u8::MAX as i64) }),
+        "u16" => (quote! { Some(0) }, quote! { Some(u16::MAX as i64) }),
+        "u32" => (quote! { Some(0) }, quote! { Some(u32::MAX as i64) }),
+        "u64" => (quote! { Some(0) }, quote! { None }),
+        "usize" => (
+            quote! { Some(0) },
+            quote! {
+                if usize::BITS < 64 {
+                    Some(usize::MAX as i64)
+                } else {
+                    None
+                }
+            },
+        ),
+        other => unreachable!("integer_bounds_tokens called for non-integer {other}"),
+    }
 }
 
 fn single_generic_argument<'a>(args: &'a PathArguments, parent: &str) -> syn::Result<&'a Type> {

@@ -676,7 +676,8 @@
 //! stays in sync with code — change a doc comment or a default, the
 //! template reflects it. Enum-typed fields get an
 //! `Allowed: "a" | "b" | "c"` line; required fields without a default get a
-//! commented placeholder hint. TOML and YAML carry docs as native comments;
+//! commented placeholder hint plus a `Required.` marker; array/map fields
+//! get an `Elements:`/`Values:` element-type hint. TOML and YAML carry docs as native comments;
 //! JSON carries them as `"//"` comment keys (ADR-0002's convention: at most
 //! one `"//"` per object, suffixed `"//field"` keys per field, arrays of
 //! strings for multi-line prose), which the JSON adapter strips at parse

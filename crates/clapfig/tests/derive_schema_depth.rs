@@ -191,12 +191,84 @@ fn every_scalar_type_maps_to_expected_leaf_type() {
         })
         .collect();
     assert!(matches!(by_name["s"], LeafTypeStatic::String));
-    assert!(matches!(by_name["i8v"], LeafTypeStatic::Integer));
-    assert!(matches!(by_name["i64v"], LeafTypeStatic::Integer));
-    assert!(matches!(by_name["u8v"], LeafTypeStatic::Integer));
-    assert!(matches!(by_name["u64v"], LeafTypeStatic::Integer));
-    assert!(matches!(by_name["usz"], LeafTypeStatic::Integer));
-    assert!(matches!(by_name["isz"], LeafTypeStatic::Integer));
+    // Sized widths carry their exact bounds; i64 is unbounded; isize
+    // emits isize::MIN/MAX (full i64 range on 64-bit); u64 is min 0
+    // with an open top; usize is min 0 with a max only when
+    // usize::BITS < 64.
+    assert!(matches!(
+        by_name["i8v"],
+        LeafTypeStatic::Integer {
+            min: Some(-128),
+            max: Some(127)
+        }
+    ));
+    assert!(matches!(
+        by_name["i16v"],
+        LeafTypeStatic::Integer {
+            min: Some(-32768),
+            max: Some(32767)
+        }
+    ));
+    assert!(matches!(
+        by_name["i32v"],
+        LeafTypeStatic::Integer {
+            min: Some(-2147483648),
+            max: Some(2147483647)
+        }
+    ));
+    assert!(matches!(
+        by_name["i64v"],
+        LeafTypeStatic::Integer {
+            min: None,
+            max: None
+        }
+    ));
+    assert!(matches!(
+        by_name["u8v"],
+        LeafTypeStatic::Integer {
+            min: Some(0),
+            max: Some(255)
+        }
+    ));
+    assert!(matches!(
+        by_name["u16v"],
+        LeafTypeStatic::Integer {
+            min: Some(0),
+            max: Some(65535)
+        }
+    ));
+    assert!(matches!(
+        by_name["u32v"],
+        LeafTypeStatic::Integer {
+            min: Some(0),
+            max: Some(4294967295)
+        }
+    ));
+    assert!(matches!(
+        by_name["u64v"],
+        LeafTypeStatic::Integer {
+            min: Some(0),
+            max: None
+        }
+    ));
+    match by_name["usz"] {
+        LeafTypeStatic::Integer { min, max } => {
+            assert_eq!(*min, Some(0));
+            if usize::BITS < 64 {
+                assert_eq!(*max, Some(usize::MAX as i64));
+            } else {
+                assert_eq!(*max, None);
+            }
+        }
+        other => panic!("expected Integer for usz, got {other:?}"),
+    }
+    match by_name["isz"] {
+        LeafTypeStatic::Integer { min, max } => {
+            assert_eq!(*min, Some(isize::MIN as i64));
+            assert_eq!(*max, Some(isize::MAX as i64));
+        }
+        other => panic!("expected Integer for isz, got {other:?}"),
+    }
     assert!(matches!(by_name["f32v"], LeafTypeStatic::Float));
     assert!(matches!(by_name["f64v"], LeafTypeStatic::Float));
     assert!(matches!(by_name["bv"], LeafTypeStatic::Bool));
@@ -452,7 +524,10 @@ fn handle_set_rejects_unknown_key_via_macro_schema() {
             value: "x".into(),
             scope: None,
         });
-    assert!(matches!(result, Err(clapfig::ClapfigError::KeyNotFound(_))));
+    assert!(matches!(
+        result,
+        Err(clapfig::ClapfigError::KeyNotFound { .. })
+    ));
     assert!(!dir.path().join("test.toml").exists());
 }
 
@@ -843,7 +918,7 @@ fn btreemap_string_int_emits_map_of_integer() {
     };
     match &leaf.ty {
         LeafTypeStatic::Map(inner) => {
-            assert!(matches!(inner, LeafTypeStatic::Integer));
+            assert!(matches!(inner, LeafTypeStatic::Integer { .. }));
         }
         other => panic!("expected Map(Integer), got {other:?}"),
     }

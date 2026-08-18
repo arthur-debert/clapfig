@@ -74,6 +74,73 @@ fn walk_segments(schema: &Schema, segments: &[&str]) -> Option<Vec<String>> {
     None
 }
 
+/// The nearest valid schema key to a mistyped dotted `key`, when one is
+/// plausibly a typo away — the "did you mean" suggestion carried by
+/// [`ClapfigError::KeyNotFound`](crate::error::ClapfigError::KeyNotFound).
+///
+/// Compares `key` against every addressable dotted leaf path in the
+/// schema by edit distance. When `normalize_keys` is `true`, `-` and
+/// `_` are the same character (this module's lenient-spelling rule) and
+/// a kebab request for a snake field is treated as a hit, not a typo.
+/// When `normalize_keys` is `false`, comparison uses the raw spelling,
+/// so `pool-size` against schema key `pool_size` is distance 1 and
+/// becomes the suggestion. A candidate qualifies when its distance is
+/// at most 2 and strictly less than the key's own length (so short
+/// garbage doesn't "suggest" an unrelated short key); ties break to the
+/// lexicographically smallest candidate. Returns `None` when nothing is
+/// close enough.
+pub fn nearest_key(schema: &Schema, key: &str, normalize_keys: bool) -> Option<String> {
+    let needle = if normalize_keys {
+        crate::normalize::normalize_key(key)
+    } else {
+        key.to_string()
+    };
+    let mut best: Option<(usize, String)> = None;
+    for candidate in crate::overrides::valid_keys(schema) {
+        let haystack = if normalize_keys {
+            crate::normalize::normalize_key(&candidate)
+        } else {
+            candidate.clone()
+        };
+        let dist = edit_distance(&needle, &haystack);
+        // dist 0 means the key IS valid under this spelling rule — the
+        // caller's problem is absence (e.g. an optional leaf with no
+        // value), not a typo; suggesting the key back at the user
+        // would be noise.
+        if dist == 0 || dist > 2 || dist >= needle.chars().count() {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((best_dist, best_key)) => {
+                dist < *best_dist || (dist == *best_dist && candidate < *best_key)
+            }
+        };
+        if better {
+            best = Some((dist, candidate));
+        }
+    }
+    best.map(|(_, key)| key)
+}
+
+/// Levenshtein distance over chars — small inputs (dotted config keys),
+/// so the O(m·n) two-row DP is plenty.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            curr[j + 1] = sub.min(prev[j + 1] + 1).min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
 /// Treat `-` and `_` as the same character when comparing a schema field
 /// name against a caller-supplied segment. Field names are snake by
 /// convention, but callers may type kebab when their app uses
@@ -192,6 +259,61 @@ mod tests {
         // own doc comment (it has one: "Database settings.").
         let doc = doc_for_key("database").expect("section exists");
         assert!(doc.iter().any(|line| line.contains("Database settings")));
+    }
+
+    #[test]
+    fn nearest_key_suggests_close_typos_only() {
+        let schema = test_schema();
+        // One-off typo in a nested leaf.
+        assert_eq!(
+            nearest_key(&schema, "database.pool_sizr", true).as_deref(),
+            Some("database.pool_size")
+        );
+        // With normalization on, kebab spelling is distance-free against
+        // the snake field — a kebab typo still suggests the snake key.
+        assert_eq!(
+            nearest_key(&schema, "database.pool-sizr", true).as_deref(),
+            Some("database.pool_size")
+        );
+        // Top-level typo.
+        assert_eq!(nearest_key(&schema, "hosr", true).as_deref(), Some("host"));
+        // Nothing plausibly close.
+        assert_eq!(nearest_key(&schema, "completely_unrelated", true), None);
+        // Short garbage must not "suggest" an unrelated short key.
+        assert_eq!(nearest_key(&schema, "x", true), None);
+        // A valid key gets no suggestion — the problem is absence, not a
+        // typo (e.g. scoped get against a file that doesn't set it).
+        assert_eq!(nearest_key(&schema, "database.url", true), None);
+        assert_eq!(nearest_key(&schema, "database.pool-size", true), None);
+    }
+
+    #[test]
+    fn nearest_key_suggests_kebab_as_snake_when_normalization_is_off() {
+        let schema = test_schema();
+        // Strict spelling: pool-size is not the schema key, and the
+        // dash/underscore difference is the useful suggestion.
+        assert_eq!(
+            nearest_key(&schema, "database.pool-size", false).as_deref(),
+            Some("database.pool_size")
+        );
+        // A kebab typo is still close enough (dash vs underscore + one
+        // letter) to suggest the snake field.
+        assert_eq!(
+            nearest_key(&schema, "database.pool-sizr", false).as_deref(),
+            Some("database.pool_size")
+        );
+        // Exact schema spelling still means "absence, not a typo".
+        assert_eq!(nearest_key(&schema, "database.pool_size", false), None);
+    }
+
+    #[test]
+    fn edit_distance_basics() {
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("abc", "abc"), 0);
+        assert_eq!(edit_distance("abc", "abd"), 1);
+        assert_eq!(edit_distance("abc", "ab"), 1);
+        assert_eq!(edit_distance("abc", "xabc"), 1);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
     }
 
     #[test]

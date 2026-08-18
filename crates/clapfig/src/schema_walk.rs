@@ -13,13 +13,14 @@
 //!   `default` is populated in place into the merged table; absent nested
 //!   sections, map-of nodes, and non-optional map leaves materialize as
 //!   empty tables (an absent map is the empty map).
-//! - **[`finalize`]**: coerces schema-declared datetime leaves (string
-//!   values in TOML's four lexical forms become [`Value::Datetime`] —
-//!   schema-driven coercion per ADR-0001), then recursively type-checks
-//!   every value against its `LeafType`, enum-checks `LeafType::Enum`,
-//!   and enforces required fields. Returns the merged value [`Map`] (the
-//!   typed [`TypedBuilder`](crate::TypedBuilder) deserializes that map
-//!   into `C` afterwards).
+//! - **[`finalize`]**: applies schema-driven coercions (string values in
+//!   TOML's four datetime lexical forms become [`Value::Datetime`] on
+//!   datetime leaves per ADR-0001; integer values become [`Value::Float`]
+//!   on float leaves, matching what serde accepts), then recursively
+//!   type-checks every value against its `LeafType`, enum-checks
+//!   `LeafType::Enum`, and enforces required fields. Returns the merged
+//!   value [`Map`] (the typed [`TypedBuilder`](crate::TypedBuilder)
+//!   deserializes that map into `C` afterwards).
 //!
 //! [`Schema`]: crate::runtime::Schema
 //! [`UnknownKey`]: crate::validate::UnknownKey
@@ -186,44 +187,48 @@ pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
     }
 }
 
-/// Finalize a merged table: coerce schema-declared datetimes, then
-/// enforce required fields and per-leaf types. Returns the merged map on
-/// success.
+/// Finalize a merged table: apply schema-driven coercions
+/// (datetime strings, integer-for-float), then enforce required fields
+/// and per-leaf types. Returns the merged map on success.
 pub(crate) fn finalize(mut merged: Map, schema: &Schema) -> Result<Map, ClapfigError> {
-    coerce_datetimes(&mut merged, schema);
+    coerce_leaf_values(&mut merged, schema);
     check_required_and_types(&merged, schema, "")?;
     Ok(merged)
 }
 
-/// Schema-driven datetime coercion (ADR-0001): for every leaf the schema
-/// declares [`LeafType::DateTime`](crate::runtime::LeafType::DateTime), a
-/// merged string value that parses as one of TOML's four datetime lexical
-/// forms is replaced in place with the typed [`Value::Datetime`]. Strings
-/// matching none of the forms are left untouched, so the type check that
-/// follows reports the normal "expected datetime, got string" error.
+/// Schema-driven value coercion: for every leaf the schema declares
+/// [`LeafType::DateTime`](crate::runtime::LeafType::DateTime), a merged
+/// string value that parses as one of TOML's four datetime lexical forms
+/// is replaced in place with the typed [`Value::Datetime`] (ADR-0001);
+/// for every [`LeafType::Float`](crate::runtime::LeafType::Float) leaf, a
+/// merged integer value is replaced with the equivalent
+/// [`Value::Float`] (serde accepts integers for `f64` fields, so the
+/// value model does too). Values matching neither rule are left
+/// untouched, so the type check that follows reports the normal
+/// "expected …, got …" error.
 ///
 /// This is the seam that lets schema-blind sources — YAML/JSON files, env
-/// vars, CLI/URL overrides — express datetimes as strings. Detection is
-/// never value-sniffing: only leaves the schema declares as datetimes are
-/// candidates.
-fn coerce_datetimes(table: &mut Map, schema: &Schema) {
+/// vars, CLI/URL overrides — express datetimes as strings and floats as
+/// bare integers. Detection is never value-sniffing: only the declared
+/// leaf type makes a value a candidate.
+fn coerce_leaf_values(table: &mut Map, schema: &Schema) {
     for nf in &schema.fields {
         match &nf.field {
             Field::Leaf(leaf) => {
                 if let Some(value) = table.get_mut(&nf.name) {
-                    coerce_datetime_value(value, &leaf.ty);
+                    coerce_value(value, &leaf.ty);
                 }
             }
             Field::Nested(nested) => {
                 if let Some(Value::Map(t)) = table.get_mut(&nf.name) {
-                    coerce_datetimes(t, nested);
+                    coerce_leaf_values(t, nested);
                 }
             }
             Field::ArrayOf(item_schema) => {
                 if let Some(Value::Array(items)) = table.get_mut(&nf.name) {
                     for item in items {
                         if let Value::Map(t) = item {
-                            coerce_datetimes(t, item_schema);
+                            coerce_leaf_values(t, item_schema);
                         }
                     }
                 }
@@ -232,7 +237,7 @@ fn coerce_datetimes(table: &mut Map, schema: &Schema) {
                 if let Some(Value::Map(entries)) = table.get_mut(&nf.name) {
                     for entry_value in entries.values_mut() {
                         if let Value::Map(t) = entry_value {
-                            coerce_datetimes(t, item_schema);
+                            coerce_leaf_values(t, item_schema);
                         }
                     }
                 }
@@ -241,11 +246,12 @@ fn coerce_datetimes(table: &mut Map, schema: &Schema) {
     }
 }
 
-/// Coerce one value against its declared leaf type, recursing through
-/// declared containers (`Array` elements, homogeneous `Map` values).
-/// Shared with the persist path, which validates `config set` values
-/// against the same leaf declarations.
-pub(crate) fn coerce_datetime_value(value: &mut Value, ty: &crate::runtime::LeafType) {
+/// Coerce one value against its declared leaf type (datetime strings on
+/// datetime leaves, integers on float leaves), recursing through declared
+/// containers (`Array` elements, homogeneous `Map` values). Shared with
+/// the persist path, which validates `config set` values against the same
+/// leaf declarations.
+pub(crate) fn coerce_value(value: &mut Value, ty: &crate::runtime::LeafType) {
     use crate::runtime::LeafType;
     match ty {
         LeafType::DateTime => {
@@ -255,17 +261,22 @@ pub(crate) fn coerce_datetime_value(value: &mut Value, ty: &crate::runtime::Leaf
                 *value = Value::Datetime(dt);
             }
         }
+        LeafType::Float => {
+            if let Value::Integer(i) = value {
+                *value = Value::Float(*i as f64);
+            }
+        }
         LeafType::Array(elem) => {
             if let Value::Array(items) = value {
                 for item in items {
-                    coerce_datetime_value(item, elem);
+                    coerce_value(item, elem);
                 }
             }
         }
         LeafType::Map(elem) => {
             if let Value::Map(entries) = value {
                 for entry in entries.values_mut() {
-                    coerce_datetime_value(entry, elem);
+                    coerce_value(entry, elem);
                 }
             }
         }
@@ -641,6 +652,71 @@ mod tests {
         table.insert("s".into(), Value::String("1979-05-27".into()));
         let out = finalize(table, &schema).unwrap();
         assert_eq!(out["s"], Value::String("1979-05-27".into()));
+    }
+
+    // --- finalize: integer-for-float coercion ---
+
+    #[test]
+    fn finalize_coerces_integer_to_float_on_float_leaves() {
+        // serde accepts `timeout = 5` for an f64 field; finalize rewrites
+        // the merged value so Map-out consumers see a float too.
+        let schema = Schema::object("T")
+            .field("timeout", RtField::float().optional())
+            .field(
+                "rates",
+                RtField::array_of_type(crate::runtime::LeafType::Float).optional(),
+            )
+            .build();
+        let mut table = Map::new();
+        table.insert("timeout".into(), Value::Integer(5));
+        table.insert(
+            "rates".into(),
+            Value::Array(vec![Value::Integer(1), Value::Float(2.5)]),
+        );
+        let out = finalize(table, &schema).unwrap();
+        assert_eq!(out["timeout"], Value::Float(5.0));
+        assert_eq!(
+            out["rates"],
+            Value::Array(vec![Value::Float(1.0), Value::Float(2.5)])
+        );
+    }
+
+    #[test]
+    fn finalize_never_coerces_integers_on_integer_leaves() {
+        let schema = Schema::object("T")
+            .field("count", RtField::integer().optional())
+            .build();
+        let mut table = Map::new();
+        table.insert("count".into(), Value::Integer(5));
+        let out = finalize(table, &schema).unwrap();
+        assert_eq!(out["count"], Value::Integer(5));
+    }
+
+    // --- finalize: integer bounds ---
+
+    #[test]
+    fn finalize_reports_out_of_range_integer_with_key_path() {
+        // A `u8`-shaped leaf rejects 300 at the schema check, naming the
+        // key — not as a `<merged>` deserialize failure downstream.
+        let schema = Schema::object("T")
+            .nested(
+                "server",
+                Schema::object("Server").field(
+                    "retries",
+                    RtField::integer_in(Some(0), Some(255)).optional(),
+                ),
+            )
+            .build();
+        let table = parse("[server]\nretries = 300\n");
+        let err = finalize(table, &schema).unwrap_err();
+        match err {
+            ClapfigError::InvalidValue { key, reason } => {
+                assert_eq!(key, "server.retries");
+                assert!(reason.contains("out of range"), "{reason}");
+                assert!(reason.contains("0..=255"), "{reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
     }
 
     #[test]

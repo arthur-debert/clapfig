@@ -92,7 +92,10 @@ pub fn set_in_document(
                 kind,
             });
         }
-        return Err(ClapfigError::KeyNotFound(key.into()));
+        return Err(ClapfigError::KeyNotFound {
+            key: key.into(),
+            suggestion: crate::meta::nearest_key(schema, &canonical, normalize_keys),
+        });
     }
 
     let leaf_ty = lookup_leaf_type(schema, &canonical);
@@ -102,7 +105,7 @@ pub fn set_in_document(
             reason,
         })?;
     if let Some(leaf_ty) = leaf_ty {
-        crate::schema_walk::coerce_datetime_value(&mut value, leaf_ty);
+        crate::schema_walk::coerce_value(&mut value, leaf_ty);
         leaf_ty
             .check(&value)
             .map_err(|reason| ClapfigError::InvalidValue {
@@ -478,7 +481,7 @@ fn parse_raw_value(raw: &str, ty: Option<&crate::runtime::LeafType>) -> Result<V
     };
     match ty {
         LeafType::String => Ok(Value::String(raw.to_owned())),
-        LeafType::Integer => raw
+        LeafType::Integer { .. } => raw
             .parse::<i64>()
             .map(Value::Integer)
             .map_err(|_| format!("expected integer, got '{raw}'")),
@@ -749,7 +752,27 @@ mod tests {
     #[test]
     fn set_rejects_unknown_key() {
         let result = set_toml(Some(""), "nonexistent", "value");
-        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound { .. })));
+    }
+
+    #[test]
+    fn set_kebab_key_suggests_snake_when_normalization_is_off() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &test_schema(),
+            Some(""),
+            "database.pool-size",
+            "10",
+            false,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::KeyNotFound { key, suggestion } => {
+                assert_eq!(key, "database.pool-size");
+                assert_eq!(suggestion.as_deref(), Some("database.pool_size"));
+            }
+            other => panic!("expected KeyNotFound, got {other:?}"),
+        }
     }
 
     #[test]
@@ -882,7 +905,14 @@ mod tests {
             Value::String("123".into())
         );
         assert_eq!(
-            parse_raw_value("123", Some(&LeafType::Integer)).unwrap(),
+            parse_raw_value(
+                "123",
+                Some(&LeafType::Integer {
+                    min: None,
+                    max: None,
+                }),
+            )
+            .unwrap(),
             Value::Integer(123)
         );
         assert_eq!(
@@ -899,7 +929,14 @@ mod tests {
     fn value_parsing_errors_name_the_expected_type() {
         use crate::runtime::LeafType;
         for (raw, ty, expected) in [
-            ("abc", LeafType::Integer, "expected integer"),
+            (
+                "abc",
+                LeafType::Integer {
+                    min: None,
+                    max: None,
+                },
+                "expected integer",
+            ),
             ("abc", LeafType::Float, "expected float"),
             ("yes", LeafType::Bool, "expected bool"),
             (
@@ -909,7 +946,10 @@ mod tests {
             ),
             (
                 "a=1",
-                LeafType::Map(Box::new(LeafType::Integer)),
+                LeafType::Map(Box::new(LeafType::Integer {
+                    min: None,
+                    max: None,
+                })),
                 "expected map",
             ),
         ] {
@@ -981,7 +1021,11 @@ mod tests {
         let schema = Schema::object("T")
             .field(
                 "limits",
-                Field::map_of(crate::runtime::LeafType::Integer).optional(),
+                Field::map_of(crate::runtime::LeafType::Integer {
+                    min: None,
+                    max: None,
+                })
+                .optional(),
             )
             .build();
         let result = set_in_document(
@@ -1138,7 +1182,7 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(matches!(err, ClapfigError::KeyNotFound(_)), "{err:?}");
+        assert!(matches!(err, ClapfigError::KeyNotFound { .. }), "{err:?}");
     }
 
     #[test]
@@ -1433,7 +1477,7 @@ mod tests {
         // Acceptance boundary: with normalization off, the load path
         // rejects kebab keys, so the persistence path does too.
         let result = set_toml(Some(""), "database.pool-size", "20");
-        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound { .. })));
     }
 
     #[test]

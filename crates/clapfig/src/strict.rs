@@ -75,10 +75,10 @@ pub struct UnknownKeyContext<'a> {
     /// would silently consume.
     pub value: Option<&'a Value>,
 
-    /// The file the key came from. `None` when the key came from a non-file
-    /// source (env, CLI override, URL query) — strict-mode unknown-key
-    /// checking only fires on files today, so this is effectively always
-    /// `Some` in Phase 3.
+    /// The file the key came from. `None` when the key came from a
+    /// non-file source — for an env-derived key the callback sees
+    /// `file: None` and a `path` whose segments mirror the variable's
+    /// `__`-separated pieces.
     pub file: Option<&'a Path>,
 
     /// 1-indexed line number in `file` where the key appears. `None` when
