@@ -108,7 +108,7 @@ fn three_level_nesting_produces_three_level_schema() {
 #[test]
 fn three_level_loads_typed_with_nested_defaults() {
     let dir = TempDir::new().unwrap();
-    let cfg: L1 = Clapfig::schema_builder::<L1>()
+    let cfg: L1 = Clapfig::typed::<L1>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -278,7 +278,7 @@ fn env_attribute_propagates_to_runtime_schema_leaf() {
     };
     assert_eq!(leaf.env, Some("X_PORT_OVERRIDE"));
 
-    let result = Clapfig::schema_builder::<EnvConfig>()
+    let result = Clapfig::typed::<EnvConfig>()
         .app_name("t")
         .no_env()
         .handle(&ConfigAction::Schema { output: None })
@@ -308,7 +308,7 @@ struct Renamed {
 fn rename_attribute_makes_load_accept_the_renamed_key() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("test.toml"), "Host = \"prod\"\n").unwrap();
-    let cfg: Renamed = Clapfig::schema_builder::<Renamed>()
+    let cfg: Renamed = Clapfig::typed::<Renamed>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -331,7 +331,7 @@ struct SerdeRenamed {
 fn serde_only_rename_makes_load_accept_the_renamed_key() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("test.toml"), "listen-port = 9000\n").unwrap();
-    let cfg: SerdeRenamed = Clapfig::schema_builder::<SerdeRenamed>()
+    let cfg: SerdeRenamed = Clapfig::typed::<SerdeRenamed>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -350,7 +350,7 @@ struct IntEnum {
 
 #[test]
 fn allowed_integer_enum_is_carried_through_to_json_schema() {
-    let result = Clapfig::schema_builder::<IntEnum>()
+    let result = Clapfig::typed::<IntEnum>()
         .app_name("t")
         .no_env()
         .handle(&ConfigAction::Schema { output: None })
@@ -371,7 +371,7 @@ fn allowed_integer_enum_is_carried_through_to_json_schema() {
 fn allowed_rejects_out_of_set_integer_value() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "n = 99\n").unwrap();
-    let result: Result<IntEnum, _> = Clapfig::schema_builder::<IntEnum>()
+    let result: Result<IntEnum, _> = Clapfig::typed::<IntEnum>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -396,7 +396,7 @@ fn handle_set_then_get_roundtrips_through_macro_path() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
 
-    let set = Clapfig::schema_builder::<PersistConfig>()
+    let set = Clapfig::typed::<PersistConfig>()
         .app_name("test")
         .persist_scope("local", SearchPath::Path(path.clone()))
         .no_env()
@@ -408,7 +408,7 @@ fn handle_set_then_get_roundtrips_through_macro_path() {
         .unwrap();
     assert!(matches!(set, ConfigResult::ValueSet { .. }));
 
-    let got = Clapfig::schema_builder::<PersistConfig>()
+    let got = Clapfig::typed::<PersistConfig>()
         .app_name("test")
         .persist_scope("local", SearchPath::Path(path.clone()))
         .no_env()
@@ -425,7 +425,7 @@ fn handle_set_then_get_roundtrips_through_macro_path() {
         other => panic!("expected KeyValue, got {other:?}"),
     }
 
-    let unset = Clapfig::schema_builder::<PersistConfig>()
+    let unset = Clapfig::typed::<PersistConfig>()
         .app_name("test")
         .persist_scope("local", SearchPath::Path(path.clone()))
         .no_env()
@@ -443,7 +443,7 @@ fn handle_set_rejects_unknown_key_via_macro_schema() {
     // emitted schema were missing fields, `Set` would accept typos and
     // corrupt the on-disk file.
     let dir = TempDir::new().unwrap();
-    let result = Clapfig::schema_builder::<PersistConfig>()
+    let result = Clapfig::typed::<PersistConfig>()
         .app_name("test")
         .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
         .no_env()
@@ -459,7 +459,7 @@ fn handle_set_rejects_unknown_key_via_macro_schema() {
 #[test]
 fn handle_set_rejects_invalid_enum_via_macro_schema() {
     let dir = TempDir::new().unwrap();
-    let result = Clapfig::schema_builder::<IntEnum>()
+    let result = Clapfig::typed::<IntEnum>()
         .app_name("t")
         .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
         .no_env()
@@ -508,7 +508,7 @@ fn struct_strict_attribute_on_nested_cascades_to_descendants() {
         "[mid]\nm = \"a\"\nmid_rogue = 1\n[mid.deep]\nd = \"b\"\ndeep_rogue = 1\n",
     )
     .unwrap();
-    let cfg: CascTop = Clapfig::schema_builder::<CascTop>()
+    let cfg: CascTop = Clapfig::typed::<CascTop>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -528,7 +528,7 @@ fn struct_strict_attribute_does_not_leak_to_top_level() {
         "root_rogue = 1\nt = \"v\"\n[mid]\nm = \"a\"\n[mid.deep]\nd = \"b\"\n",
     )
     .unwrap();
-    let result: Result<CascTop, _> = Clapfig::schema_builder::<CascTop>()
+    let result: Result<CascTop, _> = Clapfig::typed::<CascTop>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -563,7 +563,7 @@ fn cli_overrides_from_drops_keys_not_in_macro_schema() {
         verbose: true,
     };
     let dir = TempDir::new().unwrap();
-    let cfg: AutoMatch = Clapfig::schema_builder::<AutoMatch>()
+    let cfg: AutoMatch = Clapfig::typed::<AutoMatch>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -599,7 +599,7 @@ fn option_of_vec_emits_optional_array_leaf() {
 #[test]
 fn option_of_vec_loads_as_none_when_absent() {
     let dir = TempDir::new().unwrap();
-    let cfg: OptVec = Clapfig::schema_builder::<OptVec>()
+    let cfg: OptVec = Clapfig::typed::<OptVec>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -618,7 +618,7 @@ struct OnlyNested {
 #[test]
 fn struct_with_only_nested_fields_builds_and_loads() {
     let dir = TempDir::new().unwrap();
-    let cfg: OnlyNested = Clapfig::schema_builder::<OnlyNested>()
+    let cfg: OnlyNested = Clapfig::typed::<OnlyNested>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -640,7 +640,7 @@ fn post_validate_sees_default_filled_value() {
     let dir = TempDir::new().unwrap();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(0u16));
     let seen_cl = seen.clone();
-    let _cfg: DefaultedForHook = Clapfig::schema_builder::<DefaultedForHook>()
+    let _cfg: DefaultedForHook = Clapfig::typed::<DefaultedForHook>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -689,7 +689,7 @@ struct AllowedNegativeInts {
 
 #[test]
 fn allowed_accepts_negative_integer_literals() {
-    let result = Clapfig::schema_builder::<AllowedNegativeInts>()
+    let result = Clapfig::typed::<AllowedNegativeInts>()
         .app_name("t")
         .no_env()
         .handle(&ConfigAction::Schema { output: None })
@@ -712,7 +712,7 @@ fn allowed_accepts_negative_integer_literals() {
 fn allowed_accepts_negative_int_on_load() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "n = -1\n").unwrap();
-    let cfg: AllowedNegativeInts = Clapfig::schema_builder::<AllowedNegativeInts>()
+    let cfg: AllowedNegativeInts = Clapfig::typed::<AllowedNegativeInts>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -773,7 +773,7 @@ fn datetime_default_survives_runtime_conversion() {
     // End-to-end: the static default must convert into a `Value::Datetime`
     // and pass the `LeafType::DateTime` check at finalize.
     let dir = TempDir::new().unwrap();
-    let cfg: DateTimeDefault = Clapfig::schema_builder::<DateTimeDefault>()
+    let cfg: DateTimeDefault = Clapfig::typed::<DateTimeDefault>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -814,7 +814,7 @@ fn hashmap_loads_via_runtime_pipeline() {
         "[headers]\nx_request_id = \"abc\"\nx_trace_id = \"def\"\n",
     )
     .unwrap();
-    let cfg: HashMapStringConfig = Clapfig::schema_builder::<HashMapStringConfig>()
+    let cfg: HashMapStringConfig = Clapfig::typed::<HashMapStringConfig>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -923,7 +923,7 @@ fn value_attribute_works_on_custom_enum() {
 fn value_attribute_custom_enum_loads_end_to_end() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "size = \"a4\"\n").unwrap();
-    let cfg: ValueOnCustomEnum = Clapfig::schema_builder::<ValueOnCustomEnum>()
+    let cfg: ValueOnCustomEnum = Clapfig::typed::<ValueOnCustomEnum>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -969,7 +969,7 @@ fn value_attribute_untagged_enum_accepts_string_shape_at_load() {
     // shape resolves to `RuleConfig::Severity`.
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "rule = \"warn\"\n").unwrap();
-    let cfg: ValueOnUntaggedEnum = Clapfig::schema_builder::<ValueOnUntaggedEnum>()
+    let cfg: ValueOnUntaggedEnum = Clapfig::typed::<ValueOnUntaggedEnum>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -993,7 +993,7 @@ fn value_attribute_untagged_enum_accepts_array_shape_at_load() {
         "rule = [\"warn\", { max = 80 }]\n",
     )
     .unwrap();
-    let cfg: ValueOnUntaggedEnum = Clapfig::schema_builder::<ValueOnUntaggedEnum>()
+    let cfg: ValueOnUntaggedEnum = Clapfig::typed::<ValueOnUntaggedEnum>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -1059,7 +1059,7 @@ fn value_attribute_preserves_outer_option_optionality() {
 #[test]
 fn value_attribute_optional_loads_absent_as_none() {
     let dir = TempDir::new().unwrap();
-    let cfg: ValueOnOptionalCustom = Clapfig::schema_builder::<ValueOnOptionalCustom>()
+    let cfg: ValueOnOptionalCustom = Clapfig::typed::<ValueOnOptionalCustom>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -1072,7 +1072,7 @@ fn value_attribute_optional_loads_absent_as_none() {
 
 #[test]
 fn handle_to_string_produces_template_text() {
-    let s = Clapfig::schema_builder::<DefaultedForHook>()
+    let s = Clapfig::typed::<DefaultedForHook>()
         .app_name("t")
         .no_env()
         .handle_to_string(&ConfigAction::Gen { output: None })

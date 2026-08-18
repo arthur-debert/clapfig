@@ -1,98 +1,47 @@
-//! Runtime-path adapter: `DynamicSpec` implements [`ConfigSpec`] over an
-//! owned [`Schema`].
+//! Schema-driven walks of a value [`Map`] against a [`Schema`]: the
+//! resolve pipeline's validation stages as free functions.
 //!
-//! Pairs with [`crate::runtime`] (the owned schema data) and [`crate::spec`]
-//! (the `SchemaRef` view that every other consumer walks). The adapter
-//! walks the schema directly:
+//! Every function here recurses a parsed table and the schema tree side
+//! by side:
 //!
-//! - **`validate_unknown`**: recursive walk against the schema, every key
-//!   not declared in the schema is collected and reported with line numbers
-//!   from the same `find_key_line` heuristic the static path uses.
-//! - **`fill_defaults`**: recursive walk, every missing leaf with a
-//!   declared `default` is populated in place into the merged table;
-//!   absent nested sections, map-of nodes, and non-optional map leaves
-//!   materialize as empty tables (an absent map is the empty map).
-//! - **`finalize`**: coerces schema-declared datetime leaves (string
+//! - **[`collect_unknown_paths`]**: every key not declared in the schema
+//!   is collected as an [`UnknownKey`]; the caller threads the list
+//!   through [`crate::validate::filter_through_cascade`] for strictness
+//!   decisions. One walker serves every layer — per-file tables and the
+//!   env-derived table alike.
+//! - **[`fill_defaults_into`]**: every missing leaf with a declared
+//!   `default` is populated in place into the merged table; absent nested
+//!   sections, map-of nodes, and non-optional map leaves materialize as
+//!   empty tables (an absent map is the empty map).
+//! - **[`finalize`]**: coerces schema-declared datetime leaves (string
 //!   values in TOML's four lexical forms become [`Value::Datetime`] —
 //!   schema-driven coercion per ADR-0001), then recursively type-checks
 //!   every value against its `LeafType`, enum-checks `LeafType::Enum`,
 //!   and enforces required fields. Returns the merged value [`Map`] (the
-//!   typed `SchemaConfigBuilder` deserializes that map into `C`
-//!   afterwards).
+//!   typed [`TypedBuilder`](crate::TypedBuilder) deserializes that map
+//!   into `C` afterwards).
 //!
-//! [`ConfigSpec`]: crate::spec::ConfigSpec
 //! [`Schema`]: crate::runtime::Schema
-
-use std::path::Path;
-use std::sync::Arc;
+//! [`UnknownKey`]: crate::validate::UnknownKey
 
 use crate::error::ClapfigError;
 use crate::runtime::{Field, NamedField, Schema};
-use crate::spec::{ConfigSpec, SchemaRef};
-use crate::validate::{UnknownKey, ValidateContext, filter_through_cascade};
+use crate::validate::UnknownKey;
 use crate::value::{Map, Value};
-
-/// Runtime-path adapter: drives the resolve pipeline from a user-supplied
-/// schema. The schema is held behind an `Arc` so the macro-driven static
-/// path can share the same `&'static Schema` view that
-/// `clapfig::Schema::schema()` caches without cloning the schema tree per
-/// builder construction.
-pub(crate) struct DynamicSpec {
-    pub(crate) schema: Arc<Schema>,
-}
-
-impl DynamicSpec {
-    pub fn new(schema: Schema) -> Self {
-        Self {
-            schema: Arc::new(schema),
-        }
-    }
-
-    pub fn from_arc(schema: Arc<Schema>) -> Self {
-        Self { schema }
-    }
-}
-
-impl ConfigSpec for DynamicSpec {
-    type Output = Map;
-
-    fn schema(&self) -> SchemaRef<'_> {
-        SchemaRef::from_dynamic(&self.schema)
-    }
-
-    fn validate_unknown(
-        &self,
-        table: &Map,
-        source: &str,
-        path: &Path,
-        ctx: &ValidateContext<'_>,
-    ) -> Result<Vec<crate::strict::CollectedUnknown>, ClapfigError> {
-        let mut unknown: Vec<UnknownKey> = Vec::new();
-        collect_unknown_paths(table, &self.schema, "", &mut unknown);
-        filter_through_cascade(table, source, path, unknown, ctx)
-    }
-
-    fn fill_defaults(&self, table: &mut Map) -> Result<(), ClapfigError> {
-        fill_defaults_into(table, &self.schema);
-        Ok(())
-    }
-
-    fn finalize(&self, mut merged: Map) -> Result<Map, ClapfigError> {
-        coerce_datetimes(&mut merged, &self.schema);
-        check_required_and_types(&merged, &self.schema, "")?;
-        Ok(merged)
-    }
-}
 
 /// Recursively walk `table` against `schema`, collecting dotted paths of
 /// any keys not declared in the schema.
 ///
 /// For nested objects (`Field::Nested`) the recursion descends into the
 /// sub-table; for `Field::ArrayOf`, each entry is validated against the
-/// item schema; for `Field::MapOf`, each entry's value is validated
-/// against the item schema (with the user-supplied key forming a path
-/// segment).
-fn collect_unknown_paths(
+/// item schema (with an `[index]` path segment); for `Field::MapOf`,
+/// each entry's value is validated against the item schema (with the
+/// user-supplied key forming a path segment).
+///
+/// The same walker serves the per-file pass and the env layer. Env
+/// dotted-key syntax cannot express arrays-of-tables, so the `ArrayOf`
+/// arm simply never fires there — recursion support is harmless.
+pub(crate) fn collect_unknown_paths(
     table: &Map,
     schema: &Schema,
     prefix: &str,
@@ -173,7 +122,7 @@ fn find_field<'a>(schema: &'a Schema, name: &str) -> Option<&'a NamedField> {
 /// non-optional map-typed leaves materialize as empty tables (an absent
 /// section/map is the empty one — and the typed path's serde deserialize
 /// needs the table present). Existing values are never overwritten.
-fn fill_defaults_into(table: &mut Map, schema: &Schema) {
+pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
     for nf in &schema.fields {
         match &nf.field {
             Field::Leaf(leaf) => {
@@ -237,12 +186,21 @@ fn fill_defaults_into(table: &mut Map, schema: &Schema) {
     }
 }
 
+/// Finalize a merged table: coerce schema-declared datetimes, then
+/// enforce required fields and per-leaf types. Returns the merged map on
+/// success.
+pub(crate) fn finalize(mut merged: Map, schema: &Schema) -> Result<Map, ClapfigError> {
+    coerce_datetimes(&mut merged, schema);
+    check_required_and_types(&merged, schema, "")?;
+    Ok(merged)
+}
+
 /// Schema-driven datetime coercion (ADR-0001): for every leaf the schema
-/// declares [`LeafType::DateTime`], a merged string value that parses as
-/// one of TOML's four datetime lexical forms is replaced in place with the
-/// typed [`Value::Datetime`]. Strings matching none of the forms are left
-/// untouched, so the type check that follows reports the normal "expected
-/// datetime, got string" error.
+/// declares [`LeafType::DateTime`](crate::runtime::LeafType::DateTime), a
+/// merged string value that parses as one of TOML's four datetime lexical
+/// forms is replaced in place with the typed [`Value::Datetime`]. Strings
+/// matching none of the forms are left untouched, so the type check that
+/// follows reports the normal "expected datetime, got string" error.
 ///
 /// This is the seam that lets schema-blind sources — YAML/JSON files, env
 /// vars, CLI/URL overrides — express datetimes as strings. Detection is
@@ -467,68 +425,66 @@ mod tests {
         crate::fixtures::test::parse_toml(toml_text)
     }
 
-    /// Default validate context — strict on, no overrides, no callback.
-    /// Phase-3 trait method takes a `&ValidateContext<'_>`; tests reach
-    /// for the same defaults via this `'static` helper.
-    fn test_ctx() -> crate::validate::ValidateContext<'static> {
-        use crate::strict::StrictnessOverrides;
-        use std::sync::OnceLock;
-        static EMPTY: OnceLock<StrictnessOverrides> = OnceLock::new();
-        let overrides = EMPTY.get_or_init(StrictnessOverrides::new);
-        crate::validate::ValidateContext {
-            overrides,
-            default_strict: true,
-            callback: None,
-            normalize_keys: false,
-        }
+    fn unknown_paths(table: &Map, schema: &Schema) -> Vec<String> {
+        let mut unknown = Vec::new();
+        collect_unknown_paths(table, schema, "", &mut unknown);
+        unknown.into_iter().map(|u| u.path).collect()
     }
 
-    // --- validate_unknown ---
+    // --- collect_unknown_paths ---
 
     #[test]
-    fn validate_unknown_accepts_known_keys() {
-        let spec = DynamicSpec::new(test_schema());
+    fn walker_accepts_known_keys() {
         let table = parse("port = 1\nname = \"x\"\n");
-        assert!(
-            spec.validate_unknown(&table, "", std::path::Path::new("test"), &test_ctx())
-                .is_ok()
-        );
+        assert!(unknown_paths(&table, &test_schema()).is_empty());
     }
 
     #[test]
-    fn validate_unknown_flags_top_level_typo() {
-        let spec = DynamicSpec::new(test_schema());
-        let source = "name = \"x\"\ntypo = 1\n";
-        let table = parse(source);
-        let err = spec
-            .validate_unknown(&table, source, std::path::Path::new("/t"), &test_ctx())
-            .unwrap_err();
-        let keys = err.unknown_keys().expect("unknown keys");
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].key, "typo");
-        assert_eq!(keys[0].line, 2);
+    fn walker_flags_top_level_typo() {
+        let table = parse("name = \"x\"\ntypo = 1\n");
+        assert_eq!(unknown_paths(&table, &test_schema()), vec!["typo"]);
     }
 
     #[test]
-    fn validate_unknown_flags_nested_typo() {
-        let spec = DynamicSpec::new(test_schema());
-        let source = "name = \"x\"\n[db]\ntypo = 1\n";
-        let table = parse(source);
-        let err = spec
-            .validate_unknown(&table, source, std::path::Path::new("/t"), &test_ctx())
-            .unwrap_err();
-        let keys = err.unknown_keys().expect("unknown keys");
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].key, "db.typo");
+    fn walker_flags_nested_typo() {
+        let table = parse("name = \"x\"\n[db]\ntypo = 1\n");
+        assert_eq!(unknown_paths(&table, &test_schema()), vec!["db.typo"]);
     }
 
-    // --- fill_defaults ---
+    #[test]
+    fn walker_recurses_into_array_of_entries() {
+        // The unified walker recurses into `ArrayOf` indexed entries — the
+        // behavior that used to exist only on the per-file walker. The env
+        // layer shares this walker; env dotted keys can't build
+        // arrays-of-tables, so the arm is simply inert there.
+        let schema = Schema::object("App")
+            .array_of(
+                "plugins",
+                Schema::object("Plugin").field("name", RtField::string().optional()),
+            )
+            .build();
+        let table = parse("[[plugins]]\nname = \"a\"\n[[plugins]]\nrogue = 1\n");
+        assert_eq!(unknown_paths(&table, &schema), vec!["plugins[1].rogue"]);
+    }
+
+    #[test]
+    fn walker_recurses_into_map_of_entries() {
+        let schema = Schema::object("App")
+            .map_of(
+                "plugins",
+                Schema::object("Plugin").field("name", RtField::string().optional()),
+            )
+            .build();
+        let table = parse("[plugins.audit]\nrogue = 1\n");
+        assert_eq!(unknown_paths(&table, &schema), vec!["plugins.audit.rogue"]);
+    }
+
+    // --- fill_defaults_into ---
 
     #[test]
     fn fill_defaults_populates_missing_top_level() {
-        let spec = DynamicSpec::new(test_schema());
         let mut table = parse("name = \"x\"\n");
-        spec.fill_defaults(&mut table).unwrap();
+        fill_defaults_into(&mut table, &test_schema());
         assert_eq!(table.get("port"), Some(&Value::Integer(8080)));
         assert_eq!(table.get("host"), Some(&Value::String("localhost".into())));
         assert_eq!(table.get("level"), Some(&Value::String("info".into())));
@@ -536,17 +492,15 @@ mod tests {
 
     #[test]
     fn fill_defaults_does_not_overwrite() {
-        let spec = DynamicSpec::new(test_schema());
         let mut table = parse("name = \"x\"\nport = 9999\n");
-        spec.fill_defaults(&mut table).unwrap();
+        fill_defaults_into(&mut table, &test_schema());
         assert_eq!(table.get("port"), Some(&Value::Integer(9999)));
     }
 
     #[test]
     fn fill_defaults_creates_nested_section_when_missing() {
-        let spec = DynamicSpec::new(test_schema());
         let mut table = parse("name = \"x\"\n");
-        spec.fill_defaults(&mut table).unwrap();
+        fill_defaults_into(&mut table, &test_schema());
         let db = table.get("db").and_then(Value::as_map).unwrap();
         assert_eq!(db.get("pool_size"), Some(&Value::Integer(5)));
         // `url` is optional; should stay absent.
@@ -557,10 +511,10 @@ mod tests {
 
     #[test]
     fn finalize_errors_on_missing_required() {
-        let spec = DynamicSpec::new(test_schema());
+        let schema = test_schema();
         let mut table = parse("port = 1\n");
-        spec.fill_defaults(&mut table).unwrap();
-        let err = spec.finalize(table).unwrap_err();
+        fill_defaults_into(&mut table, &schema);
+        let err = finalize(table, &schema).unwrap_err();
         match err {
             ClapfigError::MissingRequired { key } => assert_eq!(key, "name"),
             other => panic!("expected MissingRequired, got {other:?}"),
@@ -569,10 +523,10 @@ mod tests {
 
     #[test]
     fn finalize_accepts_when_required_present() {
-        let spec = DynamicSpec::new(test_schema());
+        let schema = test_schema();
         let mut table = parse("name = \"x\"\n");
-        spec.fill_defaults(&mut table).unwrap();
-        let out = spec.finalize(table).unwrap();
+        fill_defaults_into(&mut table, &schema);
+        let out = finalize(table, &schema).unwrap();
         assert_eq!(out.get("name"), Some(&Value::String("x".into())));
         assert_eq!(out.get("port"), Some(&Value::Integer(8080)));
     }
@@ -581,10 +535,10 @@ mod tests {
 
     #[test]
     fn finalize_rejects_wrong_leaf_type() {
-        let spec = DynamicSpec::new(test_schema());
+        let schema = test_schema();
         let mut table = parse("name = \"x\"\nport = \"oops\"\n");
-        spec.fill_defaults(&mut table).unwrap();
-        let err = spec.finalize(table).unwrap_err();
+        fill_defaults_into(&mut table, &schema);
+        let err = finalize(table, &schema).unwrap_err();
         match err {
             ClapfigError::InvalidValue { key, reason } => {
                 assert_eq!(key, "port");
@@ -596,10 +550,10 @@ mod tests {
 
     #[test]
     fn finalize_rejects_out_of_set_enum_value() {
-        let spec = DynamicSpec::new(test_schema());
+        let schema = test_schema();
         let mut table = parse("name = \"x\"\nlevel = \"garbage\"\n");
-        spec.fill_defaults(&mut table).unwrap();
-        let err = spec.finalize(table).unwrap_err();
+        fill_defaults_into(&mut table, &schema);
+        let err = finalize(table, &schema).unwrap_err();
         match err {
             ClapfigError::InvalidValue { key, reason } => {
                 assert_eq!(key, "level");
@@ -626,7 +580,7 @@ mod tests {
         // TOML's four datetime forms: offset date-time, local date-time,
         // local date, local time. Schema-blind sources deliver them as
         // strings; the DateTime leaf declaration coerces each.
-        let spec = DynamicSpec::new(datetime_schema());
+        let schema = datetime_schema();
         for form in [
             "1979-05-27T07:32:00Z",
             "1979-05-27T07:32:00",
@@ -635,7 +589,7 @@ mod tests {
         ] {
             let mut table = Map::new();
             table.insert("dt".into(), Value::String(form.into()));
-            let out = spec.finalize(table).unwrap();
+            let out = finalize(table, &schema).unwrap();
             match &out["dt"] {
                 Value::Datetime(dt) => assert_eq!(dt.to_string(), form),
                 other => panic!("{form}: expected Datetime, got {other:?}"),
@@ -645,13 +599,13 @@ mod tests {
 
     #[test]
     fn finalize_coerces_datetimes_inside_declared_arrays() {
-        let spec = DynamicSpec::new(datetime_schema());
+        let schema = datetime_schema();
         let mut table = Map::new();
         table.insert(
             "dts".into(),
             Value::Array(vec![Value::String("1979-05-27".into())]),
         );
-        let out = spec.finalize(table).unwrap();
+        let out = finalize(table, &schema).unwrap();
         match &out["dts"][0] {
             Value::Datetime(dt) => assert_eq!(dt.to_string(), "1979-05-27"),
             other => panic!("expected Datetime, got {other:?}"),
@@ -662,11 +616,11 @@ mod tests {
     fn finalize_rejects_malformed_datetime_string_as_type_error() {
         // A string matching none of the four forms is a normal type
         // error, never a silent pass-through.
-        let spec = DynamicSpec::new(datetime_schema());
+        let schema = datetime_schema();
         for bad in ["not-a-date", "1979-13-45", "07:99:00", "2024/01/02"] {
             let mut table = Map::new();
             table.insert("dt".into(), Value::String(bad.into()));
-            match spec.finalize(table) {
+            match finalize(table, &schema) {
                 Err(ClapfigError::InvalidValue { key, reason }) => {
                     assert_eq!(key, "dt");
                     assert!(reason.contains("expected datetime"), "{bad}: {reason}");
@@ -680,14 +634,12 @@ mod tests {
     fn finalize_never_coerces_strings_on_non_datetime_leaves() {
         // Coercion is schema-driven, not sniffing: a datetime-looking
         // string on a String leaf stays a string.
-        let spec = DynamicSpec::new(
-            Schema::object("T")
-                .field("s", RtField::string().optional())
-                .build(),
-        );
+        let schema = Schema::object("T")
+            .field("s", RtField::string().optional())
+            .build();
         let mut table = Map::new();
         table.insert("s".into(), Value::String("1979-05-27".into()));
-        let out = spec.finalize(table).unwrap();
+        let out = finalize(table, &schema).unwrap();
         assert_eq!(out["s"], Value::String("1979-05-27".into()));
     }
 
@@ -695,11 +647,11 @@ mod tests {
     fn finalize_nested_required_check() {
         // Supply every top-level required field by hand so the only missing
         // required field is `db.pool_size` (which has a default but is
-        // required if no layer provides it). Skipping `fill_defaults`
+        // required if no layer provides it). Skipping `fill_defaults_into`
         // exposes the nested-required path.
-        let spec = DynamicSpec::new(test_schema());
+        let schema = test_schema();
         let table = parse("name = \"x\"\nport = 8080\nhost = \"h\"\nlevel = \"info\"\n[db]\n");
-        let err = spec.finalize(table).unwrap_err();
+        let err = finalize(table, &schema).unwrap_err();
         match err {
             ClapfigError::MissingRequired { key } => assert_eq!(key, "db.pool_size"),
             other => panic!("expected MissingRequired(db.pool_size), got {other:?}"),

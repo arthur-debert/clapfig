@@ -1395,7 +1395,7 @@ mod tests {
         // document is the generated template (comment keys included) with
         // the set applied.
         use crate::fixtures::test::test_schema;
-        let out = crate::persist::set_in_document_runtime(
+        let out = crate::persist::set_in_document(
             &JsonAdapter,
             &test_schema(),
             None,

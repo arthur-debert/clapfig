@@ -6,8 +6,8 @@
 //! Schema document. Useful for auto-generating UI editors, external
 //! validation tools, or IDE integrations.
 //!
-//! Internally the walker consumes a crate-private `SchemaRef` view so the
-//! same generator serves both entry points without a separate code path.
+//! The walker consumes `&runtime::Schema` directly — the crate's one
+//! schema model — so the same generator serves both entry points.
 //!
 //! # What is in the schema
 //!
@@ -34,16 +34,15 @@
 //! # Example
 //!
 //! ```ignore
-//! use clapfig::schema;
+//! use clapfig::json_schema;
 //!
-//! let value = schema::generate_schema(MyConfig::schema());
+//! let value = json_schema::generate_schema(MyConfig::schema());
 //! println!("{}", serde_json::to_string_pretty(&value).unwrap());
 //! ```
 
 use serde_json::{Map, Value, json};
 
-use crate::runtime::LeafType;
-use crate::spec::{FieldKindRef, FieldRef, LeafRef, SchemaRef};
+use crate::runtime::{Field, Leaf, LeafType, NamedField, Schema};
 use crate::value::Value as ConfigValue;
 
 /// JSON Schema dialect emitted in the root `$schema` field.
@@ -65,18 +64,12 @@ fn comment_key_allowlist() -> Value {
 /// Generate a JSON Schema document from a config schema.
 ///
 /// Works for both entry points: pass the schema handed to
-/// [`Clapfig::runtime`](crate::Clapfig::runtime), or a derive-emitted
+/// [`Clapfig::builder`](crate::Clapfig::builder), or a derive-emitted
 /// schema via `C::schema()`.
 ///
 /// Returns a `serde_json::Value` — the caller serializes it to a string,
 /// writes it to a file, or embeds it wherever needed.
-pub fn generate_schema(schema: &crate::runtime::Schema) -> Value {
-    generate_schema_from_ref(SchemaRef::from_dynamic(schema))
-}
-
-/// Internal entry point. Walks any `SchemaRef`-backed schema and emits the
-/// JSON Schema document.
-pub(crate) fn generate_schema_from_ref(schema: SchemaRef<'_>) -> Value {
+pub fn generate_schema(schema: &Schema) -> Value {
     let mut root = schema_to_object(schema);
     if let Value::Object(map) = &mut root {
         map.insert("$schema".into(), Value::String(SCHEMA_DIALECT.into()));
@@ -85,19 +78,18 @@ pub(crate) fn generate_schema_from_ref(schema: SchemaRef<'_>) -> Value {
 }
 
 /// Convert a schema node into a JSON Schema object.
-fn schema_to_object(schema: SchemaRef<'_>) -> Value {
+fn schema_to_object(schema: &Schema) -> Value {
     let mut obj = Map::new();
     obj.insert("type".into(), Value::String("object".into()));
-    obj.insert("title".into(), Value::String(schema.name().into()));
-    let schema_doc = schema.doc();
-    if !schema_doc.is_empty() {
-        obj.insert("description".into(), Value::String(join_doc(schema_doc)));
+    obj.insert("title".into(), Value::String(schema.name.clone()));
+    if !schema.doc.is_empty() {
+        obj.insert("description".into(), Value::String(join_doc(&schema.doc)));
     }
 
     let mut properties = Map::new();
     let mut required = Vec::new();
 
-    for field in schema.fields() {
+    for field in &schema.fields {
         let (name, prop, is_required) = field_to_property(field);
         if is_required {
             required.push(Value::String(name.clone()));
@@ -115,64 +107,59 @@ fn schema_to_object(schema: SchemaRef<'_>) -> Value {
     Value::Object(obj)
 }
 
-/// Convert a [`FieldRef`] into a `(name, schema, required)` triple.
+/// Convert a [`NamedField`] into a `(name, schema, required)` triple.
 ///
 /// `required` is `true` for non-optional non-map leaves and for all nested
 /// structs (a nested struct has its own internal required list). Map-typed
 /// leaves, like structural `MapOf`/`ArrayOf` nodes, are never required —
 /// an absent map loads as the empty map.
-fn field_to_property(field: FieldRef<'_>) -> (String, Value, bool) {
-    match field.kind {
-        FieldKindRef::Nested { schema: nested } => {
-            let mut schema = schema_to_object(nested);
-            if !field.doc.is_empty()
-                && let Value::Object(map) = &mut schema
-            {
-                map.insert("description".into(), Value::String(join_doc(field.doc)));
-            }
-            (field.name.into(), schema, true)
+fn field_to_property(field: &NamedField) -> (String, Value, bool) {
+    match &field.field {
+        Field::Nested(nested) => {
+            let schema = schema_to_object(nested);
+            (field.name.clone(), schema, true)
         }
-        FieldKindRef::ArrayOf { schema: item } => {
+        Field::ArrayOf(item) => {
             // JSON Schema for a TOML `[[name]]` array of items: `type: array`
             // with `items: <item schema>`. Each runtime array entry is itself
             // typed against `item`, so the per-item schema is the natural
             // place to declare structure.
             //
-            // Not marked required: `DynamicSpec::finalize` treats an absent
+            // Not marked required: finalization treats an absent
             // array-of as the empty list (no entries), so a JSON Schema
             // requiring the property would reject configs clapfig accepts.
             let mut prop = Map::new();
-            if !field.doc.is_empty() {
-                prop.insert("description".into(), Value::String(join_doc(field.doc)));
+            if !item.doc.is_empty() {
+                prop.insert("description".into(), Value::String(join_doc(&item.doc)));
             }
             prop.insert("type".into(), Value::String("array".into()));
             prop.insert("items".into(), schema_to_object(item));
-            (field.name.into(), Value::Object(prop), false)
+            (field.name.clone(), Value::Object(prop), false)
         }
-        FieldKindRef::MapOf { schema: item } => {
+        Field::MapOf(item) => {
             // TOML `[name.<key>]` with arbitrary entry keys. JSON Schema
             // models this as `type: object` with `additionalProperties:
             // <entry schema>` — entry keys are user-supplied so there are
             // no fixed properties, but each value must satisfy the item
             // schema.
             //
-            // Not marked required: `DynamicSpec::finalize` treats an
+            // Not marked required: finalization treats an
             // absent map-of as the empty map (no entries).
             let mut prop = Map::new();
-            if !field.doc.is_empty() {
-                prop.insert("description".into(), Value::String(join_doc(field.doc)));
+            if !item.doc.is_empty() {
+                prop.insert("description".into(), Value::String(join_doc(&item.doc)));
             }
             prop.insert("type".into(), Value::String("object".into()));
             // Comment keys inside a map-of instance are comments, not
             // entries — allowlist them so they escape the entry schema.
             prop.insert("patternProperties".into(), comment_key_allowlist());
             prop.insert("additionalProperties".into(), schema_to_object(item));
-            (field.name.into(), Value::Object(prop), false)
+            (field.name.clone(), Value::Object(prop), false)
         }
-        FieldKindRef::Leaf(leaf) => {
+        Field::Leaf(leaf) => {
             let mut prop = Map::new();
-            if !field.doc.is_empty() {
-                prop.insert("description".into(), Value::String(join_doc(field.doc)));
+            if !leaf.doc.is_empty() {
+                prop.insert("description".into(), Value::String(join_doc(&leaf.doc)));
             }
             populate_leaf(&mut prop, leaf);
             // Map-typed leaves are never required, mirroring the structural
@@ -180,17 +167,17 @@ fn field_to_property(field: FieldRef<'_>) -> (String, Value, bool) {
             // map loads as the empty map, so a JSON Schema requiring the
             // property would reject configs clapfig accepts.
             let required = !leaf.optional && !matches!(leaf.ty, LeafType::Map(_));
-            (field.name.into(), Value::Object(prop), required)
+            (field.name.clone(), Value::Object(prop), required)
         }
     }
 }
 
 /// Apply a leaf's declared type, default, env hint, and allowed-value set
 /// onto its JSON Schema object.
-fn populate_leaf(prop: &mut Map<String, Value>, leaf: LeafRef<'_>) {
-    if let Some(name) = leaf_type_json_name(leaf.ty) {
+fn populate_leaf(prop: &mut Map<String, Value>, leaf: &Leaf) {
+    if let Some(name) = leaf_type_json_name(&leaf.ty) {
         prop.insert("type".into(), Value::String(name.into()));
-        if let LeafType::Array(item) = leaf.ty
+        if let LeafType::Array(item) = &leaf.ty
             && let Some(item_name) = leaf_type_json_name(item)
         {
             let mut items = Map::new();
@@ -199,17 +186,18 @@ fn populate_leaf(prop: &mut Map<String, Value>, leaf: LeafRef<'_>) {
         }
     }
 
-    if let Some(default) = leaf.default
+    if let Some(default) = &leaf.default
         && let Some(default_value) = value_to_json(default)
     {
         prop.insert("default".into(), default_value);
     }
 
-    if let Some(env_name) = leaf.env {
-        prop.insert("x-env".into(), Value::String(env_name.into()));
+    if let Some(env_name) = &leaf.env {
+        prop.insert("x-env".into(), Value::String(env_name.clone()));
     }
 
-    if let Some(values) = leaf.allowed_values() {
+    // Allowed-value constraint: the value set of a `LeafType::Enum` leaf.
+    if let LeafType::Enum { values } = &leaf.ty {
         let enum_array: Vec<Value> = values.iter().filter_map(value_to_json).collect();
         if !enum_array.is_empty() {
             prop.insert("enum".into(), Value::Array(enum_array));

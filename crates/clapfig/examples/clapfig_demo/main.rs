@@ -50,7 +50,7 @@ mod config;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use clapfig::{Clapfig, ClapfigError, ConfigArgs, SchemaConfigBuilder, SearchPath, render};
+use clapfig::{Clapfig, ClapfigError, ConfigArgs, SearchPath, TypedBuilder, render};
 
 use config::DemoConfig;
 
@@ -111,13 +111,13 @@ enum Commands {
 }
 
 /// Serializable projection of CLI flags for
-/// [`SchemaConfigBuilder::cli_overrides_from`].
+/// [`TypedBuilder::cli_overrides_from`].
 ///
 /// Only includes fields whose names match top-level config keys.
 /// `cli_overrides_from` auto-matches by field name and silently ignores
 /// the rest, so we only need `verbose` here (it matches `DemoConfig::verbose`).
 /// The other CLI flags (`color`, `host`, `port`) map to *nested* config keys
-/// and must be wired with [`SchemaConfigBuilder::cli_override`] instead.
+/// and must be wired with [`TypedBuilder::cli_override`] instead.
 #[derive(Serialize)]
 struct CliOverrides {
     verbose: bool,
@@ -127,7 +127,7 @@ struct CliOverrides {
 // Builder helper
 // ---------------------------------------------------------------------------
 
-/// Create a [`SchemaConfigBuilder`] wired up for the demo app.
+/// Create a [`TypedBuilder`] wired up for the demo app.
 ///
 /// Search paths: Platform (XDG / Library) → `~/.clapfig-demo/` → cwd.
 /// Env prefix: `CLAPFIG_DEMO` (auto-derived).
@@ -139,12 +139,12 @@ struct CliOverrides {
 /// 2. **`cli_override`** — manually maps `--color` → `display.color`,
 ///    `--host` → `server.host`, `--port` → `server.port` (nested keys that
 ///    don't match by flat name).
-fn make_builder(cli: &Cli) -> SchemaConfigBuilder<DemoConfig> {
+fn make_builder(cli: &Cli) -> TypedBuilder<DemoConfig> {
     let overrides = CliOverrides {
         verbose: cli.verbose,
     };
 
-    Clapfig::schema_builder::<DemoConfig>()
+    Clapfig::typed::<DemoConfig>()
         .app_name("clapfig-demo")
         .env_prefix("CLAPFIG_DEMO")
         .search_paths(vec![

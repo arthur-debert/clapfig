@@ -5,7 +5,7 @@
 //!
 //! 1. **`strict(bool)`** — whole-resolution default. Existing API, unchanged.
 //! 2. **Per-node strictness** — per-node [`Schema::strict`](crate::runtime::Schema::strict)
-//!    and [`RuntimeBuilder::strict_at`](crate::RuntimeBuilder::strict_at) set an
+//!    and [`Builder::strict_at`](crate::Builder::strict_at) set an
 //!    explicit `strict` value on a schema node (or on a dotted path that
 //!    resolves to one). The cascade picks the nearest explicit ancestor.
 //! 3. **`on_unknown_key(callback)`** — last word for keys the cascade
@@ -27,16 +27,17 @@
 //! - The first descendant that sets its own `strict` becomes the new root
 //!   for its subtree, overriding the inherited value below it.
 //!
-//! [Knob 1]: crate::RuntimeBuilder::strict
+//! [Knob 1]: crate::Builder::strict
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::spec::{FieldKindRef, SchemaRef};
+use crate::error::ClapfigError;
+use crate::runtime::{Field, Schema};
 use crate::value::Value;
 
-/// Context handed to an [`on_unknown_key`](crate::RuntimeBuilder::on_unknown_key)
+/// Context handed to an [`on_unknown_key`](crate::Builder::on_unknown_key)
 /// callback. Carries every signal the callback needs to make a per-key
 /// decision: where the key lives in the merged tree, what it was, what
 /// file produced it, and — for TOML sources — which line.
@@ -55,7 +56,7 @@ pub struct UnknownKeyContext<'a> {
     /// `leaf = "acme.task-due-date-missing"` (the dots are part of the
     /// key, not segment separators).
     ///
-    /// With [`normalize_keys(true)`](crate::RuntimeBuilder::normalize_keys)
+    /// With [`normalize_keys(true)`](crate::Builder::normalize_keys)
     /// the key has been rewritten (kebab → snake) before reaching the
     /// callback, matching the form every other downstream consumer sees.
     /// Callbacks that pattern-match on raw user-supplied spellings
@@ -88,7 +89,7 @@ pub struct UnknownKeyContext<'a> {
     pub line: Option<usize>,
 }
 
-/// Decision returned by an [`on_unknown_key`](crate::RuntimeBuilder::on_unknown_key)
+/// Decision returned by an [`on_unknown_key`](crate::Builder::on_unknown_key)
 /// callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownKeyDecision {
@@ -98,7 +99,7 @@ pub enum UnknownKeyDecision {
     /// Drop the key silently (same outcome as a lenient subtree).
     Accept,
     /// Route the key into the collected-unknowns list returned by
-    /// [`load_with_unknowns`](crate::RuntimeBuilder::load_with_unknowns).
+    /// [`load_with_unknowns`](crate::Builder::load_with_unknowns).
     /// The key is NOT a strict-mode violation — load succeeds — but the
     /// caller can inspect the list to surface diagnostic-style "we saw
     /// this key, it wasn't in the schema, here's what to do" feedback
@@ -107,9 +108,9 @@ pub enum UnknownKeyDecision {
 }
 
 /// One collected unknown-key entry returned alongside the loaded config
-/// from [`load_with_unknowns`](crate::RuntimeBuilder::load_with_unknowns).
+/// from [`load_with_unknowns`](crate::Builder::load_with_unknowns).
 ///
-/// Produced when an [`on_unknown_key`](crate::RuntimeBuilder::on_unknown_key)
+/// Produced when an [`on_unknown_key`](crate::Builder::on_unknown_key)
 /// callback returns [`UnknownKeyDecision::Collect`] for a key the
 /// strictness cascade flagged. Owned variant of [`UnknownKeyContext`] —
 /// the values are cloned out of the parsed table so the caller can use
@@ -134,8 +135,8 @@ pub struct CollectedUnknown {
 }
 
 /// Internal type-alias for the boxed callback. `Send + Sync` is required so
-/// the hook threads through `Resolver` / `RuntimeResolver`, both of which
-/// may be shared across threads.
+/// the hook threads through [`Resolver`](crate::Resolver), which may be
+/// shared across threads.
 pub(crate) type UnknownKeyHook =
     Arc<dyn Fn(&UnknownKeyContext<'_>) -> UnknownKeyDecision + Send + Sync>;
 
@@ -179,8 +180,8 @@ pub(crate) fn dotted_extension_callback(
 ///
 /// Built once at `build_resolver` time from:
 ///
-/// - `RuntimeBuilder::strict_at(path, bool)` calls (and, through the
-///   forwarding `SchemaConfigBuilder`, the typed path's `strict_at`).
+/// - `Builder::strict_at(path, bool)` calls (and, through the
+///   forwarding `TypedBuilder`, the typed path's `strict_at`).
 /// - Walking a runtime [`Schema`](crate::runtime::Schema) and copying every
 ///   node where `strict.is_some()` into the same map.
 ///
@@ -208,17 +209,15 @@ impl StrictnessOverrides {
     /// Used by the resolve pipeline to decide whether the validate step is
     /// worth running at all — a uniformly-lenient cascade (no `true`
     /// overrides anywhere) lets every unknown key drop silently anyway,
-    /// so the per-file walk + `serde_ignored::deserialize` is wasted work
-    /// and (worse) changes behavior on the static path by surfacing type
-    /// errors that pre-Phase-3 `strict(false)` would have masked.
+    /// so the per-file and env-layer walks would be pure wasted work.
     pub fn has_any_strict(&self) -> bool {
         self.entries.values().any(|v| *v)
     }
 
     /// Walk a schema and copy every node's explicit `strict` into the map.
-    /// Used to seed overrides from a runtime [`Schema`](crate::runtime::Schema)
+    /// Used to seed overrides from a [`Schema`](crate::runtime::Schema)
     /// at `build_resolver` time.
-    pub fn from_schema(schema: SchemaRef<'_>) -> Self {
+    pub fn from_schema(schema: &Schema) -> Self {
         let mut out = Self::new();
         walk_schema_strict(schema, "", &mut out);
         out
@@ -274,23 +273,21 @@ impl StrictnessOverrides {
 
 /// Recursively visit `schema` and populate `out` with every node whose
 /// `strict` is explicitly set.
-fn walk_schema_strict(schema: SchemaRef<'_>, prefix: &str, out: &mut StrictnessOverrides) {
-    if let Some(value) = schema.strict() {
+fn walk_schema_strict(schema: &Schema, prefix: &str, out: &mut StrictnessOverrides) {
+    if let Some(value) = schema.strict {
         out.insert(prefix.to_string(), value);
     }
-    for field in schema.fields() {
+    for field in &schema.fields {
         let dotted = if prefix.is_empty() {
             field.name.to_string()
         } else {
             format!("{prefix}.{}", field.name)
         };
-        match field.kind {
-            FieldKindRef::Leaf(_) => {
+        match &field.field {
+            Field::Leaf(_) => {
                 // Leaves don't carry a `strict` override.
             }
-            FieldKindRef::Nested { schema: nested }
-            | FieldKindRef::ArrayOf { schema: nested }
-            | FieldKindRef::MapOf { schema: nested } => {
+            Field::Nested(nested) | Field::ArrayOf(nested) | Field::MapOf(nested) => {
                 walk_schema_strict(nested, &dotted, out);
             }
         }
@@ -350,34 +347,25 @@ fn strip_brackets(path: &str) -> String {
 /// Resolve a dotted path against a schema and return the kind of the node
 /// it lands on (`Nested`, `ArrayOf`, or `Leaf`). Used to validate
 /// `strict_at` paths at `build_resolver` time.
-pub(crate) fn resolve_path_kind(schema: SchemaRef<'_>, dotted: &str) -> PathKind {
+pub(crate) fn resolve_path_kind(schema: &Schema, dotted: &str) -> PathKind {
     if dotted.is_empty() {
         return PathKind::Section;
     }
     let mut current = schema;
     let mut segments = dotted.split('.').peekable();
     while let Some(seg) = segments.next() {
-        let mut found = None;
-        for field in current.fields() {
-            if field.name == seg {
-                found = Some(field);
-                break;
-            }
-        }
-        let Some(field) = found else {
+        let Some(field) = current.fields.iter().find(|f| f.name == seg) else {
             return PathKind::Unknown;
         };
-        match field.kind {
-            FieldKindRef::Leaf(_) => {
+        match &field.field {
+            Field::Leaf(_) => {
                 return if segments.peek().is_some() {
                     PathKind::Unknown
                 } else {
                     PathKind::Leaf
                 };
             }
-            FieldKindRef::Nested { schema: nested }
-            | FieldKindRef::ArrayOf { schema: nested }
-            | FieldKindRef::MapOf { schema: nested } => {
+            Field::Nested(nested) | Field::ArrayOf(nested) | Field::MapOf(nested) => {
                 if segments.peek().is_none() {
                     return PathKind::Section;
                 }
@@ -386,6 +374,51 @@ pub(crate) fn resolve_path_kind(schema: SchemaRef<'_>, dotted: &str) -> PathKind
         }
     }
     PathKind::Section
+}
+
+/// Validate a list of `(path, strict)` overrides against a schema and
+/// collect them into a [`StrictnessOverrides`], seeded from the schema's
+/// own per-node `strict` settings (builder-supplied `strict_at` entries
+/// override schema-derived ones for the same path).
+///
+/// Errors as [`ClapfigError::InvalidStrictPath`] when:
+///
+/// - the path does not resolve to any field in the schema, or
+/// - the path resolves to a leaf field (strict is a container property).
+///
+/// When `normalize_keys` is `true`, each path is rewritten through
+/// `normalize::normalize_key` before lookup so the override accepts the
+/// same kebab/snake spellings the rest of the pipeline does.
+pub(crate) fn build_strict_overrides(
+    entries: &[(String, bool)],
+    normalize_keys: bool,
+    schema: &Schema,
+) -> Result<StrictnessOverrides, ClapfigError> {
+    let mut out = StrictnessOverrides::from_schema(schema);
+    for (raw_path, strict) in entries {
+        let path = if normalize_keys {
+            crate::normalize::normalize_key(raw_path)
+        } else {
+            raw_path.clone()
+        };
+        match resolve_path_kind(schema, &path) {
+            PathKind::Section => out.insert(path, *strict),
+            PathKind::Leaf => {
+                return Err(ClapfigError::InvalidStrictPath {
+                    path: raw_path.clone(),
+                    reason: "path resolves to a leaf field, but strict is a section property"
+                        .into(),
+                });
+            }
+            PathKind::Unknown => {
+                return Err(ClapfigError::InvalidStrictPath {
+                    path: raw_path.clone(),
+                    reason: "path does not resolve to any field in the config schema".into(),
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Result of [`resolve_path_kind`].

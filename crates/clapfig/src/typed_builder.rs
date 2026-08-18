@@ -1,72 +1,74 @@
 //! Builder for configs whose schema comes from `#[derive(clapfig::Schema)]`.
 //!
-//! Entry point: [`crate::Clapfig::schema_builder::<C>()`](crate::Clapfig::schema_builder).
+//! Entry point: [`crate::Clapfig::typed::<C>()`](crate::Clapfig::typed).
 //!
-//! Internally this wraps a [`RuntimeBuilder`](crate::RuntimeBuilder)
-//! constructed from `C::schema()` (the cached runtime view of the
-//! macro-emitted `SchemaStatic`). Every method forwards through to the
-//! runtime builder so the typed and runtime paths share one resolve
-//! pipeline. The only added work is the final `Map → C` deserialize
-//! step on `load()` (through the value model's serde bridge) and the
-//! typed `post_validate(&C)` hook.
+//! Internally this wraps a [`Builder`](crate::Builder)
+//! constructed from `C::schema()` (the cached [`runtime::Schema`] view
+//! of the macro-emitted `SchemaStatic`). Every method forwards through
+//! to the Map-out builder so both paths share one resolve pipeline. The
+//! only added work is the final `Map → C` deserialize step on `load()`
+//! (through the value model's serde bridge) and the typed
+//! `post_validate(&C)` hook.
+//!
+//! [`runtime::Schema`]: crate::runtime::Schema
 
 use std::marker::PhantomData;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::builder::Builder;
 use crate::error::ClapfigError;
 use crate::ops::ConfigResult;
-use crate::runtime_builder::RuntimeBuilder;
 use crate::static_schema::Schema;
 use crate::types::{ConfigAction, Layer, SearchMode, SearchPath};
 use crate::value::{Map, Value, from_value};
 
 /// Typed-config builder driven by a `#[derive(clapfig::Schema)]` struct.
 ///
-/// Same surface as [`RuntimeBuilder`](crate::RuntimeBuilder) — `app_name`,
+/// Same surface as [`Builder`](crate::Builder) — `app_name`,
 /// `search_paths`, `env_prefix`, `cli_override`, `post_validate`, `load`,
 /// `handle` — but `load()` returns the typed `C` and `post_validate`
 /// receives a typed `&C`.
-pub struct SchemaConfigBuilder<C: Schema> {
-    inner: RuntimeBuilder,
+pub struct TypedBuilder<C: Schema> {
+    inner: Builder,
     _phantom: PhantomData<fn() -> C>,
 }
 
-impl<C: Schema> SchemaConfigBuilder<C> {
+impl<C: Schema> TypedBuilder<C> {
     pub(crate) fn new() -> Self {
         // Reuse the per-type `Arc<Schema>` cache the derive maintains —
         // one `Arc::clone` (atomic increment, no allocation) per builder
         // construction instead of a full schema-tree clone.
         Self {
-            inner: RuntimeBuilder::from_arc(C::schema_arc()),
+            inner: Builder::from_arc(C::schema_arc()),
             _phantom: PhantomData,
         }
     }
 
     /// Set the application name. See
-    /// [`RuntimeBuilder::app_name`](crate::RuntimeBuilder::app_name).
+    /// [`Builder::app_name`](crate::Builder::app_name).
     pub fn app_name(mut self, name: &str) -> Self {
         self.inner = self.inner.app_name(name);
         self
     }
 
     /// Override the config file name. See
-    /// [`RuntimeBuilder::file_name`](crate::RuntimeBuilder::file_name).
+    /// [`Builder::file_name`](crate::Builder::file_name).
     pub fn file_name(mut self, name: &str) -> Self {
         self.inner = self.inner.file_name(name);
         self
     }
 
     /// Discover config files by stem across the enabled formats. See
-    /// [`RuntimeBuilder::file_stem`](crate::RuntimeBuilder::file_stem).
+    /// [`Builder::file_stem`](crate::Builder::file_stem).
     pub fn file_stem(mut self, stem: &str) -> Self {
         self.inner = self.inner.file_stem(stem);
         self
     }
 
     /// Set the ordered enabled-formats list. See
-    /// [`RuntimeBuilder::formats`](crate::RuntimeBuilder::formats).
+    /// [`Builder::formats`](crate::Builder::formats).
     pub fn formats<I, S>(mut self, names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -135,7 +137,7 @@ impl<C: Schema> SchemaConfigBuilder<C> {
 
     /// Convenience: "accept dotted, reject bare" at a dotted-path
     /// subtree. See
-    /// [`RuntimeBuilder::accept_dotted_extension_keys_in`](crate::RuntimeBuilder::accept_dotted_extension_keys_in)
+    /// [`Builder::accept_dotted_extension_keys_in`](crate::Builder::accept_dotted_extension_keys_in)
     /// for the full semantics.
     pub fn accept_dotted_extension_keys_in(
         mut self,
@@ -178,13 +180,13 @@ impl<C: Schema> SchemaConfigBuilder<C> {
     }
 }
 
-impl<C: Schema + DeserializeOwned> SchemaConfigBuilder<C> {
+impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
     /// Post-merge validation hook. Receives the typed `&C`.
     ///
     /// Conceptually the same as
-    /// [`RuntimeBuilder::post_validate`](crate::RuntimeBuilder::post_validate)
+    /// [`Builder::post_validate`](crate::Builder::post_validate)
     /// — internally we deserialize the merged value [`Map`] into `C`
-    /// inside the runtime builder's hook so the user's closure stays
+    /// inside the Map-out builder's hook so the user's closure stays
     /// typed.
     pub fn post_validate<F>(mut self, f: F) -> Self
     where
@@ -218,7 +220,7 @@ impl<C: Schema + DeserializeOwned> SchemaConfigBuilder<C> {
 
     /// Dispatch a [`ConfigAction`] and return the rendered output.
     ///
-    /// The action surface is identical to the runtime path —
+    /// The action surface is identical to the Map-out path —
     /// `gen | schema | get | list | set | unset` all delegate.
     pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError> {
         self.inner.handle(action)

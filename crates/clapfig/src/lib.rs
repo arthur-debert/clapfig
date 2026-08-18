@@ -23,7 +23,7 @@
 //!     port: u16,
 //! }
 //!
-//! let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+//! let config: AppConfig = Clapfig::typed::<AppConfig>()
 //!     .app_name("myapp")
 //!     .load()?;
 //! ```
@@ -114,8 +114,8 @@
 //!   lossy fallback. Call sites react to the error; nothing branches on
 //!   format names.
 //! - **Formats are opt-in and ordered.** Discovery by
-//!   [`file_stem`](RuntimeBuilder::file_stem) enables the
-//!   [`formats`](RuntimeBuilder::formats) list (default: TOML only, never
+//!   [`file_stem`](Builder::file_stem) enables the
+//!   [`formats`](Builder::formats) list (default: TOML only, never
 //!   inferred from cargo features); the first entry is the preferred
 //!   format `config gen` renders and file seeding uses. The Discovery
 //!   section below spells out the full file-name contract.
@@ -152,11 +152,11 @@
 //! ```
 //!
 //! This is the default order. You can customize it with
-//! [`layer_order()`](RuntimeBuilder::layer_order) — for example, to make
+//! [`layer_order()`](Builder::layer_order) — for example, to make
 //! files override env vars, or to exclude a layer entirely:
 //!
 //! ```ignore
-//! Clapfig::schema_builder::<MyConfig>()
+//! Clapfig::typed::<MyConfig>()
 //!     .app_name("myapp")
 //!     .layer_order(vec![Layer::Env, Layer::Files, Layer::Cli])
 //!     .load()?;
@@ -177,7 +177,7 @@
 //!
 //! ## Discovery — where to look
 //!
-//! [`search_paths()`](RuntimeBuilder::search_paths) accepts a list of
+//! [`search_paths()`](Builder::search_paths) accepts a list of
 //! [`SearchPath`] variants in **priority-ascending** order (last = highest):
 //!
 //! - **`Platform`** — the OS config directory (XDG on Linux, `~/Library/
@@ -198,13 +198,13 @@
 //!
 //! *What* to look for in each directory is the file-name contract:
 //!
-//! - **[`file_name("myapp.toml")`](RuntimeBuilder::file_name)** — exact-name
+//! - **[`file_name("myapp.toml")`](Builder::file_name)** — exact-name
 //!   discovery. Only files with that precise name are considered, and the
 //!   name's extension selects the single enabled format (an extensionless
 //!   rc-style name parses as TOML). This is the default
 //!   (`{app_name}.toml`), so TOML-only apps configure nothing.
-//! - **[`file_stem("myapp")`](RuntimeBuilder::file_stem)** plus
-//!   **[`formats([...])`](RuntimeBuilder::formats)** — stem discovery
+//! - **[`file_stem("myapp")`](Builder::file_stem)** plus
+//!   **[`formats([...])`](Builder::formats)** — stem discovery
 //!   across the enabled formats' extensions (`myapp.toml`, `myapp.yaml` /
 //!   `myapp.yml`, `myapp.json`). Formats are opt-in and ordered (default:
 //!   TOML only); the first entry is the **preferred format** (`config gen`
@@ -218,7 +218,7 @@
 //!
 //! ## Resolution — what to do with found files
 //!
-//! [`search_mode()`](RuntimeBuilder::search_mode) controls what happens
+//! [`search_mode()`](Builder::search_mode) controls what happens
 //! when multiple config files are found:
 //!
 //! - **[`Merge`](SearchMode::Merge)** (default) — deep-merge all files. Each
@@ -236,7 +236,7 @@
 //!
 //! ## Persistence — where to write
 //!
-//! [`persist_scope()`](RuntimeBuilder::persist_scope) names a target for
+//! [`persist_scope()`](Builder::persist_scope) names a target for
 //! `config set`/`unset`. You can have multiple scopes (e.g. "local" and
 //! "global") and the `--scope` flag selects which one to write to. The first
 //! scope added is the default.
@@ -266,7 +266,7 @@
 //! flags, URLs). If you need exact control over how a value is interpreted,
 //! use serde's `#[serde(deserialize_with = ...)]` on the field.
 //!
-//! Disable env loading entirely with [`.no_env()`](RuntimeBuilder::no_env)
+//! Disable env loading entirely with [`.no_env()`](Builder::no_env)
 //! when you don't want environment variables in the mix (e.g. in tests or
 //! embedded contexts).
 //!
@@ -277,12 +277,12 @@
 //! For Rust-backed web applications, URL query parameters can serve as a
 //! per-request config layer — by default sitting between environment variables
 //! and CLI overrides in precedence (customizable via
-//! [`layer_order()`](RuntimeBuilder::layer_order)). This is useful for WASM
+//! [`layer_order()`](Builder::layer_order)). This is useful for WASM
 //! frontends (Leptos, Dioxus, Yew) or server-side apps that accept config
 //! overrides via the URL.
 //!
 //! ```ignore
-//! let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+//! let config: AppConfig = Clapfig::typed::<AppConfig>()
 //!     .app_name("myapp")
 //!     .url_query("port=9090&database.url=pg%3A%2F%2Fprod&debug=true")
 //!     .load()?;
@@ -311,13 +311,13 @@
 //!
 //! # Programmatic overrides
 //!
-//! The [`cli_override()`](RuntimeBuilder::cli_override) and
-//! [`cli_overrides_from()`](RuntimeBuilder::cli_overrides_from) methods
+//! The [`cli_override()`](Builder::cli_override) and
+//! [`cli_overrides_from()`](Builder::cli_overrides_from) methods
 //! inject values at the `Cli` layer (highest priority by default). Despite
 //! the name, they are not clap-specific — use them with any value source
 //! (GUI inputs, HTTP headers, hardcoded test values). Their position in the
 //! merge order can be changed with
-//! [`layer_order()`](RuntimeBuilder::layer_order).
+//! [`layer_order()`](Builder::layer_order).
 //!
 //! `cli_overrides_from(source)` auto-matches: it serializes the source,
 //! skips `None` values, and keeps only keys that exist in the schema.
@@ -340,7 +340,7 @@
 //! ```
 //!
 //! This catches typos and stale keys early. Turn it off with
-//! [`.strict(false)`](RuntimeBuilder::strict) if you intentionally share
+//! [`.strict(false)`](Builder::strict) if you intentionally share
 //! config files across tools or want forward-compatible configs.
 //!
 //! ## Cascading strictness
@@ -373,7 +373,7 @@
 //!   for its subtree, overriding the inherited value below it.
 //!
 //! ```ignore
-//! Clapfig::schema_builder::<AppConfig>()
+//! Clapfig::typed::<AppConfig>()
 //!     .strict(true)                       // typo protection by default
 //!     .strict_at("plugins", false)        // plugins.* subtree: lenient
 //!     .strict_at("plugins.audit", true)   // …but plugins.audit re-tightens
@@ -381,9 +381,9 @@
 //! ```
 //!
 //! Targeting a leaf or an unknown path errors at
-//! [`build_resolver()`](RuntimeBuilder::build_resolver) time with
+//! [`build_resolver()`](Builder::build_resolver) time with
 //! [`ClapfigError::InvalidStrictPath`] — typo protection on the override
-//! itself. With [`.normalize_keys(true)`](RuntimeBuilder::normalize_keys)
+//! itself. With [`.normalize_keys(true)`](Builder::normalize_keys)
 //! set, `path` may be written in kebab-case.
 //!
 //! ### The `on_unknown_key` callback
@@ -397,7 +397,7 @@
 //! produces a `ClapfigError::UnknownKeys` entry (the default).
 //!
 //! ```ignore
-//! Clapfig::schema_builder::<AppConfig>()
+//! Clapfig::typed::<AppConfig>()
 //!     .strict(true)
 //!     .on_unknown_key(|c: &UnknownKeyContext<'_>| {
 //!         // Extension-emitted dotted keys (`"acme.task-due-date"`) are
@@ -426,7 +426,7 @@
 //! Some apps don't have a single compile-time config struct: plugin
 //! hosts assemble their schema from loaded plugins, scripting hosts read
 //! it from a config descriptor file, generated apps build it programmatically.
-//! [`Clapfig::runtime`] is the entry point for those cases.
+//! [`Clapfig::builder`] is the entry point for those cases.
 //!
 //! ```ignore
 //! use clapfig::{Clapfig, runtime::{Field, Schema}};
@@ -449,12 +449,12 @@
 //!     )
 //!     .build();
 //!
-//! let table: clapfig::value::Map = Clapfig::runtime(schema)
+//! let table: clapfig::value::Map = Clapfig::builder(schema)
 //!     .app_name("myapp")
 //!     .load()?;
 //! ```
 //!
-//! Same surface as [`Clapfig::schema_builder`] — `app_name`, `search_paths`,
+//! Same surface as [`Clapfig::typed`] — `app_name`, `search_paths`,
 //! `env_prefix`, `cli_override`, `post_validate`, `build_resolver`,
 //! `handle` (drives `config gen|list|get|set|unset|schema`) — but the
 //! result is a value [`Map`](value::Map) rather than a typed `C`, and
@@ -464,8 +464,8 @@
 //! derive macro emits the same [`runtime::Schema`] shape the runtime
 //! builder constructs, so `config gen`, JSON Schema emission, persistence
 //! validation, and strict-mode value context behave identically. The only
-//! difference is that `Clapfig::schema_builder::<C>().load()` returns a
-//! typed `C` while `Clapfig::runtime(schema).load()` returns a value
+//! difference is that `Clapfig::typed::<C>().load()` returns a
+//! typed `C` while `Clapfig::builder(schema).load()` returns a value
 //! [`Map`](value::Map).
 //!
 //! `LeafType` covers the value model's primitives + array + map, plus
@@ -473,13 +473,13 @@
 //! formats, modes). The schema is consumed by every surface with no extra
 //! wiring: `config gen` emits a commented template with allowed-value
 //! lines for enum leaves; the JSON Schema emitter emits `enum: [...]` on
-//! the property; [`meta::doc_for_runtime`] reads doc-comment lines from
+//! the property; [`meta::doc_for`] reads doc-comment lines from
 //! the schema.
 //!
 //! Cascading strictness composes naturally: schemas can set per-node
 //! strictness inline via [`Schema::strict(bool)`](crate::runtime::Schema::strict),
-//! and [`RuntimeBuilder::strict_at`](RuntimeBuilder::strict_at) /
-//! [`RuntimeBuilder::on_unknown_key`](RuntimeBuilder::on_unknown_key)
+//! and [`Builder::strict_at`](Builder::strict_at) /
+//! [`Builder::on_unknown_key`](Builder::on_unknown_key)
 //! overlay on top.
 //!
 //! Schema field names are validated at construction: empty names, names
@@ -491,18 +491,18 @@
 //!
 //! By default, keys in config files and overrides must match the Rust field
 //! name exactly (`pool_size`, not `pool-size`). Opt into kebab acceptance
-//! with [`.normalize_keys(true)`](RuntimeBuilder::normalize_keys):
+//! with [`.normalize_keys(true)`](Builder::normalize_keys):
 //!
 //! ```ignore
-//! Clapfig::schema_builder::<MyConfig>()
+//! Clapfig::typed::<MyConfig>()
 //!     .app_name("myapp")
 //!     .normalize_keys(true)
 //!     .load()?;
 //! ```
 //!
 //! Every key crossing the boundary into clapfig — TOML keys in files, dotted
-//! keys in [`.cli_override()`](RuntimeBuilder::cli_override) /
-//! [`.cli_overrides_from()`](RuntimeBuilder::cli_overrides_from), URL query
+//! keys in [`.cli_override()`](Builder::cli_override) /
+//! [`.cli_overrides_from()`](Builder::cli_overrides_from), URL query
 //! parameter keys — has its `-` characters rewritten to `_` before
 //! validation, merging, and deserialization. So `pool-size`, `pool_size`,
 //! and mixed forms all resolve to the same `pool_size` field.
@@ -551,7 +551,7 @@
 //! Write them once, in a closure, and register it on the builder:
 //!
 //! ```ignore
-//! let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+//! let config: AppConfig = Clapfig::typed::<AppConfig>()
 //!     .app_name("myapp")
 //!     .post_validate(|c| {
 //!         if c.port < 1024 {
@@ -566,7 +566,7 @@
 //! ```
 //!
 //! The hook runs after all layers have been merged and type-validated, but
-//! before [`load()`](SchemaConfigBuilder::load) returns. Rejections become
+//! before [`load()`](TypedBuilder::load) returns. Rejections become
 //! [`ClapfigError::PostValidationFailed`],
 //! which renders with the same error pipeline as every other clapfig error.
 //!
@@ -580,24 +580,24 @@
 //! - **One hook per builder.** Calling `.post_validate()` twice replaces the
 //!   previous hook — compose multiple checks inside one closure.
 //! - **The hook is captured by value and fires on every resolution.** If you
-//!   build a [`RuntimeResolver`] for tree-walk use cases (see the next
+//!   build a [`Resolver`] for tree-walk use cases (see the next
 //!   section), the same hook runs on every
-//!   [`resolve_at()`](RuntimeResolver::resolve_at) call.
+//!   [`resolve_at()`](Resolver::resolve_at) call.
 //!
-//! # Tree-walk resolution — the `RuntimeResolver` handle
+//! # Tree-walk resolution — the `Resolver` handle
 //!
-//! [`load()`](RuntimeBuilder::load) assumes one resolution per process,
+//! [`load()`](Builder::load) assumes one resolution per process,
 //! anchored at `std::env::current_dir()`. For one-shot CLI tools that's
 //! exactly right. But for tools that walk a **dynamic file tree** where every
 //! directory can have an optional config — the `.htaccess` / `.gitignore` /
 //! `.editorconfig` / `.eslintrc` pattern — you need N resolutions from N
 //! different anchors, and you want to amortize the I/O cost across calls.
 //!
-//! [`RuntimeBuilder::build_resolver()`] gives you a reusable
-//! [`RuntimeResolver`] handle for that case:
+//! [`Builder::build_resolver()`] gives you a reusable
+//! [`Resolver`] handle for that case:
 //!
 //! ```ignore
-//! let resolver = Clapfig::runtime(schema)
+//! let resolver = Clapfig::builder(schema)
 //!     .app_name("myapp")
 //!     .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
 //!     .post_validate(|t| validate_ranges(t))
@@ -612,7 +612,7 @@
 //! Key properties:
 //!
 //! - **`SearchPath::Cwd` and `SearchPath::Ancestors` are anchored at the
-//!   directory passed to [`resolve_at()`](RuntimeResolver::resolve_at)**, not
+//!   directory passed to [`resolve_at()`](Resolver::resolve_at)**, not
 //!   at the process CWD. Each call is a fully independent resolution with the
 //!   same builder state but a different starting point. Walking a site tree
 //!   with `Ancestors(Boundary::Marker(".git"))` gives you
@@ -633,7 +633,7 @@
 //!   builder, captured into the resolver, fired on every `resolve_at` call —
 //!   so per-leaf invariants get the same enforcement as top-level `load()`.
 //!
-//! See [`RuntimeResolver`] for the full API.
+//! See [`Resolver`] for the full API.
 //!
 //! # Normalizing values
 //!
@@ -679,10 +679,10 @@
 //! Tools that build help text, tooltips, settings UIs, or `--describe`
 //! flags can read a field's doc-comment lines directly from the schema —
 //! no need to spin up the full resolve pipeline. See
-//! [`meta::doc_for_runtime`]:
+//! [`meta::doc_for`]:
 //!
 //! ```ignore
-//! let lines = clapfig::meta::doc_for_runtime(AppConfig::schema(), "database.pool-size")
+//! let lines = clapfig::meta::doc_for(AppConfig::schema(), "database.pool-size")
 //!     .unwrap_or_default();
 //! ```
 //!
@@ -742,10 +742,10 @@
 
 pub mod error;
 pub mod format;
+pub mod json_schema;
 pub mod meta;
 pub mod render;
 pub mod runtime;
-pub mod schema;
 pub mod static_schema;
 pub mod types;
 pub mod value;
@@ -762,11 +762,9 @@ mod ops;
 mod overrides;
 mod persist;
 mod resolve;
-mod runtime_builder;
-mod runtime_spec;
-mod schema_builder;
-mod spec;
+mod schema_walk;
 mod strict;
+mod typed_builder;
 #[cfg(feature = "url")]
 mod url;
 mod validate;
@@ -774,15 +772,94 @@ mod validate;
 #[cfg(test)]
 mod fixtures;
 
-pub use builder::Clapfig;
+pub use builder::{Builder, Resolver};
 #[cfg(feature = "derive")]
 pub use clapfig_derive::Schema;
 #[cfg(feature = "clap")]
 pub use cli::{ConfigArgs, ConfigCommand, ConfigSubcommand};
 pub use error::{ClapfigError, UnknownKeyInfo};
 pub use ops::ConfigResult;
-pub use runtime_builder::{RuntimeBuilder, RuntimeResolver};
-pub use schema_builder::SchemaConfigBuilder;
 pub use static_schema::Schema;
 pub use strict::{CollectedUnknown, UnknownKeyContext, UnknownKeyDecision};
+pub use typed_builder::TypedBuilder;
 pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};
+
+/// Entry point for building a clapfig configuration.
+///
+/// Two entry points cover the two output shapes:
+///
+/// - [`Clapfig::typed::<C>()`](Clapfig::typed) — the typed path: `C`
+///   derives [`Schema`] via `#[derive(clapfig::Schema)]`,
+///   and `load()` returns a typed `C`.
+/// - [`Clapfig::builder(schema)`](Clapfig::builder) — the Map-out path:
+///   the schema is an owned [`runtime::Schema`](crate::runtime::Schema)
+///   built at run time, and `load()` returns a value
+///   [`Map`](crate::value::Map).
+///
+/// Both produce builders with the same surface — `app_name`,
+/// `search_paths`, `env_prefix`, `cli_override`, `post_validate`, `load`,
+/// `handle` — backed by one shared resolve pipeline.
+pub struct Clapfig;
+
+impl Clapfig {
+    /// Entry point for the Map-out path: build a config pipeline from an
+    /// owned [`Schema`](crate::runtime::Schema) instead of a compile-time
+    /// derive.
+    ///
+    /// Returns a [`Builder`] with the same surface as
+    /// [`Self::typed`] — `app_name`, `search_paths`, `env_prefix`,
+    /// `cli_override`, `post_validate`, `load`, `handle`,
+    /// `build_resolver`, etc. — but produces a value
+    /// [`Map`](crate::value::Map) rather than a typed `C`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use clapfig::{Clapfig, runtime::{Field, Schema}};
+    ///
+    /// let schema = Schema::object("App")
+    ///     .field("port", Field::integer().default(8080i64))
+    ///     .build();
+    ///
+    /// let table: clapfig::value::Map = Clapfig::builder(schema)
+    ///     .app_name("myapp")
+    ///     .load()?;
+    /// ```
+    pub fn builder(schema: crate::runtime::Schema) -> Builder {
+        Builder::new(schema)
+    }
+
+    /// Entry point for the typed path: build a config pipeline from a
+    /// struct whose schema was emitted by the `#[derive(clapfig::Schema)]`
+    /// macro.
+    ///
+    /// Same builder surface as [`Self::builder`], but `load()` returns the
+    /// typed `C`. The schema metadata available to JSON Schema, template,
+    /// and persistence emission is the full schema view — full type info,
+    /// enum sets, and doc comments, identical to the Map-out path.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use clapfig::{Clapfig, Schema};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Schema, Serialize, Deserialize, Debug)]
+    /// struct AppConfig {
+    ///     /// App host.
+    ///     #[clapfig(default = "localhost")]
+    ///     host: String,
+    ///
+    ///     /// App port.
+    ///     #[clapfig(default = 8080)]
+    ///     port: u16,
+    /// }
+    ///
+    /// let cfg: AppConfig = Clapfig::typed::<AppConfig>()
+    ///     .app_name("myapp")
+    ///     .load()?;
+    /// ```
+    pub fn typed<C: crate::static_schema::Schema>() -> TypedBuilder<C> {
+        TypedBuilder::new()
+    }
+}

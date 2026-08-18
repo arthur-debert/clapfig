@@ -78,7 +78,7 @@ fn map_of_unit_enum_loads_string_entries() {
         "[levels]\ncore = \"debug\"\nnet = \"warn\"\n",
     )
     .unwrap();
-    let cfg: PerTargetLevels = Clapfig::schema_builder::<PerTargetLevels>()
+    let cfg: PerTargetLevels = Clapfig::typed::<PerTargetLevels>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -92,7 +92,7 @@ fn map_of_unit_enum_loads_string_entries() {
 fn map_of_unit_enum_rejects_out_of_set_entry_at_load() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "[levels]\ncore = \"loud\"\n").unwrap();
-    let result: Result<PerTargetLevels, _> = Clapfig::schema_builder::<PerTargetLevels>()
+    let result: Result<PerTargetLevels, _> = Clapfig::typed::<PerTargetLevels>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -126,7 +126,7 @@ fn raw_identifier_field_emits_unraw_schema_name() {
 fn raw_identifier_field_loads_from_its_serde_spelling() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "type = \"dir\"\n").unwrap();
-    let cfg: RawIdent = Clapfig::schema_builder::<RawIdent>()
+    let cfg: RawIdent = Clapfig::typed::<RawIdent>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -258,7 +258,7 @@ struct DatetimeArray {
 fn absent_map_of_unit_enum_loads_as_empty_map() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "").unwrap();
-    let cfg: PerTargetLevels = Clapfig::schema_builder::<PerTargetLevels>()
+    let cfg: PerTargetLevels = Clapfig::typed::<PerTargetLevels>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -277,7 +277,7 @@ struct ScalarMapCfg {
 fn absent_bare_scalar_map_loads_as_empty_map() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "").unwrap();
-    let cfg: ScalarMapCfg = Clapfig::schema_builder::<ScalarMapCfg>()
+    let cfg: ScalarMapCfg = Clapfig::typed::<ScalarMapCfg>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -299,7 +299,7 @@ fn absent_structural_map_of_loads_as_empty_map() {
     // serde fails with a missing-field error.
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "").unwrap();
-    let cfg: StructuralMapCfg = Clapfig::schema_builder::<StructuralMapCfg>()
+    let cfg: StructuralMapCfg = Clapfig::typed::<StructuralMapCfg>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -320,7 +320,7 @@ fn absent_optional_map_stays_none() {
     // synthesized, so absence deserializes to `None`, not `Some({})`.
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "").unwrap();
-    let cfg: OptScalarMapCfg = Clapfig::schema_builder::<OptScalarMapCfg>()
+    let cfg: OptScalarMapCfg = Clapfig::typed::<OptScalarMapCfg>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -334,7 +334,7 @@ fn map_leaf_is_not_required_in_json_schema() {
     // Mirrors the structural-MapOf rule: an absent map loads as the empty
     // map, so a JSON Schema requiring the key would reject configs clapfig
     // accepts.
-    let result = Clapfig::schema_builder::<PerTargetLevels>()
+    let result = Clapfig::typed::<PerTargetLevels>()
         .app_name("t")
         .no_env()
         .handle(&ConfigAction::Schema { output: None })

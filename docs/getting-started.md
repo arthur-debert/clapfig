@@ -93,7 +93,7 @@ Key points:
 use clapfig::Clapfig;
 
 fn main() -> anyhow::Result<()> {
-    let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+    let config: AppConfig = Clapfig::typed::<AppConfig>()
         .app_name("myapp")
         .load()?;
 
@@ -115,7 +115,7 @@ switch from an exact file name to a **stem** plus an ordered list of enabled
 formats:
 
 ```rust
-let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+let config: AppConfig = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .file_stem("myapp")
     .formats(["toml", "yaml", "json"])
@@ -158,7 +158,7 @@ MYAPP__DATABASE__URL=postgres://localhost/mydb cargo run
 Disable env loading with `.no_env()` when you don't want it:
 
 ```rust
-let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+let config: AppConfig = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .no_env()
     .load()?;
@@ -171,7 +171,7 @@ Control where clapfig looks for config files:
 ```rust
 use clapfig::{Clapfig, SearchPath};
 
-let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+let config: AppConfig = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .search_paths(vec![
         SearchPath::Platform,             // XDG / Library / AppData
@@ -209,7 +209,7 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let builder = Clapfig::schema_builder::<AppConfig>()
+    let builder = Clapfig::typed::<AppConfig>()
         .app_name("myapp")
         .persist_scope("local", SearchPath::Cwd);
 
