@@ -1108,9 +1108,10 @@ fn get_from_table(
 /// snake_case path and looked up by dash/underscore equivalence
 /// ([`ops::table_get_normalized`]), so a kebab-case document answers for
 /// either action-key spelling — and a document holding BOTH equivalent
-/// spellings fails as [`ClapfigError::NormalizedKeyCollision`] instead
-/// of one spelling silently answering. The reported key keeps the
-/// caller's spelling.
+/// spellings anywhere (even at keys the lookup never touches) fails as
+/// [`ClapfigError::NormalizedKeyCollision`] instead of answering from a
+/// document the load path refuses. The reported key keeps the caller's
+/// spelling.
 fn get_scope_runtime(
     adapter: &dyn FormatAdapter,
     schema: &Schema,
@@ -2566,6 +2567,36 @@ mod tests {
                 }
                 other => panic!("expected NormalizedKeyCollision, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn scoped_get_rejects_collision_off_the_requested_path() {
+        // Whole-document validation: `host` itself is unambiguous, but
+        // the file holds both spellings in the untraversed `db` table —
+        // scoped get still fails, because a document the load path
+        // refuses is never queried.
+        use crate::format::TomlAdapter;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("demo.toml");
+        fs::write(
+            &path,
+            "host = \"h\"\n\n[db]\npool-size = 5\npool_size = 6\n",
+        )
+        .unwrap();
+        let err = get_scope_runtime(&TomlAdapter, &demo_schema(), &path, "host", true).unwrap_err();
+        match err {
+            ClapfigError::NormalizedKeyCollision {
+                path: reported,
+                section,
+                normalized_key,
+                ..
+            } => {
+                assert_eq!(reported, path);
+                assert_eq!(section, "db");
+                assert_eq!(normalized_key, "pool_size");
+            }
+            other => panic!("expected NormalizedKeyCollision, got {other:?}"),
         }
     }
 

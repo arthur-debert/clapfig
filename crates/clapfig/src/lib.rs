@@ -525,9 +525,10 @@
 //! edits `pool-size` rather than creating a colliding duplicate), and
 //! paths not yet present — including whole files seeded by `config set` —
 //! are emitted kebab-case, matching `config gen` output. A file already
-//! holding both equivalent spellings of a key is ambiguous: `set`,
-//! `unset`, and scoped `get` fail with the same collision error loading
-//! it reports, never silently picking one spelling.
+//! holding both equivalent spellings of a key — anywhere, even at a key
+//! the operation does not touch — is ambiguous: `set`, `unset`, and
+//! scoped `get` fail with the same collision error loading it reports,
+//! never operating on a file loading refuses.
 //!
 //! Environment variables are unaffected — shells dislike `-` in variable
 //! names, and the env layer already lower-cases segments and treats `__` as

@@ -11,14 +11,16 @@
 //! [`normalize_keys`](crate::RuntimeBuilder::normalize_keys) (dash and
 //! underscore spellings are equivalent; the spelling already present in
 //! the document is the one edited, and a document holding both
-//! equivalent spellings errors as a collision rather than one spelling
-//! silently winning), and the file I/O around each edit.
+//! equivalent spellings anywhere errors as a collision rather than one
+//! spelling silently winning), and the file I/O around each edit.
 
 use std::path::Path;
 
 use crate::error::ClapfigError;
 use crate::format::{ConfigPath, FileEdit, FormatAdapter, Operation, SetTarget};
-use crate::normalize::{KeyCollision, kebab_key, normalize_key, resolve_table_key};
+use crate::normalize::{
+    KeyCollision, check_collisions, kebab_key, normalize_key, resolve_table_key,
+};
 use crate::ops::ConfigResult;
 use crate::value::Value;
 
@@ -40,11 +42,11 @@ use crate::value::Value;
 /// against a kebab-case document edits `pool-size` instead of creating a
 /// colliding sibling), and paths not present are emitted kebab-case —
 /// matching what `config gen` emits. A document already holding BOTH
-/// equivalent spellings at a traversed table is ambiguous — such a file
-/// fails to load — so the edit fails with
-/// [`ClapfigError::NormalizedKeyCollision`] instead of silently picking
-/// one spelling (the I/O wrapper stamps the file path; from this pure
-/// function the error's path is empty).
+/// equivalent spellings ANYWHERE — even at a key or table the edit never
+/// touches — is ambiguous and fails to load, so the edit fails with
+/// [`ClapfigError::NormalizedKeyCollision`] instead of editing a
+/// document the load path refuses (the I/O wrapper stamps the file path;
+/// from this pure function the error's path is empty).
 ///
 /// If `content` is `None` (file doesn't exist yet), starts from the
 /// adapter's generated template — rendered with the same `normalize_keys`
@@ -247,11 +249,12 @@ fn lookup_leaf_type<'a>(
 /// `normalize_keys`, the document is parsed first and the key is resolved
 /// by dash/underscore equivalence, so `unset pool_size` removes an
 /// existing `pool-size` entry (and vice versa) — parse failures propagate
-/// in that mode, and a document holding both equivalent spellings fails
-/// with [`ClapfigError::NormalizedKeyCollision`] (empty path here; the
-/// I/O wrapper stamps the file) rather than removing one of two
-/// ambiguous entries. Comment preservation is per the adapter's declared
-/// edit capability; adapter failures propagate as [`ClapfigError::Format`].
+/// in that mode, and a document holding both equivalent spellings
+/// anywhere fails with [`ClapfigError::NormalizedKeyCollision`] (empty
+/// path here; the I/O wrapper stamps the file) rather than editing a
+/// document the load path refuses. Comment preservation is per the
+/// adapter's declared edit capability; adapter failures propagate as
+/// [`ClapfigError::Format`].
 ///
 /// Returns the modified document string.
 pub fn unset_in_document(
@@ -334,20 +337,24 @@ fn emitted_spelling(segment: &str, normalize_keys: bool) -> String {
 /// [`SetTarget::ExistingValue`] vs [`SetTarget::MissingKey`]
 /// classification for a set against an existing file.
 ///
-/// With `normalize_keys`, each segment matches an existing key by
-/// dash/underscore equivalence ([`resolve_table_key`]); a table holding
-/// more than one equivalent spelling (`pool-size` AND `pool_size`) is
-/// ambiguous and errors with [`KeyCollision`] — the same
-/// never-silently-compete rule the load path enforces, so an edit can
-/// never pick one spelling of a document the load path refuses. Segments
-/// with no match resolve to their emitted (kebab-case) spelling. Without
-/// normalization, matching is exact and missing segments keep their
-/// canonical spelling.
+/// With `normalize_keys`, the WHOLE document tree is first validated
+/// with [`check_collisions`]: any table holding more than one equivalent
+/// spelling (`pool-size` AND `pool_size`) — even one the requested path
+/// never traverses — is ambiguous and errors with [`KeyCollision`]. The
+/// same never-silently-compete rule the load path enforces, so an edit
+/// can never touch a document the load path refuses. Each segment then
+/// matches an existing key by dash/underscore equivalence
+/// ([`resolve_table_key`]); segments with no match resolve to their
+/// emitted (kebab-case) spelling. Without normalization, matching is
+/// exact and missing segments keep their canonical spelling.
 fn resolve_document_path(
     tree: &Value,
     canonical: &str,
     normalize_keys: bool,
 ) -> Result<(Vec<String>, bool), KeyCollision> {
+    if normalize_keys && let Value::Map(map) = tree {
+        check_collisions(map)?;
+    }
     let mut segments: Vec<String> = Vec::new();
     let mut current = Some(tree);
     let mut exists = true;
@@ -355,7 +362,7 @@ fn resolve_document_path(
         let matched = match current {
             Some(Value::Map(map)) => {
                 if normalize_keys {
-                    resolve_table_key(map, seg, &segments.join("."))?.cloned()
+                    resolve_table_key(map, seg).cloned()
                 } else if map.contains_key(seg) {
                     Some(seg.to_owned())
                 } else {
@@ -1110,6 +1117,55 @@ mod tests {
         let result =
             set_in_document_runtime(&TomlAdapter, &schema, Some(doc), "my_db.size", "3", true);
         assert_collision(result, "", "my_db", &["my-db", "my_db"], "intermediate");
+    }
+
+    #[test]
+    fn normalized_set_rejects_collision_off_the_requested_path() {
+        // The whole document is validated, not just the traversed path:
+        // the requested key (`host`, root level) is unambiguous, but the
+        // untraversed `database` table holds both spellings — the edit
+        // still fails, because a document the load path refuses is never
+        // edited.
+        for (adapter, doc) in colliding_docs() {
+            let doc = with_host(adapter, doc);
+            let result =
+                set_in_document_runtime(adapter, &test_schema(), Some(&doc), "host", "h2", true);
+            assert_collision(
+                result,
+                "database",
+                "pool_size",
+                &["pool-size", "pool_size"],
+                adapter.name(),
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_unset_rejects_collision_off_the_requested_path() {
+        // Unset runs the same whole-document validation.
+        for (adapter, doc) in colliding_docs() {
+            let doc = with_host(adapter, doc);
+            let result = unset_in_document(adapter, &doc, "host", true);
+            assert_collision(
+                result,
+                "database",
+                "pool_size",
+                &["pool-size", "pool_size"],
+                adapter.name(),
+            );
+        }
+    }
+
+    /// The colliding fixture with an unambiguous root-level `host` key
+    /// added, so a test can target a key that never touches the
+    /// colliding table.
+    fn with_host(adapter: &dyn FormatAdapter, doc: &str) -> String {
+        match adapter.name() {
+            "toml" => format!("host = \"h\"\n{doc}"),
+            "yaml" => format!("host: h\n{doc}"),
+            "json" => doc.replacen("{\n", "{\n  \"host\": \"h\",\n", 1),
+            other => panic!("unexpected adapter {other}"),
+        }
     }
 
     #[test]
