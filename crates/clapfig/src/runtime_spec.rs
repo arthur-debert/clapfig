@@ -332,7 +332,7 @@ fn check_required_and_types(
                 Some(other) => {
                     return Err(ClapfigError::InvalidValue {
                         key: path,
-                        reason: format!("expected table, got {}", value_type_name(other)),
+                        reason: format!("expected map, got {}", value_type_name(other)),
                     });
                 }
             },
@@ -352,10 +352,7 @@ fn check_required_and_types(
                             other => {
                                 return Err(ClapfigError::InvalidValue {
                                     key: indexed,
-                                    reason: format!(
-                                        "expected table, got {}",
-                                        value_type_name(other)
-                                    ),
+                                    reason: format!("expected map, got {}", value_type_name(other)),
                                 });
                             }
                         }
@@ -384,10 +381,7 @@ fn check_required_and_types(
                             other => {
                                 return Err(ClapfigError::InvalidValue {
                                     key: entry_path,
-                                    reason: format!(
-                                        "expected table, got {}",
-                                        value_type_name(other)
-                                    ),
+                                    reason: format!("expected map, got {}", value_type_name(other)),
                                 });
                             }
                         }
@@ -396,7 +390,7 @@ fn check_required_and_types(
                 Some(other) => {
                     return Err(ClapfigError::InvalidValue {
                         key: path,
-                        reason: format!("expected table, got {}", value_type_name(other)),
+                        reason: format!("expected map, got {}", value_type_name(other)),
                     });
                 }
             },
@@ -405,6 +399,9 @@ fn check_required_and_types(
     Ok(())
 }
 
+/// Type name of a [`Value`] for error messages, in the same vocabulary as
+/// [`LeafType::name`](crate::runtime::LeafType) (so "expected map, got
+/// string" reads consistently).
 fn value_type_name(v: &Value) -> &'static str {
     match v {
         Value::String(_) => "string",
@@ -413,7 +410,7 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Boolean(_) => "bool",
         Value::Datetime(_) => "datetime",
         Value::Array(_) => "array",
-        Value::Map(_) => "table",
+        Value::Map(_) => "map",
     }
 }
 

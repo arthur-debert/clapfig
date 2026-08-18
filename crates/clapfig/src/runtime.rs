@@ -333,12 +333,12 @@ impl LeafType {
                 } else {
                     let listed = values
                         .iter()
-                        .map(format_toml_value)
+                        .map(format_value)
                         .collect::<Vec<_>>()
                         .join(" | ");
                     Err(format!(
                         "value {} is not in allowed set: {listed}",
-                        format_toml_value(v)
+                        format_value(v)
                     ))
                 }
             }
@@ -434,7 +434,7 @@ fn validate_field_name(schema: &Schema, name: &str) {
 }
 
 /// Pretty-print a [`Value`] for error messages.
-fn format_toml_value(v: &Value) -> String {
+fn format_value(v: &Value) -> String {
     match v {
         Value::String(s) => format!("\"{s}\""),
         Value::Integer(i) => i.to_string(),
@@ -442,10 +442,12 @@ fn format_toml_value(v: &Value) -> String {
         Value::Boolean(b) => b.to_string(),
         Value::Datetime(d) => d.to_string(),
         Value::Array(_) => "<array>".into(),
-        Value::Map(_) => "<table>".into(),
+        Value::Map(_) => "<map>".into(),
     }
 }
 
+/// Type name of a [`Value`] for error messages, in the same vocabulary as
+/// [`LeafType::name`] (so "expected map, got string" reads consistently).
 fn value_type_name(v: &Value) -> &'static str {
     match v {
         Value::String(_) => "string",
@@ -454,7 +456,7 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Boolean(_) => "bool",
         Value::Datetime(_) => "datetime",
         Value::Array(_) => "array",
-        Value::Map(_) => "table",
+        Value::Map(_) => "map",
     }
 }
 

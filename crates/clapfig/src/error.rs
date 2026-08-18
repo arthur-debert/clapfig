@@ -165,11 +165,13 @@ pub enum ClapfigError {
     Format(#[from] crate::format::FormatError),
 
     /// A format name or file extension resolves to no shipped adapter:
-    /// the builder's `formats(...)` list names an unknown format, or a
+    /// the builder's `formats(...)` list names an unknown format, a
     /// file name / explicit path (a persist target, `gen --output`)
-    /// carries an extension no adapter claims. Extensionless names are
-    /// not this error — they fall back to TOML (exact-name discovery,
-    /// explicit paths) or the preferred format (`gen --output`).
+    /// carries an extension no adapter claims, or a file reaching the
+    /// resolve pipeline carries an extension no enabled adapter claims.
+    /// Extensionless names are not this error — they fall back to TOML
+    /// (exact-name discovery, explicit paths) or the preferred format
+    /// (`gen --output`, pipeline parsing).
     #[error("Unknown format '{name}' — available formats: {}", available.join(", "))]
     UnknownFormat {
         name: String,

@@ -38,9 +38,12 @@ pub(crate) struct ResolveInput<'a, S: ConfigSpec> {
     /// table into the spec's `Output`.
     pub spec: &'a S,
     /// Enabled format adapters — the routing seam every file parse goes
-    /// through. Per-file adapter selection is by extension; files whose
-    /// extension no enabled adapter claims fall back to the preferred
-    /// (first-registered) adapter.
+    /// through. Per-file adapter selection is by extension; extensionless
+    /// files (rc-style names) fall back to the preferred
+    /// (first-registered) adapter, and an extension no enabled adapter
+    /// claims is a hard [`ClapfigError::UnknownFormat`] — the same
+    /// explicit-path rule as persist targets and `gen --output`, never a
+    /// silent parse under another format.
     pub registry: &'a FormatRegistry,
     /// File contents in precedence order: first = lowest priority, last = highest.
     pub files: Vec<(PathBuf, String)>,
@@ -141,15 +144,28 @@ pub(crate) fn resolve<S: ConfigSpec>(
     let files_table = {
         let mut t = Map::new();
         for (path, content) in &input.files {
-            let adapter = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .and_then(|ext| input.registry.by_extension(ext))
-                .or_else(|| input.registry.preferred())
-                .ok_or_else(|| ClapfigError::UnknownFormat {
-                    name: path.display().to_string(),
-                    available: format::builtin_names(),
-                })?;
+            // Extensionless (rc-style) names fall back to the preferred
+            // adapter; an extension no enabled adapter claims is a hard
+            // UnknownFormat — the documented explicit-path rule, never a
+            // silent parse under another format.
+            let adapter = match path.extension() {
+                None => input
+                    .registry
+                    .preferred()
+                    .ok_or_else(|| ClapfigError::UnknownFormat {
+                        name: path.display().to_string(),
+                        available: format::builtin_names(),
+                    })?,
+                Some(ext) => {
+                    let ext = ext.to_string_lossy();
+                    input.registry.by_extension(&ext).ok_or_else(|| {
+                        ClapfigError::UnknownFormat {
+                            name: ext.into_owned(),
+                            available: format::builtin_names(),
+                        }
+                    })?
+                }
+            };
             let parsed = adapter
                 .parse(content)
                 .map_err(|e| ClapfigError::ParseError {
@@ -336,6 +352,37 @@ mod tests {
         assert_eq!(get(&table, "port").unwrap().as_integer(), Some(3000));
         // default preserved
         assert_eq!(get(&table, "host").unwrap().as_str(), Some("localhost"));
+    }
+
+    #[test]
+    fn unclaimed_extension_is_unknown_format() {
+        // The explicit-path rule holds at the pipeline seam too: a file
+        // whose extension no enabled adapter claims is a hard
+        // UnknownFormat, never a silent parse under the preferred format.
+        let spec = test_spec();
+        let input = ResolveInput {
+            files: vec![("config.ini".into(), "port = 3000\n".into())],
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        match err {
+            ClapfigError::UnknownFormat { name, .. } => assert_eq!(name, "ini"),
+            other => panic!("expected UnknownFormat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extensionless_file_falls_back_to_preferred() {
+        // Rc-style extensionless names are the documented UnknownFormat
+        // carve-out: they parse under the preferred (first-registered)
+        // adapter.
+        let spec = test_spec();
+        let input = ResolveInput {
+            files: vec![(".myapprc".into(), "port = 3000\n".into())],
+            ..empty_input(&spec)
+        };
+        let (table, _) = resolve(input).unwrap();
+        assert_eq!(get(&table, "port").unwrap().as_integer(), Some(3000));
     }
 
     #[test]

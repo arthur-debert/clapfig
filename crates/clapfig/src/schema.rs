@@ -244,14 +244,15 @@ fn value_json_type(value: &ConfigValue) -> Option<&'static str> {
 /// Convert an owned config [`ConfigValue`] into a JSON value for the
 /// `default` and `enum` slots.
 ///
-/// Complex variants (`Datetime`) are dropped rather than emitted as a
-/// misleading `null`. Arrays and maps convert recursively; entries that
-/// can't be represented are skipped.
+/// Unrepresentable values (`Datetime`, non-finite floats — JSON has no
+/// literal for them) are dropped rather than emitted as a misleading
+/// `null`. Arrays and maps convert recursively; entries that can't be
+/// represented are skipped.
 fn value_to_json(value: &ConfigValue) -> Option<Value> {
     match value {
         ConfigValue::String(s) => Some(Value::String(s.clone())),
         ConfigValue::Integer(i) => Some(json!(i)),
-        ConfigValue::Float(f) => Some(json!(f)),
+        ConfigValue::Float(f) => f.is_finite().then(|| json!(f)),
         ConfigValue::Boolean(b) => Some(Value::Bool(*b)),
         ConfigValue::Array(items) => Some(Value::Array(
             items.iter().filter_map(value_to_json).collect(),
@@ -286,6 +287,29 @@ mod tests {
 
     fn schema() -> Value {
         generate_schema(&test_schema())
+    }
+
+    #[test]
+    fn non_finite_floats_are_skipped_not_null() {
+        // JSON has no literal for NaN/±inf; the drop-not-null rule that
+        // covers Datetime applies to them too (serde_json's `json!` would
+        // otherwise silently emit `null`).
+        assert_eq!(value_to_json(&ConfigValue::Float(f64::NAN)), None);
+        assert_eq!(value_to_json(&ConfigValue::Float(f64::INFINITY)), None);
+        assert_eq!(value_to_json(&ConfigValue::Float(f64::NEG_INFINITY)), None);
+        assert_eq!(
+            value_to_json(&ConfigValue::Float(1.5)),
+            Some(json!(1.5)),
+            "finite floats still convert"
+        );
+        // Recursive skip: the array entry vanishes rather than nulling.
+        assert_eq!(
+            value_to_json(&ConfigValue::Array(vec![
+                ConfigValue::Float(f64::NAN),
+                ConfigValue::Float(2.5),
+            ])),
+            Some(json!([2.5]))
+        );
     }
 
     #[test]

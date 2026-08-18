@@ -1719,7 +1719,7 @@ mod tests {
     #[test]
     fn map_of_invalid_value_shape_errors_on_load() {
         // `[plugins]` is a leaf scalar in the source file. The schema says
-        // it must be a table-of-tables; loading must error.
+        // it must be a map-of-maps; loading must error.
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("demo.toml"), "plugins = \"oops\"\n").unwrap();
         let result = Clapfig::runtime(map_of_schema())
@@ -1731,7 +1731,7 @@ mod tests {
         match result.unwrap_err() {
             ClapfigError::InvalidValue { key, reason } => {
                 assert_eq!(key, "plugins");
-                assert!(reason.contains("expected table"));
+                assert!(reason.contains("expected map"));
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
@@ -1744,7 +1744,7 @@ mod tests {
         // persist path builds nested tables (not arrays-of-tables), so
         // writing `plugins.id` would produce `[plugins] id = "..."` and
         // then runtime validation would reject the result with
-        // "expected array, got table". The fix excludes ArrayOf subtrees
+        // "expected array, got map". The fix excludes ArrayOf subtrees
         // from `valid_keys`; the user-facing symptom is a clean
         // `KeyNotFound` instead of a corrupted file.
         let dir = TempDir::new().unwrap();
