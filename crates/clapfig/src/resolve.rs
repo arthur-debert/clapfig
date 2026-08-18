@@ -544,6 +544,26 @@ mod tests {
     }
 
     #[test]
+    fn env_unknown_nested_section_names_the_variable() {
+        // No `database` field: the walker reports `database`, not
+        // `database.rogue`. The original variable must still be named.
+        use crate::runtime::{Field, Schema};
+        let spec = Schema::object("App")
+            .field("host", Field::string().default("localhost"))
+            .build();
+        let input = ResolveInput {
+            env_vars: vec![("MYAPP__DATABASE__ROGUE".into(), "1".into())],
+            env_prefix: Some("MYAPP".into()),
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "database");
+        assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__DATABASE__ROGUE"));
+    }
+
+    #[test]
     fn env_unknown_key_invokes_on_unknown_key_callback() {
         // The callback fires on env-derived unknowns the same as file
         // unknowns — closing the gap where dotted-extension keys from

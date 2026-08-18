@@ -143,7 +143,7 @@ pub(crate) fn filter_through_cascade(
                 None,
             ),
             UnknownKeySource::Env { sources } => {
-                (None, 0, sources.get(&key).map(|names| names.join(", ")))
+                (None, 0, crate::env::env_source_names(sources, &key))
             }
         };
         let value_ref = lookup_value(table, &key, &leaf);
@@ -476,6 +476,90 @@ mod tests {
         assert_eq!(
             keys[0].env_var.as_deref(),
             Some("MYAPP__rogue_key, MYAPP__ROGUE_KEY")
+        );
+    }
+
+    /// Schema with no `database` section — unknown-key traversal stops
+    /// at that ancestor instead of walking to `database.rogue`.
+    fn schema_without_database() -> Schema {
+        use crate::runtime::{Field, Schema};
+        Schema::object("App")
+            .field("host", Field::string().default("localhost"))
+            .build()
+    }
+
+    #[test]
+    fn env_origin_names_variable_when_unknown_is_a_nested_section() {
+        // MYAPP__DATABASE__ROGUE is stored under `database.rogue`, but
+        // with no `database` field the walker reports `database`.
+        let (table, sources) = crate::env::env_to_table_with_sources(
+            "MYAPP",
+            [("MYAPP__DATABASE__ROGUE".into(), "1".into())],
+        );
+        let err = validate_unknown(
+            &table,
+            &schema_without_database(),
+            &UnknownKeySource::Env { sources: &sources },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "database");
+        assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__DATABASE__ROGUE"));
+    }
+
+    #[test]
+    fn env_origin_lists_flat_and_nested_names_after_nested_overwrite() {
+        // Flat then nested: the table is the nested section, but both
+        // original names touched this path and must be listed.
+        let (table, sources) = crate::env::env_to_table_with_sources(
+            "MYAPP",
+            [
+                ("MYAPP__DATABASE".into(), "flat".into()),
+                ("MYAPP__DATABASE__ROGUE".into(), "1".into()),
+            ],
+        );
+        assert!(table["database"].as_map().is_some());
+        let err = validate_unknown(
+            &table,
+            &schema_without_database(),
+            &UnknownKeySource::Env { sources: &sources },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "database");
+        assert_eq!(
+            keys[0].env_var.as_deref(),
+            Some("MYAPP__DATABASE, MYAPP__DATABASE__ROGUE")
+        );
+    }
+
+    #[test]
+    fn env_origin_lists_flat_and_nested_names_after_flat_overwrite() {
+        // Nested then flat: the table holds the flat value, but the
+        // nested variable is still set in the environment.
+        let (table, sources) = crate::env::env_to_table_with_sources(
+            "MYAPP",
+            [
+                ("MYAPP__DATABASE__ROGUE".into(), "1".into()),
+                ("MYAPP__DATABASE".into(), "flat".into()),
+            ],
+        );
+        assert_eq!(table["database"].as_str(), Some("flat"));
+        let err = validate_unknown(
+            &table,
+            &schema_without_database(),
+            &UnknownKeySource::Env { sources: &sources },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "database");
+        assert_eq!(
+            keys[0].env_var.as_deref(),
+            Some("MYAPP__DATABASE, MYAPP__DATABASE__ROGUE")
         );
     }
 

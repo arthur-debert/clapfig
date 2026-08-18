@@ -24,9 +24,10 @@
 //!   [`LeafType`] — including leaves without defaults. String →
 //!   `"string"`, integer → `"integer"` (with declared bounds as
 //!   `minimum`/`maximum`), float → `"number"`, bool → `"boolean"`,
-//!   datetime → `"string"` with an `anyOf` of patterns covering TOML's
-//!   four lexical forms (JSON Schema `format: "date-time"` is only the
-//!   offset form, so it is not used), array → `"array"` with a recursive
+//!   datetime → `"string"` with an `anyOf` covering TOML's four lexical
+//!   forms (range-aware patterns; `format: "date-time"` / `"date"` only
+//!   on the branches those formats actually describe), array → `"array"`
+//!   with a recursive
 //!   `items` schema, map → `"object"` with a recursive
 //!   `additionalProperties` value schema.
 //! - **Defaults**: the literal default value (when present) is emitted as
@@ -70,18 +71,46 @@ const SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 /// the entry schema).
 const COMMENT_KEY_PATTERN: &str = "^//";
 
-/// TOML offset date-time (`1979-05-27T07:32:00Z`, space/`t`/`z` variants).
-const DATETIME_OFFSET_PATTERN: &str = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|z|[+-][0-9]{2}:[0-9]{2})$";
+/// RFC 3339 offset date-time (`T` + `Z`/`±hh:mm`) — the form
+/// JSON Schema `format: "date-time"` describes. Month 01–12, day
+/// 01–31, hour 00–23, minute 00–59, second 00–60 (leap second),
+/// offset hour 00–23 / minute 00–59. Leap-year and month-length
+/// rules stay with the runtime parser.
+const DATETIME_RFC3339_PATTERN: &str = concat!(
+    r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])",
+    r"T",
+    r"([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?",
+    r"(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])",
+    r"$",
+);
+
+/// TOML offset date-time, including `T`/`t`/space and `Z`/`z`.
+const DATETIME_OFFSET_PATTERN: &str = concat!(
+    r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])",
+    r"[Tt ]",
+    r"([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?",
+    r"(Z|z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])",
+    r"$",
+);
 
 /// TOML local date-time (`1979-05-27T07:32:00`) — no offset.
-const DATETIME_LOCAL_DATETIME_PATTERN: &str =
-    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?$";
+const DATETIME_LOCAL_DATETIME_PATTERN: &str = concat!(
+    r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])",
+    r"[Tt ]",
+    r"([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?",
+    r"$",
+);
 
 /// TOML local date (`1979-05-27`).
-const DATETIME_LOCAL_DATE_PATTERN: &str = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$";
+const DATETIME_LOCAL_DATE_PATTERN: &str =
+    concat!(r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])", r"$",);
 
 /// TOML local time (`07:32:00`, optional fraction).
-const DATETIME_LOCAL_TIME_PATTERN: &str = r"^[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?$";
+const DATETIME_LOCAL_TIME_PATTERN: &str = concat!(
+    r"^",
+    r"([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?",
+    r"$",
+);
 
 /// The `patternProperties` object allowlisting [`COMMENT_KEY_PATTERN`]
 /// (the empty schema `{}` accepts any comment value shape).
@@ -308,27 +337,33 @@ fn leaf_type_to_schema(ty: &LeafType) -> Option<Map<String, Value>> {
     Some(obj)
 }
 
-/// JSON Schema for a datetime leaf: `type: string` plus an `anyOf` of
-/// patterns covering TOML's four lexical forms.
+/// JSON Schema for a datetime leaf: `type: string` plus an `anyOf`
+/// covering TOML's four lexical forms.
 ///
 /// `format: "date-time"` is only RFC 3339 with a required offset, so it
-/// is not emitted — an external validator asserting that format would
-/// reject local date, local time, and local date-time (and a default in
-/// one of those forms would contradict its own schema). The dialect has
-/// no single format that covers the domain.
+/// is never placed on the leaf itself (that would reject local date,
+/// local time, local date-time, and TOML's space/`t`/`z` variants).
+/// It rides the RFC 3339 offset branch, next to a range-aware pattern;
+/// `format: "date"` rides the local-date branch the same way. Local
+/// date-time, local time, and TOML's extra offset spellings have no
+/// matching format and are pattern-only. Patterns constrain month,
+/// day, hour, minute, second, and offset ranges so a digit-only
+/// schema cannot accept `1979-99-99` / `25:61:61` / `+99:99`.
 fn datetime_type_schema() -> Map<String, Value> {
     let mut obj = Map::new();
     obj.insert("type".into(), Value::String("string".into()));
-    obj.insert(
-        "anyOf".into(),
-        json!([
-            { "pattern": DATETIME_OFFSET_PATTERN },
-            { "pattern": DATETIME_LOCAL_DATETIME_PATTERN },
-            { "pattern": DATETIME_LOCAL_DATE_PATTERN },
-            { "pattern": DATETIME_LOCAL_TIME_PATTERN },
-        ]),
-    );
+    obj.insert("anyOf".into(), datetime_any_of());
     obj
+}
+
+fn datetime_any_of() -> Value {
+    json!([
+        { "format": "date-time", "pattern": DATETIME_RFC3339_PATTERN },
+        { "pattern": DATETIME_OFFSET_PATTERN },
+        { "pattern": DATETIME_LOCAL_DATETIME_PATTERN },
+        { "format": "date", "pattern": DATETIME_LOCAL_DATE_PATTERN },
+        { "pattern": DATETIME_LOCAL_TIME_PATTERN },
+    ])
 }
 
 /// The single JSON Schema `type` name shared by every value, or `None`
@@ -715,12 +750,7 @@ mod tests {
                 .field("time", Field::datetime().default(dt("07:32:00")))
                 .build(),
         );
-        let expected_any_of = json!([
-            { "pattern": DATETIME_OFFSET_PATTERN },
-            { "pattern": DATETIME_LOCAL_DATETIME_PATTERN },
-            { "pattern": DATETIME_LOCAL_DATE_PATTERN },
-            { "pattern": DATETIME_LOCAL_TIME_PATTERN },
-        ]);
+        let expected_any_of = datetime_any_of();
         for (name, default) in [
             ("offset", "1979-05-27T07:32:00Z"),
             ("local_dt", "1979-05-27T07:32:00"),
@@ -731,10 +761,69 @@ mod tests {
             assert_eq!(leaf["type"], "string", "{name}");
             assert!(
                 leaf.get("format").is_none(),
-                "{name}: format: date-time would reject local date/time forms"
+                "{name}: format on the leaf itself would reject other TOML forms"
             );
             assert_eq!(leaf["anyOf"], expected_any_of, "{name}");
             assert_eq!(leaf["default"], default, "{name}");
+        }
+        assert_eq!(s["properties"]["date"]["anyOf"][3]["format"], "date");
+        assert_eq!(s["properties"]["offset"]["anyOf"][0]["format"], "date-time");
+    }
+
+    /// Whether `candidate` matches any `pattern` in the datetime `anyOf`.
+    /// JSON Schema patterns are ECMA-262; these patterns use a regex
+    /// subset both dialects share, so the Rust regex crate is a fair
+    /// stand-in without adding the jsonschema crate (MSRV / dep tree).
+    fn datetime_schema_matches(candidate: &str) -> bool {
+        let any_of = datetime_any_of();
+        any_of
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|branch| branch.get("pattern").and_then(Value::as_str))
+            .any(|pattern| {
+                regex::Regex::new(pattern)
+                    .unwrap_or_else(|e| {
+                        panic!("schema pattern must be valid regex: {e}: {pattern}")
+                    })
+                    .is_match(candidate)
+            })
+    }
+
+    #[test]
+    fn datetime_patterns_reject_out_of_range_components() {
+        for bad in [
+            "1979-99-99",
+            "1979-00-01",
+            "1979-13-01",
+            "25:61:61",
+            "24:00:00",
+            "07:60:00",
+            "07:32:61",
+            "1979-05-27T07:32:00+99:99",
+            "1979-05-27T07:32:00+25:00",
+            "1979-05-27T07:32:00+07:60",
+        ] {
+            assert!(
+                !datetime_schema_matches(bad),
+                "{bad} is not a valid TOML datetime and must fail the schema"
+            );
+        }
+        for good in [
+            "1979-05-27T07:32:00Z",
+            "1979-05-27T00:32:00-07:00",
+            "1979-05-27T07:32:00",
+            "1979-05-27",
+            "07:32:00",
+            "1979-05-27 07:32:00Z",
+            "1979-05-27t07:32:00z",
+            "23:59:60",
+            "07:32:00.5",
+        ] {
+            assert!(
+                datetime_schema_matches(good),
+                "{good} is a valid TOML datetime and must pass the schema"
+            );
         }
     }
 

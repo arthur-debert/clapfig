@@ -77,6 +77,33 @@ pub(crate) fn env_to_table_with_sources(
     (table, sources)
 }
 
+/// Original variable names that produced `path` or any descendant of it.
+///
+/// Unknown-key traversal stops at the first unknown schema ancestor, so
+/// `MYAPP__DATABASE__ROGUE` is stored under `database.rogue` while
+/// validation reports `database`. An exact-path lookup would miss it;
+/// this walks descendants (`path` or `path.`) and deduplicates names
+/// in first-seen (path-sorted, then recorded) order so the error can
+/// still name every variable to unset.
+pub(crate) fn env_source_names(sources: &EnvSources, path: &str) -> Option<String> {
+    let prefix = format!("{path}.");
+    let mut names = Vec::new();
+    for (key, vars) in sources {
+        if key == path || key.starts_with(&prefix) {
+            for name in vars {
+                if !names.iter().any(|existing| existing == name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join(", "))
+    }
+}
+
 fn insert_nested(
     table: &mut Map,
     sources: &mut EnvSources,
@@ -292,6 +319,26 @@ mod tests {
             sources.get("database.rogue"),
             Some(&vec!["MYAPP__Database__Rogue".to_string()])
         );
+    }
+
+    #[test]
+    fn source_names_include_descendants_of_an_unknown_ancestor() {
+        // Stored under the leaf path; validation reports the unknown
+        // ancestor. Both the exact path and its descendants must name
+        // the variable.
+        let (_, sources) =
+            env_to_table_with_sources("MYAPP", vars(&[("MYAPP__DATABASE__ROGUE", "1")]));
+        assert_eq!(
+            env_source_names(&sources, "database.rogue").as_deref(),
+            Some("MYAPP__DATABASE__ROGUE")
+        );
+        assert_eq!(
+            env_source_names(&sources, "database").as_deref(),
+            Some("MYAPP__DATABASE__ROGUE")
+        );
+        // A sibling prefix must not steal the name.
+        assert_eq!(env_source_names(&sources, "data"), None);
+        assert_eq!(env_source_names(&sources, "database_backup"), None);
     }
 
     #[test]
