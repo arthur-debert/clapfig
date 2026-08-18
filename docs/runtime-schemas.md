@@ -53,7 +53,7 @@ let schema = Schema::object("App")
 ### Field kinds
 
 - **`Field::string()`, `Field::integer()`, `Field::float()`, `Field::boolean()`, `Field::datetime()`** — TOML primitive leaves.
-- **`Field::integer_in(min, max)`** — range-bounded integer (`None` leaves an end open). Out-of-range values fail validation naming the key, and `config schema` exports the bounds as `minimum`/`maximum` — the runtime counterpart of the width bounds the derive macro emits for sized integer fields (`u8` → `0..=255`).
+- **`Field::integer_in(min, max)`** — range-bounded integer (`None` leaves an end open). Both ends set with `min > max` is rejected when the field is built. Out-of-range values fail validation naming the key, and `config schema` exports the bounds as `minimum`/`maximum` — the runtime counterpart of the width bounds the derive macro emits for sized integer fields (`u8` → `0..=255`).
 - **`Field::array_of_type(LeafType)`** — homogeneous array of a primitive type.
 - **`Field::map_of(LeafType)`** — string-keyed map with homogeneous values.
 - **`Field::enum_of(values)`** — constrained value: must be one of the listed TOML primitives. Used for log levels, output formats, modes.

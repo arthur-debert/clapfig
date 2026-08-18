@@ -13,7 +13,7 @@
 //!   as the type error it is, not as a hook rejection;
 //! - the exported JSON Schema's `required` arrays list exactly the
 //!   absences the runtime rejects, and its leaf schemas carry integer
-//!   bounds and datetime formats.
+//!   bounds and the four-form datetime `anyOf`.
 
 #![cfg(feature = "derive")]
 
@@ -213,6 +213,10 @@ fn exported_schema_carries_integer_bounds_and_datetime_format() {
     assert_eq!(props["retries"]["minimum"], 0);
     assert_eq!(props["retries"]["maximum"], 255);
     assert_eq!(props["starts_at"]["type"], "string");
-    assert_eq!(props["starts_at"]["format"], "date-time");
+    // `format: "date-time"` is only the offset form; the export models
+    // all four TOML datetime forms as an `anyOf` of patterns.
+    assert!(props["starts_at"].get("format").is_none());
+    assert!(props["starts_at"]["anyOf"].is_array());
+    assert_eq!(props["starts_at"]["anyOf"].as_array().unwrap().len(), 4);
     assert_eq!(props["starts_at"]["default"], "1979-05-27T07:32:00Z");
 }

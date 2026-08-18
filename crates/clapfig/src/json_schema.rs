@@ -24,14 +24,19 @@
 //!   [`LeafType`] — including leaves without defaults. String →
 //!   `"string"`, integer → `"integer"` (with declared bounds as
 //!   `minimum`/`maximum`), float → `"number"`, bool → `"boolean"`,
-//!   datetime → `"string"` with `format: "date-time"`, array → `"array"`
-//!   with a recursive `items` schema, map → `"object"` with a recursive
+//!   datetime → `"string"` with an `anyOf` of patterns covering TOML's
+//!   four lexical forms (JSON Schema `format: "date-time"` is only the
+//!   offset form, so it is not used), array → `"array"` with a recursive
+//!   `items` schema, map → `"object"` with a recursive
 //!   `additionalProperties` value schema.
 //! - **Defaults**: the literal default value (when present) is emitted as
 //!   `default` on the property (datetimes in their lexical string form).
-//! - **Enums**: `Enum { values }` leaves emit `enum: [...]` alongside the
-//!   primitive type implied by the value set — at any nesting depth
-//!   (an `Array(Enum)` leaf constrains its `items`).
+//! - **Enums**: `Enum { values }` leaves emit `enum: [...]`. A single
+//!   `type` is added only when every allowed value shares one JSON
+//!   primitive type — a mixed set (`"auto"` and `0`) is constrained by
+//!   `enum` alone, so an external validator still accepts every value
+//!   clapfig does. Applies at any nesting depth (an `Array(Enum)` leaf
+//!   constrains its `items`).
 //! - **Env vars**: when a field maps to an env var, the name is attached as
 //!   the non-standard `x-env` extension.
 //! - **JSON comment keys**: every object allowlists the `^//` key pattern
@@ -64,6 +69,19 @@ const SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 /// pattern escape `additionalProperties: false` (and, on map-of objects,
 /// the entry schema).
 const COMMENT_KEY_PATTERN: &str = "^//";
+
+/// TOML offset date-time (`1979-05-27T07:32:00Z`, space/`t`/`z` variants).
+const DATETIME_OFFSET_PATTERN: &str = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|z|[+-][0-9]{2}:[0-9]{2})$";
+
+/// TOML local date-time (`1979-05-27T07:32:00`) — no offset.
+const DATETIME_LOCAL_DATETIME_PATTERN: &str =
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?$";
+
+/// TOML local date (`1979-05-27`).
+const DATETIME_LOCAL_DATE_PATTERN: &str = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$";
+
+/// TOML local time (`07:32:00`, optional fraction).
+const DATETIME_LOCAL_TIME_PATTERN: &str = r"^[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?$";
 
 /// The `patternProperties` object allowlisting [`COMMENT_KEY_PATTERN`]
 /// (the empty schema `{}` accepts any comment value shape).
@@ -229,8 +247,9 @@ fn populate_leaf(prop: &mut Map<String, Value>, leaf: &Leaf) {
 /// the enum constraint), and a map leaf constrains entry values via
 /// `additionalProperties` (with the ADR-0002 `^//` comment-key allowlist,
 /// since comment keys inside a map instance are comments, not entries).
-/// `Enum` emits `enum: [...]` alongside the primitive type implied by the
-/// first allowed value.
+/// `Enum` emits `enum: [...]`. A single `type` is added only when every
+/// allowed value shares one JSON primitive type; mixed sets (`"auto"`
+/// and `0`) omit `type` so `enum` alone constrains the value.
 ///
 /// Returns `None` for [`LeafType::Value`]: JSON Schema convention is to
 /// omit the constraint entirely, signalling that any value is acceptable.
@@ -258,8 +277,7 @@ fn leaf_type_to_schema(ty: &LeafType) -> Option<Map<String, Value>> {
             obj.insert("type".into(), Value::String("boolean".into()));
         }
         LeafType::DateTime => {
-            obj.insert("type".into(), Value::String("string".into()));
-            obj.insert("format".into(), Value::String("date-time".into()));
+            obj.extend(datetime_type_schema());
         }
         LeafType::Array(elem) => {
             obj.insert("type".into(), Value::String("array".into()));
@@ -277,7 +295,7 @@ fn leaf_type_to_schema(ty: &LeafType) -> Option<Map<String, Value>> {
             }
         }
         LeafType::Enum { values } => {
-            if let Some(name) = values.first().and_then(value_json_type) {
+            if let Some(name) = homogeneous_json_type(values) {
                 obj.insert("type".into(), Value::String(name.into()));
             }
             let enum_array: Vec<Value> = values.iter().filter_map(value_to_json).collect();
@@ -288,6 +306,44 @@ fn leaf_type_to_schema(ty: &LeafType) -> Option<Map<String, Value>> {
         LeafType::Value => return None,
     }
     Some(obj)
+}
+
+/// JSON Schema for a datetime leaf: `type: string` plus an `anyOf` of
+/// patterns covering TOML's four lexical forms.
+///
+/// `format: "date-time"` is only RFC 3339 with a required offset, so it
+/// is not emitted — an external validator asserting that format would
+/// reject local date, local time, and local date-time (and a default in
+/// one of those forms would contradict its own schema). The dialect has
+/// no single format that covers the domain.
+fn datetime_type_schema() -> Map<String, Value> {
+    let mut obj = Map::new();
+    obj.insert("type".into(), Value::String("string".into()));
+    obj.insert(
+        "anyOf".into(),
+        json!([
+            { "pattern": DATETIME_OFFSET_PATTERN },
+            { "pattern": DATETIME_LOCAL_DATETIME_PATTERN },
+            { "pattern": DATETIME_LOCAL_DATE_PATTERN },
+            { "pattern": DATETIME_LOCAL_TIME_PATTERN },
+        ]),
+    );
+    obj
+}
+
+/// The single JSON Schema `type` name shared by every value, or `None`
+/// when the set is empty, mixed, or contains a non-primitive.
+fn homogeneous_json_type(values: &[ConfigValue]) -> Option<&'static str> {
+    let mut seen: Option<&'static str> = None;
+    for value in values {
+        let name = value_json_type(value)?;
+        match seen {
+            None => seen = Some(name),
+            Some(prev) if prev != name => return None,
+            Some(_) => {}
+        }
+    }
+    seen
 }
 
 /// Map an owned config [`ConfigValue`] to its JSON Schema `type` name.
@@ -305,7 +361,7 @@ fn value_json_type(value: &ConfigValue) -> Option<&'static str> {
 /// `default` and `enum` slots.
 ///
 /// Datetimes emit as their lexical string form — matching the
-/// `type: string, format: date-time` shape their leaves declare.
+/// `type: string` plus four-form `anyOf` their leaves declare.
 /// Unrepresentable values (non-finite floats — JSON has no literal for
 /// them) are dropped rather than emitted as a misleading `null`. Arrays
 /// and maps convert recursively; entries that can't be represented are
@@ -602,7 +658,8 @@ mod tests {
         // Nested array keeps its inner `items`.
         assert_eq!(props["matrix"]["items"]["type"], "array");
         assert_eq!(props["matrix"]["items"]["items"]["type"], "integer");
-        // Array(Enum) keeps the enum constraint on items.
+        // Array(Enum) keeps the enum constraint on items; a homogeneous
+        // set still carries the shared primitive type.
         assert_eq!(props["modes"]["items"]["type"], "string");
         assert_eq!(props["modes"]["items"]["enum"], json!(["fast", "slow"]));
         // Map(elem) constrains entry values and allowlists comment keys.
@@ -639,22 +696,80 @@ mod tests {
     }
 
     #[test]
-    fn datetime_leaves_emit_format_and_lexical_defaults() {
+    fn datetime_leaves_model_all_four_toml_forms() {
         use crate::runtime::{Field, Schema as RtSchema};
-        let dt: crate::value::Datetime = "1979-05-27T07:32:00Z".parse().unwrap();
+        fn dt(s: &str) -> ConfigValue {
+            ConfigValue::Datetime(s.parse().unwrap())
+        }
         let s = generate_schema(
             &RtSchema::object("App")
                 .field(
-                    "starts_at",
-                    Field::datetime().default(ConfigValue::Datetime(dt)),
+                    "offset",
+                    Field::datetime().default(dt("1979-05-27T07:32:00Z")),
+                )
+                .field(
+                    "local_dt",
+                    Field::datetime().default(dt("1979-05-27T07:32:00")),
+                )
+                .field("date", Field::datetime().default(dt("1979-05-27")))
+                .field("time", Field::datetime().default(dt("07:32:00")))
+                .build(),
+        );
+        let expected_any_of = json!([
+            { "pattern": DATETIME_OFFSET_PATTERN },
+            { "pattern": DATETIME_LOCAL_DATETIME_PATTERN },
+            { "pattern": DATETIME_LOCAL_DATE_PATTERN },
+            { "pattern": DATETIME_LOCAL_TIME_PATTERN },
+        ]);
+        for (name, default) in [
+            ("offset", "1979-05-27T07:32:00Z"),
+            ("local_dt", "1979-05-27T07:32:00"),
+            ("date", "1979-05-27"),
+            ("time", "07:32:00"),
+        ] {
+            let leaf = &s["properties"][name];
+            assert_eq!(leaf["type"], "string", "{name}");
+            assert!(
+                leaf.get("format").is_none(),
+                "{name}: format: date-time would reject local date/time forms"
+            );
+            assert_eq!(leaf["anyOf"], expected_any_of, "{name}");
+            assert_eq!(leaf["default"], default, "{name}");
+        }
+    }
+
+    #[test]
+    fn heterogeneous_enum_omits_inferred_type() {
+        use crate::runtime::{Field, LeafType, Schema as RtSchema};
+        let mixed = vec!["auto".into(), 0i64.into()];
+        let s = generate_schema(
+            &RtSchema::object("App")
+                .field("choice", Field::enum_of(mixed.clone()).optional())
+                .field(
+                    "modes",
+                    Field::array_of_type(LeafType::Enum {
+                        values: mixed.clone(),
+                    })
+                    .optional(),
+                )
+                .field(
+                    "labels",
+                    Field::map_of(LeafType::Enum { values: mixed }).optional(),
                 )
                 .build(),
         );
-        let starts = &s["properties"]["starts_at"];
-        assert_eq!(starts["type"], "string");
-        assert_eq!(starts["format"], "date-time");
-        // Datetime defaults emit in lexical string form, not dropped.
-        assert_eq!(starts["default"], "1979-05-27T07:32:00Z");
+        let props = &s["properties"];
+        // enum alone constrains; a single inferred type would reject
+        // the other allowed primitive.
+        let choice = props["choice"].as_object().unwrap();
+        assert!(!choice.contains_key("type"), "{choice:?}");
+        assert_eq!(choice["enum"], json!(["auto", 0]));
+        let items = props["modes"]["items"].as_object().unwrap();
+        assert!(!items.contains_key("type"), "{items:?}");
+        assert_eq!(items["enum"], json!(["auto", 0]));
+        let entries = props["labels"]["additionalProperties"].as_object().unwrap();
+        assert!(!entries.contains_key("type"), "{entries:?}");
+        assert_eq!(entries["enum"], json!(["auto", 0]));
     }
 
     #[test]

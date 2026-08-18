@@ -1265,11 +1265,12 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
         // Every Rust integer maps to TOML's single Integer width, carrying
         // the source width's bounds so out-of-range values fail the schema
         // check with the key path (and export as JSON Schema
-        // `minimum`/`maximum`). `i64`/`isize` are unbounded; `u64`/`usize`
-        // carry `min = 0` with an open upper end (values that exceed
-        // `i64::MAX` cannot be represented in TOML at all; `usize`'s upper
-        // end is target-dependent) — documented on
-        // `LeafTypeStatic::Integer`.
+        // `minimum`/`maximum`). `i64` is unbounded; `isize` emits
+        // `isize::MIN/MAX as i64` (full value-model range on 64-bit,
+        // signed 32-bit range on 32-bit). `u64` is min 0 with an open
+        // top; `usize` is min 0 with a maximum only when
+        // `usize::BITS < 64` (`usize::MAX as i64` wraps to -1 on
+        // 64-bit) — documented on `LeafTypeStatic::Integer`.
         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
             let (min, max) = integer_bounds_tokens(&name);
             Some((
@@ -1300,11 +1301,12 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
 ///
 /// Fixed-width types emit their exact range via `as i64` casts on the
 /// width's own `MIN`/`MAX` consts (evaluated in the emitted code, so they
-/// are always faithful). `i64` and `isize` are unbounded — `isize` is at
-/// most 64-bit and clapfig's integer value is `i64`, so no representable
-/// value can violate it. `u64` and `usize` emit `min = 0` with an open
-/// upper end: their `MAX` exceeds `i64` (or is target-dependent), and
-/// values above `i64::MAX` are unrepresentable in the value model anyway.
+/// are always faithful). `i64` is unbounded. `isize` emits
+/// `isize::MIN/MAX as i64` so a 32-bit target rejects values the `i64`
+/// value model can hold but `isize` cannot. `u64` is min 0 with an open
+/// top (`u64::MAX` exceeds `i64`). `usize` is min 0 with a maximum only
+/// when `usize::BITS < 64`; on 64-bit, `usize::MAX as i64` wraps to -1
+/// so the top stays open.
 fn integer_bounds_tokens(name: &str) -> (TokenStream2, TokenStream2) {
     match name {
         "i8" => (
@@ -1319,12 +1321,26 @@ fn integer_bounds_tokens(name: &str) -> (TokenStream2, TokenStream2) {
             quote! { Some(i32::MIN as i64) },
             quote! { Some(i32::MAX as i64) },
         ),
+        "i64" => (quote! { None }, quote! { None }),
+        "isize" => (
+            quote! { Some(isize::MIN as i64) },
+            quote! { Some(isize::MAX as i64) },
+        ),
         "u8" => (quote! { Some(0) }, quote! { Some(u8::MAX as i64) }),
         "u16" => (quote! { Some(0) }, quote! { Some(u16::MAX as i64) }),
         "u32" => (quote! { Some(0) }, quote! { Some(u32::MAX as i64) }),
-        "u64" | "usize" => (quote! { Some(0) }, quote! { None }),
-        // i64 spans the full value-model range; isize is at most 64-bit.
-        _ => (quote! { None }, quote! { None }),
+        "u64" => (quote! { Some(0) }, quote! { None }),
+        "usize" => (
+            quote! { Some(0) },
+            quote! {
+                if usize::BITS < 64 {
+                    Some(usize::MAX as i64)
+                } else {
+                    None
+                }
+            },
+        ),
+        other => unreachable!("integer_bounds_tokens called for non-integer {other}"),
     }
 }
 

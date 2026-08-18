@@ -1130,7 +1130,7 @@ fn get_from_table(
     };
     let value = ops::table_get(table, &canonical).ok_or_else(|| ClapfigError::KeyNotFound {
         key: key.into(),
-        suggestion: crate::meta::nearest_key(schema, &canonical),
+        suggestion: crate::meta::nearest_key(schema, &canonical, normalize_keys),
     })?;
     let doc = crate::meta::doc_for(schema, &canonical).unwrap_or_default();
     Ok(ConfigResult::key_value(
@@ -1206,7 +1206,7 @@ fn get_scope(
     };
     let value = value.ok_or_else(|| ClapfigError::KeyNotFound {
         key: key.into(),
-        suggestion: crate::meta::nearest_key(schema, &canonical),
+        suggestion: crate::meta::nearest_key(schema, &canonical, normalize_keys),
     })?;
     let doc = crate::meta::doc_for(schema, &canonical).unwrap_or_default();
     Ok(ConfigResult::key_value(
@@ -2753,6 +2753,53 @@ mod tests {
         match err {
             ClapfigError::KeyNotFound { key, suggestion } => {
                 assert_eq!(key, "db.pool_sizr");
+                assert_eq!(suggestion.as_deref(), Some("db.pool_size"));
+            }
+            other => panic!("expected KeyNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_kebab_key_suggests_snake_when_normalization_is_off() {
+        // Default is normalize_keys(false): pool-size is not the schema
+        // key, and the dash/underscore difference is the useful hint.
+        let dir = TempDir::new().unwrap();
+        let err = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .handle(&ConfigAction::Get {
+                key: "db.pool-size".into(),
+                scope: None,
+            })
+            .unwrap_err();
+        match err {
+            ClapfigError::KeyNotFound { key, suggestion } => {
+                assert_eq!(key, "db.pool-size");
+                assert_eq!(suggestion.as_deref(), Some("db.pool_size"));
+            }
+            other => panic!("expected KeyNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_kebab_key_suggests_snake_when_normalization_is_off() {
+        let dir = TempDir::new().unwrap();
+        let err = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Set {
+                key: "db.pool-size".into(),
+                value: "10".into(),
+                scope: None,
+            })
+            .unwrap_err();
+        match err {
+            ClapfigError::KeyNotFound { key, suggestion } => {
+                assert_eq!(key, "db.pool-size");
                 assert_eq!(suggestion.as_deref(), Some("db.pool_size"));
             }
             other => panic!("expected KeyNotFound, got {other:?}"),

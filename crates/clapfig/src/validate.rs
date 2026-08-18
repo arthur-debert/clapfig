@@ -38,23 +38,13 @@ pub(crate) struct ValidateContext<'a> {
 ///
 /// A `File` source carries the raw text (for the TOML line-number
 /// heuristic and renderer snippets) and the file path. An `Env` source
-/// carries the env prefix so each violation can name the exact variable
-/// to unset (`MYAPP__ROGUE_KEY`) instead of wearing config-file clothing.
+/// carries the original variable name(s) for each dotted path so each
+/// violation can name the exact variable to unset (`MYAPP__rogue_key`,
+/// not a reconstructed `MYAPP__ROGUE_KEY`) instead of wearing
+/// config-file clothing.
 pub(crate) enum UnknownKeySource<'a> {
     File { path: &'a Path, source: &'a str },
-    Env { prefix: &'a str },
-}
-
-impl UnknownKeySource<'_> {
-    /// Reconstruct the environment variable name for a dotted key path:
-    /// segments uppercased and joined with `__`, under the prefix —
-    /// the inverse of `env_to_table`'s lowercasing split. Faithful
-    /// because only `{PREFIX}__*` vars (conventionally upper-case) reach
-    /// the env table.
-    fn env_var_name(prefix: &str, dotted_path: &str) -> String {
-        let segments: Vec<String> = dotted_path.split('.').map(str::to_uppercase).collect();
-        format!("{prefix}__{}", segments.join("__"))
-    }
+    Env { sources: &'a crate::env::EnvSources },
 }
 
 /// Single unknown-key entry passed to `filter_through_cascade`.
@@ -79,10 +69,11 @@ pub(crate) struct UnknownKey {
 /// One entry point serves every layer. The per-file pass supplies an
 /// [`UnknownKeySource::File`] (source text and path, for line-number
 /// rendering); the env-layer pass supplies [`UnknownKeySource::Env`] with
-/// the prefix — env vars are merged after the per-file pass, so without
-/// this call an `MYAPP__ROGUE_KEY=...` would slip into the merged result
-/// without ever reaching the cascade or the `on_unknown_key` callback,
-/// and violations render as env errors naming the variable.
+/// the original variable names — env vars are merged after the per-file
+/// pass, so without this call an `MYAPP__ROGUE_KEY=...` would slip into
+/// the merged result without ever reaching the cascade or the
+/// `on_unknown_key` callback, and violations render as env errors naming
+/// the exact variable that produced the key.
 ///
 /// Returns the keys the callback opted to
 /// [`UnknownKeyDecision::Collect`] — empty for callers that don't use
@@ -151,8 +142,8 @@ pub(crate) fn filter_through_cascade(
                 find_key_line(source, &key, &leaf, ctx.normalize_keys),
                 None,
             ),
-            UnknownKeySource::Env { prefix } => {
-                (None, 0, Some(UnknownKeySource::env_var_name(prefix, &key)))
+            UnknownKeySource::Env { sources } => {
+                (None, 0, sources.get(&key).map(|names| names.join(", ")))
             }
         };
         let value_ref = lookup_value(table, &key, &leaf);
@@ -415,16 +406,22 @@ mod tests {
     #[test]
     fn env_origin_reports_variable_name_not_file() {
         // An env-derived unknown key is reported as an env problem: the
-        // variable name is reconstructed from the prefix and path, no
-        // source text or line is attached, and no file path leaks in.
+        // original variable name is taken from the source map (not
+        // reconstructed), no source text or line is attached, and no
+        // file path leaks in.
         let mut table = Map::new();
         let mut db = Map::new();
         db.insert("rogue".into(), crate::value::Value::Integer(1));
         table.insert("database".into(), crate::value::Value::Map(db));
+        let mut sources = crate::env::EnvSources::new();
+        sources.insert(
+            "database.rogue".into(),
+            vec!["MYAPP__DATABASE__ROGUE".into()],
+        );
         let err = validate_unknown(
             &table,
             &crate::fixtures::test::test_schema(),
-            &UnknownKeySource::Env { prefix: "MYAPP" },
+            &UnknownKeySource::Env { sources: &sources },
             &test_ctx(false),
         )
         .unwrap_err();
@@ -434,6 +431,52 @@ mod tests {
         assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__DATABASE__ROGUE"));
         assert_eq!(keys[0].line, 0);
         assert!(keys[0].source.is_none());
+    }
+
+    #[test]
+    fn env_origin_names_the_mixed_case_variable_that_produced_the_value() {
+        // Reconstructing an uppercased path would tell the user to
+        // unset MYAPP__ROGUE_KEY, which does not remove MYAPP__rogue_key
+        // on a case-sensitive platform.
+        let (table, sources) = crate::env::env_to_table_with_sources(
+            "MYAPP",
+            [("MYAPP__rogue_key".into(), "1".into())],
+        );
+        let err = validate_unknown(
+            &table,
+            &crate::fixtures::test::test_schema(),
+            &UnknownKeySource::Env { sources: &sources },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "rogue_key");
+        assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__rogue_key"));
+    }
+
+    #[test]
+    fn env_origin_lists_every_source_name_that_collapsed_onto_the_path() {
+        let (table, sources) = crate::env::env_to_table_with_sources(
+            "MYAPP",
+            [
+                ("MYAPP__rogue_key".into(), "1".into()),
+                ("MYAPP__ROGUE_KEY".into(), "2".into()),
+            ],
+        );
+        let err = validate_unknown(
+            &table,
+            &crate::fixtures::test::test_schema(),
+            &UnknownKeySource::Env { sources: &sources },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].env_var.as_deref(),
+            Some("MYAPP__rogue_key, MYAPP__ROGUE_KEY")
+        );
     }
 
     #[test]

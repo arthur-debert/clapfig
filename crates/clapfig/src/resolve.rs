@@ -202,11 +202,13 @@ pub(crate) fn resolve(
         t
     };
 
-    // Env layer
-    let env_table = input
+    // Env layer. Sources travel with the table so unknown-key errors
+    // name the exact variable that produced each path, not a
+    // reconstructed uppercase spelling.
+    let env_layer = input
         .env_prefix
         .as_ref()
-        .map(|prefix| env::env_to_table(prefix, input.env_vars));
+        .map(|prefix| env::env_to_table_with_sources(prefix, input.env_vars));
 
     // Validate the env-derived table against the schema. Before this pass
     // env-unknown keys merged in unnoticed: `validate_unknown` only ran
@@ -220,18 +222,16 @@ pub(crate) fn resolve(
     // mismatches between env's heuristic value parsing (e.g. string
     // "1.5" for an integer field) don't fail validation — that's
     // still the job of the final-merge type check inside `finalize`.
-    if cascade_active
-        && let Some(env_table_ref) = env_table.as_ref()
-        && let Some(prefix) = input.env_prefix.as_deref()
-    {
+    if cascade_active && let Some((env_table_ref, sources)) = env_layer.as_ref() {
         let mut env_filtered = validate_unknown(
             env_table_ref,
             input.schema,
-            &UnknownKeySource::Env { prefix },
+            &UnknownKeySource::Env { sources },
             &validate_ctx,
         )?;
         collected_unknowns.append(&mut env_filtered);
     }
+    let env_table = env_layer.map(|(table, _)| table);
 
     // URL layer
     #[cfg(feature = "url")]
@@ -519,6 +519,28 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("MYAPP__ROGUE_KEY"), "{msg}");
         assert!(!msg.contains("config file"), "{msg}");
+    }
+
+    #[test]
+    fn env_unknown_key_names_the_mixed_case_variable() {
+        // The suffix is accepted in any case and lowercased for the
+        // table path. The error must name the spelling that is actually
+        // set — unsetting a reconstructed MYAPP__ROGUE_KEY would leave
+        // MYAPP__rogue_key in place on a case-sensitive platform.
+        let spec = test_spec();
+        let input = ResolveInput {
+            env_vars: vec![("MYAPP__rogue_key".into(), "1".into())],
+            env_prefix: Some("MYAPP".into()),
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "rogue_key");
+        assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__rogue_key"));
+        let msg = err.to_string();
+        assert!(msg.contains("MYAPP__rogue_key"), "{msg}");
+        assert!(!msg.contains("MYAPP__ROGUE_KEY"), "{msg}");
     }
 
     #[test]

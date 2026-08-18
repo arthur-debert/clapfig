@@ -94,7 +94,7 @@ pub fn set_in_document(
         }
         return Err(ClapfigError::KeyNotFound {
             key: key.into(),
-            suggestion: crate::meta::nearest_key(schema, &canonical),
+            suggestion: crate::meta::nearest_key(schema, &canonical, normalize_keys),
         });
     }
 
@@ -753,6 +753,26 @@ mod tests {
     fn set_rejects_unknown_key() {
         let result = set_toml(Some(""), "nonexistent", "value");
         assert!(matches!(result, Err(ClapfigError::KeyNotFound { .. })));
+    }
+
+    #[test]
+    fn set_kebab_key_suggests_snake_when_normalization_is_off() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &test_schema(),
+            Some(""),
+            "database.pool-size",
+            "10",
+            false,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::KeyNotFound { key, suggestion } => {
+                assert_eq!(key, "database.pool-size");
+                assert_eq!(suggestion.as_deref(), Some("database.pool_size"));
+            }
+            other => panic!("expected KeyNotFound, got {other:?}"),
+        }
     }
 
     #[test]

@@ -198,7 +198,16 @@ impl Field {
     /// validation naming the key, and JSON Schema export carries the
     /// bounds as `minimum`/`maximum` — the runtime-schema counterpart of
     /// the width bounds the derive macro emits for sized integer fields.
+    ///
+    /// Panics if both ends are set and `min > max` — the same class of
+    /// construction-time check as [`SchemaBuilder::field`] field names.
     pub fn integer_in(min: Option<i64>, max: Option<i64>) -> FieldBuilder {
+        if let (Some(lo), Some(hi)) = (min, max) {
+            assert!(
+                lo <= hi,
+                "clapfig: integer_in min ({lo}) must be <= max ({hi})"
+            );
+        }
         FieldBuilder::new(LeafType::Integer { min, max })
     }
 
@@ -662,6 +671,20 @@ mod tests {
     fn field_value_constructs_value_leaf() {
         let f = Field::value().build();
         assert!(matches!(f.ty, LeafType::Value));
+    }
+
+    #[test]
+    #[should_panic(expected = "integer_in min")]
+    fn integer_in_rejects_min_greater_than_max() {
+        let _ = Field::integer_in(Some(10), Some(1));
+    }
+
+    #[test]
+    fn integer_in_accepts_open_and_equal_ends() {
+        let _ = Field::integer_in(Some(0), None);
+        let _ = Field::integer_in(None, Some(10));
+        let _ = Field::integer_in(Some(5), Some(5));
+        let _ = Field::integer_in(None, None);
     }
 
     #[test]
