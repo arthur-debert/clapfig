@@ -644,6 +644,19 @@
 //! useful for case-insensitive fields, path canonicalization, or unit
 //! conversion.
 //!
+//! The supported use is **shape-preserving** normalization: the deserializer
+//! accepts the field's declared TOML shape (a string for a `String` field,
+//! an integer for a `u16` field, …) and adjusts the *value*. The derived
+//! schema keeps advertising the field's inferred shape — validation, JSON
+//! Schema, and templates all speak that shape — and schema validation runs
+//! *before* the typed deserialize. A deserializer expecting a *different*
+//! wire shape (say, a string-encoded number on a `u16` field) never sees
+//! its input: the schema type-check rejects it first with a loud error
+//! ("expected integer, got string") — a load failure, never a silently
+//! mis-typed value. To take over the wire shape, mark the field
+//! `#[clapfig(value)]`: the schema then declares a free-form leaf, any TOML
+//! shape passes validation, and your deserializer owns the interpretation.
+//!
 //! # Template generation
 //!
 //! `config gen` (or [`ConfigAction::Gen`]) produces a documented config

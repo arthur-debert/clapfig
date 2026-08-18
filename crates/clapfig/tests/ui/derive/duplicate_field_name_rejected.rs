@@ -1,3 +1,8 @@
+// The conflicting renames below also trip serde's own `unreachable pattern`
+// lint; suppress it so the expected stderr pins only clapfig's diagnostic
+// (compiler/serde warning text drifts across versions).
+#![allow(unreachable_patterns)]
+
 use clapfig::Schema;
 
 // Two fields renamed onto the same schema name must be a derive error —

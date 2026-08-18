@@ -9,7 +9,9 @@
 //!   not declared in the schema is collected and reported with line numbers
 //!   from the same `find_key_line` heuristic the static path uses.
 //! - **`fill_defaults`**: recursive walk, every missing leaf with a
-//!   declared `default` is populated in place into the merged table.
+//!   declared `default` is populated in place into the merged table;
+//!   absent nested sections, map-of nodes, and non-optional map leaves
+//!   materialize as empty tables (an absent map is the empty map).
 //! - **`finalize`**: coerces schema-declared datetime leaves (string
 //!   values in TOML's four lexical forms become [`Value::Datetime`] —
 //!   schema-driven coercion per ADR-0001), then recursively type-checks
@@ -167,15 +169,30 @@ fn find_field<'a>(schema: &'a Schema, name: &str) -> Option<&'a NamedField> {
 }
 
 /// Recursively populate missing leaves in `table` with their schema-declared
-/// defaults. Existing values are never overwritten.
+/// defaults. Absent `Nested` sections, absent `MapOf` nodes, and absent
+/// non-optional map-typed leaves materialize as empty tables (an absent
+/// section/map is the empty one — and the typed path's serde deserialize
+/// needs the table present). Existing values are never overwritten.
 fn fill_defaults_into(table: &mut Map, schema: &Schema) {
     for nf in &schema.fields {
         match &nf.field {
             Field::Leaf(leaf) => {
-                if !table.contains_key(&nf.name)
-                    && let Some(default) = &leaf.default
-                {
-                    table.insert(nf.name.clone(), default.clone());
+                if !table.contains_key(&nf.name) {
+                    if let Some(default) = &leaf.default {
+                        table.insert(nf.name.clone(), default.clone());
+                    } else if !leaf.optional && matches!(leaf.ty, crate::runtime::LeafType::Map(_))
+                    {
+                        // A non-optional map leaf (bare `HashMap<String,
+                        // scalar>`, or `HashMap<String, UnitEnum>` flattened
+                        // to `Map(Enum)`) follows the `MapOf` absence rule:
+                        // entries are user-supplied, so an absent map is the
+                        // empty map — materialized here so the required
+                        // check passes and the typed deserialize yields an
+                        // empty map instead of a missing-field error.
+                        // Optional (`Option<Map<..>>`) leaves stay absent
+                        // and deserialize to `None`.
+                        table.insert(nf.name.clone(), Value::Map(Map::new()));
+                    }
                 }
             }
             Field::Nested(nested) => {
@@ -198,9 +215,17 @@ fn fill_defaults_into(table: &mut Map, schema: &Schema) {
                 }
             }
             Field::MapOf(item_schema) => {
-                // Map entries are user-supplied — only push defaults into
-                // existing entries, never synthesize missing map values.
-                if let Some(Value::Map(entries)) = table.get_mut(&nf.name) {
+                // Map entries are user-supplied — push defaults into
+                // existing entries, never synthesize missing entries. An
+                // absent map-of node itself materializes as the empty map
+                // (same as `Nested` above): absence means "no entries",
+                // and the typed path's serde deserialize needs the `{}` to
+                // produce an empty `HashMap` instead of a missing-field
+                // error.
+                let entry = table
+                    .entry(nf.name.clone())
+                    .or_insert_with(|| Value::Map(Map::new()));
+                if let Value::Map(entries) = entry {
                     for (_entry_key, entry_value) in entries.iter_mut() {
                         if let Value::Map(t) = entry_value {
                             fill_defaults_into(t, item_schema);

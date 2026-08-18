@@ -117,8 +117,10 @@ fn schema_to_object(schema: SchemaRef<'_>) -> Value {
 
 /// Convert a [`FieldRef`] into a `(name, schema, required)` triple.
 ///
-/// `required` is `true` for non-optional leaves and for all nested structs
-/// (a nested struct has its own internal required list).
+/// `required` is `true` for non-optional non-map leaves and for all nested
+/// structs (a nested struct has its own internal required list). Map-typed
+/// leaves, like structural `MapOf`/`ArrayOf` nodes, are never required —
+/// an absent map loads as the empty map.
 fn field_to_property(field: FieldRef<'_>) -> (String, Value, bool) {
     match field.kind {
         FieldKindRef::Nested { schema: nested } => {
@@ -173,7 +175,12 @@ fn field_to_property(field: FieldRef<'_>) -> (String, Value, bool) {
                 prop.insert("description".into(), Value::String(join_doc(field.doc)));
             }
             populate_leaf(&mut prop, leaf);
-            (field.name.into(), Value::Object(prop), !leaf.optional)
+            // Map-typed leaves are never required, mirroring the structural
+            // `MapOf` rule above: entries are user-supplied and an absent
+            // map loads as the empty map, so a JSON Schema requiring the
+            // property would reject configs clapfig accepts.
+            let required = !leaf.optional && !matches!(leaf.ty, LeafType::Map(_));
+            (field.name.into(), Value::Object(prop), required)
         }
     }
 }

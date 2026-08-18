@@ -115,7 +115,14 @@ use syn::{
 /// cause — never silently ignored. Honored: `rename` (fields/variants,
 /// directional included), `rename_all` on unit-only enums, and
 /// `deserialize_with`/`with` (the typed deserialize runs through serde,
-/// so custom deserializers apply to every source). Serialize-only
+/// so custom deserializers apply to every source). `deserialize_with` is
+/// honored for *shape-preserving* normalization: the schema keeps
+/// advertising the field's inferred shape and validates the merged table
+/// against it *before* serde runs, so a deserializer expecting a different
+/// wire shape gets its inputs rejected by schema validation with a loud
+/// type error — a load failure, never a silently mis-typed value. Pair a
+/// shape-changing deserializer with `#[clapfig(value)]` so the schema
+/// declares a free-form leaf and steps aside. Serialize-only
 /// attributes (`skip_serializing`, `serialize_with`, …) and derive
 /// plumbing (`bound`, `borrow`, `crate`, `expecting`) are accepted — they
 /// cannot make the schema disagree with serde's deserialize. Everything
@@ -646,7 +653,13 @@ fn serde_key_allowed(key: &str, ctx: SerdeCtx) -> bool {
             // Honored by construction: the typed deserialize runs through
             // serde on the merged table, so custom deserializers apply to
             // every source (files, env, CLI, defaults). Documented in the
-            // crate docs as the normalization escape hatch.
+            // crate docs as the normalization escape hatch. The contract
+            // is shape-preserving normalization: schema validation checks
+            // the field's inferred shape *before* serde runs, so a
+            // shape-changing deserializer's alternate wire shape is
+            // rejected loudly at validation (never silently mis-typed);
+            // `#[clapfig(value)]` is the opt-out that hands the wire
+            // shape to the deserializer.
             | "deserialize_with" | "with"
             // Serialize-only: the schema tracks what deserialize accepts.
             | "serialize_with" | "skip_serializing" | "skip_serializing_if"
@@ -1615,6 +1628,15 @@ fn expand_field(field: &syn::Field) -> syn::Result<ExpandedField> {
             let v = expr_to_value_static(expr, &shape)?;
             quote! { Some(#v) }
         }
+        // Bare (non-`Option`) map-typed leaves carry no default, yet an
+        // absent map still loads as the empty map: `fill_defaults`
+        // materializes `{}` for non-optional map leaves, so the typed
+        // deserialize produces an empty `HashMap`/`BTreeMap` instead of a
+        // missing-field error — the rule the structural `MapOf` shape
+        // follows, and what makes the "an absent map is already the empty
+        // map" remediation in the map-default rejection true.
+        // (`Option<Map<..>>` leaves are optional: absence stays absent and
+        // deserializes to `None`.)
         None => quote! { None },
     };
 

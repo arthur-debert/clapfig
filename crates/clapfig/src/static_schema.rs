@@ -248,6 +248,12 @@ impl FieldStatic {
             // `Map(Enum { .. })` — keeping the `MapOf` object shape here
             // would emit a schema of zero fields that rejects every
             // string entry at load ("expected map, got string").
+            //
+            // `MapOf` absence semantics survive the flatten: an absent map
+            // is the empty map (entries are user-supplied), so
+            // `fill_defaults` materializes `{}` for non-optional map
+            // leaves and the typed deserialize yields an empty `HashMap`
+            // instead of a missing-required error.
             FieldStatic::MapOf { schema: s, doc } if s.is_enum() => {
                 RuntimeField::Leaf(RuntimeLeaf {
                     doc: effective_doc(doc, s.doc),
@@ -456,10 +462,11 @@ pub trait Schema {
 /// Derive-support marker: asserts a field type the macro claimed as a
 /// datetime leaf really is [`clapfig::value::Datetime`](crate::value::Datetime).
 ///
-/// The derive macro recognizes datetime fields *syntactically* — any path
-/// ending in `Datetime` (`Datetime`, `value::Datetime`,
-/// `clapfig::value::Datetime`) is claimed as a `LeafTypeStatic::DateTime`
-/// leaf. Name resolution isn't available to a proc macro, so a user's own
+/// The derive macro recognizes datetime fields *syntactically* — exactly
+/// the spellings `Datetime`, `value::Datetime`, and
+/// `clapfig::value::Datetime` are claimed as a `LeafTypeStatic::DateTime`
+/// leaf (any other path, e.g. `my_mod::Datetime`, is not). Name resolution
+/// isn't available to a proc macro, so a user's own use-imported
 /// `struct Datetime` would otherwise be *silently* mis-typed as a datetime
 /// leaf. The macro therefore emits an `IsClapfigDatetime` bound assertion
 /// for every claimed match; a lookalike type fails to compile with this
@@ -478,8 +485,9 @@ impl IsClapfigDatetime for crate::value::Datetime {}
 
 /// Derive-support marker: asserts a field type the macro claimed as a
 /// free-form value leaf really is [`clapfig::value::Value`](crate::value::Value).
-/// Same rationale as [`IsClapfigDatetime`] — the macro matches `Value` by
-/// type name and must not silently claim a user's own `Value` type.
+/// Same rationale as [`IsClapfigDatetime`] — the macro matches exactly the
+/// spellings `Value`, `value::Value`, and `clapfig::value::Value`, and
+/// must not silently claim a user's own use-imported `Value` type.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not `clapfig::value::Value`",
     label = "field type claimed as a free-form value leaf by #[derive(clapfig::Schema)]",

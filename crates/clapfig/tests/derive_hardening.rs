@@ -5,6 +5,9 @@
 //! Covered here:
 //! - `HashMap<String, UnitEnum>` flattens to `Map(Enum)` instead of an
 //!   empty `MapOf` schema that rejected every entry at load.
+//! - Absent derived maps (flattened enum maps, bare scalar maps, and
+//!   structural map-of-struct) load as the empty map; `Option<Map<..>>`
+//!   stays `None`. Map leaves are not `required` in JSON Schema.
 //! - Raw identifiers (`r#type`) emit serde's spelling (`type`).
 //! - Field-site `///` docs are retained on bare nested / enum / map-of
 //!   fields (previously dropped, asymmetric with `Option<Enum>`).
@@ -21,7 +24,7 @@ use std::collections::HashMap;
 
 use clapfig::runtime::{Field as RuntimeField, LeafType as RuntimeLeafType};
 use clapfig::value::Value;
-use clapfig::{Clapfig, Schema, SearchPath};
+use clapfig::{Clapfig, ConfigAction, ConfigResult, Schema, SearchPath};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
@@ -241,6 +244,112 @@ struct DatetimeArray {
     /// Maintenance windows.
     #[clapfig(default = ["2020-01-01T00:00:00Z"])]
     windows: Vec<clapfig::value::Datetime>,
+}
+
+// -- Absent maps load as the empty map ---------------------------------------
+//
+// Map entries are user-supplied, so absence means "no entries" — the rule
+// the structural `MapOf` shape always had. Derived map *leaves* (the
+// `Map(Enum)` flatten and bare scalar maps) must follow it too: no
+// `MissingRequired` at validation, no missing-field error at the typed
+// serde deserialize, and no `required` listing in JSON Schema.
+
+#[test]
+fn absent_map_of_unit_enum_loads_as_empty_map() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("t.toml"), "").unwrap();
+    let cfg: PerTargetLevels = Clapfig::schema_builder::<PerTargetLevels>()
+        .app_name("t")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert!(cfg.levels.is_empty());
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct ScalarMapCfg {
+    /// Named limits.
+    limits: HashMap<String, i64>,
+}
+
+#[test]
+fn absent_bare_scalar_map_loads_as_empty_map() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("t.toml"), "").unwrap();
+    let cfg: ScalarMapCfg = Clapfig::schema_builder::<ScalarMapCfg>()
+        .app_name("t")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert!(cfg.limits.is_empty());
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct StructuralMapCfg {
+    /// Per-plugin settings.
+    plugins: HashMap<String, Inner>,
+}
+
+#[test]
+fn absent_structural_map_of_loads_as_empty_map() {
+    // The structural shape always accepted absence at validation, but the
+    // typed path still needs `fill_defaults` to materialize the `{}` or
+    // serde fails with a missing-field error.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("t.toml"), "").unwrap();
+    let cfg: StructuralMapCfg = Clapfig::schema_builder::<StructuralMapCfg>()
+        .app_name("t")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert!(cfg.plugins.is_empty());
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct OptScalarMapCfg {
+    /// Optional labels.
+    labels: Option<HashMap<String, String>>,
+}
+
+#[test]
+fn absent_optional_map_stays_none() {
+    // `Option<Map<..>>` keeps the presence signal: no empty-map default is
+    // synthesized, so absence deserializes to `None`, not `Some({})`.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("t.toml"), "").unwrap();
+    let cfg: OptScalarMapCfg = Clapfig::schema_builder::<OptScalarMapCfg>()
+        .app_name("t")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert!(cfg.labels.is_none());
+}
+
+#[test]
+fn map_leaf_is_not_required_in_json_schema() {
+    // Mirrors the structural-MapOf rule: an absent map loads as the empty
+    // map, so a JSON Schema requiring the key would reject configs clapfig
+    // accepts.
+    let result = Clapfig::schema_builder::<PerTargetLevels>()
+        .app_name("t")
+        .no_env()
+        .handle(&ConfigAction::Schema { output: None })
+        .unwrap();
+    let s = match result {
+        ConfigResult::Schema(s) => s,
+        other => panic!("expected Schema, got {other:?}"),
+    };
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    assert!(
+        v.get("required").is_none(),
+        "map leaf must not be listed as required, got: {:?}",
+        v["required"]
+    );
+    assert_eq!(v["properties"]["levels"]["type"], "object");
 }
 
 #[test]
