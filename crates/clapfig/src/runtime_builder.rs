@@ -1062,7 +1062,7 @@ fn format_runtime_value(value: &Value) -> String {
         Value::Integer(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Boolean(b) => b.to_string(),
-        Value::Datetime(d) => d.to_string(),
+        Value::Datetime(d) => crate::value::lexical_string(d),
         // Containers render in the value model's deterministic inline
         // notation.
         Value::Array(_) | Value::Map(_) => value.to_string(),

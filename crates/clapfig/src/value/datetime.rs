@@ -9,8 +9,21 @@
 //! and offsets). The component fields are public (they are `toml_datetime`'s
 //! fields), so safe code *can* assemble a non-grammatical value; clapfig
 //! follows the toml ecosystem's contract for those — a serialize error or a
-//! non-grammatical spelling in output, never a panic (the adapters convert
-//! by identity or [`Display`](std::fmt::Display), no reparse).
+//! non-grammatical spelling in output, never a panic.
+//!
+//! One upstream wrinkle forces clapfig to own the spelling: `toml_datetime`'s
+//! [`Display`](std::fmt::Display) negates a negative custom offset in `i16`,
+//! which overflows — and panics in overflow-checked builds — for
+//! `Offset::Custom { minutes: i16::MIN }`. So everywhere clapfig turns a
+//! datetime into text it goes through [`lexical_string`], which matches
+//! `Display` byte-for-byte on every value upstream can format and spells the
+//! one it cannot; the TOML adapter, whose format stack formats datetimes
+//! natively in code clapfig hands the value to, instead refuses that offset
+//! as a typed serialize error. The one path clapfig cannot guard is serde on
+//! a bare [`Datetime`] outside [`Value`](super::Value) (e.g. `to_value` of a
+//! struct with a `Datetime` field): upstream's own `Serialize` impl formats
+//! the string before any clapfig code runs, and inherits upstream's panic —
+//! exactly as it would with the `toml` crate alone.
 //!
 //! The types are `toml_datetime`'s, re-exported. `toml_datetime` is a
 //! standalone type crate, not a format crate, so this does not violate
@@ -43,12 +56,65 @@ pub(crate) use toml_datetime::__unstable::NAME as DATETIME_NAME;
 /// Marker field key inside the marker struct (see the [module docs](self)).
 pub(crate) use toml_datetime::__unstable::FIELD as DATETIME_FIELD;
 
+/// Whether formatting `dt` through `toml_datetime`'s
+/// [`Display`](std::fmt::Display) would overflow: the upstream impl negates
+/// a negative custom offset in `i16`, and `i16::MIN` has no `i16` negation
+/// (see the [module docs](self)).
+pub(crate) fn display_overflows(dt: &Datetime) -> bool {
+    matches!(dt.offset, Some(Offset::Custom { minutes: i16::MIN }))
+}
+
+/// The datetime's lexical spelling, never a panic: byte-identical to
+/// [`Display`](std::fmt::Display) for every value the upstream formatter
+/// can spell, and — for the one offset it cannot ([`display_overflows`]) —
+/// the spelling upstream *would* produce if its negation did not overflow
+/// (`-546:08`, still garbage-in-garbage-out).
+pub(crate) fn lexical_string(dt: &Datetime) -> String {
+    if !display_overflows(dt) {
+        return dt.to_string();
+    }
+    let unsigned = Datetime {
+        offset: None,
+        ..*dt
+    };
+    let minutes = i32::from(i16::MIN).unsigned_abs();
+    format!("{unsigned}-{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Datetime;
+    use super::{Datetime, Offset, lexical_string};
 
     fn parse(s: &str) -> Datetime {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn lexical_string_matches_display_for_formattable_values() {
+        for form in [
+            "1979-05-27T07:32:00Z",
+            "1979-05-27T00:32:00-07:00",
+            "1979-05-27T07:32:00",
+            "1979-05-27",
+            "07:32:00.5",
+        ] {
+            let dt = parse(form);
+            assert_eq!(lexical_string(&dt), dt.to_string());
+        }
+        // A garbage offset upstream CAN format also matches.
+        let mut dt = parse("1979-05-27T07:32:00Z");
+        dt.offset = Some(Offset::Custom { minutes: -30000 });
+        assert_eq!(lexical_string(&dt), dt.to_string());
+    }
+
+    #[test]
+    fn lexical_string_spells_the_offset_display_overflows_on() {
+        // `Display` negates the offset in `i16` and overflows on
+        // `i16::MIN` (a panic in overflow-checked builds);
+        // `lexical_string` spells it instead. 32768 minutes = 546h 08m.
+        let mut dt = parse("1979-05-27T07:32:00Z");
+        dt.offset = Some(Offset::Custom { minutes: i16::MIN });
+        assert_eq!(lexical_string(&dt), "1979-05-27T07:32:00-546:08");
     }
 
     #[test]

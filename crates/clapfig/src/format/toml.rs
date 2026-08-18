@@ -85,6 +85,7 @@ impl FormatAdapter for TomlAdapter {
                 ),
             });
         };
+        check_datetime_offsets(value)?;
         toml::to_string(&value_to_toml(value)).map_err(|e| FormatError::Serialize {
             format: "toml",
             message: e.to_string(),
@@ -124,6 +125,7 @@ impl FormatAdapter for TomlAdapter {
                 })?;
         match edit {
             FileEdit::Set { path, value, .. } => {
+                check_datetime_offsets(value)?;
                 let keys = key_segments(path);
                 write_at_path(&mut doc, &keys, value)?;
             }
@@ -142,6 +144,29 @@ impl FormatAdapter for TomlAdapter {
             operation: Operation::SpanIndex,
         }
         .into())
+    }
+}
+
+/// Refuse, as a typed serialize error, the one datetime the toml stack
+/// cannot format: `toml`/`toml_edit` spell datetimes through
+/// `toml_datetime`'s `Display` in code this adapter hands the value to,
+/// and that impl overflows — a panic in overflow-checked builds — on
+/// `Offset::Custom { minutes: i16::MIN }` (see the `value::datetime`
+/// module docs). Every other hand-built garbage value keeps its existing
+/// behavior: a typed error or a non-grammatical spelling from the toml
+/// stack itself.
+fn check_datetime_offsets(value: &Value) -> Result<(), FormatError> {
+    match value {
+        Value::Datetime(d) if crate::value::display_overflows(d) => Err(FormatError::Serialize {
+            format: "toml",
+            message: format!(
+                "datetime offset of {} minutes overflows the TOML datetime formatter",
+                i16::MIN
+            ),
+        }),
+        Value::Array(items) => items.iter().try_for_each(check_datetime_offsets),
+        Value::Map(map) => map.values().try_for_each(check_datetime_offsets),
+        _ => Ok(()),
     }
 }
 
@@ -610,8 +635,52 @@ pool_size = 5
     }
 
     #[test]
+    fn serialize_and_edit_refuse_offset_the_toml_stack_cannot_format() {
+        // The one hand-built datetime the toml stack cannot even spell
+        // as garbage: upstream `Display` overflows negating
+        // `Offset::Custom { minutes: i16::MIN }` (a panic in
+        // overflow-checked builds), so the adapter refuses it before
+        // handing the value over (see `check_datetime_offsets`).
+        use crate::value::{Date, Datetime, Offset, Time};
+        let dt = Datetime {
+            date: Some(Date {
+                year: 1979,
+                month: 5,
+                day: 27,
+            }),
+            time: Some(Time {
+                hour: 7,
+                minute: 32,
+                second: 0,
+                nanosecond: 0,
+            }),
+            offset: Some(Offset::Custom { minutes: i16::MIN }),
+        };
+
+        let mut map = Map::new();
+        map.insert("dt".into(), Value::Datetime(dt));
+        let err = TomlAdapter.serialize(&Value::Map(map)).unwrap_err();
+        assert!(matches!(err, FormatError::Serialize { .. }), "{err:?}");
+
+        let path = ConfigPath::new().key("dt");
+        let value = Value::Datetime(dt);
+        let err = TomlAdapter
+            .edit(
+                "",
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, FormatError::Serialize { .. }), "{err:?}");
+    }
+
+    #[test]
     fn edit_set_hand_constructed_invalid_datetime_never_panics() {
-        // The edit path writes `Display` output without revalidating:
+        // The edit path writes `Display` output without revalidating
+        // (beyond the one offset `check_datetime_offsets` refuses):
         // garbage in, garbage out — but never a panic (the conversion is
         // identity, no reparse).
         use crate::value::{Date, Datetime};

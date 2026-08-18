@@ -167,8 +167,10 @@ impl<'de> de::Deserializer<'de> for Value {
             // Presented as the marker map so a self-describing target
             // (e.g. `Value` itself) rebuilds the datetime, and a typed
             // `Datetime` target's visitor sees the shape its
-            // `deserialize_struct` expects.
-            Value::Datetime(d) => visitor.visit_map(DatetimeAccess::new(d.to_string())),
+            // `deserialize_struct` expects. `lexical_string`, not
+            // `to_string`: upstream `Display` panics on one offset (see
+            // the `datetime` module docs).
+            Value::Datetime(d) => visitor.visit_map(DatetimeAccess::new(super::lexical_string(&d))),
             Value::Array(a) => {
                 let mut seq = de::value::SeqDeserializer::new(a.into_iter());
                 let out = visitor.visit_seq(&mut seq)?;
@@ -215,7 +217,9 @@ impl<'de> de::Deserializer<'de> for Value {
     {
         if name == DATETIME_NAME {
             match self {
-                Value::Datetime(d) => visitor.visit_map(DatetimeAccess::new(d.to_string())),
+                Value::Datetime(d) => {
+                    visitor.visit_map(DatetimeAccess::new(super::lexical_string(&d)))
+                }
                 other => Err(de::Error::custom(format!(
                     "invalid type: {}, expected a datetime",
                     other.type_str()
@@ -415,6 +419,18 @@ mod tests {
         round_trip(42i64);
         round_trip(2.5f64);
         round_trip(false);
+    }
+
+    #[test]
+    fn datetime_with_unformattable_offset_deserializes_as_typed_error() {
+        // `Offset::Custom { minutes: i16::MIN }` overflows upstream
+        // `Display`; the marker map carries the panic-free spelling
+        // instead, and the typed target's reparse rejects it as a
+        // typed error — never a panic.
+        use super::super::{Offset, Value};
+        let mut dt: Datetime = "1979-05-27T07:32:00Z".parse().unwrap();
+        dt.offset = Some(Offset::Custom { minutes: i16::MIN });
+        assert!(from_value::<Datetime>(Value::Datetime(dt)).is_err());
     }
 
     #[test]

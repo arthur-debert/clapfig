@@ -42,7 +42,7 @@ pub use datetime::{Date, Datetime, DatetimeParseError, Offset, Time};
 pub use de::{DeserializeError, from_value};
 pub use ser::{SerializeError, to_value};
 
-pub(crate) use datetime::{DATETIME_FIELD, DATETIME_NAME};
+pub(crate) use datetime::{DATETIME_FIELD, DATETIME_NAME, display_overflows, lexical_string};
 
 /// The map type the public API traffics in.
 ///
@@ -293,7 +293,9 @@ impl fmt::Display for Value {
                 }
             }
             Value::Boolean(b) => write!(f, "{b}"),
-            Value::Datetime(d) => write!(f, "{d}"),
+            // Via the panic-free spelling, not upstream `Display` (see
+            // the `datetime` module docs).
+            Value::Datetime(d) => f.write_str(&lexical_string(d)),
             Value::Array(values) => {
                 f.write_str("[")?;
                 for (i, v) in values.iter().enumerate() {

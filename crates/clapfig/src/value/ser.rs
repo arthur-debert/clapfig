@@ -2,10 +2,11 @@
 //!
 //! [`to_value`] runs a type's `Serialize` impl against a serializer whose
 //! output *is* a [`Value`] tree (the pattern `serde_json::to_value` and
-//! the `toml` crate use). Datetimes ride the private marker
-//! struct ([`Datetime`](super::Datetime)'s own `Serialize` impl), which
-//! this serializer intercepts and rebuilds as [`Value::Datetime`] — no
-//! serialize-reparse round trip.
+//! the `toml` crate use). Datetimes ride the private marker struct — spelled
+//! by [`Datetime`](super::Datetime)'s own `Serialize` impl for a bare
+//! datetime, and by [`Value`]'s impl (through the panic-free formatter; see
+//! the `datetime` module docs) for [`Value::Datetime`] — which this
+//! serializer intercepts and rebuilds as [`Value::Datetime`].
 //!
 //! Baseline mapping (ADR-0002): map keys must be strings; `u64` values
 //! above `i64::MAX` are range errors. `None` has no value-model
@@ -115,8 +116,16 @@ impl Serialize for Value {
             Value::Boolean(b) => serializer.serialize_bool(*b),
             // Rides the marker struct so `to_value`/`from_value` (and any
             // format serializer that understands the marker) keep the
-            // datetime typed.
-            Value::Datetime(d) => d.serialize(serializer),
+            // datetime typed. Spelled here rather than by `d.serialize`:
+            // upstream's impl (same wire shape) formats through its own
+            // `Display`, which panics on the one offset `lexical_string`
+            // guards (see the `datetime` module docs).
+            Value::Datetime(d) => {
+                use serde::ser::SerializeStruct;
+                let mut s = serializer.serialize_struct(DATETIME_NAME, 1)?;
+                s.serialize_field(DATETIME_FIELD, &super::lexical_string(d))?;
+                s.end()
+            }
             Value::Array(a) => a.serialize(serializer),
             Value::Map(m) => {
                 use serde::ser::SerializeMap;
@@ -577,6 +586,21 @@ mod tests {
     fn datetime_serializes_typed() {
         let dt: Datetime = "1979-05-27T07:32:00Z".parse().unwrap();
         assert_eq!(to_value(dt).unwrap(), Value::Datetime(dt));
+    }
+
+    #[test]
+    fn value_datetime_with_unformattable_offset_is_typed_error() {
+        // `Offset::Custom { minutes: i16::MIN }` overflows upstream
+        // `Display`; `Value`'s own `Serialize` impl spells the marker
+        // struct through the panic-free formatter, and the reparse on
+        // the way back into a datetime rejects the garbage spelling as
+        // a typed error — never a panic. (A bare `Datetime` outside
+        // `Value` still runs upstream's `Serialize` first and inherits
+        // upstream's panic; see the `datetime` module docs.)
+        use super::super::Offset;
+        let mut dt: Datetime = "1979-05-27T07:32:00Z".parse().unwrap();
+        dt.offset = Some(Offset::Custom { minutes: i16::MIN });
+        assert!(to_value(Value::Datetime(dt)).is_err());
     }
 
     #[test]

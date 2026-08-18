@@ -316,8 +316,10 @@ fn value_to_json(value: &Value, path: &mut Vec<WalkSegment>) -> Result<Json, For
         },
         Value::Boolean(b) => Json::Bool(*b),
         // TOML lexical form as a string; the schema-driven coercion pass
-        // reads it back into the Datetime variant (ADR-0001).
-        Value::Datetime(d) => Json::String(d.to_string()),
+        // reads it back into the Datetime variant (ADR-0001). The
+        // panic-free spelling, not upstream `Display` (see the
+        // `value::datetime` module docs).
+        Value::Datetime(d) => Json::String(crate::value::lexical_string(d)),
         Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
@@ -972,6 +974,38 @@ mod tests {
         );
         let text = JsonAdapter.serialize(&Value::Map(map)).unwrap();
         assert!(text.contains(r#""stamp": "1979-13-01""#), "{text}");
+    }
+
+    #[test]
+    fn serialize_offset_upstream_display_cannot_format_never_panics() {
+        // `Offset::Custom { minutes: i16::MIN }` overflows upstream
+        // `Display` (a panic in overflow-checked builds); the adapter
+        // spells it through the value model's panic-free formatter:
+        // garbage in, garbage out — 32768 minutes = 546h 08m.
+        use crate::value::{Date, Datetime, Offset, Time};
+        let mut map = Map::new();
+        map.insert(
+            "stamp".into(),
+            Value::Datetime(Datetime {
+                date: Some(Date {
+                    year: 1979,
+                    month: 5,
+                    day: 27,
+                }),
+                time: Some(Time {
+                    hour: 7,
+                    minute: 32,
+                    second: 0,
+                    nanosecond: 0,
+                }),
+                offset: Some(Offset::Custom { minutes: i16::MIN }),
+            }),
+        );
+        let text = JsonAdapter.serialize(&Value::Map(map)).unwrap();
+        assert!(
+            text.contains(r#""stamp": "1979-05-27T07:32:00-546:08""#),
+            "{text}"
+        );
     }
 
     #[test]
