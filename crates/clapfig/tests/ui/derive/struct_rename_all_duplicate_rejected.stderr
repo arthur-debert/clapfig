@@ -1,0 +1,5 @@
+error: duplicate schema field name "listen-port" — two fields (after `rename`/`rename_all`) would collide in the schema, making lookups and unknown-key validation order-dependent. Rename one of them.
+  --> tests/ui/derive/struct_rename_all_duplicate_rejected.rs:11:5
+   |
+11 |     port: i64,
+   |     ^^^^

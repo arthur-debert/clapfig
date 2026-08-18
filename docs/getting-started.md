@@ -82,10 +82,15 @@ Key points:
   is shared with the schema: `#[serde(rename = "...")]` on a field renames
   the config key too (the schema follows serde's spelling; the directional
   `rename(deserialize = "...")` form contributes its deserialize name),
-  while struct-level `#[serde(rename_all = ...)]`, including
-  `rename_all(deserialize = "...")`, is rejected at compile time — rename
-  fields individually. (A serialize-only `rename_all(serialize = "...")`
-  is allowed: it doesn't affect config loading.)
+  and struct-level `#[serde(rename_all = "...")]` — or the equivalent
+  `#[clapfig(rename_all = "...")]` — converts every config key the same
+  way serde converts its deserialize names, for the full serde rule set
+  (`lowercase`, `UPPERCASE`, `PascalCase`, `camelCase`, `snake_case`,
+  `SCREAMING_SNAKE_CASE`, `kebab-case`, `SCREAMING-KEBAB-CASE`). Explicit
+  field renames win over the rule, and the directional
+  `rename_all(deserialize = "...")` form contributes its deserialize rule.
+  (A serialize-only `rename_all(serialize = "...")` doesn't affect config
+  loading and leaves the keys on the Rust spellings.)
 
 ## Load it
 
