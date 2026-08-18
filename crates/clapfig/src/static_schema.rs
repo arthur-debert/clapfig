@@ -96,13 +96,18 @@ pub struct LeafStatic {
 #[derive(Debug)]
 pub enum LeafTypeStatic {
     String,
-    /// Signed 64-bit integer (TOML's only integer width).
+    /// Signed 64-bit integer (TOML's only integer width), carrying the
+    /// source Rust type's range so out-of-range values fail the schema
+    /// check with the key path instead of a post-merge deserialize
+    /// failure.
     ///
     /// The derive macro maps every Rust integer type, including the
     /// unsigned ones (`u8`/`u16`/`u32`/`u64`/`usize`) and `isize`, to
-    /// this variant. Values that exceed `i64::MAX` (e.g. a `u64`
-    /// holding 2^63) **cannot be represented in TOML at all** — the
-    /// failure mode is at serialize time, before the value ever
+    /// this variant, emitting the width's bounds (`u8` → `0..=255`).
+    /// `i64`/`isize` are unbounded; `u64`/`usize` carry `min: Some(0)`
+    /// with an open upper end — values that exceed `i64::MAX` (e.g. a
+    /// `u64` holding 2^63) **cannot be represented in TOML at all** —
+    /// the failure mode is at serialize time, before the value ever
     /// reaches a deserializer, and there is no faithful intermediate.
     /// Field types like `u64` are accepted because they are convenient
     /// and round-trip correctly for the overwhelming majority of
@@ -111,7 +116,10 @@ pub enum LeafTypeStatic {
     ///
     /// `i128` and `u128` are rejected at derive time with a compile
     /// error rather than silently truncated.
-    Integer,
+    Integer {
+        min: Option<i64>,
+        max: Option<i64>,
+    },
     Float,
     Bool,
     DateTime,
@@ -312,7 +320,10 @@ impl LeafTypeStatic {
     pub fn to_runtime(&self) -> RuntimeLeafType {
         match self {
             LeafTypeStatic::String => RuntimeLeafType::String,
-            LeafTypeStatic::Integer => RuntimeLeafType::Integer,
+            LeafTypeStatic::Integer { min, max } => RuntimeLeafType::Integer {
+                min: *min,
+                max: *max,
+            },
             LeafTypeStatic::Float => RuntimeLeafType::Float,
             LeafTypeStatic::Bool => RuntimeLeafType::Bool,
             LeafTypeStatic::DateTime => RuntimeLeafType::DateTime,
@@ -579,7 +590,10 @@ mod tests {
             name: "port",
             field: FieldStatic::Leaf(LeafStatic {
                 doc: EMPTY_DOC,
-                ty: LeafTypeStatic::Integer,
+                ty: LeafTypeStatic::Integer {
+                    min: None,
+                    max: None,
+                },
                 default: Some(ValueStatic::Integer(8080)),
                 optional: false,
                 env: None,
@@ -595,7 +609,13 @@ mod tests {
         assert_eq!(s.fields.len(), 1);
         match &s.fields[0].field {
             RuntimeField::Leaf(leaf) => {
-                assert!(matches!(leaf.ty, RuntimeLeafType::Integer));
+                assert!(matches!(
+                    leaf.ty,
+                    RuntimeLeafType::Integer {
+                        min: None,
+                        max: None
+                    }
+                ));
                 assert_eq!(leaf.default, Some(Value::Integer(8080)));
                 assert!(!leaf.optional);
             }

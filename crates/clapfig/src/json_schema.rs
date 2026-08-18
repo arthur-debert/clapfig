@@ -12,16 +12,26 @@
 //! # What is in the schema
 //!
 //! - **Structure**: every nested config object becomes a JSON `object` with
-//!   `properties`; non-optional fields are listed in `required`.
+//!   `properties`.
+//! - **Required**: `required` mirrors what the runtime actually rejects
+//!   when absent — a leaf is required only if it is non-optional AND has
+//!   no default (defaults are synthesized during finalization), and a
+//!   nested section is required only if it transitively contains such a
+//!   leaf. An external validator therefore accepts exactly the documents
+//!   clapfig loads.
 //! - **Docs**: schema and field doc lines become `description`.
-//! - **Types**: emitted from each leaf's declared
-//!   [`LeafType`] — including leaves without
-//!   defaults. String → `"string"`, integer → `"integer"`, float →
-//!   `"number"`, bool → `"boolean"`, array → `"array"`, map → `"object"`.
+//! - **Types**: converted recursively from each leaf's declared
+//!   [`LeafType`] — including leaves without defaults. String →
+//!   `"string"`, integer → `"integer"` (with declared bounds as
+//!   `minimum`/`maximum`), float → `"number"`, bool → `"boolean"`,
+//!   datetime → `"string"` with `format: "date-time"`, array → `"array"`
+//!   with a recursive `items` schema, map → `"object"` with a recursive
+//!   `additionalProperties` value schema.
 //! - **Defaults**: the literal default value (when present) is emitted as
-//!   `default` on the property.
+//!   `default` on the property (datetimes in their lexical string form).
 //! - **Enums**: `Enum { values }` leaves emit `enum: [...]` alongside the
-//!   primitive type implied by the value set.
+//!   primitive type implied by the value set — at any nesting depth
+//!   (an `Array(Enum)` leaf constrains its `items`).
 //! - **Env vars**: when a field maps to an env var, the name is attached as
 //!   the non-standard `x-env` extension.
 //! - **JSON comment keys**: every object allowlists the `^//` key pattern
@@ -109,15 +119,16 @@ fn schema_to_object(schema: &Schema) -> Value {
 
 /// Convert a [`NamedField`] into a `(name, schema, required)` triple.
 ///
-/// `required` is `true` for non-optional non-map leaves and for all nested
-/// structs (a nested struct has its own internal required list). Map-typed
-/// leaves, like structural `MapOf`/`ArrayOf` nodes, are never required —
-/// an absent map loads as the empty map.
+/// `required` mirrors the runtime's absence rules: `true` for a leaf that
+/// is non-optional AND defaultless AND not map-typed (an absent
+/// non-optional map leaf materializes as the empty map, like structural
+/// `MapOf`/`ArrayOf` nodes), and for a nested struct that transitively
+/// contains such a leaf ([`schema_requires_presence`]).
 fn field_to_property(field: &NamedField) -> (String, Value, bool) {
     match &field.field {
         Field::Nested(nested) => {
             let schema = schema_to_object(nested);
-            (field.name.clone(), schema, true)
+            (field.name.clone(), schema, schema_requires_presence(nested))
         }
         Field::ArrayOf(item) => {
             // JSON Schema for a TOML `[[name]]` array of items: `type: array`
@@ -162,27 +173,40 @@ fn field_to_property(field: &NamedField) -> (String, Value, bool) {
                 prop.insert("description".into(), Value::String(join_doc(&leaf.doc)));
             }
             populate_leaf(&mut prop, leaf);
-            // Map-typed leaves are never required, mirroring the structural
-            // `MapOf` rule above: entries are user-supplied and an absent
-            // map loads as the empty map, so a JSON Schema requiring the
-            // property would reject configs clapfig accepts.
-            let required = !leaf.optional && !matches!(leaf.ty, LeafType::Map(_));
+            // Required only when the runtime rejects the absence:
+            // non-optional AND defaultless AND not map-typed — an absent
+            // non-optional map leaf materializes as the empty map.
+            let required =
+                !leaf.optional && leaf.default.is_none() && !matches!(leaf.ty, LeafType::Map(_));
             (field.name.clone(), Value::Object(prop), required)
         }
     }
 }
 
-/// Apply a leaf's declared type, default, env hint, and allowed-value set
-/// onto its JSON Schema object.
+/// `true` when the runtime rejects a document that omits this schema
+/// subtree entirely: it transitively contains a non-optional leaf with no
+/// default. Finalization synthesizes defaults into absent sections, so a
+/// section whose required leaves all carry defaults is satisfiable when
+/// absent — exporting it `required` would make external validators reject
+/// configs clapfig loads fine. `ArrayOf`/`MapOf` subtrees never require
+/// presence (absent means the empty list/map), and neither do map-typed
+/// leaves (an absent non-optional map leaf materializes as the empty map).
+fn schema_requires_presence(schema: &Schema) -> bool {
+    schema.fields.iter().any(|nf| match &nf.field {
+        Field::Leaf(leaf) => {
+            !leaf.optional && leaf.default.is_none() && !matches!(leaf.ty, LeafType::Map(_))
+        }
+        Field::Nested(nested) => schema_requires_presence(nested),
+        Field::ArrayOf(_) | Field::MapOf(_) => false,
+    })
+}
+
+/// Apply a leaf's declared type, default, and env hint onto its JSON
+/// Schema object.
 fn populate_leaf(prop: &mut Map<String, Value>, leaf: &Leaf) {
-    if let Some(name) = leaf_type_json_name(&leaf.ty) {
-        prop.insert("type".into(), Value::String(name.into()));
-        if let LeafType::Array(item) = &leaf.ty
-            && let Some(item_name) = leaf_type_json_name(item)
-        {
-            let mut items = Map::new();
-            items.insert("type".into(), Value::String(item_name.into()));
-            prop.insert("items".into(), Value::Object(items));
+    if let Some(ty_schema) = leaf_type_to_schema(&leaf.ty) {
+        for (key, value) in ty_schema {
+            prop.insert(key, value);
         }
     }
 
@@ -195,34 +219,75 @@ fn populate_leaf(prop: &mut Map<String, Value>, leaf: &Leaf) {
     if let Some(env_name) = &leaf.env {
         prop.insert("x-env".into(), Value::String(env_name.clone()));
     }
-
-    // Allowed-value constraint: the value set of a `LeafType::Enum` leaf.
-    if let LeafType::Enum { values } = &leaf.ty {
-        let enum_array: Vec<Value> = values.iter().filter_map(value_to_json).collect();
-        if !enum_array.is_empty() {
-            prop.insert("enum".into(), Value::Array(enum_array));
-        }
-    }
 }
 
-/// JSON Schema `type` name for a runtime [`LeafType`]. `Enum` returns the
-/// underlying primitive type implied by the first allowed value (callers
-/// also emit `enum: [...]` separately).
-fn leaf_type_json_name(ty: &LeafType) -> Option<&'static str> {
+/// Recursively convert a runtime [`LeafType`] into the JSON Schema object
+/// constraining values of that type.
+///
+/// Containers recurse for full fidelity: an array leaf constrains its
+/// `items` (nested arrays keep their inner `items`, `Array(Enum)` keeps
+/// the enum constraint), and a map leaf constrains entry values via
+/// `additionalProperties` (with the ADR-0002 `^//` comment-key allowlist,
+/// since comment keys inside a map instance are comments, not entries).
+/// `Enum` emits `enum: [...]` alongside the primitive type implied by the
+/// first allowed value.
+///
+/// Returns `None` for [`LeafType::Value`]: JSON Schema convention is to
+/// omit the constraint entirely, signalling that any value is acceptable.
+/// Callers reading the schema are expected to validate the value
+/// themselves.
+fn leaf_type_to_schema(ty: &LeafType) -> Option<Map<String, Value>> {
+    let mut obj = Map::new();
     match ty {
-        LeafType::String => Some("string"),
-        LeafType::Integer => Some("integer"),
-        LeafType::Float => Some("number"),
-        LeafType::Bool => Some("boolean"),
-        LeafType::DateTime => Some("string"),
-        LeafType::Array(_) => Some("array"),
-        LeafType::Map(_) => Some("object"),
-        LeafType::Enum { values } => values.first().and_then(value_json_type),
-        // Unconstrained: JSON Schema convention is to omit `type` entirely,
-        // signalling that any value is acceptable. Callers reading the
-        // schema are expected to validate the value themselves.
-        LeafType::Value => None,
+        LeafType::String => {
+            obj.insert("type".into(), Value::String("string".into()));
+        }
+        LeafType::Integer { min, max } => {
+            obj.insert("type".into(), Value::String("integer".into()));
+            if let Some(lo) = min {
+                obj.insert("minimum".into(), json!(lo));
+            }
+            if let Some(hi) = max {
+                obj.insert("maximum".into(), json!(hi));
+            }
+        }
+        LeafType::Float => {
+            obj.insert("type".into(), Value::String("number".into()));
+        }
+        LeafType::Bool => {
+            obj.insert("type".into(), Value::String("boolean".into()));
+        }
+        LeafType::DateTime => {
+            obj.insert("type".into(), Value::String("string".into()));
+            obj.insert("format".into(), Value::String("date-time".into()));
+        }
+        LeafType::Array(elem) => {
+            obj.insert("type".into(), Value::String("array".into()));
+            if let Some(items) = leaf_type_to_schema(elem) {
+                obj.insert("items".into(), Value::Object(items));
+            }
+        }
+        LeafType::Map(elem) => {
+            obj.insert("type".into(), Value::String("object".into()));
+            if let Some(entry) = leaf_type_to_schema(elem) {
+                // Comment keys inside a map instance are comments, not
+                // entries — allowlist them so they escape the value schema.
+                obj.insert("patternProperties".into(), comment_key_allowlist());
+                obj.insert("additionalProperties".into(), Value::Object(entry));
+            }
+        }
+        LeafType::Enum { values } => {
+            if let Some(name) = values.first().and_then(value_json_type) {
+                obj.insert("type".into(), Value::String(name.into()));
+            }
+            let enum_array: Vec<Value> = values.iter().filter_map(value_to_json).collect();
+            if !enum_array.is_empty() {
+                obj.insert("enum".into(), Value::Array(enum_array));
+            }
+        }
+        LeafType::Value => return None,
     }
+    Some(obj)
 }
 
 /// Map an owned config [`ConfigValue`] to its JSON Schema `type` name.
@@ -239,10 +304,12 @@ fn value_json_type(value: &ConfigValue) -> Option<&'static str> {
 /// Convert an owned config [`ConfigValue`] into a JSON value for the
 /// `default` and `enum` slots.
 ///
-/// Unrepresentable values (`Datetime`, non-finite floats — JSON has no
-/// literal for them) are dropped rather than emitted as a misleading
-/// `null`. Arrays and maps convert recursively; entries that can't be
-/// represented are skipped.
+/// Datetimes emit as their lexical string form — matching the
+/// `type: string, format: date-time` shape their leaves declare.
+/// Unrepresentable values (non-finite floats — JSON has no literal for
+/// them) are dropped rather than emitted as a misleading `null`. Arrays
+/// and maps convert recursively; entries that can't be represented are
+/// skipped.
 fn value_to_json(value: &ConfigValue) -> Option<Value> {
     match value {
         ConfigValue::String(s) => Some(Value::String(s.clone())),
@@ -261,7 +328,7 @@ fn value_to_json(value: &ConfigValue) -> Option<Value> {
             }
             Some(Value::Object(obj))
         }
-        ConfigValue::Datetime(_) => None,
+        ConfigValue::Datetime(d) => Some(Value::String(crate::value::lexical_string(d))),
     }
 }
 
@@ -286,9 +353,8 @@ mod tests {
 
     #[test]
     fn non_finite_floats_are_skipped_not_null() {
-        // JSON has no literal for NaN/±inf; the drop-not-null rule that
-        // covers Datetime applies to them too (serde_json's `json!` would
-        // otherwise silently emit `null`).
+        // JSON has no literal for NaN/±inf; drop them rather than let
+        // serde_json's `json!` silently emit `null`.
         assert_eq!(value_to_json(&ConfigValue::Float(f64::NAN)), None);
         assert_eq!(value_to_json(&ConfigValue::Float(f64::INFINITY)), None);
         assert_eq!(value_to_json(&ConfigValue::Float(f64::NEG_INFINITY)), None);
@@ -375,28 +441,59 @@ mod tests {
     }
 
     #[test]
-    fn required_array_excludes_optional_fields() {
+    fn required_mirrors_runtime_absence_rules() {
+        // The test schema's leaves are all defaulted or optional, and
+        // finalization synthesizes defaults for absent fields/sections —
+        // the runtime loads `{}` fine, so NOTHING may be `required` or an
+        // external validator would reject documents clapfig accepts.
         let s = schema();
-        let root_required: Vec<&str> = s["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(root_required.contains(&"host"));
-        assert!(root_required.contains(&"port"));
-        assert!(root_required.contains(&"debug"));
-        assert!(root_required.contains(&"database"));
+        assert!(
+            s.get("required").is_none(),
+            "all-defaulted root must have no required array: {s}"
+        );
+        assert!(
+            s["properties"]["database"].get("required").is_none(),
+            "all-satisfiable section must have no required array"
+        );
+    }
 
-        let db_required: Vec<&str> = s["properties"]["database"]["required"]
+    #[test]
+    fn required_lists_defaultless_leaves_and_sections_containing_them() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let s = generate_schema(
+            &RtSchema::object("App")
+                .field("name", Field::string()) // required, no default
+                .field("host", Field::string().default("localhost"))
+                .nested(
+                    "auth",
+                    RtSchema::object("Auth").field("token", Field::string()),
+                )
+                .nested(
+                    "limits",
+                    RtSchema::object("Limits").field("max", Field::integer().default(10i64)),
+                )
+                .build(),
+        );
+        let required: Vec<&str> = s["required"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert!(db_required.contains(&"pool_size"));
-        // url is optional — must NOT be required.
-        assert!(!db_required.contains(&"url"));
+        // The defaultless leaf and the section transitively containing one.
+        assert!(required.contains(&"name"));
+        assert!(required.contains(&"auth"));
+        // Defaulted leaf and all-satisfiable section are absence-safe.
+        assert!(!required.contains(&"host"));
+        assert!(!required.contains(&"limits"));
+        // Inside `auth`, the defaultless leaf is required.
+        let auth_required: Vec<&str> = s["properties"]["auth"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(auth_required, vec!["token"]);
     }
 
     #[test]
@@ -475,6 +572,89 @@ mod tests {
             !url_obj.contains_key("default"),
             "optional field must not have a default key: {url}"
         );
+    }
+
+    #[test]
+    fn container_leaf_types_convert_recursively() {
+        use crate::runtime::{Field, LeafType, Schema as RtSchema};
+        let s = generate_schema(
+            &RtSchema::object("App")
+                .field(
+                    "matrix",
+                    Field::array_of_type(LeafType::Array(Box::new(LeafType::Integer {
+                        min: None,
+                        max: None,
+                    })))
+                    .optional(),
+                )
+                .field(
+                    "modes",
+                    Field::array_of_type(LeafType::Enum {
+                        values: vec!["fast".into(), "slow".into()],
+                    })
+                    .optional(),
+                )
+                .field("weights", Field::map_of(LeafType::Float).optional())
+                .field("extras", Field::map_of(LeafType::Value).optional())
+                .build(),
+        );
+        let props = &s["properties"];
+        // Nested array keeps its inner `items`.
+        assert_eq!(props["matrix"]["items"]["type"], "array");
+        assert_eq!(props["matrix"]["items"]["items"]["type"], "integer");
+        // Array(Enum) keeps the enum constraint on items.
+        assert_eq!(props["modes"]["items"]["type"], "string");
+        assert_eq!(props["modes"]["items"]["enum"], json!(["fast", "slow"]));
+        // Map(elem) constrains entry values and allowlists comment keys.
+        assert_eq!(props["weights"]["type"], "object");
+        assert_eq!(props["weights"]["additionalProperties"]["type"], "number");
+        assert_eq!(props["weights"]["patternProperties"]["^//"], json!({}));
+        // Map(Value) accepts anything — no constraint emitted.
+        assert!(
+            props["extras"]
+                .as_object()
+                .unwrap()
+                .get("additionalProperties")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn integer_bounds_emit_minimum_and_maximum() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let s = generate_schema(
+            &RtSchema::object("App")
+                .field("retries", Field::integer_in(Some(0), Some(255)).optional())
+                .field("count", Field::integer().optional())
+                .build(),
+        );
+        let retries = &s["properties"]["retries"];
+        assert_eq!(retries["type"], "integer");
+        assert_eq!(retries["minimum"], 0);
+        assert_eq!(retries["maximum"], 255);
+        // Unbounded integers emit no bounds keys.
+        let count = s["properties"]["count"].as_object().unwrap();
+        assert!(!count.contains_key("minimum"));
+        assert!(!count.contains_key("maximum"));
+    }
+
+    #[test]
+    fn datetime_leaves_emit_format_and_lexical_defaults() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let dt: crate::value::Datetime = "1979-05-27T07:32:00Z".parse().unwrap();
+        let s = generate_schema(
+            &RtSchema::object("App")
+                .field(
+                    "starts_at",
+                    Field::datetime().default(ConfigValue::Datetime(dt)),
+                )
+                .build(),
+        );
+        let starts = &s["properties"]["starts_at"];
+        assert_eq!(starts["type"], "string");
+        assert_eq!(starts["format"], "date-time");
+        // Datetime defaults emit in lexical string form, not dropped.
+        assert_eq!(starts["default"], "1979-05-27T07:32:00Z");
     }
 
     #[test]

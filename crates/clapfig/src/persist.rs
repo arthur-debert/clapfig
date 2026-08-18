@@ -92,7 +92,10 @@ pub fn set_in_document(
                 kind,
             });
         }
-        return Err(ClapfigError::KeyNotFound(key.into()));
+        return Err(ClapfigError::KeyNotFound {
+            key: key.into(),
+            suggestion: crate::meta::nearest_key(schema, &canonical),
+        });
     }
 
     let leaf_ty = lookup_leaf_type(schema, &canonical);
@@ -102,7 +105,7 @@ pub fn set_in_document(
             reason,
         })?;
     if let Some(leaf_ty) = leaf_ty {
-        crate::schema_walk::coerce_datetime_value(&mut value, leaf_ty);
+        crate::schema_walk::coerce_value(&mut value, leaf_ty);
         leaf_ty
             .check(&value)
             .map_err(|reason| ClapfigError::InvalidValue {
@@ -749,7 +752,7 @@ mod tests {
     #[test]
     fn set_rejects_unknown_key() {
         let result = set_toml(Some(""), "nonexistent", "value");
-        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound { .. })));
     }
 
     #[test]
@@ -1138,7 +1141,7 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(matches!(err, ClapfigError::KeyNotFound(_)), "{err:?}");
+        assert!(matches!(err, ClapfigError::KeyNotFound { .. }), "{err:?}");
     }
 
     #[test]
@@ -1433,7 +1436,7 @@ mod tests {
         // Acceptance boundary: with normalization off, the load path
         // rejects kebab keys, so the persistence path does too.
         let result = set_toml(Some(""), "database.pool-size", "20");
-        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound { .. })));
     }
 
     #[test]

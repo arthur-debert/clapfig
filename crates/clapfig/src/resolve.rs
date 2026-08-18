@@ -27,7 +27,7 @@ use crate::runtime::Schema;
 use crate::schema_walk;
 use crate::strict::{CollectedUnknown, StrictnessOverrides, UnknownKeyHook};
 use crate::types::Layer;
-use crate::validate::{ValidateContext, validate_unknown};
+use crate::validate::{UnknownKeySource, ValidateContext, validate_unknown};
 use crate::value::{Map, Value};
 
 /// All pre-loaded data needed to resolve a config. No I/O happens here.
@@ -186,8 +186,15 @@ pub(crate) fn resolve(
                 normalize_table(&mut table).map_err(|c| c.into_error(path))?;
             }
             if cascade_active {
-                let mut per_file =
-                    validate_unknown(&table, input.schema, content, path, &validate_ctx)?;
+                let mut per_file = validate_unknown(
+                    &table,
+                    input.schema,
+                    &UnknownKeySource::File {
+                        path,
+                        source: content,
+                    },
+                    &validate_ctx,
+                )?;
                 collected_unknowns.append(&mut per_file);
             }
             t = deep_merge(t, table);
@@ -206,17 +213,23 @@ pub(crate) fn resolve(
     // per-file, the env layer landed afterwards, and `finalize` doesn't
     // re-check unknown keys. Now an env var like `MYAPP__ROGUE` flows
     // through the same cascade (and `on_unknown_key` callback) as a
-    // file-supplied `rogue = 1` key, with the source path rendered as
-    // `<env>` and no line number.
+    // file-supplied `rogue = 1` key, and a violation renders as an env
+    // error naming the exact variable to unset.
     //
     // The walker is schema-driven (no typed deserialize) so type
     // mismatches between env's heuristic value parsing (e.g. string
     // "1.5" for an integer field) don't fail validation — that's
     // still the job of the final-merge type check inside `finalize`.
-    if cascade_active && let Some(env_table_ref) = env_table.as_ref() {
-        let env_path = std::path::PathBuf::from("<env>");
-        let mut env_filtered =
-            validate_unknown(env_table_ref, input.schema, "", &env_path, &validate_ctx)?;
+    if cascade_active
+        && let Some(env_table_ref) = env_table.as_ref()
+        && let Some(prefix) = input.env_prefix.as_deref()
+    {
+        let mut env_filtered = validate_unknown(
+            env_table_ref,
+            input.schema,
+            &UnknownKeySource::Env { prefix },
+            &validate_ctx,
+        )?;
         collected_unknowns.append(&mut env_filtered);
     }
 
@@ -500,6 +513,12 @@ mod tests {
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key, "rogue_key");
+        // The violation is reported as an env problem naming the exact
+        // variable to unset, never dressed as a config-file error.
+        assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__ROGUE_KEY"));
+        let msg = err.to_string();
+        assert!(msg.contains("MYAPP__ROGUE_KEY"), "{msg}");
+        assert!(!msg.contains("config file"), "{msg}");
     }
 
     #[test]

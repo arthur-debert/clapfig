@@ -45,15 +45,26 @@ pub struct UnknownKeyInfo {
     /// Dotted key path that was not recognized by the config schema
     /// (e.g. `"database.typo"`).
     pub key: String,
-    /// Path to the config file that contained the unknown key.
+    /// Path to the config file that contained the unknown key. For an
+    /// env-derived key (see [`env_var`](Self::env_var)) this is the
+    /// synthesized `<env>` placeholder — renderers name the variable
+    /// instead.
     pub path: PathBuf,
     /// 1-indexed line number where the key was found, or `0` if the line
     /// could not be located. The `find_key_line` heuristic only recognizes
-    /// TOML syntax, so keys from YAML/JSON sources are always `0`.
+    /// TOML syntax, so keys from YAML/JSON sources are always `0` (and
+    /// renderers suppress the line entirely rather than print a bogus
+    /// `line 0`); env-derived keys have no line either.
     pub line: usize,
     /// Full contents of the config file, shared across all infos from the
-    /// same file. Used by renderers for source snippets.
+    /// same file. Used by renderers for source snippets. `None` for
+    /// env-derived keys.
     pub source: Option<Arc<str>>,
+    /// For a key derived from the environment layer: the environment
+    /// variable that supplied it (e.g. `MYAPP__ROGUE_KEY`). Renderers use
+    /// this to describe the error as an env problem — naming the variable
+    /// to unset — instead of dressing it in config-file clothing.
+    pub env_var: Option<String>,
 }
 
 impl UnknownKeyInfo {
@@ -93,8 +104,15 @@ pub enum ClapfigError {
         source: std::io::Error,
     },
 
-    #[error("Key not found: {0}")]
-    KeyNotFound(String),
+    /// A dotted key does not resolve against the config schema (or, for
+    /// scoped reads, the scope's document). `suggestion` carries the
+    /// nearest valid schema key when one is plausibly a typo away —
+    /// compute it with [`crate::meta::nearest_key`].
+    #[error("Key not found: {key}{}", suggestion.as_deref().map(|s| format!(" — did you mean '{s}'?")).unwrap_or_default())]
+    KeyNotFound {
+        key: String,
+        suggestion: Option<String>,
+    },
 
     /// A `config set` action key targets an `ArrayOf`/`MapOf` schema
     /// section or a path inside one. A dotted CLI key cannot say which
@@ -129,6 +147,13 @@ pub enum ClapfigError {
         scope: String,
         available: Vec<String>,
     },
+
+    /// A scoped read (`config get --scope <name>`) targeted a scope whose
+    /// config file does not exist yet. Distinct from
+    /// [`KeyNotFound`](Self::KeyNotFound): the key may be perfectly valid
+    /// — there is simply no file to read it from.
+    #[error("Scope '{scope}' has no config file: {} does not exist", path.display())]
+    ScopeFileMissing { scope: String, path: PathBuf },
 
     #[error("Unknown config subcommand: '{0}'")]
     UnknownSubcommand(String),
@@ -251,15 +276,32 @@ impl ClapfigError {
 
 fn format_unknown_keys(infos: &[UnknownKeyInfo]) -> String {
     use std::fmt::Write;
-    let mut out = String::from("Unknown keys in config file:");
+    let header = if infos.iter().all(|i| i.env_var.is_some()) {
+        "Unknown keys in environment:"
+    } else {
+        "Unknown keys in config file:"
+    };
+    let mut out = String::from(header);
     for info in infos {
-        let _ = write!(
-            out,
-            "\n  - '{}' in {} (line {})",
-            info.key,
-            info.path.display(),
-            info.line
-        );
+        match (&info.env_var, info.line) {
+            (Some(var), _) => {
+                let _ = write!(out, "\n  - '{}' from environment variable {var}", info.key);
+            }
+            // Line 0 means "could not be located" (YAML/JSON sources have
+            // no TOML line heuristic) — omit it rather than render a
+            // bogus `(line 0)`.
+            (None, 0) => {
+                let _ = write!(out, "\n  - '{}' in {}", info.key, info.path.display());
+            }
+            (None, line) => {
+                let _ = write!(
+                    out,
+                    "\n  - '{}' in {} (line {line})",
+                    info.key,
+                    info.path.display(),
+                );
+            }
+        }
     }
     out
 }
@@ -274,6 +316,14 @@ mod tests {
             path: "/home/user/.config/myapp/config.toml".into(),
             line,
             source: None,
+            env_var: None,
+        }
+    }
+
+    fn key_not_found(key: &str) -> ClapfigError {
+        ClapfigError::KeyNotFound {
+            key: key.into(),
+            suggestion: None,
         }
     }
 
@@ -298,24 +348,66 @@ mod tests {
 
     #[test]
     fn unknown_keys_accessor_none_for_other_variants() {
-        assert!(
-            ClapfigError::KeyNotFound("x".into())
-                .unknown_keys()
-                .is_none()
-        );
+        assert!(key_not_found("x").unknown_keys().is_none());
     }
 
     #[test]
     fn is_strict_violation_matches_only_unknown_keys() {
         assert!(ClapfigError::UnknownKeys(vec![info("x", 1)]).is_strict_violation());
-        assert!(!ClapfigError::KeyNotFound("x".into()).is_strict_violation());
+        assert!(!key_not_found("x").is_strict_violation());
         assert!(!ClapfigError::AppNameRequired.is_strict_violation());
     }
 
     #[test]
     fn key_not_found_formats() {
-        let err = ClapfigError::KeyNotFound("database.url".into());
-        assert!(err.to_string().contains("database.url"));
+        let err = key_not_found("database.url");
+        let msg = err.to_string();
+        assert!(msg.contains("database.url"));
+        assert!(!msg.contains("did you mean"), "{msg}");
+    }
+
+    #[test]
+    fn key_not_found_formats_suggestion() {
+        let err = ClapfigError::KeyNotFound {
+            key: "database.ur1".into(),
+            suggestion: Some("database.url".into()),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("did you mean 'database.url'?"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_key_line_zero_is_suppressed() {
+        // YAML/JSON sources have no line heuristic; never print `(line 0)`.
+        let msg = ClapfigError::UnknownKeys(vec![info("typo", 0)]).to_string();
+        assert!(msg.contains("'typo' in"), "{msg}");
+        assert!(!msg.contains("line"), "{msg}");
+    }
+
+    #[test]
+    fn env_derived_unknown_key_names_the_variable() {
+        let mut i = info("rogue_key", 0);
+        i.path = "<env>".into();
+        i.env_var = Some("MYAPP__ROGUE_KEY".into());
+        let msg = ClapfigError::UnknownKeys(vec![i]).to_string();
+        assert!(msg.contains("Unknown keys in environment:"), "{msg}");
+        assert!(
+            msg.contains("'rogue_key' from environment variable MYAPP__ROGUE_KEY"),
+            "{msg}"
+        );
+        assert!(!msg.contains("config file"), "{msg}");
+        assert!(!msg.contains("<env>"), "{msg}");
+    }
+
+    #[test]
+    fn scope_file_missing_names_scope_and_path() {
+        let err = ClapfigError::ScopeFileMissing {
+            scope: "local".into(),
+            path: "/proj/.myapp.toml".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("'local'"), "{msg}");
+        assert!(msg.contains("/proj/.myapp.toml"), "{msg}");
     }
 
     #[test]

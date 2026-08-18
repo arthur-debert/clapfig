@@ -74,6 +74,59 @@ fn walk_segments(schema: &Schema, segments: &[&str]) -> Option<Vec<String>> {
     None
 }
 
+/// The nearest valid schema key to a mistyped dotted `key`, when one is
+/// plausibly a typo away — the "did you mean" suggestion carried by
+/// [`ClapfigError::KeyNotFound`](crate::error::ClapfigError::KeyNotFound).
+///
+/// Compares `key` against every addressable dotted leaf path in the
+/// schema by edit distance, with `-` and `_` treated as the same
+/// character (this module's lenient-spelling rule). A candidate
+/// qualifies when its distance is at most 2 and strictly less than the
+/// key's own length (so short garbage doesn't "suggest" an unrelated
+/// short key); ties break to the lexicographically smallest candidate.
+/// Returns `None` when nothing is close enough.
+pub fn nearest_key(schema: &Schema, key: &str) -> Option<String> {
+    let needle = crate::normalize::normalize_key(key);
+    let mut best: Option<(usize, String)> = None;
+    for candidate in crate::overrides::valid_keys(schema) {
+        let dist = edit_distance(&needle, &crate::normalize::normalize_key(&candidate));
+        // dist 0 means the key IS valid — the caller's problem is absence
+        // (e.g. an optional leaf with no value), not a typo; suggesting
+        // the key back at the user would be noise.
+        if dist == 0 || dist > 2 || dist >= needle.chars().count() {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((best_dist, best_key)) => {
+                dist < *best_dist || (dist == *best_dist && candidate < *best_key)
+            }
+        };
+        if better {
+            best = Some((dist, candidate));
+        }
+    }
+    best.map(|(_, key)| key)
+}
+
+/// Levenshtein distance over chars — small inputs (dotted config keys),
+/// so the O(m·n) two-row DP is plenty.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            curr[j + 1] = sub.min(prev[j + 1] + 1).min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
 /// Treat `-` and `_` as the same character when comparing a schema field
 /// name against a caller-supplied segment. Field names are snake by
 /// convention, but callers may type kebab when their app uses
@@ -192,6 +245,41 @@ mod tests {
         // own doc comment (it has one: "Database settings.").
         let doc = doc_for_key("database").expect("section exists");
         assert!(doc.iter().any(|line| line.contains("Database settings")));
+    }
+
+    #[test]
+    fn nearest_key_suggests_close_typos_only() {
+        let schema = test_schema();
+        // One-off typo in a nested leaf.
+        assert_eq!(
+            nearest_key(&schema, "database.pool_sizr").as_deref(),
+            Some("database.pool_size")
+        );
+        // Kebab spelling is distance-free against the snake field.
+        assert_eq!(
+            nearest_key(&schema, "database.pool-sizr").as_deref(),
+            Some("database.pool_size")
+        );
+        // Top-level typo.
+        assert_eq!(nearest_key(&schema, "hosr").as_deref(), Some("host"));
+        // Nothing plausibly close.
+        assert_eq!(nearest_key(&schema, "completely_unrelated"), None);
+        // Short garbage must not "suggest" an unrelated short key.
+        assert_eq!(nearest_key(&schema, "x"), None);
+        // A valid key gets no suggestion — the problem is absence, not a
+        // typo (e.g. scoped get against a file that doesn't set it).
+        assert_eq!(nearest_key(&schema, "database.url"), None);
+        assert_eq!(nearest_key(&schema, "database.pool-size"), None);
+    }
+
+    #[test]
+    fn edit_distance_basics() {
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("abc", "abc"), 0);
+        assert_eq!(edit_distance("abc", "abd"), 1);
+        assert_eq!(edit_distance("abc", "ab"), 1);
+        assert_eq!(edit_distance("abc", "xabc"), 1);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
     }
 
     #[test]

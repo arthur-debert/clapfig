@@ -31,7 +31,13 @@ use crate::value::{Map, Value};
 /// Post-merge validation hook for the Map-out path: receives the merged
 /// value [`Map`]. (The typed path wraps its `Fn(&C)` hook into this shape
 /// by deserializing the map first.)
-pub(crate) type PostValidateHook = Box<dyn Fn(&Map) -> Result<(), String> + Send + Sync>;
+/// Internal post-validate hook shape. Returns a full [`ClapfigError`] so
+/// wrappers can distinguish the hook's own rejection (a
+/// [`ClapfigError::PostValidationFailed`] carrying the user's message)
+/// from failures *around* the user's closure — the typed path's
+/// `Map → C` deserialize step categorizes its failure as the
+/// [`ClapfigError::InvalidValue`] type error it is.
+pub(crate) type PostValidateHook = Box<dyn Fn(&Map) -> Result<(), ClapfigError> + Send + Sync>;
 
 /// How config files are discovered inside each search directory — the
 /// file-name half of the builder's file contract.
@@ -374,6 +380,21 @@ impl Builder {
     pub fn post_validate<F>(mut self, f: F) -> Self
     where
         F: Fn(&Map) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.post_validate = Some(Box::new(move |t: &Map| {
+            f(t).map_err(ClapfigError::PostValidationFailed)
+        }));
+        self
+    }
+
+    /// Internal variant of [`post_validate`](Self::post_validate) whose
+    /// hook returns a full [`ClapfigError`]. Lets the typed wrapper
+    /// ([`TypedBuilder::post_validate`](crate::TypedBuilder::post_validate))
+    /// report its `Map → C` deserialize failure as the type error it is
+    /// instead of a `PostValidationFailed` wearing a bare serde message.
+    pub(crate) fn post_validate_raw<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&Map) -> Result<(), ClapfigError> + Send + Sync + 'static,
     {
         self.post_validate = Some(Box::new(f));
         self
@@ -821,6 +842,7 @@ impl Builder {
                     get_scope(
                         adapter.as_ref(),
                         &self.schema,
+                        name,
                         &path,
                         key,
                         self.normalize_keys,
@@ -939,7 +961,7 @@ impl Resolver {
 
         let (table, unknowns) = resolve::resolve(input)?;
         if let Some(hook) = self.post_validate.as_ref() {
-            hook(&table).map_err(ClapfigError::PostValidationFailed)?;
+            hook(&table)?;
         }
         Ok((table, unknowns))
     }
@@ -1106,8 +1128,10 @@ fn get_from_table(
     } else {
         key.to_owned()
     };
-    let value =
-        ops::table_get(table, &canonical).ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
+    let value = ops::table_get(table, &canonical).ok_or_else(|| ClapfigError::KeyNotFound {
+        key: key.into(),
+        suggestion: crate::meta::nearest_key(schema, &canonical),
+    })?;
     let doc = crate::meta::doc_for(schema, &canonical).unwrap_or_default();
     Ok(ConfigResult::key_value(
         adapter,
@@ -1126,10 +1150,13 @@ fn get_from_table(
 /// [`ClapfigError::NormalizedKeyCollision`] instead of answering from a
 /// document the load path refuses. The reported key keeps the caller's
 /// spelling; the display block is spelled by `adapter` (the scope file's
-/// format).
+/// format). A scope whose file does not exist fails as
+/// [`ClapfigError::ScopeFileMissing`] naming the scope and the file —
+/// the key may be perfectly valid; there is just nothing to read.
 fn get_scope(
     adapter: &dyn FormatAdapter,
     schema: &Schema,
+    scope: &str,
     file_path: &std::path::Path,
     key: &str,
     normalize_keys: bool,
@@ -1137,7 +1164,10 @@ fn get_scope(
     let content = match std::fs::read_to_string(file_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ClapfigError::KeyNotFound(key.into()));
+            return Err(ClapfigError::ScopeFileMissing {
+                scope: scope.into(),
+                path: file_path.to_path_buf(),
+            });
         }
         Err(e) => {
             return Err(ClapfigError::IoError {
@@ -1174,7 +1204,10 @@ fn get_scope(
     } else {
         (key.to_owned(), ops::table_get(&table, key))
     };
-    let value = value.ok_or_else(|| ClapfigError::KeyNotFound(key.into()))?;
+    let value = value.ok_or_else(|| ClapfigError::KeyNotFound {
+        key: key.into(),
+        suggestion: crate::meta::nearest_key(schema, &canonical),
+    })?;
     let doc = crate::meta::doc_for(schema, &canonical).unwrap_or_default();
     Ok(ConfigResult::key_value(
         adapter,
@@ -2604,7 +2637,7 @@ mod tests {
             let path = dir.path().join(name);
             fs::write(&path, content).unwrap();
             for key in ["db.pool-size", "db.pool_size"] {
-                let result = get_scope(adapter, &demo_schema(), &path, key, true).unwrap();
+                let result = get_scope(adapter, &demo_schema(), "local", &path, key, true).unwrap();
                 match result {
                     ConfigResult::KeyValue {
                         key: reported,
@@ -2631,7 +2664,8 @@ mod tests {
         let path = dir.path().join("demo.toml");
         fs::write(&path, "[db]\npool-size = 5\npool_size = 6\n").unwrap();
         for key in ["db.pool-size", "db.pool_size"] {
-            let err = get_scope(&TomlAdapter, &demo_schema(), &path, key, true).unwrap_err();
+            let err =
+                get_scope(&TomlAdapter, &demo_schema(), "local", &path, key, true).unwrap_err();
             match err {
                 ClapfigError::NormalizedKeyCollision {
                     path: reported,
@@ -2663,7 +2697,8 @@ mod tests {
             "host = \"h\"\n\n[db]\npool-size = 5\npool_size = 6\n",
         )
         .unwrap();
-        let err = get_scope(&TomlAdapter, &demo_schema(), &path, "host", true).unwrap_err();
+        let err =
+            get_scope(&TomlAdapter, &demo_schema(), "local", &path, "host", true).unwrap_err();
         match err {
             ClapfigError::NormalizedKeyCollision {
                 path: reported,
@@ -2680,13 +2715,47 @@ mod tests {
     }
 
     #[test]
-    fn scoped_get_missing_file_is_key_not_found_for_both_spellings() {
+    fn scoped_get_missing_file_names_scope_and_file_not_the_key() {
+        // The key may be perfectly valid — there is simply no file to
+        // read. Claiming "key not found" would send the user hunting for
+        // a typo that isn't there.
         use crate::format::TomlAdapter;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.toml");
         for key in ["db.pool-size", "db.pool_size"] {
-            let result = get_scope(&TomlAdapter, &demo_schema(), &path, key, true);
-            assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))), "{key}");
+            let err =
+                get_scope(&TomlAdapter, &demo_schema(), "local", &path, key, true).unwrap_err();
+            match err {
+                ClapfigError::ScopeFileMissing {
+                    scope,
+                    path: reported,
+                } => {
+                    assert_eq!(scope, "local");
+                    assert_eq!(reported, path);
+                }
+                other => panic!("expected ScopeFileMissing, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn get_unknown_key_suggests_near_miss() {
+        let dir = TempDir::new().unwrap();
+        let err = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .handle(&ConfigAction::Get {
+                key: "db.pool_sizr".into(),
+                scope: None,
+            })
+            .unwrap_err();
+        match err {
+            ClapfigError::KeyNotFound { key, suggestion } => {
+                assert_eq!(key, "db.pool_sizr");
+                assert_eq!(suggestion.as_deref(), Some("db.pool_size"));
+            }
+            other => panic!("expected KeyNotFound, got {other:?}"),
         }
     }
 

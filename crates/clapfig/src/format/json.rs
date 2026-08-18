@@ -1164,11 +1164,13 @@ mod tests {
   "level": "info",
   "//name": [
     "Required name.",
+    "Required.",
     "\"name\": \"\""
   ],
   "//rule": [
     "Any value.",
     "Accepts: any JSON value",
+    "Required.",
     "\"rule\": \"\""
   ],
   "db": {

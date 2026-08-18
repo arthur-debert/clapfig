@@ -1293,10 +1293,12 @@ port: 8080
 level: info
 
 # Required name.
+# Required.
 #name: ''
 
 # Any value.
 # Accepts: any YAML value
+# Required.
 #rule: ''
 
 # Database settings
