@@ -12,11 +12,15 @@
 //! - [`edit`](TomlAdapter::edit): comment-preserving `toml_edit` set/unset
 //!   against existing source text.
 
-use crate::runtime::{Field, LeafType, Schema};
+use crate::runtime::{Leaf, Schema};
 use crate::value::{Map, Value};
 
 use std::collections::BTreeMap;
 
+use super::template::{
+    TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
+    walk_level,
+};
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
     UnsupportedByFormat,
@@ -93,21 +97,14 @@ impl FormatAdapter for TomlAdapter {
     }
 
     fn template(&self, schema: &Schema) -> Result<String, FormatError> {
-        use std::fmt::Write;
-
         let mut out = String::new();
         for line in &schema.doc {
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                out.push_str("#\n");
-            } else {
-                let _ = writeln!(out, "# {trimmed}");
-            }
+            push_comment_line(&mut out, "", line);
         }
         if !schema.doc.is_empty() {
             out.push('\n');
         }
-        emit_schema(&mut out, schema, "");
+        walk_level(&mut TomlTemplate, schema, &String::new(), &mut out)?;
         Ok(out)
     }
 
@@ -127,11 +124,11 @@ impl FormatAdapter for TomlAdapter {
             FileEdit::Set { path, value, .. } => {
                 check_datetime_offsets(value)?;
                 let keys = key_segments(path);
-                write_at_path(&mut doc, &keys, value)?;
+                super::edit::write_at_path(doc.as_item_mut(), &keys, value_to_toml_edit(value))?;
             }
             FileEdit::Unset { path } => {
                 let keys = key_segments(path);
-                unset_at_path(&mut doc, &keys);
+                super::edit::unset_at_path(doc.as_item_mut(), &keys);
             }
         }
         Ok(doc.to_string())
@@ -224,74 +221,40 @@ fn key_segments(path: &super::ConfigPath) -> Vec<&str> {
         .collect()
 }
 
-/// Walk `keys` through `doc`, creating intermediate tables when missing,
-/// and assign `value` at the leaf. Errors when an existing intermediate is
-/// a non-table scalar — `toml_edit`'s `IndexMut` would panic on that case,
-/// and schema-time pre-checks only validate the schema, not the shape of
-/// an existing on-disk file (`config set database.url x` with
-/// `database = "string"` already in the file).
-fn write_at_path(
-    doc: &mut toml_edit::DocumentMut,
-    keys: &[&str],
-    value: &Value,
-) -> Result<(), FormatError> {
-    let (leaf, parents) = keys
-        .split_last()
-        .expect("ConfigPath edits always carry at least one segment");
-    let display_path = keys.join(".");
-    let mut current: &mut toml_edit::Item = doc.as_item_mut();
-    for segment in parents {
-        if current.get(segment).is_none() {
-            if current.as_table_like_mut().is_none() {
-                return Err(FormatError::Edit {
-                    format: "toml",
-                    message: format!(
-                        "path conflict: existing file has a non-table value at the path before '{segment}' (setting '{display_path}')"
-                    ),
-                });
-            }
-            current[*segment] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        let next = current
-            .get_mut(*segment)
-            .expect("just confirmed or inserted above");
-        if next.as_table_like().is_none() {
-            return Err(FormatError::Edit {
-                format: "toml",
-                message: format!(
-                    "path conflict: existing file has a non-table value at '{segment}' (setting '{display_path}')"
-                ),
-            });
-        }
-        current = next;
-    }
-    if current.as_table_like_mut().is_none() {
-        return Err(FormatError::Edit {
-            format: "toml",
-            message: format!(
-                "path conflict: leaf parent is not a table (setting '{display_path}')"
-            ),
-        });
-    }
-    current[*leaf] = toml_edit::value(value_to_toml_edit(value));
-    Ok(())
-}
+/// The TOML document tree behind the shared edit walkers
+/// (`format::edit`). `toml_edit`'s `IndexMut` would panic where the
+/// walkers' conflict checks refuse typed instead.
+impl super::edit::EditDoc for toml_edit::Item {
+    type Value = toml_edit::Value;
 
-/// Remove the key at `keys`. A missing parent or leaf is a no-op — the
-/// document is returned unchanged.
-fn unset_at_path(doc: &mut toml_edit::DocumentMut, keys: &[&str]) {
-    let (leaf, parents) = keys
-        .split_last()
-        .expect("ConfigPath edits always carry at least one segment");
-    let mut current: &mut toml_edit::Item = doc.as_item_mut();
-    for segment in parents {
-        match current.get_mut(segment) {
-            Some(item) => current = item,
-            None => return, // parent doesn't exist, nothing to unset
-        }
+    const FORMAT: &'static str = "toml";
+    const CONTAINER: &'static str = "table";
+    const CONTAINER_WITH_ARTICLE: &'static str = "a table";
+    const SOURCE: &'static str = "file";
+
+    fn is_container(&self) -> bool {
+        self.as_table_like().is_some()
     }
-    if let Some(table) = current.as_table_like_mut() {
-        table.remove(leaf);
+
+    fn has_child(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn child_mut(&mut self, key: &str) -> Option<&mut Self> {
+        self.get_mut(key)
+    }
+
+    fn insert_container(&mut self, key: &str) {
+        self[key] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+
+    fn insert_value(&mut self, key: &str, value: toml_edit::Value) {
+        self[key] = toml_edit::value(value);
+    }
+
+    fn remove_key(&mut self, key: &str) -> bool {
+        self.as_table_like_mut()
+            .is_some_and(|table| table.remove(key).is_some())
     }
 }
 
@@ -319,125 +282,111 @@ fn value_to_toml_edit(value: &Value) -> toml_edit::Value {
     }
 }
 
-// --- template emission (relocated from `ops`; byte-identical output) -----
+// --- template emission (shared traversal in `format::template`) ----------
 
-fn emit_schema(out: &mut String, schema: &Schema, prefix: &str) {
-    use std::fmt::Write;
+/// The TOML template renderer: `key = value` lines, dotted `[section]`
+/// headers, commented `#[[path]]` / `#[path.<key>]` example blocks. The
+/// context is the dotted section path (empty at the root).
+struct TomlTemplate;
+
+/// The dotted section path of `name` under `prefix`.
+fn section_path(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}.{name}")
+    }
+}
+
+impl TemplateRenderer for TomlTemplate {
+    type Ctx = String;
+    type Out = String;
 
     // TOML rule: once a [section] header is emitted, every following key
-    // belongs to that section until the next header. Emit local leaves
-    // first, then sections — otherwise a sibling leaf declared after a
-    // nested field in the schema would land inside the wrong section.
-    for nf in &schema.fields {
-        let Field::Leaf(leaf) = &nf.field else {
-            continue;
-        };
-        for line in &leaf.doc {
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                out.push_str("#\n");
-            } else {
-                let _ = writeln!(out, "# {trimmed}");
-            }
-        }
-        if let LeafType::Enum { values } = &leaf.ty {
-            let listed = values
-                .iter()
-                .map(format_inline_toml)
-                .collect::<Vec<_>>()
-                .join(" | ");
-            let _ = writeln!(out, "# Allowed: {listed}");
-        }
-        if matches!(&leaf.ty, LeafType::Value) {
-            let _ = writeln!(out, "# Accepts: any TOML value");
+    // belongs to that section until the next header — a sibling leaf
+    // declared after a nested field would land inside the wrong section.
+    const LEAVES_FIRST: bool = true;
+
+    fn leaf(
+        &mut self,
+        out: &mut String,
+        _prefix: &String,
+        name: &str,
+        leaf: &Leaf,
+    ) -> Result<(), FormatError> {
+        use std::fmt::Write;
+
+        for line in leaf_annotations(leaf, "TOML", &mut |v| Ok(format_inline_toml(v)))? {
+            push_comment_line(out, "", &line);
         }
         match &leaf.default {
             Some(value) => {
-                let _ = writeln!(out, "{} = {}", nf.name, format_inline_toml(value));
+                let _ = writeln!(out, "{name} = {}", format_inline_toml(value));
             }
             None => {
-                let hint = template_placeholder(&leaf.ty);
-                let _ = writeln!(out, "#{} = {hint}", nf.name);
+                let hint = placeholder(&leaf.ty, "\"\"", "1970-01-01T00:00:00Z");
+                let _ = writeln!(out, "#{name} = {hint}");
             }
         }
         out.push('\n');
+        Ok(())
     }
 
-    for nf in &schema.fields {
-        match &nf.field {
-            Field::Leaf(_) => {} // already emitted above
-            Field::Nested(child) => {
-                let path = if prefix.is_empty() {
-                    nf.name.clone()
-                } else {
-                    format!("{prefix}.{}", nf.name)
-                };
-                for line in &child.doc {
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        out.push_str("#\n");
-                    } else {
-                        let _ = writeln!(out, "# {trimmed}");
-                    }
-                }
-                let _ = writeln!(out, "[{path}]");
-                emit_schema(out, child, &path);
-            }
-            Field::ArrayOf(child) => {
-                let path = if prefix.is_empty() {
-                    nf.name.clone()
-                } else {
-                    format!("{prefix}.{}", nf.name)
-                };
-                for line in &child.doc {
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        out.push_str("#\n");
-                    } else {
-                        let _ = writeln!(out, "# {trimmed}");
-                    }
-                }
-                // Array-of-objects is rendered commented — clapfig can't
-                // know how many entries the user wants; show one example.
-                let _ = writeln!(out, "#[[{path}]]");
-                let mut buf = String::new();
-                emit_schema(&mut buf, child, &path);
-                for line in buf.lines() {
-                    if line.is_empty() {
-                        out.push('\n');
-                    } else {
-                        let _ = writeln!(out, "#{line}");
-                    }
-                }
-            }
-            Field::MapOf(child) => {
-                let path = if prefix.is_empty() {
-                    nf.name.clone()
-                } else {
-                    format!("{prefix}.{}", nf.name)
-                };
-                for line in &child.doc {
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        out.push_str("#\n");
-                    } else {
-                        let _ = writeln!(out, "# {trimmed}");
-                    }
-                }
-                // Map-of-objects: entry keys are user-supplied so emit a
-                // commented example using a placeholder entry name.
-                let _ = writeln!(out, "#[{path}.<key>]");
-                let mut buf = String::new();
-                emit_schema(&mut buf, child, &format!("{path}.<key>"));
-                for line in buf.lines() {
-                    if line.is_empty() {
-                        out.push('\n');
-                    } else {
-                        let _ = writeln!(out, "#{line}");
-                    }
-                }
-            }
+    fn nested(
+        &mut self,
+        out: &mut String,
+        prefix: &String,
+        name: &str,
+        child: &Schema,
+    ) -> Result<(), FormatError> {
+        use std::fmt::Write;
+
+        let path = section_path(prefix, name);
+        for line in &child.doc {
+            push_comment_line(out, "", line);
         }
+        let _ = writeln!(out, "[{path}]");
+        walk_level(self, child, &path, out)
+    }
+
+    fn array_of(
+        &mut self,
+        out: &mut String,
+        prefix: &String,
+        name: &str,
+        child: &Schema,
+    ) -> Result<(), FormatError> {
+        use std::fmt::Write;
+
+        let path = section_path(prefix, name);
+        for line in &child.doc {
+            push_comment_line(out, "", line);
+        }
+        let _ = writeln!(out, "#[[{path}]]");
+        let mut buf = String::new();
+        walk_level(self, child, &path, &mut buf)?;
+        push_commented_block(out, &buf);
+        Ok(())
+    }
+
+    fn map_of(
+        &mut self,
+        out: &mut String,
+        prefix: &String,
+        name: &str,
+        child: &Schema,
+    ) -> Result<(), FormatError> {
+        use std::fmt::Write;
+
+        let path = section_path(prefix, name);
+        for line in &child.doc {
+            push_comment_line(out, "", line);
+        }
+        let _ = writeln!(out, "#[{path}.<key>]");
+        let mut buf = String::new();
+        walk_level(self, child, &format!("{path}.<key>"), &mut buf)?;
+        push_commented_block(out, &buf);
+        Ok(())
     }
 }
 
@@ -460,22 +409,6 @@ fn format_inline_toml(value: &Value) -> String {
             .unwrap_or_else(|| trimmed.to_string())
     })
     .unwrap_or_else(|_| format!("{value:?}"))
-}
-
-/// Single-word placeholder rendered in a commented-out template line for a
-/// leaf without a default, hinting the expected value shape.
-fn template_placeholder(ty: &LeafType) -> &'static str {
-    match ty {
-        LeafType::String => "\"\"",
-        LeafType::Integer => "0",
-        LeafType::Float => "0.0",
-        LeafType::Bool => "false",
-        LeafType::DateTime => "1970-01-01T00:00:00Z",
-        LeafType::Array(_) => "[]",
-        LeafType::Map(_) => "{}",
-        LeafType::Enum { .. } => "\"\"",
-        LeafType::Value => "\"\"",
-    }
 }
 
 #[cfg(test)]

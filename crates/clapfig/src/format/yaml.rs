@@ -34,11 +34,15 @@
 
 use std::fmt::Write;
 
-use crate::runtime::{Field, LeafType, Schema};
+use crate::runtime::{Field, Leaf, Schema};
 use crate::value::{Map, Value};
 
 use std::collections::BTreeMap;
 
+use super::template::{
+    TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
+    walk_level,
+};
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
     UnsupportedByFormat, WalkSegment, walk_label,
@@ -104,7 +108,7 @@ impl FormatAdapter for YamlAdapter {
         if !schema.doc.is_empty() {
             out.push('\n');
         }
-        emit_schema(&mut out, schema, 0);
+        walk_level(&mut YamlTemplate, schema, &0, &mut out)?;
         Ok(out)
     }
 
@@ -364,32 +368,60 @@ fn trees_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// The owned [`Value`] tree behind the shared edit walkers
+/// (`format::edit`). The YAML adapter edits by patching the parsed tree
+/// and verifying the patched source reparses to it, so its "document"
+/// for the walkers is the owned model itself.
+impl super::edit::EditDoc for Value {
+    type Value = Value;
+
+    const FORMAT: &'static str = "yaml";
+    const CONTAINER: &'static str = "map";
+    const CONTAINER_WITH_ARTICLE: &'static str = "a map";
+    const SOURCE: &'static str = "file";
+
+    fn is_container(&self) -> bool {
+        matches!(self, Value::Map(_))
+    }
+
+    fn has_child(&self, key: &str) -> bool {
+        self.as_map().is_some_and(|map| map.contains_key(key))
+    }
+
+    fn child_mut(&mut self, key: &str) -> Option<&mut Self> {
+        self.as_map_mut()?.get_mut(key)
+    }
+
+    fn insert_container(&mut self, key: &str) {
+        self.as_map_mut()
+            .expect("callers guarantee a container")
+            .insert(key.to_string(), Value::Map(Map::new()));
+    }
+
+    fn insert_value(&mut self, key: &str, value: Value) {
+        self.as_map_mut()
+            .expect("callers guarantee a container")
+            .insert(key.to_string(), value);
+    }
+
+    fn remove_key(&mut self, key: &str) -> bool {
+        self.as_map_mut()
+            .is_some_and(|map| map.remove(key).is_some())
+    }
+}
+
 /// Insert `value` at `keys` in `map`, creating intermediate maps. Errors on
 /// a path conflict — an existing non-map value where the path needs a map.
+/// A root adapter over the shared walker, which walks [`Value`] nodes (the
+/// edited tree's root is a bare [`Map`]).
 fn set_in_tree(map: &mut Map, keys: &[&str], value: Value) -> Result<(), FormatError> {
-    let (leaf, parents) = keys
-        .split_last()
-        .expect("ConfigPath edits always carry at least one segment");
-    let display_path = keys.join(".");
-    let mut current = map;
-    for segment in parents {
-        let entry = current
-            .entry(segment.to_string())
-            .or_insert_with(|| Value::Map(Map::new()));
-        match entry {
-            Value::Map(next) => current = next,
-            _ => {
-                return Err(FormatError::Edit {
-                    format: "yaml",
-                    message: format!(
-                        "path conflict: existing file has a non-map value at '{segment}' (setting '{display_path}')"
-                    ),
-                });
-            }
-        }
-    }
-    current.insert(leaf.to_string(), value);
-    Ok(())
+    let mut root = Value::Map(std::mem::take(map));
+    let result = super::edit::write_at_path(&mut root, keys, value);
+    let Value::Map(walked) = root else {
+        unreachable!("the root stays a map")
+    };
+    *map = walked;
+    result
 }
 
 /// The mapping at `keys` in `map`, when every segment resolves to one.
@@ -405,18 +437,15 @@ fn map_at<'a>(map: &'a Map, keys: &[&str]) -> Option<&'a Map> {
 }
 
 /// Remove `keys` from `map`; `false` when the path was already absent.
+/// The same root adapter shape as [`set_in_tree`].
 fn remove_from_tree(map: &mut Map, keys: &[&str]) -> bool {
-    let (leaf, parents) = keys
-        .split_last()
-        .expect("ConfigPath edits always carry at least one segment");
-    let mut current = map;
-    for segment in parents {
-        match current.get_mut(*segment) {
-            Some(Value::Map(next)) => current = next,
-            _ => return false,
-        }
-    }
-    current.remove(*leaf).is_some()
+    let mut root = Value::Map(std::mem::take(map));
+    let removed = super::edit::unset_at_path(&mut root, keys);
+    let Value::Map(walked) = root else {
+        unreachable!("the root stays a map")
+    };
+    *map = walked;
+    removed
 }
 
 /// Parse the file under edit into its value tree. Empty and comments-only
@@ -668,30 +697,6 @@ fn unset_in_source(source: &str, keys: &[&str]) -> Result<String, FormatError> {
 
 // --- template emission (native YAML comments) -----------------------------
 
-/// Append one doc-comment line at `indent` (`#` alone for blank lines).
-fn push_comment_line(out: &mut String, indent: &str, line: &str) {
-    let trimmed = line.trim_end();
-    if trimmed.is_empty() {
-        let _ = writeln!(out, "{indent}#");
-    } else {
-        let _ = writeln!(out, "{indent}# {trimmed}");
-    }
-}
-
-/// Append `block` with every non-blank line commented out at column zero —
-/// uncommenting is deleting the leading `#`, indentation intact.
-fn push_commented_block(out: &mut String, block: &str) {
-    for line in block.lines() {
-        if line.is_empty() {
-            out.push('\n');
-        } else {
-            out.push('#');
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-}
-
 /// `true` when the schema subtree emits at least one uncommented line — a
 /// leaf with a default. A mapping key whose lines are all commented must
 /// itself be commented, or the generated document would carry a null.
@@ -704,97 +709,112 @@ fn has_active_content(schema: &Schema) -> bool {
     })
 }
 
-/// Emit one schema level of the template. Every schema-derived mapping key
-/// renders through [`inline_scalar`], so field names the parser would
-/// misread bare (`#token`, `a: b`, `*alias`) land quoted and the generated
-/// document stays parseable.
-fn emit_schema(out: &mut String, schema: &Schema, depth: usize) {
-    let indent = "  ".repeat(depth);
+/// The YAML template renderer: `key: value` lines scoped by indentation.
+/// The context is the indentation depth (0 at the root). Every
+/// schema-derived mapping key renders through [`inline_scalar`], so field
+/// names the parser would misread bare (`#token`, `a: b`, `*alias`) land
+/// quoted and the generated document stays parseable.
+struct YamlTemplate;
 
-    // Local leaves first, then subsections — the same layout as the TOML
-    // template, so cross-format templates read alike. (YAML's indentation
-    // scoping does not require it.)
-    for nf in &schema.fields {
-        let Field::Leaf(leaf) = &nf.field else {
-            continue;
-        };
-        for line in &leaf.doc {
-            push_comment_line(out, &indent, line);
-        }
-        if let LeafType::Enum { values } = &leaf.ty {
-            let listed = values
-                .iter()
-                .map(format_inline_yaml)
-                .collect::<Vec<_>>()
-                .join(" | ");
-            let _ = writeln!(out, "{indent}# Allowed: {listed}");
-        }
-        if matches!(&leaf.ty, LeafType::Value) {
-            let _ = writeln!(out, "{indent}# Accepts: any YAML value");
+impl TemplateRenderer for YamlTemplate {
+    type Ctx = usize;
+    type Out = String;
+
+    // The same layout as the TOML template, so cross-format templates read
+    // alike. (YAML's indentation scoping does not require it.)
+    const LEAVES_FIRST: bool = true;
+
+    fn leaf(
+        &mut self,
+        out: &mut String,
+        depth: &usize,
+        name: &str,
+        leaf: &Leaf,
+    ) -> Result<(), FormatError> {
+        let indent = "  ".repeat(*depth);
+        for line in leaf_annotations(leaf, "YAML", &mut |v| Ok(format_inline_yaml(v)))? {
+            push_comment_line(out, &indent, &line);
         }
         match &leaf.default {
             Some(value) => {
                 let _ = writeln!(
                     out,
                     "{indent}{}: {}",
-                    inline_scalar(&nf.name),
+                    inline_scalar(name),
                     format_inline_yaml(value)
                 );
             }
             None => {
-                let hint = template_placeholder(&leaf.ty);
-                let _ = writeln!(out, "{indent}#{}: {hint}", inline_scalar(&nf.name));
+                let hint = placeholder(&leaf.ty, "''", "1970-01-01T00:00:00Z");
+                let _ = writeln!(out, "{indent}#{}: {hint}", inline_scalar(name));
             }
         }
         out.push('\n');
+        Ok(())
     }
 
-    for nf in &schema.fields {
-        match &nf.field {
-            Field::Leaf(_) => {} // already emitted above
-            Field::Nested(child) => {
-                for line in &child.doc {
-                    push_comment_line(out, &indent, line);
-                }
-                if has_active_content(child) {
-                    let _ = writeln!(out, "{indent}{}:", inline_scalar(&nf.name));
-                    emit_schema(out, child, depth + 1);
-                } else {
-                    // All-commented section: comment the key too, or the
-                    // generated document would parse it as null.
-                    let mut buf = String::new();
-                    let _ = writeln!(buf, "{indent}{}:", inline_scalar(&nf.name));
-                    emit_schema(&mut buf, child, depth + 1);
-                    push_commented_block(out, &buf);
-                }
-            }
-            Field::ArrayOf(child) => {
-                for line in &child.doc {
-                    push_comment_line(out, &indent, line);
-                }
-                // Array-of-objects renders one fully commented example
-                // item — clapfig can't know how many entries the user
-                // wants.
-                let mut buf = String::new();
-                let _ = writeln!(buf, "{indent}{}:", inline_scalar(&nf.name));
-                let mut item = String::new();
-                emit_schema(&mut item, child, depth + 2);
-                buf.push_str(&with_sequence_dash(&item, depth + 1));
-                push_commented_block(out, &buf);
-            }
-            Field::MapOf(child) => {
-                for line in &child.doc {
-                    push_comment_line(out, &indent, line);
-                }
-                // Map-of-objects: entry keys are user-supplied, so the
-                // example uses a placeholder entry name, fully commented.
-                let mut buf = String::new();
-                let _ = writeln!(buf, "{indent}{}:", inline_scalar(&nf.name));
-                let _ = writeln!(buf, "{indent}  <key>:");
-                emit_schema(&mut buf, child, depth + 2);
-                push_commented_block(out, &buf);
-            }
+    fn nested(
+        &mut self,
+        out: &mut String,
+        depth: &usize,
+        name: &str,
+        child: &Schema,
+    ) -> Result<(), FormatError> {
+        let indent = "  ".repeat(*depth);
+        for line in &child.doc {
+            push_comment_line(out, &indent, line);
         }
+        if has_active_content(child) {
+            let _ = writeln!(out, "{indent}{}:", inline_scalar(name));
+            walk_level(self, child, &(depth + 1), out)
+        } else {
+            // All-commented section: comment the key too, or the
+            // generated document would parse it as null.
+            let mut buf = String::new();
+            let _ = writeln!(buf, "{indent}{}:", inline_scalar(name));
+            walk_level(self, child, &(depth + 1), &mut buf)?;
+            push_commented_block(out, &buf);
+            Ok(())
+        }
+    }
+
+    fn array_of(
+        &mut self,
+        out: &mut String,
+        depth: &usize,
+        name: &str,
+        child: &Schema,
+    ) -> Result<(), FormatError> {
+        let indent = "  ".repeat(*depth);
+        for line in &child.doc {
+            push_comment_line(out, &indent, line);
+        }
+        let mut buf = String::new();
+        let _ = writeln!(buf, "{indent}{}:", inline_scalar(name));
+        let mut item = String::new();
+        walk_level(self, child, &(depth + 2), &mut item)?;
+        buf.push_str(&with_sequence_dash(&item, depth + 1));
+        push_commented_block(out, &buf);
+        Ok(())
+    }
+
+    fn map_of(
+        &mut self,
+        out: &mut String,
+        depth: &usize,
+        name: &str,
+        child: &Schema,
+    ) -> Result<(), FormatError> {
+        let indent = "  ".repeat(*depth);
+        for line in &child.doc {
+            push_comment_line(out, &indent, line);
+        }
+        let mut buf = String::new();
+        let _ = writeln!(buf, "{indent}{}:", inline_scalar(name));
+        let _ = writeln!(buf, "{indent}  <key>:");
+        walk_level(self, child, &(depth + 2), &mut buf)?;
+        push_commented_block(out, &buf);
+        Ok(())
     }
 }
 
@@ -883,22 +903,6 @@ fn json_escaped(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-/// Single-word placeholder rendered in a commented-out template line for a
-/// leaf without a default, hinting the expected value shape.
-fn template_placeholder(ty: &LeafType) -> &'static str {
-    match ty {
-        LeafType::String => "''",
-        LeafType::Integer => "0",
-        LeafType::Float => "0.0",
-        LeafType::Bool => "false",
-        LeafType::DateTime => "1970-01-01T00:00:00Z",
-        LeafType::Array(_) => "[]",
-        LeafType::Map(_) => "{}",
-        LeafType::Enum { .. } => "''",
-        LeafType::Value => "''",
-    }
 }
 
 #[cfg(test)]

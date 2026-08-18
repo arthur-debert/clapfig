@@ -20,9 +20,13 @@
 //! per-format branches.
 //!
 //! This module holds the contract and its pure data structures; the
-//! adapters themselves live in [`toml`], [`yaml`], and [`json`].
+//! adapters themselves live in [`toml`], [`yaml`], and [`json`], and the
+//! shared walkers they drive — the schema → template traversal and the
+//! edit path-walk — live in the private `template` and `edit` submodules.
 
+pub(crate) mod edit;
 pub mod json;
+pub(crate) mod template;
 pub mod toml;
 pub mod yaml;
 
