@@ -37,9 +37,11 @@ use std::fmt::Write;
 use crate::runtime::{Field, LeafType, Schema};
 use crate::value::{Map, Value};
 
+use std::collections::BTreeMap;
+
 use super::{
-    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span, SpanIndex,
-    UnsupportedByFormat,
+    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
+    UnsupportedByFormat, WalkSegment, walk_label,
 };
 
 /// The YAML format behind the adapter contract.
@@ -110,17 +112,17 @@ impl FormatAdapter for YamlAdapter {
         let operation = edit.operation();
         match edit {
             FileEdit::Set { path, value, .. } => {
-                let keys = key_segments(path, operation)?;
+                let keys = key_segments(path);
                 set_in_source(source, &keys, value, operation)
             }
             FileEdit::Unset { path } => {
-                let keys = key_segments(path, Operation::EditUnset)?;
+                let keys = key_segments(path);
                 unset_in_source(source, &keys)
             }
         }
     }
 
-    fn span_index(&self, _text: &str) -> Result<SpanIndex, FormatError> {
+    fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
         // Provenance epic: build the path → span index from parser spans.
         Err(UnsupportedByFormat {
             format: self.name(),
@@ -179,16 +181,6 @@ fn parse_error(e: &serde_norway::Error, text: &str) -> FormatError {
     }
 }
 
-/// Render the path built up during conversion for an error message; the
-/// document root has no path to name.
-fn path_label(path: &[PathSegment]) -> String {
-    if path.is_empty() {
-        "the document root".to_string()
-    } else {
-        format!("'{}'", ConfigPath::from(path.to_vec()))
-    }
-}
-
 fn mapping_error(message: String) -> FormatError {
     FormatError::Parse {
         format: "yaml",
@@ -202,12 +194,12 @@ fn mapping_error(message: String) -> FormatError {
 /// error.
 fn norway_to_value(
     value: serde_norway::Value,
-    path: &mut Vec<PathSegment>,
+    path: &mut Vec<WalkSegment>,
 ) -> Result<Value, FormatError> {
     match value {
         serde_norway::Value::Null => Err(mapping_error(format!(
             "null at {}: absence expresses unset; null is not a configuration value — omit the key instead",
-            path_label(path)
+            walk_label(path)
         ))),
         serde_norway::Value::Bool(b) => Ok(Value::Boolean(b)),
         serde_norway::Value::Number(n) => {
@@ -216,7 +208,7 @@ fn norway_to_value(
             } else if n.is_u64() {
                 Err(mapping_error(format!(
                     "integer {n} at {} is out of range: integers are 64-bit signed",
-                    path_label(path)
+                    walk_label(path)
                 )))
             } else if let Some(f) = n.as_f64() {
                 Ok(Value::Float(f))
@@ -225,7 +217,7 @@ fn norway_to_value(
                 // but untrusted input earns a typed error, never a panic.
                 Err(mapping_error(format!(
                     "number {n} at {} is outside the supported numeric range: expected a 64-bit integer or float",
-                    path_label(path)
+                    walk_label(path)
                 )))
             }
         }
@@ -233,7 +225,7 @@ fn norway_to_value(
         serde_norway::Value::Sequence(items) => {
             let mut array = Vec::with_capacity(items.len());
             for (i, item) in items.into_iter().enumerate() {
-                path.push(PathSegment::Index(i));
+                path.push(WalkSegment::Index(i));
                 let converted = norway_to_value(item, path)?;
                 path.pop();
                 array.push(converted);
@@ -247,16 +239,16 @@ fn norway_to_value(
                     return Err(mapping_error(format!(
                         "non-string mapping key `{}` at {}: configuration keys are strings",
                         inline_norway(&key),
-                        path_label(path)
+                        walk_label(path)
                     )));
                 };
                 if key == "<<" {
                     return Err(mapping_error(format!(
                         "YAML merge key '<<' at {} is outside the configuration baseline: spell the keys out",
-                        path_label(path)
+                        walk_label(path)
                     )));
                 }
-                path.push(PathSegment::Key(key.clone()));
+                path.push(WalkSegment::Key(key.clone()));
                 let converted = norway_to_value(entry, path)?;
                 path.pop();
                 map.insert(key, converted);
@@ -266,7 +258,7 @@ fn norway_to_value(
         serde_norway::Value::Tagged(tagged) => Err(mapping_error(format!(
             "YAML tag '{}' at {} is outside the configuration baseline",
             tagged.tag,
-            path_label(path)
+            walk_label(path)
         ))),
     }
 }
@@ -303,19 +295,11 @@ fn value_to_norway(value: &Value) -> serde_norway::Value {
 
 // --- editing (yamlpath/yamlpatch span surgery) ---------------------------
 
-/// Extract the key segments of a [`ConfigPath`], refusing array-index
-/// segments: sequence-item edits (replace or append) are ADR-0002's known
-/// YAML refusals — `yamlpatch` cannot patch them honestly.
-fn key_segments(path: &ConfigPath, operation: Operation) -> Result<Vec<&str>, FormatError> {
+/// The key segments of a [`ConfigPath`], for the edit path below.
+fn key_segments(path: &ConfigPath) -> Vec<&str> {
     path.segments()
         .iter()
-        .map(|seg| match seg {
-            PathSegment::Key(k) => Ok(k.as_str()),
-            PathSegment::Index(_) => Err(FormatError::Unsupported(UnsupportedByFormat {
-                format: "yaml",
-                operation,
-            })),
-        })
+        .map(|PathSegment::Key(k)| k.as_str())
         .collect()
 }
 
@@ -1169,6 +1153,29 @@ mod tests {
         assert_eq!(text, "when: 1979-05-27T07:32:00Z\n");
     }
 
+    #[test]
+    fn serialize_hand_constructed_invalid_datetime_never_panics() {
+        // `Datetime`'s component fields are public (`toml_datetime`'s
+        // types); a hand-assembled non-grammatical value serializes as
+        // its `Display` string — garbage in, garbage out, never a panic.
+        use crate::value::{Date, Datetime};
+        let mut map = Map::new();
+        map.insert(
+            "when".into(),
+            Value::Datetime(Datetime {
+                date: Some(Date {
+                    year: 1979,
+                    month: 13,
+                    day: 1,
+                }),
+                time: None,
+                offset: None,
+            }),
+        );
+        let text = YamlAdapter.serialize(&Value::Map(map)).unwrap();
+        assert_eq!(text, "when: 1979-13-01\n");
+    }
+
     // --- template ---
 
     #[test]
@@ -1607,45 +1614,6 @@ db:
     }
 
     // --- the known refusals (ADR-0002's YAML row) ---
-
-    #[test]
-    fn edit_refuses_sequence_item_replace() {
-        // Sequence-item replace is a known refusal: index segments are
-        // refused typed, under the request's own matrix row.
-        let path = ConfigPath::new().key("servers").index(0).key("host");
-        let value = Value::from("x");
-        let err = YamlAdapter
-            .edit(
-                "servers:\n  - host: a\n",
-                set_edit(&path, &value, SetTarget::ExistingValue),
-            )
-            .unwrap_err();
-        match err {
-            FormatError::Unsupported(u) => {
-                assert_eq!(u.format, "yaml");
-                assert_eq!(u.operation, Operation::EditSet);
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn edit_refuses_list_append_via_index() {
-        // Appending (an index one past the end) is the same refusal family
-        // as flow-style list append: no honest span patch exists.
-        let path = ConfigPath::new().key("servers").index(2);
-        let value = Value::from("c");
-        let err = YamlAdapter
-            .edit(
-                "servers: [a, b]\n",
-                set_edit(&path, &value, SetTarget::MissingKey),
-            )
-            .unwrap_err();
-        match err {
-            FormatError::Unsupported(u) => assert_eq!(u.operation, Operation::EditCreateKey),
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-    }
 
     #[test]
     fn edit_refuses_flow_member_edits_instead_of_corrupting() {

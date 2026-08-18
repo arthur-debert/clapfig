@@ -18,7 +18,7 @@ use std::fmt;
 
 use serde::ser::{self, Serialize};
 
-use super::{DATETIME_MARKER, Datetime, Map, Value};
+use super::{DATETIME_FIELD, DATETIME_NAME, Datetime, Map, Value};
 
 /// Error produced while building a [`Value`] from a `Serialize` type.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -77,6 +77,13 @@ impl SerializeError {
     /// serializers translate into "skip the entry".
     fn is_none(&self) -> bool {
         self.kind == ErrorKind::UnsupportedNone
+    }
+
+    /// Whether this error came from the serialized type's own `Serialize`
+    /// impl calling [`ser::Error::custom`]. [`string_only`] passes these
+    /// through instead of collapsing them into its caller's error kind.
+    fn is_custom(&self) -> bool {
+        matches!(self.kind, ErrorKind::Custom(_))
     }
 }
 
@@ -297,7 +304,7 @@ impl ser::Serializer for ValueSerializer {
         name: &'static str,
         _len: usize,
     ) -> Result<SerializeStruct, SerializeError> {
-        if name == DATETIME_MARKER {
+        if name == DATETIME_NAME {
             Ok(SerializeStruct::Datetime { value: None })
         } else {
             Ok(SerializeStruct::Map(SerializeMap {
@@ -431,7 +438,7 @@ impl ser::SerializeMap for SerializeMap {
     where
         T: Serialize + ?Sized,
     {
-        self.next_key = Some(key.serialize(MapKeySerializer)?);
+        self.next_key = Some(string_only(key, ErrorKind::NonStringKey)?);
         Ok(())
     }
 
@@ -470,12 +477,12 @@ impl ser::SerializeStruct for SerializeStruct {
             SerializeStruct::Map(map) => map.entry(key.to_owned(), value),
             SerializeStruct::Datetime { value: slot } => {
                 // The marker struct has exactly one field, keyed by the
-                // marker name, holding the display string. Any other
+                // marker field name, holding the display string. Any other
                 // shape riding the marker struct name is malformed.
-                if key != DATETIME_MARKER || slot.is_some() {
+                if key != DATETIME_FIELD || slot.is_some() {
                     return Err(SerializeError::new(ErrorKind::InvalidDatetime));
                 }
-                let repr = value.serialize(RawStringExtractor)?;
+                let repr = string_only(value, ErrorKind::InvalidDatetime)?;
                 *slot = Some(
                     repr.parse()
                         .map_err(|_| SerializeError::new(ErrorKind::InvalidDatetime))?,
@@ -526,196 +533,24 @@ impl ser::SerializeStructVariant for SerializeStructVariant {
     }
 }
 
-/// Serializer that accepts only strings — used for map keys (the baseline
-/// requires string keys) and for extracting the datetime marker field.
-struct MapKeySerializer;
-
-/// Same string-only stance as [`MapKeySerializer`] but with a distinct
-/// error, used to pull the display string out of the datetime marker
-/// struct.
-struct RawStringExtractor;
-
-macro_rules! string_only_serializer {
-    ($name:ident, $err:expr) => {
-        impl ser::Serializer for $name {
-            type Ok = String;
-            type Error = SerializeError;
-
-            type SerializeSeq = ser::Impossible<String, SerializeError>;
-            type SerializeTuple = ser::Impossible<String, SerializeError>;
-            type SerializeTupleStruct = ser::Impossible<String, SerializeError>;
-            type SerializeTupleVariant = ser::Impossible<String, SerializeError>;
-            type SerializeMap = ser::Impossible<String, SerializeError>;
-            type SerializeStruct = ser::Impossible<String, SerializeError>;
-            type SerializeStructVariant = ser::Impossible<String, SerializeError>;
-
-            fn serialize_str(self, v: &str) -> Result<String, SerializeError> {
-                Ok(v.to_owned())
-            }
-
-            fn serialize_char(self, v: char) -> Result<String, SerializeError> {
-                Ok(v.to_string())
-            }
-
-            fn serialize_bool(self, _: bool) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_i8(self, _: i8) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_i16(self, _: i16) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_i32(self, _: i32) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_i64(self, _: i64) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_u8(self, _: u8) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_u16(self, _: u16) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_u32(self, _: u32) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_u64(self, _: u64) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_f32(self, _: f32) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_f64(self, _: f64) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_bytes(self, _: &[u8]) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_none(self) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_some<T>(self, value: &T) -> Result<String, SerializeError>
-            where
-                T: Serialize + ?Sized,
-            {
-                value.serialize(self)
-            }
-
-            fn serialize_unit(self) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_unit_struct(self, _: &'static str) -> Result<String, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_unit_variant(
-                self,
-                _: &'static str,
-                _: u32,
-                variant: &'static str,
-            ) -> Result<String, SerializeError> {
-                Ok(variant.to_owned())
-            }
-
-            fn serialize_newtype_struct<T>(
-                self,
-                _: &'static str,
-                value: &T,
-            ) -> Result<String, SerializeError>
-            where
-                T: Serialize + ?Sized,
-            {
-                value.serialize(self)
-            }
-
-            fn serialize_newtype_variant<T>(
-                self,
-                _: &'static str,
-                _: u32,
-                _: &'static str,
-                _: &T,
-            ) -> Result<String, SerializeError>
-            where
-                T: Serialize + ?Sized,
-            {
-                Err($err)
-            }
-
-            fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_tuple_struct(
-                self,
-                _: &'static str,
-                _: usize,
-            ) -> Result<Self::SerializeTupleStruct, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_tuple_variant(
-                self,
-                _: &'static str,
-                _: u32,
-                _: &'static str,
-                _: usize,
-            ) -> Result<Self::SerializeTupleVariant, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_struct(
-                self,
-                _: &'static str,
-                _: usize,
-            ) -> Result<Self::SerializeStruct, SerializeError> {
-                Err($err)
-            }
-
-            fn serialize_struct_variant(
-                self,
-                _: &'static str,
-                _: u32,
-                _: &'static str,
-                _: usize,
-            ) -> Result<Self::SerializeStructVariant, SerializeError> {
-                Err($err)
-            }
-        }
-    };
+/// Serialize `value` and require the result to be a string — the shared
+/// stance for map keys (the baseline requires string keys; a non-string
+/// key is `kind`'s error, never stringified) and for pulling the display
+/// string out of the datetime marker struct. An error the type's own
+/// `Serialize` impl raised via `Error::custom` passes through unchanged —
+/// it names the actual failure, which `kind`'s generic message would hide;
+/// every other outcome (non-string value, unsupported shape) collapses
+/// into `kind`.
+fn string_only<T>(value: &T, kind: ErrorKind) -> Result<String, SerializeError>
+where
+    T: Serialize + ?Sized,
+{
+    match value.serialize(ValueSerializer) {
+        Ok(Value::String(s)) => Ok(s),
+        Err(e) if e.is_custom() => Err(e),
+        _ => Err(SerializeError::new(kind)),
+    }
 }
-
-string_only_serializer!(
-    MapKeySerializer,
-    SerializeError::new(ErrorKind::NonStringKey)
-);
-string_only_serializer!(
-    RawStringExtractor,
-    SerializeError::new(ErrorKind::InvalidDatetime)
-);
 
 #[cfg(test)]
 mod tests {
@@ -786,22 +621,16 @@ mod tests {
         use serde::ser::{SerializeStruct as _, Serializer as _};
 
         // Wrong field key under the marker struct name.
-        let mut s = ValueSerializer
-            .serialize_struct(DATETIME_MARKER, 1)
-            .unwrap();
+        let mut s = ValueSerializer.serialize_struct(DATETIME_NAME, 1).unwrap();
         assert!(s.serialize_field("not_the_marker", "1979-05-27").is_err());
 
         // A second field where exactly one is allowed.
-        let mut s = ValueSerializer
-            .serialize_struct(DATETIME_MARKER, 2)
-            .unwrap();
-        s.serialize_field(DATETIME_MARKER, "1979-05-27").unwrap();
-        assert!(s.serialize_field(DATETIME_MARKER, "2001-01-01").is_err());
+        let mut s = ValueSerializer.serialize_struct(DATETIME_NAME, 2).unwrap();
+        s.serialize_field(DATETIME_FIELD, "1979-05-27").unwrap();
+        assert!(s.serialize_field(DATETIME_FIELD, "2001-01-01").is_err());
 
         // No field at all.
-        let s = ValueSerializer
-            .serialize_struct(DATETIME_MARKER, 0)
-            .unwrap();
+        let s = ValueSerializer.serialize_struct(DATETIME_NAME, 0).unwrap();
         assert!(s.end().is_err());
     }
 
@@ -810,5 +639,30 @@ mod tests {
         let mut m = std::collections::BTreeMap::new();
         m.insert(1i64, "x");
         assert!(to_value(&m).is_err());
+    }
+
+    #[test]
+    fn custom_key_serializer_error_surfaces_instead_of_non_string_key() {
+        // A key type whose own `Serialize` impl fails with `Error::custom`
+        // names the actual failure; collapsing it into the generic "map
+        // keys must be strings" would hide it.
+        struct Loud;
+        impl Serialize for Loud {
+            fn serialize<S: ser::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(ser::Error::custom("boom: key exploded"))
+            }
+        }
+        struct OneEntry;
+        impl Serialize for OneEntry {
+            fn serialize<S: ser::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                use ser::SerializeMap;
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_key(&Loud)?;
+                m.serialize_value(&1i64)?;
+                m.end()
+            }
+        }
+        let err = to_value(OneEntry).unwrap_err();
+        assert!(err.to_string().contains("boom: key exploded"), "{err}");
     }
 }

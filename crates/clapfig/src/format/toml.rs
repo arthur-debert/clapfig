@@ -15,8 +15,10 @@
 use crate::runtime::{Field, LeafType, Schema};
 use crate::value::{Map, Value};
 
+use std::collections::BTreeMap;
+
 use super::{
-    FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span, SpanIndex,
+    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
     UnsupportedByFormat,
 };
 
@@ -120,21 +122,20 @@ impl FormatAdapter for TomlAdapter {
                         end: r.end,
                     }),
                 })?;
-        let operation = edit.operation();
         match edit {
             FileEdit::Set { path, value, .. } => {
-                let keys = key_segments(path, operation)?;
+                let keys = key_segments(path);
                 write_at_path(&mut doc, &keys, value)?;
             }
             FileEdit::Unset { path } => {
-                let keys = key_segments(path, operation)?;
+                let keys = key_segments(path);
                 unset_at_path(&mut doc, &keys);
             }
         }
         Ok(doc.to_string())
     }
 
-    fn span_index(&self, _text: &str) -> Result<SpanIndex, FormatError> {
+    fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
         // Provenance epic: build the path → span index from parser spans.
         Err(UnsupportedByFormat {
             format: self.name(),
@@ -152,11 +153,9 @@ fn toml_to_value(value: toml::Value) -> Value {
         toml::Value::Integer(i) => Value::Integer(i),
         toml::Value::Float(f) => Value::Float(f),
         toml::Value::Boolean(b) => Value::Boolean(b),
-        toml::Value::Datetime(d) => Value::Datetime(
-            d.to_string()
-                .parse()
-                .expect("toml datetimes display in the owned model's own grammar"),
-        ),
+        // Identity: `toml::value::Datetime` IS the owned model's `Datetime`
+        // (both are `toml_datetime`'s, same pinned version).
+        toml::Value::Datetime(d) => Value::Datetime(d),
         toml::Value::Array(items) => Value::Array(items.into_iter().map(toml_to_value).collect()),
         toml::Value::Table(entries) => {
             let mut map = Map::new();
@@ -176,11 +175,10 @@ fn value_to_toml(value: &Value) -> toml::Value {
         Value::Integer(i) => toml::Value::Integer(*i),
         Value::Float(f) => toml::Value::Float(*f),
         Value::Boolean(b) => toml::Value::Boolean(*b),
-        Value::Datetime(d) => toml::Value::Datetime(
-            d.to_string()
-                .parse()
-                .expect("the owned datetime displays in TOML's grammar"),
-        ),
+        // Identity (see `toml_to_value`). No reparse, so a hand-constructed
+        // non-grammatical datetime (the component fields are public) cannot
+        // panic here; `toml::to_string` rejects it as a serialize error.
+        Value::Datetime(d) => toml::Value::Datetime(*d),
         Value::Array(items) => toml::Value::Array(items.iter().map(value_to_toml).collect()),
         Value::Map(map) => {
             let mut table = toml::Table::new();
@@ -192,20 +190,12 @@ fn value_to_toml(value: &Value) -> toml::Value {
     }
 }
 
-/// Extract the key segments of a [`ConfigPath`](super::ConfigPath),
-/// refusing array-index segments — the TOML edit path addresses map keys
-/// only (no current call site produces indexed edits; the honest answer
-/// until one exists is the typed refusal, not a partial implementation).
-fn key_segments(path: &super::ConfigPath, operation: Operation) -> Result<Vec<&str>, FormatError> {
+/// The key segments of a [`ConfigPath`](super::ConfigPath), for the edit
+/// walkers below.
+fn key_segments(path: &super::ConfigPath) -> Vec<&str> {
     path.segments()
         .iter()
-        .map(|seg| match seg {
-            PathSegment::Key(k) => Ok(k.as_str()),
-            PathSegment::Index(_) => Err(FormatError::Unsupported(UnsupportedByFormat {
-                format: "toml",
-                operation,
-            })),
-        })
+        .map(|PathSegment::Key(k)| k.as_str())
         .collect()
 }
 
@@ -287,13 +277,9 @@ fn value_to_toml_edit(value: &Value) -> toml_edit::Value {
         Value::Integer(i) => (*i).into(),
         Value::Float(f) => (*f).into(),
         Value::Boolean(b) => (*b).into(),
-        Value::Datetime(d) => {
-            let dt: toml_edit::Datetime = d
-                .to_string()
-                .parse()
-                .expect("the owned datetime displays in TOML's grammar");
-            dt.into()
-        }
+        // Identity (see `toml_to_value`): `toml_edit::Datetime` is the same
+        // `toml_datetime` type, so no reparse and no panic path.
+        Value::Datetime(d) => (*d).into(),
         Value::Array(items) => {
             let arr: toml_edit::Array = items.iter().map(value_to_toml_edit).collect();
             arr.into()
@@ -570,6 +556,90 @@ pool_size = 5
     }
 
     #[test]
+    fn serialize_hand_constructed_invalid_datetime_is_typed_error() {
+        // The component fields are public (`toml_datetime`'s types), so
+        // safe code can assemble non-grammatical values. The adapter
+        // converts by identity — no reparse, no panic path — and
+        // `toml::to_string` rejects the invalid shape as a typed error.
+        use crate::value::{Date, Datetime};
+        let month13 = Datetime {
+            date: Some(Date {
+                year: 1979,
+                month: 13,
+                day: 1,
+            }),
+            time: None,
+            offset: None,
+        };
+        let empty = Datetime {
+            date: None,
+            time: None,
+            offset: None,
+        };
+        for dt in [month13, empty] {
+            let mut map = Map::new();
+            map.insert("dt".into(), Value::Datetime(dt));
+            let err = TomlAdapter.serialize(&Value::Map(map)).unwrap_err();
+            assert!(
+                matches!(err, FormatError::Serialize { .. }),
+                "expected typed serialize error for {dt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn serialize_out_of_range_nanoseconds_never_panics() {
+        // The garbage-in-garbage-out edge of the public-fields contract:
+        // `Display` normalizes oversized nanoseconds into a (different)
+        // valid spelling. The guarantee under test is no panic.
+        use crate::value::{Datetime, Time};
+        let dt = Datetime {
+            date: None,
+            time: Some(Time {
+                hour: 7,
+                minute: 32,
+                second: 0,
+                nanosecond: 1_999_999_999,
+            }),
+            offset: None,
+        };
+        let mut map = Map::new();
+        map.insert("dt".into(), Value::Datetime(dt));
+        let out = TomlAdapter.serialize(&Value::Map(map)).unwrap();
+        assert_eq!(out, "dt = 07:32:00.199999999\n");
+    }
+
+    #[test]
+    fn edit_set_hand_constructed_invalid_datetime_never_panics() {
+        // The edit path writes `Display` output without revalidating:
+        // garbage in, garbage out — but never a panic (the conversion is
+        // identity, no reparse).
+        use crate::value::{Date, Datetime};
+        let dt = Datetime {
+            date: Some(Date {
+                year: 1979,
+                month: 13,
+                day: 1,
+            }),
+            time: None,
+            offset: None,
+        };
+        let path = ConfigPath::new().key("dt");
+        let value = Value::Datetime(dt);
+        let out = TomlAdapter
+            .edit(
+                "",
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap();
+        assert_eq!(out, "dt = 1979-13-01\n");
+    }
+
+    #[test]
     fn serialize_round_trips_parse() {
         let source = "b = true\ni = 3\ns = \"x\"\n\n[t]\nn = 1\n";
         let value = TomlAdapter.parse(source).unwrap();
@@ -658,27 +728,5 @@ pool_size = 5
             .edit("port = 1\n", FileEdit::Unset { path: &missing })
             .unwrap();
         assert!(unchanged.contains("port = 1"));
-    }
-
-    #[test]
-    fn edit_refuses_array_index_segments() {
-        let path = ConfigPath::new().key("servers").index(0).key("host");
-        let value = Value::from("x");
-        let err = TomlAdapter
-            .edit(
-                "",
-                FileEdit::Set {
-                    path: &path,
-                    value: &value,
-                    target: SetTarget::MissingKey,
-                },
-            )
-            .unwrap_err();
-        // The refusal names the request's own matrix row, not a blanket
-        // "set".
-        match err {
-            FormatError::Unsupported(u) => assert_eq!(u.operation, Operation::EditCreateKey),
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
     }
 }

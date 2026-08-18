@@ -15,9 +15,9 @@
 //! lossy fallback.
 //!
 //! The trait also carries the seam the provenance epic consumes: adapters
-//! supply a path → span index ([`SpanIndex`]) for their source text, so
-//! source-mapping attaches at this one seam instead of per-format
-//! branches.
+//! supply a path → span index ([`FormatAdapter::span_index`]) for their
+//! source text, so source-mapping attaches at this one seam instead of
+//! per-format branches.
 //!
 //! This module holds the contract and its pure data structures; the
 //! adapters themselves live in [`toml`], [`yaml`], and [`json`].
@@ -163,30 +163,31 @@ impl FormatError {
     }
 }
 
-/// One step of a [`ConfigPath`]: a map key or an array index.
+/// One step of a [`ConfigPath`]: a map key.
+///
+/// The public path vocabulary is key-only for now; the provenance epic
+/// adds an index segment when something can actually construct and
+/// consume one.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PathSegment {
     /// A map key. The key is a literal string — a key containing `.` is
     /// one segment, never nesting.
     Key(String),
-    /// A zero-based array element index.
-    Index(usize),
 }
 
 /// Structured address of one node in a [`Value`] tree.
 ///
 /// A path is a sequence of [`PathSegment`]s, so a literal key named
 /// `"database.port"` (one `Key` segment) is distinct from the nested keys
-/// `database` → `port` (two `Key` segments), and array elements are
-/// addressable via `Index` — an unstructured dotted string can express
-/// neither distinction. This is the path type the adapter contract
-/// traffics in ([`SpanIndex`], [`FileEdit`]); every adapter builds and
-/// consumes the same representation.
+/// `database` → `port` (two `Key` segments) — an unstructured dotted
+/// string cannot express that distinction. This is the path type the
+/// adapter contract traffics in ([`FormatAdapter::span_index`],
+/// [`FileEdit`]); every adapter builds and consumes the same
+/// representation.
 ///
 /// [`Display`](fmt::Display) renders the familiar dotted notation for
-/// error messages (`database.port`, `servers[0].host`), quoting key
-/// segments that are not bare (`"my.key".port`) — display only, never
-/// parsed back.
+/// error messages (`database.port`), quoting key segments that are not
+/// bare (`"my.key".port`) — display only, never parsed back.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConfigPath {
     segments: Vec<PathSegment>,
@@ -204,12 +205,6 @@ impl ConfigPath {
         self
     }
 
-    /// Append an array-index segment (builder style).
-    pub fn index(mut self, index: usize) -> Self {
-        self.segments.push(PathSegment::Index(index));
-        self
-    }
-
     /// The path's segments, root-first.
     pub fn segments(&self) -> &[PathSegment] {
         &self.segments
@@ -224,26 +219,67 @@ impl From<Vec<PathSegment>> for ConfigPath {
 
 impl fmt::Display for ConfigPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, segment) in self.segments.iter().enumerate() {
-            match segment {
-                PathSegment::Key(k) => {
-                    if i > 0 {
-                        f.write_str(".")?;
-                    }
-                    let bare = !k.is_empty()
-                        && k.bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-                    if bare {
-                        f.write_str(k)?;
-                    } else {
-                        write!(f, "{k:?}")?;
-                    }
-                }
-                PathSegment::Index(n) => write!(f, "[{n}]")?,
-            }
+        for (i, PathSegment::Key(k)) in self.segments.iter().enumerate() {
+            write_key(f, i == 0, k)?;
         }
         Ok(())
     }
+}
+
+/// Write one dotted-notation key: a `.` separator unless `first`, quoting
+/// keys that are not bare. Shared by [`ConfigPath`]'s `Display` and
+/// [`walk_label`].
+fn write_key(out: &mut dyn fmt::Write, first: bool, key: &str) -> fmt::Result {
+    if !first {
+        out.write_str(".")?;
+    }
+    let bare = !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if bare {
+        out.write_str(key)
+    } else {
+        write!(out, "{key:?}")
+    }
+}
+
+/// One step of a document walker's internal path.
+///
+/// Unlike the public [`PathSegment`], this can address array elements:
+/// parse/serialize walkers descend into arrays and their error messages
+/// must name the element (`servers[0]`), while the public path vocabulary
+/// stays key-only until the provenance epic needs index segments.
+pub(crate) enum WalkSegment {
+    /// A map key.
+    Key(String),
+    /// A zero-based array element index.
+    Index(usize),
+}
+
+/// Human-readable location of a walker's path for error messages: the
+/// familiar dotted notation with array indexes (`'servers[0].host'`),
+/// quoted, or a prose fallback at the document root.
+pub(crate) fn walk_label(segments: &[WalkSegment]) -> String {
+    use fmt::Write as _;
+    if segments.is_empty() {
+        return "the document root".to_string();
+    }
+    let mut out = String::from("'");
+    let mut first = true;
+    for segment in segments {
+        match segment {
+            WalkSegment::Key(k) => {
+                let _ = write_key(&mut out, first, k);
+            }
+            WalkSegment::Index(n) => {
+                let _ = write!(out, "[{n}]");
+            }
+        }
+        first = false;
+    }
+    out.push('\'');
+    out
 }
 
 /// A half-open byte range (`start..end`) into a format's source text.
@@ -253,40 +289,6 @@ pub struct Span {
     pub start: usize,
     /// Byte offset one past the range's last byte.
     pub end: usize,
-}
-
-/// Path → [`Span`] index over one file's source text — the seam the
-/// provenance epic consumes.
-///
-/// Keys are structured [`ConfigPath`]s; the span locates that value's
-/// bytes in the source the adapter parsed. WS01 pins the shape only:
-/// adapters return it from [`FormatAdapter::span_index`], and the
-/// provenance epic decides what to build on top.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SpanIndex {
-    spans: BTreeMap<ConfigPath, Span>,
-}
-
-impl SpanIndex {
-    /// An index with no entries.
-    pub fn new() -> Self {
-        SpanIndex::default()
-    }
-
-    /// Record the span for a value path.
-    pub fn insert(&mut self, path: ConfigPath, span: Span) {
-        self.spans.insert(path, span);
-    }
-
-    /// Look up the span recorded for a value path.
-    pub fn get(&self, path: &ConfigPath) -> Option<Span> {
-        self.spans.get(path).copied()
-    }
-
-    /// Iterate all `(path, span)` entries in sorted path order.
-    pub fn iter(&self) -> impl Iterator<Item = (&ConfigPath, Span)> {
-        self.spans.iter().map(|(k, v)| (k, *v))
-    }
 }
 
 /// Which capability-matrix row a [`FileEdit::Set`] request falls under.
@@ -416,10 +418,11 @@ pub trait FormatAdapter: Send + Sync {
     /// error.
     fn edit(&self, source: &str, edit: FileEdit<'_>) -> Result<String, FormatError>;
 
-    /// Build the path → span index for source text (the provenance seam).
-    /// WS01 pins the signature; adapters stub the body until the
+    /// Build the path → span index for source text (the provenance seam):
+    /// each entry locates a value's bytes in the source the adapter
+    /// parsed. WS01 pins the signature; adapters stub the body until the
     /// provenance epic lands.
-    fn span_index(&self, text: &str) -> Result<SpanIndex, FormatError>;
+    fn span_index(&self, text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError>;
 }
 
 /// Ordered set of enabled format adapters — the single routing seam.
@@ -549,7 +552,7 @@ mod tests {
             Err(self.require(edit.operation()).unwrap_err().into())
         }
 
-        fn span_index(&self, _text: &str) -> Result<SpanIndex, FormatError> {
+        fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
             Err(self.require(Operation::SpanIndex).unwrap_err().into())
         }
     }
@@ -597,43 +600,16 @@ mod tests {
     }
 
     #[test]
-    fn span_index_records_and_looks_up_paths() {
-        let mut index = SpanIndex::new();
-        let path = ConfigPath::new().key("database").key("port");
-        index.insert(path.clone(), Span { start: 10, end: 14 });
-        assert_eq!(index.get(&path), Some(Span { start: 10, end: 14 }));
-        assert_eq!(index.get(&ConfigPath::new().key("missing")), None);
-        let entries: Vec<_> = index.iter().collect();
-        assert_eq!(entries.len(), 1);
-    }
-
-    #[test]
     fn literal_dotted_key_is_distinct_from_nested_keys() {
         let nested = ConfigPath::new().key("database").key("port");
         let literal = ConfigPath::new().key("database.port");
         assert_ne!(nested, literal);
 
-        let mut index = SpanIndex::new();
+        let mut index = BTreeMap::new();
         index.insert(nested.clone(), Span { start: 0, end: 1 });
         index.insert(literal.clone(), Span { start: 2, end: 3 });
-        assert_eq!(index.get(&nested), Some(Span { start: 0, end: 1 }));
-        assert_eq!(index.get(&literal), Some(Span { start: 2, end: 3 }));
-    }
-
-    #[test]
-    fn array_elements_are_addressable() {
-        let path = ConfigPath::new().key("servers").index(0).key("host");
-        assert_eq!(
-            path.segments(),
-            [
-                PathSegment::Key("servers".into()),
-                PathSegment::Index(0),
-                PathSegment::Key("host".into()),
-            ]
-        );
-        let mut index = SpanIndex::new();
-        index.insert(path.clone(), Span { start: 5, end: 9 });
-        assert_eq!(index.get(&path), Some(Span { start: 5, end: 9 }));
+        assert_eq!(index.get(&nested), Some(&Span { start: 0, end: 1 }));
+        assert_eq!(index.get(&literal), Some(&Span { start: 2, end: 3 }));
     }
 
     #[test]
@@ -643,19 +619,28 @@ mod tests {
             "database.port"
         );
         assert_eq!(
-            ConfigPath::new()
-                .key("servers")
-                .index(0)
-                .key("host")
-                .to_string(),
-            "servers[0].host"
-        );
-        assert_eq!(
             ConfigPath::new().key("my.key").key("port").to_string(),
             "\"my.key\".port"
         );
         assert_eq!(ConfigPath::new().key("").to_string(), "\"\"");
         assert_eq!(ConfigPath::new().to_string(), "");
+    }
+
+    #[test]
+    fn walk_label_renders_indexes_and_the_root() {
+        assert_eq!(walk_label(&[]), "the document root");
+        assert_eq!(
+            walk_label(&[
+                WalkSegment::Key("servers".into()),
+                WalkSegment::Index(0),
+                WalkSegment::Key("host".into()),
+            ]),
+            "'servers[0].host'"
+        );
+        assert_eq!(
+            walk_label(&[WalkSegment::Index(2), WalkSegment::Key("my.key".into())]),
+            "'[2].\"my.key\"'"
+        );
     }
 
     #[test]

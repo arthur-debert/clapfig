@@ -343,7 +343,10 @@ mod tests {
         fn span_index(
             &self,
             _text: &str,
-        ) -> Result<crate::format::SpanIndex, crate::format::FormatError> {
+        ) -> Result<
+            std::collections::BTreeMap<crate::format::ConfigPath, crate::format::Span>,
+            crate::format::FormatError,
+        > {
             Err(self
                 .require(crate::format::Operation::SpanIndex)
                 .unwrap_err()
@@ -448,7 +451,10 @@ mod tests {
         fn span_index(
             &self,
             _text: &str,
-        ) -> Result<crate::format::SpanIndex, crate::format::FormatError> {
+        ) -> Result<
+            std::collections::BTreeMap<crate::format::ConfigPath, crate::format::Span>,
+            crate::format::FormatError,
+        > {
             Err(self
                 .require(crate::format::Operation::SpanIndex)
                 .unwrap_err()

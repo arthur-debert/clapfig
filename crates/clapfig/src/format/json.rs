@@ -50,9 +50,11 @@ use serde_json::{Map as JsonMap, Value as Json};
 use crate::runtime::{Field, LeafType, Schema};
 use crate::value::{Map, Value};
 
+use std::collections::BTreeMap;
+
 use super::{
-    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span, SpanIndex,
-    UnsupportedByFormat,
+    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
+    UnsupportedByFormat, WalkSegment, walk_label,
 };
 
 /// The canonical format name used in error messages.
@@ -125,23 +127,26 @@ impl FormatAdapter for JsonAdapter {
         } else {
             serde_json::from_str(source).map_err(|e| syntax_error(source, &e))?
         };
-        let operation = edit.operation();
         match edit {
             FileEdit::Set { path, value, .. } => {
-                let keys = key_segments(path, operation)?;
-                let mut value_path = path.segments().to_vec();
+                let keys = key_segments(path)?;
+                let mut value_path: Vec<WalkSegment> = path
+                    .segments()
+                    .iter()
+                    .map(|PathSegment::Key(k)| WalkSegment::Key(k.clone()))
+                    .collect();
                 let json_value = value_to_json(value, &mut value_path)?;
                 write_at_path(&mut doc, &keys, json_value)?;
             }
             FileEdit::Unset { path } => {
-                let keys = key_segments(path, operation)?;
+                let keys = key_segments(path)?;
                 unset_at_path(&mut doc, &keys);
             }
         }
         Ok(render(&doc))
     }
 
-    fn span_index(&self, _text: &str) -> Result<SpanIndex, FormatError> {
+    fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
         // Provenance epic: build the path → span index from parser spans.
         Err(UnsupportedByFormat {
             format: self.name(),
@@ -159,16 +164,6 @@ fn render(json: &Json) -> String {
         serde_json::to_string_pretty(json).expect("serde_json::Value serialization is infallible");
     out.push('\n');
     out
-}
-
-/// Human-readable location of `segments` for error messages: the familiar
-/// dotted [`ConfigPath`] notation, or a prose fallback at the root.
-fn display_path(segments: &[PathSegment]) -> String {
-    if segments.is_empty() {
-        "the document root".to_string()
-    } else {
-        format!("'{}'", ConfigPath::from(segments.to_vec()))
-    }
 }
 
 /// The refusal message for a `//`-prefixed name at an outgoing boundary
@@ -220,14 +215,14 @@ fn span_at(text: &str, line: usize, column: usize) -> Option<Span> {
 /// baseline mapping rules: `//`-prefixed members are stripped (before the
 /// [`Value`] tree exists), `null` and out-of-`i64` integers are typed
 /// errors naming the offending path.
-fn json_to_value(json: Json, path: &mut Vec<PathSegment>) -> Result<Value, FormatError> {
+fn json_to_value(json: Json, path: &mut Vec<WalkSegment>) -> Result<Value, FormatError> {
     Ok(match json {
         Json::Null => {
             return Err(FormatError::Parse {
                 format: FORMAT,
                 message: format!(
                     "null at {} is not a configuration value: absence expresses unset — omit the key instead",
-                    display_path(path)
+                    walk_label(path)
                 ),
                 span: None,
             });
@@ -248,7 +243,7 @@ fn json_to_value(json: Json, path: &mut Vec<PathSegment>) -> Result<Value, Forma
                         format: FORMAT,
                         message: format!(
                             "integer {lexeme} at {} is out of range: the value model's integers are 64-bit signed (i64)",
-                            display_path(path)
+                            walk_label(path)
                         ),
                         span: None,
                     });
@@ -262,7 +257,7 @@ fn json_to_value(json: Json, path: &mut Vec<PathSegment>) -> Result<Value, Forma
                             format: FORMAT,
                             message: format!(
                                 "float {lexeme} at {} is out of range: the value model's floats are 64-bit (f64)",
-                                display_path(path)
+                                walk_label(path)
                             ),
                             span: None,
                         });
@@ -274,7 +269,7 @@ fn json_to_value(json: Json, path: &mut Vec<PathSegment>) -> Result<Value, Forma
         Json::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.into_iter().enumerate() {
-                path.push(PathSegment::Index(i));
+                path.push(WalkSegment::Index(i));
                 let converted = json_to_value(item, path)?;
                 path.pop();
                 out.push(converted);
@@ -290,7 +285,7 @@ fn json_to_value(json: Json, path: &mut Vec<PathSegment>) -> Result<Value, Forma
                 if key.starts_with(COMMENT_PREFIX) {
                     continue;
                 }
-                path.push(PathSegment::Key(key.clone()));
+                path.push(WalkSegment::Key(key.clone()));
                 let converted = json_to_value(entry, path)?;
                 path.pop();
                 map.insert(key, converted);
@@ -303,7 +298,7 @@ fn json_to_value(json: Json, path: &mut Vec<PathSegment>) -> Result<Value, Forma
 /// Convert an owned [`Value`] into a `serde_json::Value`. The one
 /// unrepresentable shape is a non-finite float (JSON has no literal for
 /// it) — a typed error naming the offending path.
-fn value_to_json(value: &Value, path: &mut Vec<PathSegment>) -> Result<Json, FormatError> {
+fn value_to_json(value: &Value, path: &mut Vec<WalkSegment>) -> Result<Json, FormatError> {
     Ok(match value {
         Value::String(s) => Json::String(s.clone()),
         Value::Integer(i) => Json::Number((*i).into()),
@@ -314,7 +309,7 @@ fn value_to_json(value: &Value, path: &mut Vec<PathSegment>) -> Result<Json, For
                     format: FORMAT,
                     message: format!(
                         "non-finite float {f} at {} has no JSON representation",
-                        display_path(path)
+                        walk_label(path)
                     ),
                 });
             }
@@ -326,7 +321,7 @@ fn value_to_json(value: &Value, path: &mut Vec<PathSegment>) -> Result<Json, For
         Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
-                path.push(PathSegment::Index(i));
+                path.push(WalkSegment::Index(i));
                 let converted = value_to_json(item, path)?;
                 path.pop();
                 out.push(converted);
@@ -336,7 +331,7 @@ fn value_to_json(value: &Value, path: &mut Vec<PathSegment>) -> Result<Json, For
         Value::Map(map) => {
             let mut out = JsonMap::new();
             for (key, entry) in map {
-                path.push(PathSegment::Key(key.clone()));
+                path.push(WalkSegment::Key(key.clone()));
                 // The reserved comment namespace cuts both ways: a
                 // `//`-prefixed key written here would be stripped as a
                 // comment at the next parse — refuse loudly instead of
@@ -344,7 +339,7 @@ fn value_to_json(value: &Value, path: &mut Vec<PathSegment>) -> Result<Json, For
                 if key.starts_with(COMMENT_PREFIX) {
                     return Err(FormatError::Serialize {
                         format: FORMAT,
-                        message: reserved_key_message(&display_path(path)),
+                        message: reserved_key_message(&walk_label(path)),
                     });
                 }
                 let converted = value_to_json(entry, path)?;
@@ -358,25 +353,21 @@ fn value_to_json(value: &Value, path: &mut Vec<PathSegment>) -> Result<Json, For
 
 // --- edit ----------------------------------------------------------------
 
-/// Extract the key segments of a [`ConfigPath`], refusing array-index
-/// segments — the JSON edit path addresses map keys only, mirroring the
-/// TOML adapter (no current call site produces indexed edits; the honest
-/// answer until one exists is the typed refusal) — and refusing
-/// `//`-prefixed segments, which live in the reserved comment namespace
-/// and can never address a configuration key.
-fn key_segments(path: &ConfigPath, operation: Operation) -> Result<Vec<&str>, FormatError> {
+/// Extract the key segments of a [`ConfigPath`], refusing `//`-prefixed
+/// segments, which live in the reserved comment namespace and can never
+/// address a configuration key.
+fn key_segments(path: &ConfigPath) -> Result<Vec<&str>, FormatError> {
     path.segments()
         .iter()
-        .map(|seg| match seg {
-            PathSegment::Key(k) if k.starts_with(COMMENT_PREFIX) => Err(FormatError::Edit {
-                format: FORMAT,
-                message: reserved_key_message(&format!("'{k}'")),
-            }),
-            PathSegment::Key(k) => Ok(k.as_str()),
-            PathSegment::Index(_) => Err(FormatError::Unsupported(UnsupportedByFormat {
-                format: FORMAT,
-                operation,
-            })),
+        .map(|PathSegment::Key(k)| {
+            if k.starts_with(COMMENT_PREFIX) {
+                Err(FormatError::Edit {
+                    format: FORMAT,
+                    message: reserved_key_message(&format!("'{k}'")),
+                })
+            } else {
+                Ok(k.as_str())
+            }
         })
         .collect()
 }
@@ -505,7 +496,7 @@ fn template_object(schema: &Schema) -> Result<JsonMap<String, Json>, FormatError
                         if !lines.is_empty() {
                             obj.insert(comment_key(&nf.name), comment_value(lines));
                         }
-                        let mut path = vec![PathSegment::Key(nf.name.clone())];
+                        let mut path = vec![WalkSegment::Key(nf.name.clone())];
                         obj.insert(nf.name.clone(), value_to_json(default, &mut path)?);
                     }
                     None => {
@@ -576,7 +567,7 @@ fn example_object(
         let value = match &nf.field {
             Field::Leaf(leaf) => match &leaf.default {
                 Some(default) => {
-                    let mut path = vec![PathSegment::Key(context_key.to_string())];
+                    let mut path = vec![WalkSegment::Key(context_key.to_string())];
                     value_to_json(default, &mut path)?
                 }
                 None => placeholder_value(&leaf.ty),
@@ -638,7 +629,7 @@ fn compact(json: &Json) -> String {
 /// Render one owned value as inline JSON (for `Allowed:` enum listings),
 /// naming `key` in conversion errors.
 fn inline_json(value: &Value, key: &str) -> Result<String, FormatError> {
-    let mut path = vec![PathSegment::Key(key.to_string())];
+    let mut path = vec![WalkSegment::Key(key.to_string())];
     Ok(compact(&value_to_json(value, &mut path)?))
 }
 
@@ -958,6 +949,29 @@ mod tests {
             text.contains(r#""stamp": "1979-05-27T07:32:00Z""#),
             "{text}"
         );
+    }
+
+    #[test]
+    fn serialize_hand_constructed_invalid_datetime_never_panics() {
+        // `Datetime`'s component fields are public (`toml_datetime`'s
+        // types); a hand-assembled non-grammatical value serializes as
+        // its `Display` string — garbage in, garbage out, never a panic.
+        use crate::value::{Date, Datetime};
+        let mut map = Map::new();
+        map.insert(
+            "stamp".into(),
+            Value::Datetime(Datetime {
+                date: Some(Date {
+                    year: 1979,
+                    month: 13,
+                    day: 1,
+                }),
+                time: None,
+                offset: None,
+            }),
+        );
+        let text = JsonAdapter.serialize(&Value::Map(map)).unwrap();
+        assert!(text.contains(r#""stamp": "1979-13-01""#), "{text}");
     }
 
     #[test]
@@ -1332,28 +1346,6 @@ mod tests {
             .edit(r#"{"port": 1}"#, FileEdit::Unset { path: &missing })
             .unwrap();
         assert!(unchanged.contains(r#""port": 1"#));
-    }
-
-    #[test]
-    fn edit_refuses_array_index_segments() {
-        let path = ConfigPath::new().key("servers").index(0).key("host");
-        let value = Value::from("x");
-        let err = JsonAdapter
-            .edit(
-                "",
-                FileEdit::Set {
-                    path: &path,
-                    value: &value,
-                    target: SetTarget::MissingKey,
-                },
-            )
-            .unwrap_err();
-        // The refusal names the request's own matrix row, not a blanket
-        // "set".
-        match err {
-            FormatError::Unsupported(u) => assert_eq!(u.operation, Operation::EditCreateKey),
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
     }
 
     #[test]
