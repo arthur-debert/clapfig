@@ -1,15 +1,18 @@
 //! End-to-end tests for struct-level `rename_all` in
 //! `#[derive(clapfig::Schema)]` (#107 / DER01-WS04).
 //!
-//! The contract under test: the derived schema applies the same field-name
-//! conversion serde's deserialize does, for the full serde rule set, so a
-//! `rename_all` struct loads, validates strictly, templates, and emits
-//! JSON Schema under the converted names — with explicit renames winning
-//! over the rule and the conflict/duplicate diagnostics intact.
+//! The contract under test: the derived schema applies serde-exact
+//! field-name conversion for the full serde rule set, so a `rename_all`
+//! struct validates strictly, templates, and emits JSON Schema under the
+//! converted names — with explicit renames winning over the rule and the
+//! conflict/duplicate diagnostics intact. Typed loading agrees when the
+//! struct uses `#[serde(rename_all)]` (or a matching clapfig/serde pair);
+//! clapfig-only `rename_all` converts the schema and leaves serde's
+//! `Deserialize` on the Rust identifiers.
 
 #![cfg(feature = "derive")]
 
-use clapfig::{Clapfig, ConfigAction, ConfigResult, Schema, SearchPath};
+use clapfig::{Clapfig, ClapfigError, ConfigAction, ConfigResult, Schema, SearchPath};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
@@ -191,7 +194,13 @@ fn kebab_schema_strict_rejects_rust_identifier_spelling() {
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
         .load();
-    assert!(result.is_err(), "snake spelling must be an unknown key");
+    match result {
+        Err(ClapfigError::UnknownKeys(keys)) => {
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0].key, "listen_port");
+        }
+        other => panic!("expected UnknownKeys(listen_port), got {other:?}"),
+    }
 }
 
 #[test]
@@ -303,10 +312,18 @@ fn kebab_schema_with_normalize_keys_rejects_kebab_spelling() {
         .no_env()
         .normalize_keys(true)
         .load();
-    assert!(
-        result.is_err(),
-        "normalize_keys(true) + kebab-case schema must fail loudly"
-    );
+    match result {
+        Err(ClapfigError::UnknownKeys(keys)) => {
+            assert_eq!(keys.len(), 1);
+            assert_eq!(
+                keys[0].key, "listen_port",
+                "normalize_keys rewrites listen-port before validation"
+            );
+        }
+        other => panic!(
+            "expected UnknownKeys(listen_port) for normalize_keys + kebab schema, got {other:?}"
+        ),
+    }
 }
 
 // -- Precedence and directional forms ---------------------------------------
@@ -449,10 +466,16 @@ fn clapfig_only_rule_on_typed_struct_converts_schema_but_not_deserialize() {
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
         .load();
-    assert!(
-        result.is_err(),
-        "clapfig-only rename_all must not make the typed path accept converted keys"
-    );
+    match result {
+        Err(ClapfigError::InvalidValue { key, reason }) => {
+            assert_eq!(key, "<merged>");
+            assert!(
+                reason.contains("connect_timeout"),
+                "reason must identify the missing serde field, got {reason:?}"
+            );
+        }
+        other => panic!("expected InvalidValue(<merged>, missing connect_timeout), got {other:?}"),
+    }
 }
 
 /// Both spellings naming the same rule agree — no conflict, and the pair
