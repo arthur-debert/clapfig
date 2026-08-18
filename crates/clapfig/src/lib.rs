@@ -58,11 +58,13 @@
 //! - **`///` doc comments** become the comments in generated templates and the
 //!   output of `config get`.
 //! - **Nested structs** (fields whose type also derives `Schema`) model
-//!   hierarchical config. Nesting maps to TOML sections, dotted keys, and
-//!   double-underscore env var separators.
+//!   hierarchical config. Nesting maps to config-file sections (TOML
+//!   `[section]`, YAML/JSON nesting), dotted keys, and double-underscore
+//!   env var separators.
 //! - **Unit-only enums** deriving `Schema` become constrained value sets:
-//!   out-of-set values error at load, templates carry an `# Allowed: ...`
-//!   line, and the JSON Schema emits `enum: [...]`.
+//!   out-of-set values error at load, templates document the allowed set
+//!   with an `Allowed: ...` annotation (native comments in TOML/YAML,
+//!   `"//"` comment keys in JSON), and the JSON Schema emits `enum: [...]`.
 //! - **`Option<T>` fields** are truly optional — omitting them in every source
 //!   is valid. Fields without `Option` and without a default must be provided
 //!   by at least one layer or loading fails.
@@ -72,6 +74,51 @@
 //! enum sets, docs, defaults — is available at runtime, so JSON Schema
 //! generation, template generation, and persistence validation all see the
 //! same metadata regardless of which entry point built the schema.
+//!
+//! # Design: clapfig owns its value model
+//!
+//! Clapfig is a configuration tool, not a TOML tool. The whole pipeline —
+//! layer construction, merging, validation, defaults, resolution output —
+//! traffics in clapfig's own [`value::Value`] (string, integer, float,
+//! bool, datetime, array, unordered map), never in a serialization
+//! crate's types. Serialization formats get the same treatment as CLI
+//! frameworks: **adapters at the boundary** (the [`format`](mod@format)
+//! module), one
+//! per format — TOML, YAML, JSON — behind a single contract
+//! ([`format::FormatAdapter`]) that parses text into `Value`, renders
+//! documented templates, serializes, and edits files.
+//!
+//! The consequences you can observe:
+//!
+//! - **TOML semantics are the shared baseline.** The value vocabulary is
+//!   TOML's; formats that could express more (YAML custom tags, merge
+//!   keys, ordered maps) do not get to, and formats that express less map into
+//!   the baseline by explicit adapter rules. A config file means the same
+//!   thing in every format: identical schema validation and strict-mode
+//!   accept/reject decisions. (Unknown-key line numbers and source
+//!   snippets are TOML-only today — YAML/JSON strict errors name the key
+//!   and file but carry no source line.)
+//! - **Datetimes cross formats by schema, not by sniffing.** TOML has
+//!   first-class datetimes; in YAML and JSON they are written as strings
+//!   in TOML's four datetime spellings (offset date-time, local
+//!   date-time, local date, local time). A string becomes a
+//!   [`value::Datetime`] only when the schema declares the leaf as one —
+//!   adapters never guess types from a value's shape (no
+//!   "looks like a date" detection, no YAML Norway problem).
+//! - **Capabilities are declared, refusals are typed.** Not every format
+//!   can support every operation honestly (comment-preserving edits are
+//!   the canonical case). Each adapter declares its supported
+//!   [`format::Operation`]s; asking for an undeclared one — or a declared
+//!   one on a shape the format cannot rewrite honestly — yields the
+//!   single typed [`format::UnsupportedByFormat`] error, never a silent
+//!   lossy fallback. Call sites react to the error; nothing branches on
+//!   format names.
+//! - **Formats are opt-in and ordered.** Discovery by
+//!   [`file_stem`](RuntimeBuilder::file_stem) enables the
+//!   [`formats`](RuntimeBuilder::formats) list (default: TOML only, never
+//!   inferred from cargo features); the first entry is the preferred
+//!   format `config gen` renders and file seeding uses. The Discovery
+//!   section below spells out the full file-name contract.
 //!
 //! # Core library — no CLI framework required
 //!
@@ -148,6 +195,26 @@
 //!
 //! Missing files are silently skipped — listing a search path is a
 //! suggestion, not a requirement.
+//!
+//! *What* to look for in each directory is the file-name contract:
+//!
+//! - **[`file_name("myapp.toml")`](RuntimeBuilder::file_name)** — exact-name
+//!   discovery. Only files with that precise name are considered, and the
+//!   name's extension selects the single enabled format (an extensionless
+//!   rc-style name parses as TOML). This is the default
+//!   (`{app_name}.toml`), so TOML-only apps configure nothing.
+//! - **[`file_stem("myapp")`](RuntimeBuilder::file_stem)** plus
+//!   **[`formats([...])`](RuntimeBuilder::formats)** — stem discovery
+//!   across the enabled formats' extensions (`myapp.toml`, `myapp.yaml` /
+//!   `myapp.yml`, `myapp.json`). Formats are opt-in and ordered (default:
+//!   TOML only); the first entry is the **preferred format** (`config gen`
+//!   renders it; `config set` creates `<stem>.<preferred extension>` when
+//!   no file exists). More than one same-stem match in the same directory
+//!   is a hard error naming both files
+//!   ([`ClapfigError::AmbiguousConfigFiles`]) — across directories, normal
+//!   layering applies. Explicit paths (exact-name persist scopes,
+//!   `gen --output`) select their adapter by extension, independent of
+//!   the enabled list.
 //!
 //! ## Resolution — what to do with found files
 //!
@@ -266,7 +333,7 @@
 //!
 //! Strict mode is **on by default**. When a config file contains a key that
 //! doesn't match any field in your schema, loading fails with the file path,
-//! key name, and line number:
+//! key name, and — for TOML sources — the line number:
 //!
 //! ```text
 //! Unknown key 'typo_key' in /home/user/.config/myapp/myapp.toml (line 5)
@@ -345,12 +412,14 @@
 //!     .load()?;
 //! ```
 //!
-//! The [`UnknownKeyContext`] carries the dotted path, the raw TOML leaf
+//! The [`UnknownKeyContext`] carries the dotted path, the raw leaf
 //! key (preserves quoted-key semantics — `"acme.task-due-date-missing"`
 //! stays as a single literal even though it contains dots), the parsed
 //! value as `Option<&value::Value>` (`None` in the rare case lookup can't
 //! resolve — out-of-bounds array index, path through a non-table
-//! intermediate), the source file, and the 1-indexed line number.
+//! intermediate), the source file, and the 1-indexed line number
+//! (`Some` on a best-effort match in TOML sources; always `None` for
+//! YAML/JSON and non-file sources).
 //!
 //! # Runtime-defined schemas
 //!
@@ -399,7 +468,7 @@
 //! typed `C` while `Clapfig::runtime(schema).load()` returns a value
 //! [`Map`](value::Map).
 //!
-//! `LeafType` covers TOML primitives + array + map, plus
+//! `LeafType` covers the value model's primitives + array + map, plus
 //! `Enum { values }` for constrained value sets (log levels, output
 //! formats, modes). The schema is consumed by every surface with no extra
 //! wiring: `config gen` emits a commented template with allowed-value
@@ -439,8 +508,8 @@
 //! and mixed forms all resolve to the same `pool_size` field.
 //!
 //! Strict-mode validation still flags genuine unknown keys; the error
-//! message reports the normalized form, but the line-number snippet still
-//! points at the user's original line.
+//! message reports the normalized form, but the line-number snippet (TOML
+//! sources) still points at the user's original line.
 //!
 //! Generated templates ([`ConfigAction::Gen`]) also follow the normalized
 //! presentation: with `.normalize_keys(true)` on, `config gen` emits keys
@@ -564,14 +633,20 @@
 //!
 //! # Template generation
 //!
-//! `config gen` (or [`ConfigAction::Gen`]) produces a commented TOML file
-//! derived from the struct's `///` doc comments and `#[clapfig(default)]`
-//! values. The template stays in sync with code — change a doc comment or a
-//! default, the template reflects it. Enum-typed fields get an
-//! `# Allowed: "a" | "b" | "c"` line; required fields without a default get
-//! a commented `#key = <placeholder>` hint. When `config set` creates a new
-//! file, it seeds it from this template so the user gets a documented
-//! starting point.
+//! `config gen` (or [`ConfigAction::Gen`]) produces a documented config
+//! file derived from the struct's `///` doc comments and
+//! `#[clapfig(default)]` values, rendered in the preferred format (or, with
+//! an output path, the format the path's extension selects). The template
+//! stays in sync with code — change a doc comment or a default, the
+//! template reflects it. Enum-typed fields get an
+//! `Allowed: "a" | "b" | "c"` line; required fields without a default get a
+//! commented placeholder hint. TOML and YAML carry docs as native comments;
+//! JSON carries them as `"//"` comment keys (ADR-0002's convention: at most
+//! one `"//"` per object, suffixed `"//field"` keys per field, arrays of
+//! strings for multi-line prose), which the JSON adapter strips at parse
+//! time so a generated template passes strict validation as-is. When
+//! `config set` creates a new file, it seeds it from this template so the
+//! user gets a documented starting point.
 //!
 //! # Metadata accessors
 //!
@@ -613,9 +688,13 @@
 //!
 //! - **Comment preservation**: edits go through the format adapter's
 //!   comment-preserving editor, so users won't lose their annotations.
-//!   Lossless for TOML; in JSON, comments are `"//"`-keyed data
-//!   (ADR-0002) and survive edits for free, though formatting is
-//!   normalized (pretty-printed, document key order preserved).
+//!   Lossless for TOML (`toml_edit`); in JSON, comments are `"//"`-keyed
+//!   data (ADR-0002) and survive edits for free, though formatting is
+//!   normalized (pretty-printed, document key order preserved); YAML edits
+//!   are targeted span patches, byte-preserving outside the edited span,
+//!   and the shapes the patch stack cannot rewrite honestly (sequence-item
+//!   replacement, flow-style list append) refuse with the typed
+//!   [`format::UnsupportedByFormat`] error instead of corrupting the file.
 //! - **Seeded files**: if the target file doesn't exist, a new one is created
 //!   from the generated template, so the user gets doc comments for every
 //!   field out of the box.
@@ -630,9 +709,10 @@
 //! # Error handling
 //!
 //! All fallible operations return [`ClapfigError`]. Errors are designed to
-//! be user-facing: unknown keys include file paths and line numbers, unknown
-//! scopes list the available ones, and missing prerequisites reference the
-//! builder method to call. See the [`error`] module for the full set.
+//! be user-facing: unknown keys include file paths (and, for TOML sources,
+//! line numbers), unknown scopes list the available ones, and missing
+//! prerequisites reference the builder method to call. See the [`error`]
+//! module for the full set.
 
 pub mod error;
 pub mod format;
