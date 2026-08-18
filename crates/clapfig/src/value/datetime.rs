@@ -4,7 +4,13 @@
 //! Configuration datetimes follow the TOML baseline (ADR-0001): four forms —
 //! offset date-time, local date-time, local date, local time — with
 //! parse/display only. No timezone arithmetic, no calendar math: the type is
-//! a validated lexical value, exactly what a config file can spell.
+//! a lexical value, exactly what a config file can spell, validated at
+//! parse time ([`FromStr`](std::str::FromStr) enforces ranges, leap rules,
+//! and offsets). The component fields are public (they are `toml_datetime`'s
+//! fields), so safe code *can* assemble a non-grammatical value; clapfig
+//! follows the toml ecosystem's contract for those — a serialize error or a
+//! non-grammatical spelling in output, never a panic (the adapters convert
+//! by identity or [`Display`](std::fmt::Display), no reparse).
 //!
 //! The types are `toml_datetime`'s, re-exported. `toml_datetime` is a
 //! standalone type crate, not a format crate, so this does not violate

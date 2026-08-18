@@ -952,6 +952,29 @@ mod tests {
     }
 
     #[test]
+    fn serialize_hand_constructed_invalid_datetime_never_panics() {
+        // `Datetime`'s component fields are public (`toml_datetime`'s
+        // types); a hand-assembled non-grammatical value serializes as
+        // its `Display` string — garbage in, garbage out, never a panic.
+        use crate::value::{Date, Datetime};
+        let mut map = Map::new();
+        map.insert(
+            "stamp".into(),
+            Value::Datetime(Datetime {
+                date: Some(Date {
+                    year: 1979,
+                    month: 13,
+                    day: 1,
+                }),
+                time: None,
+                offset: None,
+            }),
+        );
+        let text = JsonAdapter.serialize(&Value::Map(map)).unwrap();
+        assert!(text.contains(r#""stamp": "1979-13-01""#), "{text}");
+    }
+
+    #[test]
     fn serialize_non_finite_float_is_typed_error_naming_path() {
         let mut inner = Map::new();
         inner.insert("rate".into(), Value::Float(f64::INFINITY));

@@ -1153,6 +1153,29 @@ mod tests {
         assert_eq!(text, "when: 1979-05-27T07:32:00Z\n");
     }
 
+    #[test]
+    fn serialize_hand_constructed_invalid_datetime_never_panics() {
+        // `Datetime`'s component fields are public (`toml_datetime`'s
+        // types); a hand-assembled non-grammatical value serializes as
+        // its `Display` string — garbage in, garbage out, never a panic.
+        use crate::value::{Date, Datetime};
+        let mut map = Map::new();
+        map.insert(
+            "when".into(),
+            Value::Datetime(Datetime {
+                date: Some(Date {
+                    year: 1979,
+                    month: 13,
+                    day: 1,
+                }),
+                time: None,
+                offset: None,
+            }),
+        );
+        let text = YamlAdapter.serialize(&Value::Map(map)).unwrap();
+        assert_eq!(text, "when: 1979-13-01\n");
+    }
+
     // --- template ---
 
     #[test]

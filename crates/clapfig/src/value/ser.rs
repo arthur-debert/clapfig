@@ -78,6 +78,13 @@ impl SerializeError {
     fn is_none(&self) -> bool {
         self.kind == ErrorKind::UnsupportedNone
     }
+
+    /// Whether this error came from the serialized type's own `Serialize`
+    /// impl calling [`ser::Error::custom`]. [`string_only`] passes these
+    /// through instead of collapsing them into its caller's error kind.
+    fn is_custom(&self) -> bool {
+        matches!(self.kind, ErrorKind::Custom(_))
+    }
 }
 
 impl ser::Error for SerializeError {
@@ -529,13 +536,18 @@ impl ser::SerializeStructVariant for SerializeStructVariant {
 /// Serialize `value` and require the result to be a string — the shared
 /// stance for map keys (the baseline requires string keys; a non-string
 /// key is `kind`'s error, never stringified) and for pulling the display
-/// string out of the datetime marker struct.
+/// string out of the datetime marker struct. An error the type's own
+/// `Serialize` impl raised via `Error::custom` passes through unchanged —
+/// it names the actual failure, which `kind`'s generic message would hide;
+/// every other outcome (non-string value, unsupported shape) collapses
+/// into `kind`.
 fn string_only<T>(value: &T, kind: ErrorKind) -> Result<String, SerializeError>
 where
     T: Serialize + ?Sized,
 {
     match value.serialize(ValueSerializer) {
         Ok(Value::String(s)) => Ok(s),
+        Err(e) if e.is_custom() => Err(e),
         _ => Err(SerializeError::new(kind)),
     }
 }
@@ -627,5 +639,30 @@ mod tests {
         let mut m = std::collections::BTreeMap::new();
         m.insert(1i64, "x");
         assert!(to_value(&m).is_err());
+    }
+
+    #[test]
+    fn custom_key_serializer_error_surfaces_instead_of_non_string_key() {
+        // A key type whose own `Serialize` impl fails with `Error::custom`
+        // names the actual failure; collapsing it into the generic "map
+        // keys must be strings" would hide it.
+        struct Loud;
+        impl Serialize for Loud {
+            fn serialize<S: ser::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(ser::Error::custom("boom: key exploded"))
+            }
+        }
+        struct OneEntry;
+        impl Serialize for OneEntry {
+            fn serialize<S: ser::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                use ser::SerializeMap;
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_key(&Loud)?;
+                m.serialize_value(&1i64)?;
+                m.end()
+            }
+        }
+        let err = to_value(OneEntry).unwrap_err();
+        assert!(err.to_string().contains("boom: key exploded"), "{err}");
     }
 }
