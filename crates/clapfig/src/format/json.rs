@@ -98,7 +98,12 @@ impl FormatAdapter for JsonAdapter {
     }
 
     fn display_entry(&self, key: &str, value: &str) -> String {
-        format!("\"{key}\": {value}")
+        // Encode the key as a JSON string rather than wrapping it in
+        // literal quotes: runtime-schema key names may contain quotes,
+        // backslashes, or control characters, and hand-rolled quoting
+        // would render them misleadingly.
+        let encoded = serde_json::to_string(key).expect("serializing a string to JSON cannot fail");
+        format!("{encoded}: {value}")
     }
 
     fn display_comment(&self, line: &str) -> String {
@@ -659,6 +664,21 @@ fn placeholder_value(ty: &LeafType) -> Json {
 mod tests {
     use super::super::SetTarget;
     use super::*;
+
+    // --- display spelling ------------------------------------------------
+
+    #[test]
+    fn display_entry_json_escapes_the_key() {
+        // The ordinary dotted path renders as before…
+        assert_eq!(
+            JsonAdapter.display_entry("server.host", "localhost"),
+            r#""server.host": localhost"#
+        );
+        // …and a runtime-schema key with JSON-special characters is
+        // escaped, not interpolated between bare quotes.
+        assert_eq!(JsonAdapter.display_entry(r#"a"b"#, "1"), r#""a\"b": 1"#);
+        assert_eq!(JsonAdapter.display_entry(r"a\b", "1"), r#""a\\b": 1"#);
+    }
 
     // --- capabilities ----------------------------------------------------
 

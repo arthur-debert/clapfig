@@ -81,7 +81,16 @@ impl FormatAdapter for YamlAdapter {
     }
 
     fn display_entry(&self, key: &str, value: &str) -> String {
-        format!("{key}: {value}")
+        // Spell the key through YAML's own scalar rules: a plain dotted
+        // path stays bare, but runtime-schema key names that YAML cannot
+        // carry as a plain scalar (embedded `: `, `#`, quotes, leading
+        // indicators…) come out quoted/escaped instead of rendering a
+        // misleading line.
+        let encoded = serde_norway::to_string(key)
+            .expect("serializing a string to YAML cannot fail")
+            .trim_end()
+            .to_string();
+        format!("{encoded}: {value}")
     }
 
     fn parse(&self, text: &str) -> Result<Value, FormatError> {
@@ -913,6 +922,29 @@ fn json_escaped(s: &str) -> String {
 mod tests {
     use super::super::SetTarget;
     use super::*;
+
+    // --- display spelling ------------------------------------------------
+
+    #[test]
+    fn display_entry_yaml_quotes_non_plain_keys() {
+        // The ordinary dotted path stays a bare plain scalar…
+        assert_eq!(
+            YamlAdapter.display_entry("server.host", "localhost"),
+            "server.host: localhost"
+        );
+        // …and a key YAML cannot carry as a plain scalar comes out in
+        // the encoder's quoted spelling: the rendered key half must
+        // round-trip back to the original name.
+        for key in ["a: b", "a # b", "'a'", "\"a\"", "- a"] {
+            let rendered = YamlAdapter.display_entry(key, "1");
+            let encoded = rendered
+                .strip_suffix(": 1")
+                .unwrap_or_else(|| panic!("no value half in {rendered:?}"));
+            let round_tripped: String =
+                serde_norway::from_str(encoded).expect("encoded key must parse as one scalar");
+            assert_eq!(round_tripped, key, "key {key:?} rendered as {rendered:?}");
+        }
+    }
 
     fn parse_map(text: &str) -> Map {
         match YamlAdapter.parse(text).expect("fixture must parse") {

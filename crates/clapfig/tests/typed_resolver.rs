@@ -13,6 +13,7 @@
 use clapfig::{Boundary, Clapfig, ClapfigError, Schema, SearchPath, UnknownKeyDecision};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
 #[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
@@ -97,6 +98,125 @@ fn typed_resolver_runs_typed_post_validate_on_every_resolve() {
     match err {
         ClapfigError::PostValidationFailed(msg) => assert!(msg.contains("drafts"), "{msg}"),
         other => panic!("expected PostValidationFailed, got {other:?}"),
+    }
+}
+
+/// A config whose hand-written `Deserialize` is deliberately
+/// non-idempotent: each construction stamps a distinct `#N` suffix onto
+/// `layout` (and counts itself), so two deserializations of the same
+/// merged map produce distinguishable values.
+#[derive(Schema, Serialize, Debug)]
+struct StampedConfig {
+    /// Page layout name.
+    #[clapfig(default = "default")]
+    layout: String,
+}
+
+static STAMP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+impl<'de> Deserialize<'de> for StampedConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            layout: String,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let serial = STAMP_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(StampedConfig {
+            layout: format!("{}#{serial}", raw.layout),
+        })
+    }
+}
+
+#[test]
+fn typed_resolve_deserializes_once_and_validates_the_returned_instance() {
+    let root = content_tree();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen_by_hook = std::sync::Arc::clone(&seen);
+    let resolver = Clapfig::typed::<StampedConfig>()
+        .app_name("site")
+        .file_name("site.toml")
+        .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".marker"))])
+        .no_env()
+        .post_validate(move |c: &StampedConfig| {
+            seen_by_hook.lock().unwrap().push(c.layout.clone());
+            Ok(())
+        })
+        .build_resolver()
+        .unwrap();
+
+    let before = STAMP_COUNT.load(Ordering::SeqCst);
+    let resolved = resolver.resolve_at(root.path()).unwrap();
+    assert_eq!(
+        STAMP_COUNT.load(Ordering::SeqCst),
+        before + 1,
+        "one resolve_at must deserialize exactly once, hook registered or not"
+    );
+    // The instance the hook validated IS the instance the call returned.
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        std::slice::from_ref(&resolved.layout)
+    );
+
+    // Same guarantees on the unknowns-returning variant.
+    let (resolved, _unknowns) = resolver.resolve_at_with_unknowns(root.path()).unwrap();
+    assert_eq!(STAMP_COUNT.load(Ordering::SeqCst), before + 2);
+    assert_eq!(seen.lock().unwrap().last(), Some(&resolved.layout));
+}
+
+/// A config whose `Deserialize` rejects one specific value, so a merged
+/// map can resolve fine and still fail the typed deserialize step.
+#[derive(Schema, Serialize, Debug)]
+struct PickyConfig {
+    /// Page layout name.
+    #[clapfig(default = "default")]
+    layout: String,
+}
+
+impl<'de> Deserialize<'de> for PickyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            layout: String,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.layout == "forbidden" {
+            return Err(serde::de::Error::custom("layout \"forbidden\" is refused"));
+        }
+        Ok(PickyConfig { layout: raw.layout })
+    }
+}
+
+#[test]
+fn typed_deserialize_failure_stays_invalid_value_with_hook_registered() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("site.toml"), "layout = \"forbidden\"\n").unwrap();
+
+    let err = Clapfig::typed::<PickyConfig>()
+        .app_name("site")
+        .file_name("site.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .post_validate(|_: &PickyConfig| Ok(()))
+        .build_resolver()
+        .unwrap()
+        .resolve_at(dir.path())
+        .unwrap_err();
+
+    // An ordinary typed-deserialize failure keeps its InvalidValue shape
+    // even when a (passing) post_validate hook is registered — it must
+    // not be laundered into PostValidationFailed by the hook plumbing.
+    match err {
+        ClapfigError::InvalidValue { reason, .. } => {
+            assert!(reason.contains("forbidden"), "{reason}")
+        }
+        other => panic!("expected InvalidValue, got {other:?}"),
     }
 }
 

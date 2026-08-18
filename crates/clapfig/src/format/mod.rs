@@ -407,10 +407,14 @@ pub trait FormatAdapter: Send + Sync {
     /// Spell one resolved `config get`/`config list` entry line in this
     /// format's assignment syntax. `key` is the flat dotted display path
     /// and `value` the value model's plain rendering — human-oriented CLI
-    /// output, not a parseable document fragment (strings stay unquoted,
-    /// dotted keys stay flat). Infallible presentation, so it is not an
-    /// [`Operation`] row. The default is the TOML-baseline spelling
-    /// (`key = value`); formats whose assignment syntax differs override.
+    /// output, not a parseable document fragment (string values stay
+    /// unquoted, dotted keys stay flat). Infallible presentation, so it
+    /// is not an [`Operation`] row. The default is the TOML-baseline
+    /// spelling (`key = value`); formats whose assignment syntax differs
+    /// override, and overrides that quote the key (JSON) or promise a
+    /// scalar spelling (YAML) escape it through their own encoder so a
+    /// runtime-schema key with special characters cannot render a
+    /// misleading line.
     fn display_entry(&self, key: &str, value: &str) -> String {
         format!("{key} = {value}")
     }

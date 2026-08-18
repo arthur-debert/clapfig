@@ -7,13 +7,15 @@
 //! view of the macro-emitted `SchemaStatic`, shared clone-free). Every
 //! method forwards through to the Map-out builder so both paths share
 //! one resolve pipeline. The only added work is the final `Map → C`
-//! deserialize step — on `load()` and on every
-//! [`TypedResolver::resolve_at`] (through the value model's serde
-//! bridge) — and the typed `post_validate(&C)` hook.
+//! deserialize step — exactly one per `load()` and per
+//! [`TypedResolver::resolve_at`] call (through the value model's serde
+//! bridge) — and the typed `post_validate(&C)` hook, which runs on that
+//! same deserialized instance.
 //!
 //! [`runtime::Schema`]: crate::runtime::Schema
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -35,7 +37,23 @@ use crate::value::{Map, Value, from_value};
 /// [`TypedResolver<C>`] whose `resolve_at` yields a typed `C` per call.
 pub struct TypedBuilder<C: Schema> {
     inner: Builder,
+    post_validate: Option<TypedHook<C>>,
     _phantom: PhantomData<fn() -> C>,
+}
+
+/// The typed post-validate callback, shared between [`TypedBuilder`] and
+/// the [`TypedResolver`] it builds.
+type TypedHook<C> = Arc<dyn Fn(&C) -> Result<(), String> + Send + Sync>;
+
+/// Run the typed hook, if any, mapping a rejection to
+/// [`ClapfigError::PostValidationFailed`]. Only the callback's rejection
+/// takes that shape — a typed-deserialize failure stays
+/// [`ClapfigError::InvalidValue`] (see [`deserialize_table`]).
+fn run_typed_hook<C>(hook: Option<&TypedHook<C>>, typed: &C) -> Result<(), ClapfigError> {
+    match hook {
+        Some(f) => f(typed).map_err(ClapfigError::PostValidationFailed),
+        None => Ok(()),
+    }
 }
 
 impl<C: Schema> TypedBuilder<C> {
@@ -45,6 +63,7 @@ impl<C: Schema> TypedBuilder<C> {
         // construction instead of a full schema-tree clone.
         Self {
             inner: Builder::from_arc(C::schema_arc()),
+            post_validate: None,
             _phantom: PhantomData,
         }
     }
@@ -187,26 +206,35 @@ impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
     /// Post-merge validation hook. Receives the typed `&C`.
     ///
     /// Conceptually the same as
-    /// [`Builder::post_validate`](crate::Builder::post_validate)
-    /// — internally we deserialize the merged value [`Map`] into `C`
-    /// inside the Map-out builder's hook so the user's closure stays
-    /// typed.
+    /// [`Builder::post_validate`](crate::Builder::post_validate), and like
+    /// it, calling this method more than once replaces the previous hook.
+    /// On the typed surfaces ([`load`](Self::load) and
+    /// [`TypedResolver::resolve_at`]) the hook runs on the exact `C`
+    /// instance the call returns — the merged [`Map`] is deserialized
+    /// once, validated, and handed back, so a non-idempotent
+    /// `Deserialize` impl cannot make the validated and returned values
+    /// diverge. Only the hook's rejection becomes
+    /// [`ClapfigError::PostValidationFailed`]; a typed-deserialize
+    /// failure stays [`ClapfigError::InvalidValue`], hook or no hook. The
+    /// Map-out [`handle`](Self::handle) surface instead bridges the hook
+    /// into the inner builder (deserializing a throwaway `C` to run it),
+    /// since no typed value is returned there.
     pub fn post_validate<F>(mut self, f: F) -> Self
     where
         F: Fn(&C) -> Result<(), String> + Send + Sync + 'static,
     {
-        self.inner = self.inner.post_validate(move |t: &Map| {
-            let typed: C = from_value(Value::Map(t.clone())).map_err(|e| e.to_string())?;
-            f(&typed)
-        });
+        self.post_validate = Some(Arc::new(f));
         self
     }
 
     /// Load and resolve the configuration through all layers, returning a
-    /// typed `C`.
+    /// typed `C`. Any [`post_validate`](Self::post_validate) hook runs on
+    /// the returned instance.
     pub fn load(self) -> Result<C, ClapfigError> {
         let table = self.inner.load()?;
-        deserialize_table::<C>(table)
+        let typed = deserialize_table::<C>(table)?;
+        run_typed_hook(self.post_validate.as_ref(), &typed)?;
+        Ok(typed)
     }
 
     /// Same as [`load`](Self::load) but also returns any keys the
@@ -218,6 +246,7 @@ impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
     ) -> Result<(C, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
         let (table, unknowns) = self.inner.load_with_unknowns()?;
         let typed = deserialize_table::<C>(table)?;
+        run_typed_hook(self.post_validate.as_ref(), &typed)?;
         Ok((typed, unknowns))
     }
 
@@ -229,9 +258,10 @@ impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
     /// [`SearchPath::Ancestors`] anchoring, and file caching are the
     /// Map-out resolver's (this wraps one); each
     /// [`resolve_at`](TypedResolver::resolve_at) call additionally
-    /// deserializes the merged [`Map`] into a typed `C`. Any typed
+    /// deserializes the merged [`Map`] into a typed `C` — once. Any typed
     /// [`post_validate`](Self::post_validate) hook registered on this
-    /// builder fires on every `resolve_at` call. See the
+    /// builder moves onto the returned resolver and fires on every
+    /// `resolve_at` call, against the instance that call returns. See the
     /// [crate-level "Tree-walk resolution" section](crate#tree-walk-resolution--the-resolver-handle).
     ///
     /// Returns [`ClapfigError::AppNameRequired`] if `.app_name()` was not
@@ -239,6 +269,7 @@ impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
     pub fn build_resolver(self) -> Result<TypedResolver<C>, ClapfigError> {
         Ok(TypedResolver {
             inner: self.inner.build_resolver()?,
+            post_validate: self.post_validate,
             _phantom: PhantomData,
         })
     }
@@ -246,20 +277,50 @@ impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
     /// Dispatch a [`ConfigAction`] and return the rendered output.
     ///
     /// The action surface is identical to the Map-out path —
-    /// `gen | schema | get | list | set | unset` all delegate.
-    pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError> {
-        self.inner.handle(action)
+    /// `gen | schema | get | list | set | unset` all delegate. A typed
+    /// [`post_validate`](Self::post_validate) hook still guards the
+    /// merged `get`/`list` views: it is bridged into the Map-out builder
+    /// (deserializing a `C` to run it) since no typed value is returned
+    /// here.
+    pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError>
+    where
+        C: 'static,
+    {
+        self.into_inner().handle(action)
     }
 
     /// Dispatch a [`ConfigAction`] and print the result.
-    pub fn handle_and_print(self, action: &ConfigAction) -> Result<(), ClapfigError> {
-        self.inner.handle_and_print(action)
+    pub fn handle_and_print(self, action: &ConfigAction) -> Result<(), ClapfigError>
+    where
+        C: 'static,
+    {
+        self.into_inner().handle_and_print(action)
     }
 
     /// Dispatch a [`ConfigAction`] and return the rendered output as a
     /// `String`.
-    pub fn handle_to_string(self, action: &ConfigAction) -> Result<String, ClapfigError> {
-        self.inner.handle_to_string(action)
+    pub fn handle_to_string(self, action: &ConfigAction) -> Result<String, ClapfigError>
+    where
+        C: 'static,
+    {
+        self.into_inner().handle_to_string(action)
+    }
+
+    /// Collapse into the Map-out builder for `handle` dispatch, bridging
+    /// any typed hook into a Map-level one (the merged `get`/`list` views
+    /// resolve through the Map pipeline, which cannot call a typed
+    /// closure directly).
+    fn into_inner(self) -> Builder
+    where
+        C: 'static,
+    {
+        match self.post_validate {
+            Some(f) => self.inner.post_validate(move |t: &Map| {
+                let typed: C = from_value(Value::Map(t.clone())).map_err(|e| e.to_string())?;
+                f(&typed)
+            }),
+            None => self.inner,
+        }
     }
 }
 
@@ -267,21 +328,29 @@ impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
 /// [`Resolver`](crate::Resolver), built by
 /// [`TypedBuilder::build_resolver`].
 ///
-/// Wraps the Map-out resolver, so anchoring semantics, the per-resolver
-/// file cache (including its no-mtime-check contract), and the captured
-/// `post_validate` hook are identical; each call adds only the final
-/// `Map → C` deserialize through the value model's serde bridge.
+/// Wraps the Map-out resolver, so anchoring semantics and the
+/// per-resolver file cache (including its no-mtime-check contract) are
+/// identical; each call adds one final `Map → C` deserialize through the
+/// value model's serde bridge, and then runs the typed
+/// [`post_validate`](TypedBuilder::post_validate) hook (carried on this
+/// resolver, not the wrapped one) on that same instance.
 pub struct TypedResolver<C> {
     inner: Resolver,
+    post_validate: Option<TypedHook<C>>,
     _phantom: PhantomData<fn() -> C>,
 }
 
 impl<C: Schema + DeserializeOwned> TypedResolver<C> {
     /// Resolve the configuration anchored at `start_dir`, returning a
     /// typed `C`. See [`Resolver::resolve_at`](crate::Resolver::resolve_at)
-    /// for the anchoring and caching semantics.
+    /// for the anchoring and caching semantics. The merged [`Map`] is
+    /// deserialized exactly once, and any typed
+    /// [`post_validate`](TypedBuilder::post_validate) hook runs on the
+    /// instance this call returns.
     pub fn resolve_at(&self, start_dir: impl AsRef<std::path::Path>) -> Result<C, ClapfigError> {
-        deserialize_table::<C>(self.inner.resolve_at(start_dir)?)
+        let typed = deserialize_table::<C>(self.inner.resolve_at(start_dir)?)?;
+        run_typed_hook(self.post_validate.as_ref(), &typed)?;
+        Ok(typed)
     }
 
     /// Same as [`resolve_at`](Self::resolve_at) but also returns any keys
@@ -293,7 +362,9 @@ impl<C: Schema + DeserializeOwned> TypedResolver<C> {
         start_dir: impl AsRef<std::path::Path>,
     ) -> Result<(C, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
         let (table, unknowns) = self.inner.resolve_at_with_unknowns(start_dir)?;
-        Ok((deserialize_table::<C>(table)?, unknowns))
+        let typed = deserialize_table::<C>(table)?;
+        run_typed_hook(self.post_validate.as_ref(), &typed)?;
+        Ok((typed, unknowns))
     }
 
     /// Number of files currently held in the wrapped resolver's cache.
