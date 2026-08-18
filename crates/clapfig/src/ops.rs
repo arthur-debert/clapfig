@@ -67,111 +67,44 @@ impl fmt::Display for ConfigResult {
     }
 }
 
-/// Rewrite snake_case keys to kebab-case in a generated config template.
+/// Recursively rewrite every field name in `schema` from snake_case to
+/// kebab-case, at every nesting depth (nested objects, array-of, map-of).
 ///
-/// Walks the template line by line and rewrites:
-/// - `[section]` / `[parent.section]` / `[[array]]` headers
-/// - `key = value` lines
-/// - `#key = value` commented-default lines (single or multi-hash prefix)
-///
-/// Doc-comment lines (a `#` followed by a space or end-of-line) and the
-/// value portion of any line are left untouched. The disambiguation between
-/// a doc comment and a commented-default line is the template convention
-/// used by [`generate_template`]: `# <text>` is documentation,
-/// `#key = ...` (no space after the hashes) is a commented key.
-fn rewrite_keys_to_kebab(template: &str) -> String {
-    let mut out = String::with_capacity(template.len());
-    let ends_with_newline = template.ends_with('\n');
-
-    for (i, line) in template.lines().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str(&rewrite_template_line(line));
-    }
-    if ends_with_newline {
-        out.push('\n');
-    }
-    out
+/// Only field NAMES change: docs, defaults, enum values, and leaf types
+/// pass through untouched, so prose and value text can never be
+/// accidentally rewritten. The renamed clone exists solely for template
+/// rendering — every adapter derives keys, section headers, comment keys,
+/// and assignment snippets from these names, which is what makes the
+/// rename format-agnostic where a textual rewrite could not be.
+fn kebab_renamed(schema: &crate::runtime::Schema) -> crate::runtime::Schema {
+    let mut renamed = schema.clone();
+    kebab_rename_fields(&mut renamed);
+    renamed
 }
 
-fn rewrite_template_line(line: &str) -> String {
-    let indent_len = line.len() - line.trim_start().len();
-    let indent = &line[..indent_len];
-    let stripped = &line[indent_len..];
-
-    // [[array.of.tables]] — must be checked before [section] since the
-    // shorter prefix `[` is a substring of `[[`.
-    if let Some(rest) = stripped.strip_prefix("[[")
-        && let Some(end) = rest.find("]]")
-    {
-        let name = rest[..end].trim();
-        let tail = &rest[end + 2..];
-        return format!("{indent}[[{}]]{tail}", swap_underscores_to_dashes(name));
-    }
-
-    // [section] / [parent.section]
-    if let Some(rest) = stripped.strip_prefix('[')
-        && let Some(end) = rest.find(']')
-    {
-        let name = rest[..end].trim();
-        let tail = &rest[end + 1..];
-        return format!("{indent}[{}]{tail}", swap_underscores_to_dashes(name));
-    }
-
-    // Commented-out key (#key = ...) vs. doc comment (# <text>).
-    let (hashes, body) = if stripped.starts_with('#') {
-        let count = stripped.bytes().take_while(|&b| b == b'#').count();
-        let after = &stripped[count..];
-        // Template convention: hashes + whitespace (or EOL) = doc comment;
-        // hashes + bareword = commented-out default. Only rewrite the latter.
-        if after.is_empty() || after.starts_with(|c: char| c.is_whitespace()) {
-            return line.to_string();
+fn kebab_rename_fields(schema: &mut crate::runtime::Schema) {
+    use crate::runtime::Field;
+    for nf in &mut schema.fields {
+        if nf.name.contains('_') {
+            nf.name = nf.name.replace('_', "-");
         }
-        (&stripped[..count], after)
-    } else {
-        ("", stripped)
-    };
-
-    // Plain or commented "key = value" line.
-    if let Some(eq_idx) = body.find('=') {
-        let key_part = &body[..eq_idx];
-        let key_trimmed = key_part.trim();
-        if is_bareword_dotted_key(key_trimmed) {
-            // Preserve whitespace around the key exactly.
-            let leading_ws_in_key = &key_part[..key_part.len() - key_part.trim_start().len()];
-            let trailing_ws_in_key = &key_part[leading_ws_in_key.len() + key_trimmed.len()..];
-            let rest = &body[eq_idx..];
-            return format!(
-                "{indent}{hashes}{leading_ws_in_key}{}{trailing_ws_in_key}{rest}",
-                swap_underscores_to_dashes(key_trimmed),
-            );
+        match &mut nf.field {
+            Field::Nested(child) | Field::ArrayOf(child) | Field::MapOf(child) => {
+                kebab_rename_fields(child);
+            }
+            Field::Leaf(_) => {}
         }
     }
-
-    line.to_string()
-}
-
-fn is_bareword_dotted_key(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-}
-
-fn swap_underscores_to_dashes(dotted: &str) -> String {
-    if !dotted.contains('_') {
-        return dotted.to_string();
-    }
-    dotted.replace('_', "-")
 }
 
 /// Template generator: renders the documented config template for a
-/// schema through the given format adapter, then optionally applies the
-/// kebab rewriter so the rendered keys match what a
+/// schema through the given format adapter. With `kebab` set, the schema's
+/// field names are structurally renamed to kebab-case first (see
+/// [`kebab_renamed`]) so the rendered keys — in any format — match what a
 /// `normalize_keys(true)` builder accepts.
 ///
-/// The template body — doc comments, `# Allowed:` enum lines,
-/// commented placeholders for defaultless leaves — is the adapter's
+/// The template body — doc comments, `Allowed:` enum lines, commented
+/// placeholders for defaultless leaves — is the adapter's
 /// [`template`](crate::format::FormatAdapter::template) output; this
 /// function is the routing seam every template consumer (`config gen`,
 /// file seeding) goes through.
@@ -180,11 +113,10 @@ pub(crate) fn generate_template(
     schema: &crate::runtime::Schema,
     kebab: bool,
 ) -> Result<String, ClapfigError> {
-    let out = adapter.template(schema)?;
     Ok(if kebab {
-        rewrite_keys_to_kebab(&out)
+        adapter.template(&kebab_renamed(schema))?
     } else {
-        out
+        adapter.template(schema)?
     })
 }
 
@@ -344,70 +276,78 @@ mod tests {
         assert!(!raw.contains("pool-size"));
     }
 
-    // -- rewrite_keys_to_kebab unit tests -----------------------------------
+    // -- kebab rename (structural, format-agnostic) -------------------------
 
     #[test]
-    fn rewriter_handles_section_headers() {
-        let input = "[my_section]\n[parent.my_child]\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert!(out.contains("[my-section]"));
-        assert!(out.contains("[parent.my-child]"));
+    fn kebab_rename_leaves_values_and_prose_alone() {
+        // Only field NAMES are renamed — a string default keeps its
+        // underscores, and doc prose mentioning the snake form survives.
+        use crate::runtime::{Field as RtField, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .field(
+                "db_url",
+                RtField::string()
+                    .doc("Set db_url to a postgres URL.")
+                    .default("postgres://my_user@host"),
+            )
+            .build();
+        let template = generate_template(&TomlAdapter, &schema, true).unwrap();
+        assert!(template.contains("db-url = "), "{template}");
+        assert!(
+            template.contains(r#""postgres://my_user@host""#),
+            "{template}"
+        );
+        assert!(
+            template.contains("Set db_url to a postgres URL."),
+            "{template}"
+        );
     }
 
     #[test]
-    fn rewriter_handles_array_of_tables_headers() {
-        let input = "[[my_list]]\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, "[[my-list]]\n");
+    fn kebab_renames_toml_section_headers_and_commented_defaults() {
+        // Nested objects become renamed [section] headers; a defaultless
+        // leaf's commented placeholder carries the renamed key too.
+        use crate::runtime::{Field as RtField, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .nested(
+                "my_section",
+                RtSchema::object("Section").field("api_key", RtField::string()),
+            )
+            .build();
+        let template = generate_template(&TomlAdapter, &schema, true).unwrap();
+        assert!(template.contains("[my-section]"), "{template}");
+        assert!(template.contains("#api-key"), "{template}");
+        assert!(!template.contains('_'), "no snake leak:\n{template}");
     }
 
     #[test]
-    fn rewriter_handles_commented_default_keys() {
-        let input = "#pool_size = 10\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, "#pool-size = 10\n");
-    }
-
-    #[test]
-    fn rewriter_handles_uncommented_keys() {
-        let input = "pool_size = 10\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, "pool-size = 10\n");
-    }
-
-    #[test]
-    fn rewriter_skips_doc_comments() {
-        // `#` followed by a space is a doc comment in the template
-        // convention — any `_` in prose must survive the rewriter untouched.
-        let input = "# Set pool_size to a positive integer.\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, input);
-    }
-
-    #[test]
-    fn rewriter_leaves_value_underscores_alone() {
-        // Underscores in the value portion (e.g. inside string defaults)
-        // must not be touched — only the key gets rewritten.
-        let input = r#"db_url = "postgres://my_user@host""#.to_string() + "\n";
-        let out = rewrite_keys_to_kebab(&input);
-        assert!(out.contains("db-url = "));
-        assert!(out.contains(r#""postgres://my_user@host""#));
-    }
-
-    #[test]
-    fn rewriter_preserves_blank_lines() {
-        let input = "key_one = 1\n\nkey_two = 2\n";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, "key-one = 1\n\nkey-two = 2\n");
-    }
-
-    #[test]
-    fn rewriter_preserves_trailing_newline_absence() {
-        // If the original lacks a trailing newline, the rewritten output
-        // shouldn't sprout one.
-        let input = "pool_size = 10";
-        let out = rewrite_keys_to_kebab(input);
-        assert_eq!(out, "pool-size = 10");
+    fn kebab_renames_json_template_keys_at_every_depth() {
+        // The rename is structural, so it reaches JSON object keys, the
+        // "//field" comment keys, and the assignment snippet inside a
+        // defaultless field's comment — none of which a TOML-line textual
+        // rewrite could see.
+        use crate::format::json::JsonAdapter;
+        use crate::runtime::{Field as RtField, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .field("api_key", RtField::string().doc("Required API key."))
+            .nested(
+                "my_section",
+                RtSchema::object("Section").field("pool_size", RtField::integer().default(5i64)),
+            )
+            .build();
+        let template = generate_template(&JsonAdapter, &schema, true).unwrap();
+        assert!(template.contains(r#""//api-key""#), "{template}");
+        assert!(
+            template.contains(r#"\"api-key\": \"\""#),
+            "snippet:\n{template}"
+        );
+        assert!(template.contains(r#""my-section""#), "{template}");
+        assert!(template.contains(r#""pool-size": 5"#), "{template}");
+        assert!(!template.contains("api_key"), "no snake leak:\n{template}");
+        assert!(
+            !template.contains("pool_size"),
+            "no snake leak:\n{template}"
+        );
     }
 
     #[test]

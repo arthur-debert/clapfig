@@ -14,9 +14,11 @@
 //!   configuration key.
 //! - [`serialize`](JsonAdapter::serialize): [`Value`] tree → pretty JSON
 //!   text. Non-finite floats have no JSON literal and refuse with a typed
-//!   error naming the offending path; datetimes serialize as strings in
-//!   their TOML lexical form (the schema-driven coercion pass reads them
-//!   back, ADR-0001).
+//!   error naming the offending path; so does a map key in the reserved
+//!   `//` namespace — writing one would produce text the next parse
+//!   silently strips (the same refusal guards template field names and
+//!   edit paths). Datetimes serialize as strings in their TOML lexical
+//!   form (the schema-driven coercion pass reads them back, ADR-0001).
 //! - [`template`](JsonAdapter::template): the documented config template,
 //!   carrying documentation as comment keys — at most one `"//"` per
 //!   object, an array of strings for multi-line prose, and suffixed
@@ -30,11 +32,16 @@
 //!   free. **Formatting is normalized** (pretty-printed, two-space
 //!   indent, trailing newline) — the documented, expected behavior;
 //!   document key order is preserved, so comment keys stay adjacent to
-//!   the fields they document.
+//!   the fields they document, and a newly created key whose `//key`
+//!   comment already exists lands right after that comment.
 //!
 //! Baseline mapping rules applied at parse (ADR-0002's table): `null` is
 //! a typed error naming the key ("absence expresses unset"); an integer
-//! literal outside `i64` is a typed error naming the key. Whitespace-only
+//! literal outside `i64` — on either side, above `i64::MAX` or below
+//! `i64::MIN` — is a typed error naming the key, never a silent float
+//! (`serde_json`'s `arbitrary_precision` keeps the lexical form that
+//! makes the two sides distinguishable from float literals). A float
+//! literal overflowing `f64` is likewise a typed error. Whitespace-only
 //! source parses as the empty map (an empty config file is "no config",
 //! matching TOML's empty document).
 
@@ -164,6 +171,16 @@ fn display_path(segments: &[PathSegment]) -> String {
     }
 }
 
+/// The refusal message for a `//`-prefixed name at an outgoing boundary
+/// (serialize, template emission, edit path): the reserved comment
+/// namespace (ADR-0002) means the next parse would strip such a member
+/// silently, so every writer refuses it typed instead.
+fn reserved_key_message(at: &str) -> String {
+    format!(
+        "key {at} is in the reserved JSON comment namespace: a `//`-prefixed member is comment syntax (ADR-0002) and would be stripped at the next parse — rename the key"
+    )
+}
+
 /// Wrap a `serde_json` syntax error as the typed parse error, translating
 /// its line/column position into a byte [`Span`] so renderers can draw
 /// snippets.
@@ -177,6 +194,11 @@ fn syntax_error(text: &str, error: &serde_json::Error) -> FormatError {
 
 /// Byte span for a one-based line/column position in `text`. Returns
 /// `None` when the position cannot be located (e.g. line 0).
+///
+/// `serde_json` reports the column as a one-based BYTE offset into the
+/// line, so it is used as such — clamped to the line, then snapped to
+/// UTF-8 character boundaries so slicing `text[span.start..span.end]`
+/// can never split a multi-byte character.
 fn span_at(text: &str, line: usize, column: usize) -> Option<Span> {
     if line == 0 {
         return None;
@@ -184,13 +206,15 @@ fn span_at(text: &str, line: usize, column: usize) -> Option<Span> {
     let mut offset = 0usize;
     for (i, line_text) in text.split_inclusive('\n').enumerate() {
         if i + 1 == line {
-            let byte_in_line = line_text
-                .char_indices()
-                .nth(column.saturating_sub(1))
-                .map(|(b, _)| b)
-                .unwrap_or(line_text.len());
-            let start = (offset + byte_in_line).min(text.len());
-            let end = (start + 1).min(text.len()).max(start);
+            let byte_in_line = column.saturating_sub(1).min(line_text.len());
+            let mut start = offset + byte_in_line;
+            while start > offset && !text.is_char_boundary(start) {
+                start -= 1;
+            }
+            let mut end = (start + 1).min(text.len());
+            while end < text.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
             return Some(Span { start, end });
         }
         offset += line_text.len();
@@ -218,19 +242,38 @@ fn json_to_value(json: Json, path: &mut Vec<PathSegment>) -> Result<Value, Forma
         Json::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Value::Integer(i)
-            } else if n.is_u64() {
-                // A u64 that did not fit i64: an integer literal outside
-                // the value model's range, never a silent float.
-                return Err(FormatError::Parse {
-                    format: FORMAT,
-                    message: format!(
-                        "integer {n} at {} is out of range: the value model's integers are 64-bit signed (i64)",
-                        display_path(path)
-                    ),
-                    span: None,
-                });
             } else {
-                Value::Float(n.as_f64().expect("serde_json numbers are i64, u64, or f64"))
+                // `arbitrary_precision` keeps the number's lexical form, so
+                // an integer literal (no fraction, no exponent) that did
+                // not fit i64 is detectable on BOTH sides of the range —
+                // above i64::MAX and below i64::MIN alike — and is a typed
+                // error, never a silent float.
+                let lexeme = n.as_str();
+                if !lexeme.contains(['.', 'e', 'E']) {
+                    return Err(FormatError::Parse {
+                        format: FORMAT,
+                        message: format!(
+                            "integer {lexeme} at {} is out of range: the value model's integers are 64-bit signed (i64)",
+                            display_path(path)
+                        ),
+                        span: None,
+                    });
+                }
+                match n.as_f64() {
+                    Some(f) if f.is_finite() => Value::Float(f),
+                    // A float literal whose magnitude overflows f64
+                    // (e.g. 1e999): out of range, not silently infinity.
+                    _ => {
+                        return Err(FormatError::Parse {
+                            format: FORMAT,
+                            message: format!(
+                                "float {lexeme} at {} is out of range: the value model's floats are 64-bit (f64)",
+                                display_path(path)
+                            ),
+                            span: None,
+                        });
+                    }
+                }
             }
         }
         Json::String(s) => Value::String(s),
@@ -300,6 +343,16 @@ fn value_to_json(value: &Value, path: &mut Vec<PathSegment>) -> Result<Json, For
             let mut out = JsonMap::new();
             for (key, entry) in map {
                 path.push(PathSegment::Key(key.clone()));
+                // The reserved comment namespace cuts both ways: a
+                // `//`-prefixed key written here would be stripped as a
+                // comment at the next parse — refuse loudly instead of
+                // producing text this same adapter silently discards.
+                if key.starts_with(COMMENT_PREFIX) {
+                    return Err(FormatError::Serialize {
+                        format: FORMAT,
+                        message: reserved_key_message(&display_path(path)),
+                    });
+                }
                 let converted = value_to_json(entry, path)?;
                 path.pop();
                 out.insert(key.clone(), converted);
@@ -314,11 +367,17 @@ fn value_to_json(value: &Value, path: &mut Vec<PathSegment>) -> Result<Json, For
 /// Extract the key segments of a [`ConfigPath`], refusing array-index
 /// segments — the JSON edit path addresses map keys only, mirroring the
 /// TOML adapter (no current call site produces indexed edits; the honest
-/// answer until one exists is the typed refusal).
+/// answer until one exists is the typed refusal) — and refusing
+/// `//`-prefixed segments, which live in the reserved comment namespace
+/// and can never address a configuration key.
 fn key_segments(path: &ConfigPath, operation: Operation) -> Result<Vec<&str>, FormatError> {
     path.segments()
         .iter()
         .map(|seg| match seg {
+            PathSegment::Key(k) if k.starts_with(COMMENT_PREFIX) => Err(FormatError::Edit {
+                format: FORMAT,
+                message: reserved_key_message(&format!("'{k}'")),
+            }),
             PathSegment::Key(k) => Ok(k.as_str()),
             PathSegment::Index(_) => Err(FormatError::Unsupported(UnsupportedByFormat {
                 format: FORMAT,
@@ -368,8 +427,30 @@ fn write_at_path(doc: &mut Json, keys: &[&str], value: Json) -> Result<(), Forma
             ),
         });
     };
-    obj.insert(leaf.to_string(), value);
+    insert_adjacent_to_comment(obj, leaf, value);
     Ok(())
+}
+
+/// Insert `leaf` into `obj`, keeping comment keys adjacent to the fields
+/// they document: replacing an existing member keeps its position
+/// (`preserve_order`), and a NEW member whose `"//leaf"` comment already
+/// exists (a generated template documents defaultless fields this way)
+/// lands immediately after that comment instead of at the end of the
+/// object. Without a comment, a new member appends.
+fn insert_adjacent_to_comment(obj: &mut JsonMap<String, Json>, leaf: &str, value: Json) {
+    let comment = comment_key(leaf);
+    if !obj.contains_key(leaf) && obj.contains_key(&comment) {
+        let mut pending = Some(value);
+        for (key, entry) in std::mem::take(obj) {
+            let is_comment = key == comment;
+            obj.insert(key, entry);
+            if is_comment && let Some(v) = pending.take() {
+                obj.insert(leaf.to_string(), v);
+            }
+        }
+    } else {
+        obj.insert(leaf.to_string(), value);
+    }
 }
 
 /// Remove the key at `keys`. A missing parent or leaf is a no-op — the
@@ -403,6 +484,15 @@ fn template_object(schema: &Schema) -> Result<JsonMap<String, Json>, FormatError
         obj.insert(COMMENT_PREFIX.into(), comment_value(doc_lines(&schema.doc)));
     }
     for nf in &schema.fields {
+        // A `//`-prefixed schema field name would render as a comment key
+        // and vanish at the next parse — refuse it here, where the name
+        // first meets JSON text.
+        if nf.name.starts_with(COMMENT_PREFIX) {
+            return Err(FormatError::Serialize {
+                format: FORMAT,
+                message: reserved_key_message(&format!("'{}'", nf.name)),
+            });
+        }
         match &nf.field {
             Field::Leaf(leaf) => {
                 let mut lines = doc_lines(&leaf.doc);
@@ -481,6 +571,14 @@ fn example_object(
 ) -> Result<JsonMap<String, Json>, FormatError> {
     let mut obj = JsonMap::new();
     for nf in &schema.fields {
+        // Same reserved-namespace refusal as `template_object`: an example
+        // entry's `//`-prefixed field would read as a comment.
+        if nf.name.starts_with(COMMENT_PREFIX) {
+            return Err(FormatError::Serialize {
+                format: FORMAT,
+                message: reserved_key_message(&format!("'{}'", nf.name)),
+            });
+        }
         let value = match &nf.field {
             Field::Leaf(leaf) => match &leaf.default {
                 Some(default) => {
@@ -752,6 +850,66 @@ mod tests {
     }
 
     #[test]
+    fn parse_integer_below_i64_is_typed_error_naming_key() {
+        // i64::MIN - 1 — the negative side of the range check. Without the
+        // lexical form this would silently coerce to a float.
+        let err = JsonAdapter
+            .parse(r#"{"low": -9223372036854775809}"#)
+            .unwrap_err();
+        match err {
+            FormatError::Parse { message, .. } => {
+                assert!(message.contains("'low'"), "names the key: {message}");
+                assert!(message.contains("out of range"), "{message}");
+                assert!(message.contains("-9223372036854775809"), "{message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_integer_above_u64_is_typed_error_naming_key() {
+        // u64::MAX + 1 — beyond even serde_json's u64 fallback, still an
+        // integer literal, still a typed error.
+        let err = JsonAdapter
+            .parse(r#"{"big": 18446744073709551616}"#)
+            .unwrap_err();
+        assert!(err.detail().contains("'big'"), "{}", err.detail());
+        assert!(err.detail().contains("out of range"), "{}", err.detail());
+    }
+
+    #[test]
+    fn parse_float_overflowing_f64_is_typed_error() {
+        // A float literal too large for f64 must not become infinity.
+        let err = JsonAdapter.parse(r#"{"huge": 1e999}"#).unwrap_err();
+        assert!(err.detail().contains("'huge'"), "{}", err.detail());
+        assert!(err.detail().contains("out of range"), "{}", err.detail());
+    }
+
+    #[test]
+    fn edit_preserves_out_of_range_literals_in_untouched_keys() {
+        // The edit path works on raw JSON text; a number the value model
+        // rejects at parse must survive an unrelated edit verbatim (the
+        // load gate still refuses the document) — never re-rendered as a
+        // lossy float.
+        let source = r#"{"big": 18446744073709551616, "low": -9223372036854775809, "port": 1}"#;
+        let path = ConfigPath::new().key("port");
+        let value = Value::Integer(2);
+        let out = JsonAdapter
+            .edit(
+                source,
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::ExistingValue,
+                },
+            )
+            .unwrap();
+        assert!(out.contains("18446744073709551616"), "{out}");
+        assert!(out.contains("-9223372036854775809"), "{out}");
+        assert!(out.contains(r#""port": 2"#), "{out}");
+    }
+
+    #[test]
     fn parse_syntax_error_carries_message_and_span() {
         let source = "{\"key\": }";
         let err = JsonAdapter.parse(source).unwrap_err();
@@ -768,6 +926,20 @@ mod tests {
             }
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_syntax_error_span_is_byte_accurate_after_multibyte_chars() {
+        // serde_json's column is a byte offset; with a multi-byte char
+        // earlier on the line the span must still land on the offending
+        // token, on valid char boundaries (slicing must not panic).
+        let source = "{\"héllo\": }";
+        let err = JsonAdapter.parse(source).unwrap_err();
+        let FormatError::Parse { span, .. } = err else {
+            panic!("expected Parse");
+        };
+        let span = span.expect("syntax errors carry a span");
+        assert_eq!(&source[span.start..span.end], "}", "span: {span:?}");
     }
 
     // --- serialize --------------------------------------------------------
@@ -817,6 +989,70 @@ mod tests {
         map.insert("xs".into(), Value::Array(vec![Value::Float(f64::NAN)]));
         let err = JsonAdapter.serialize(&Value::Map(map)).unwrap_err();
         assert!(err.detail().contains("'xs[0]'"), "{}", err.detail());
+    }
+
+    #[test]
+    fn serialize_reserved_comment_key_is_typed_error_naming_path() {
+        // Parse strips every //-prefixed member, so writing one would
+        // produce data this same adapter silently deletes on the next
+        // read — the round trip must refuse instead.
+        let mut inner = Map::new();
+        inner.insert("//secret".into(), Value::String("x".into()));
+        let mut map = Map::new();
+        map.insert("db".into(), Value::Map(inner));
+        let err = JsonAdapter.serialize(&Value::Map(map)).unwrap_err();
+        match err {
+            FormatError::Serialize { format, message } => {
+                assert_eq!(format, "json");
+                // ConfigPath quotes non-bareword segments in its dotted
+                // rendering.
+                assert!(
+                    message.contains(r#"'db."//secret"'"#),
+                    "names the path: {message}"
+                );
+                assert!(message.contains("reserved"), "{message}");
+            }
+            other => panic!("expected Serialize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_set_reserved_comment_path_is_typed_error() {
+        // The same refusal at the edit boundary: a //-prefixed path
+        // segment can never address a configuration key.
+        let path = ConfigPath::new().key("//notes");
+        let value = Value::from("x");
+        let err = JsonAdapter
+            .edit(
+                "{}",
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap_err();
+        match err {
+            FormatError::Edit { message, .. } => {
+                assert!(message.contains("reserved"), "{message}");
+                assert!(message.contains("//notes"), "{message}");
+            }
+            other => panic!("expected Edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn template_reserved_comment_field_name_is_typed_error() {
+        // A runtime schema may carry any field name; one in the reserved
+        // //-namespace would render as a comment and vanish at the next
+        // parse, so template emission refuses it.
+        use crate::runtime::{Field, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .field("//weird", Field::string().default("x"))
+            .build();
+        let err = JsonAdapter.template(&schema).unwrap_err();
+        assert!(err.detail().contains("reserved"), "{}", err.detail());
+        assert!(err.detail().contains("//weird"), "{}", err.detail());
     }
 
     // --- template ---------------------------------------------------------
@@ -987,6 +1223,61 @@ mod tests {
         let map = tree.as_map().unwrap();
         assert_eq!(map.keys().map(String::as_str).collect::<Vec<_>>(), ["port"]);
         assert_eq!(map["port"], Value::Integer(2));
+    }
+
+    #[test]
+    fn edit_set_created_key_lands_adjacent_to_its_comment() {
+        // A generated template documents a defaultless field as a
+        // "//field" comment with no real key. Setting that field must
+        // place the new member right after its comment — not at the end
+        // of the object, where the documentation would be orphaned.
+        let source = concat!(
+            "{\n",
+            "  \"//name\": [\"Required name.\", \"\\\"name\\\": \\\"\\\"\"],\n",
+            "  \"host\": \"x\"\n",
+            "}\n"
+        );
+        let path = ConfigPath::new().key("name");
+        let value = Value::from("demo");
+        let out = JsonAdapter
+            .edit(
+                source,
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap();
+        let comment_at = out.find("\"//name\"").expect("comment survives");
+        let name_at = out.find("\"name\": \"demo\"").expect("value written");
+        let host_at = out.find("\"host\": \"x\"").expect("untouched key survives");
+        assert!(
+            comment_at < name_at && name_at < host_at,
+            "new key sits right after its comment: {out}"
+        );
+
+        // Unset and re-set: the field returns to its documented slot.
+        let out = JsonAdapter
+            .edit(&out, FileEdit::Unset { path: &path })
+            .unwrap();
+        let out = JsonAdapter
+            .edit(
+                &out,
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap();
+        let comment_at = out.find("\"//name\"").expect("comment survives");
+        let name_at = out.find("\"name\": \"demo\"").expect("value re-written");
+        let host_at = out.find("\"host\": \"x\"").expect("untouched key survives");
+        assert!(
+            comment_at < name_at && name_at < host_at,
+            "re-set key returns to its documented slot: {out}"
+        );
     }
 
     #[test]

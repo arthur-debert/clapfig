@@ -64,6 +64,61 @@ fn generated_json_template_resolves_green_under_default_strict() {
     assert!(db.get("url").is_none());
 }
 
+#[test]
+fn generated_json_template_honors_normalize_keys_and_resolves_green() {
+    // normalize_keys(true) must reach JSON structurally: real keys, "//"
+    // comment keys, and the assignment snippet inside a defaultless
+    // field's comment all render kebab-case — and the generated template
+    // then loads green under the same normalizing builder.
+    let schema = || {
+        Schema::object("App")
+            .field("api_key", Field::string().doc("Required API key."))
+            .nested(
+                "db_settings",
+                Schema::object("Db").field("pool_size", Field::integer().default(5i64)),
+            )
+            .build()
+    };
+    let dir = TempDir::new().unwrap();
+    let template = builder(schema(), &dir, "app.json")
+        .normalize_keys(true)
+        .handle_to_string(&ConfigAction::Gen { output: None })
+        .unwrap();
+    assert!(template.contains(r#""//api-key""#), "{template}");
+    assert!(
+        template.contains(r#"\"api-key\": \"\""#),
+        "snippet:\n{template}"
+    );
+    assert!(template.contains(r#""db-settings""#), "{template}");
+    assert!(template.contains(r#""pool-size": 5"#), "{template}");
+    assert!(!template.contains("api_key"), "no snake leak:\n{template}");
+    assert!(
+        !template.contains("pool_size"),
+        "no snake leak:\n{template}"
+    );
+
+    // The kebab template resolves under the normalizing builder once the
+    // defaultless field is supplied (paste the snippet, uncommented).
+    let mut json: serde_json::Value = serde_json::from_str(&template).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .insert("api-key".into(), serde_json::Value::String("k".into()));
+    std::fs::write(
+        dir.path().join("app.json"),
+        serde_json::to_string_pretty(&json).unwrap(),
+    )
+    .unwrap();
+    let table = builder(schema(), &dir, "app.json")
+        .normalize_keys(true)
+        .load()
+        .unwrap();
+    assert_eq!(table["api_key"], Value::String("k".into()));
+    assert_eq!(
+        table["db_settings"].as_map().unwrap()["pool_size"],
+        Value::Integer(5)
+    );
+}
+
 // --- the format-parity JSON slice -----------------------------------------
 
 const PARITY_TOML: &str = r#"
