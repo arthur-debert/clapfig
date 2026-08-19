@@ -110,11 +110,11 @@ Both failure modes are one missing capability seen from different ends:
   Both fall out of the retained tree cheaply and are follow-ons.
 - A structured-diagnostics redesign of `post_validate` (it returns an opaque
   `String`; clapfig has no key path to join to the origin tree).
-- A new public `Origin` type. The pipeline type stays crate-private. Existing
-  public error types (`InvalidValue`, `MissingRequired`, `UnknownKeyInfo`) and
-  `UnknownKeyContext` gain the facts callers already consume (file, span/line,
-  env var, input type). That *is* a public-field change; it is not a new
-  provenance API.
+- A new public `Origin` type. The pipeline type stays crate-private.
+  `InvalidValue`, `UnknownKeyInfo`, and `UnknownKeyContext` gain the origin
+  facts callers already consume (file, span/line, env var, URL query key,
+  input type). `MissingRequired` gains the discovery record, not an origin.
+  That *is* a public-field change; it is not a new provenance API.
 - Sensitivity metadata or opt-in raw-value logging.
 
 ## Proposed Shape
