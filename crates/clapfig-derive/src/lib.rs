@@ -299,21 +299,12 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
                 // differing clapfig/serde pair is a hard error — same
                 // contract as field-level renames.
                 let serde_rename_all = find_serde_string_meta(&input.attrs, "rename_all");
-                let rename_all = match (&struct_attrs.rename_all, &serde_rename_all) {
-                    (Some(c), Some(s)) if c != s => {
-                        return Err(syn::Error::new(
-                            input.ident.span(),
-                            format!(
-                                "#[clapfig(rename_all = {c:?})] conflicts with \
-                                 #[serde(rename_all = {s:?})] — the schema would convert \
-                                 field names one way and serde's deserialize the other. \
-                                 Use the same rule in both, or drop the clapfig one (the \
-                                 schema follows serde's rule when only serde has one)."
-                            ),
-                        ));
-                    }
-                    _ => struct_attrs.rename_all.clone().or(serde_rename_all),
-                };
+                let rename_all = resolve_rename_all_rule(
+                    struct_attrs.rename_all.as_ref(),
+                    serde_rename_all,
+                    input.ident.span(),
+                    "field names",
+                )?;
                 if let Some(rule) = &rename_all
                     && !is_supported_rename_all_rule(rule)
                 {
@@ -383,7 +374,8 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ));
             }
             check_serde_attrs(&input.attrs, SerdeCtx::UnitEnum)?;
-            let variants = expand_enum_variants(&input.attrs, &struct_attrs, e)?;
+            let variants =
+                expand_enum_variants(&input.attrs, &struct_attrs, e, input.ident.span())?;
             (quote! { &[] }, quote! { &[ #(#variants),* ] })
         }
         other => {
@@ -463,6 +455,7 @@ fn expand_enum_variants(
     type_attrs: &[Attribute],
     struct_attrs: &StructAttrs,
     data: &DataEnum,
+    ident_span: proc_macro2::Span,
 ) -> syn::Result<Vec<TokenStream2>> {
     if data.variants.is_empty() {
         return Err(syn::Error::new(
@@ -471,14 +464,29 @@ fn expand_enum_variants(
              empty enum is uninhabited and cannot be deserialized)",
         ));
     }
-    // `#[clapfig(rename_all = ...)]` wins over `#[serde(rename_all = ...)]`
-    // when both are present — the clapfig form is the authoritative spelling
-    // for what reaches the schema. We still accept the serde form so users
-    // don't have to duplicate the attribute.
-    let rename_all = struct_attrs
-        .rename_all
-        .clone()
-        .or_else(|| find_serde_string_meta(type_attrs, "rename_all"));
+    // Same two-spelling rule as structs: a clapfig/serde pair must name
+    // the same rule (including serde's directional deserialize form), or
+    // the schema and serde's deserialize silently expect different
+    // variant spellings. Either spelling alone is accepted.
+    let serde_rename_all = find_serde_string_meta(type_attrs, "rename_all");
+    let rename_all = resolve_rename_all_rule(
+        struct_attrs.rename_all.as_ref(),
+        serde_rename_all,
+        ident_span,
+        "variant names",
+    )?;
+    if let Some(rule) = &rename_all
+        && !is_supported_rename_all_rule(rule)
+    {
+        return Err(syn::Error::new(
+            ident_span,
+            format!(
+                "unsupported rename_all rule {rule:?}; supported: \
+                 lowercase, UPPERCASE, PascalCase, camelCase, snake_case, \
+                 SCREAMING_SNAKE_CASE, kebab-case, SCREAMING-KEBAB-CASE"
+            ),
+        ));
+    }
     let mut out = Vec::with_capacity(data.variants.len());
     let mut seen = std::collections::HashSet::new();
     for variant in &data.variants {
@@ -745,6 +753,34 @@ fn parse_variant_rename(variant: &Variant) -> syn::Result<Option<String>> {
             ),
         )),
         _ => Ok(clapfig_rename.or(serde_rename)),
+    }
+}
+
+/// Resolve the active `rename_all` rule from the clapfig and serde
+/// spellings. A pair naming different rules is a derive-time error —
+/// otherwise the schema and serde's deserialize would disagree on
+/// `converted` ("field names" or "variant names"). Either spelling
+/// alone is accepted (`clapfig` converts the schema only; `serde`
+/// converts both). Serde's directional deserialize form is already
+/// collapsed into `serde` by [`find_serde_string_meta`].
+fn resolve_rename_all_rule(
+    clapfig: Option<&String>,
+    serde: Option<String>,
+    span: proc_macro2::Span,
+    converted: &str,
+) -> syn::Result<Option<String>> {
+    match (clapfig, &serde) {
+        (Some(c), Some(s)) if c != s => Err(syn::Error::new(
+            span,
+            format!(
+                "#[clapfig(rename_all = {c:?})] conflicts with \
+                 #[serde(rename_all = {s:?})] — the schema would convert \
+                 {converted} one way and serde's deserialize the other. \
+                 Use the same rule in both, or drop the clapfig one (the \
+                 schema follows serde's rule when only serde has one)."
+            ),
+        )),
+        _ => Ok(clapfig.cloned().or(serde)),
     }
 }
 

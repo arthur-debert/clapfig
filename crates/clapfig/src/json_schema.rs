@@ -33,12 +33,15 @@
 //!   `additionalProperties` value schema.
 //! - **Defaults**: the literal default value (when present) is emitted as
 //!   `default` on the property (datetimes in their lexical string form).
+//!   Unrepresentable values (non-finite floats) omit the whole
+//!   annotation rather than dropping members from a collection.
 //! - **Enums**: `Enum { values }` leaves emit `enum: [...]`. A single
 //!   `type` is added only when every allowed value shares one JSON
 //!   primitive type — a mixed set (`"auto"` and `0`) is constrained by
 //!   `enum` alone, so an external validator still accepts every value
 //!   clapfig does. Applies at any nesting depth (an `Array(Enum)` leaf
-//!   constrains its `items`).
+//!   constrains its `items`). If any member cannot be represented the
+//!   `enum` annotation is omitted entirely.
 //! - **Env vars**: when a field maps to an env var, the name is attached as
 //!   the non-standard `x-env` extension.
 //! - **JSON comment keys**: every object allowlists the `^//` key pattern
@@ -333,8 +336,13 @@ fn leaf_type_to_schema(ty: &LeafType) -> Option<Map<String, Value>> {
             if let Some(name) = homogeneous_json_type(values) {
                 obj.insert("type".into(), Value::String(name.into()));
             }
-            let enum_array: Vec<Value> = values.iter().filter_map(value_to_json).collect();
-            if !enum_array.is_empty() {
+            // All-or-nothing: a partial enum set would let external
+            // validators accept (or reject) a different contract than
+            // clapfig's runtime. Omit the annotation when any member
+            // cannot be represented.
+            if let Some(enum_array) = values.iter().map(value_to_json).collect::<Option<Vec<_>>>()
+                && !enum_array.is_empty()
+            {
                 obj.insert("enum".into(), Value::Array(enum_array));
             }
         }
@@ -404,24 +412,25 @@ fn value_json_type(value: &ConfigValue) -> Option<&'static str> {
 /// Datetimes emit as their lexical string form — matching the
 /// `type: string` plus four-form `anyOf` their leaves declare.
 /// Unrepresentable values (non-finite floats — JSON has no literal for
-/// them) are dropped rather than emitted as a misleading `null`. Arrays
-/// and maps convert recursively; entries that can't be represented are
-/// skipped.
+/// them) yield `None` rather than a misleading `null`. Arrays and maps
+/// convert recursively and all-or-nothing: if any member cannot be
+/// represented the whole collection fails, so callers omit the complete
+/// `default` / `enum` annotation instead of exporting a narrowed set.
 fn value_to_json(value: &ConfigValue) -> Option<Value> {
     match value {
         ConfigValue::String(s) => Some(Value::String(s.clone())),
         ConfigValue::Integer(i) => Some(json!(i)),
         ConfigValue::Float(f) => f.is_finite().then(|| json!(f)),
         ConfigValue::Boolean(b) => Some(Value::Bool(*b)),
-        ConfigValue::Array(items) => Some(Value::Array(
-            items.iter().filter_map(value_to_json).collect(),
-        )),
+        ConfigValue::Array(items) => items
+            .iter()
+            .map(value_to_json)
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
         ConfigValue::Map(entries) => {
             let mut obj = Map::new();
             for (key, val) in entries {
-                if let Some(v) = value_to_json(val) {
-                    obj.insert(key.clone(), v);
-                }
+                obj.insert(key.clone(), value_to_json(val)?);
             }
             Some(Value::Object(obj))
         }
@@ -460,13 +469,58 @@ mod tests {
             Some(json!(1.5)),
             "finite floats still convert"
         );
-        // Recursive skip: the array entry vanishes rather than nulling.
+        // All-or-nothing: a collection containing an unrepresentable
+        // member fails as a whole rather than exporting a narrowed set.
         assert_eq!(
             value_to_json(&ConfigValue::Array(vec![
                 ConfigValue::Float(f64::NAN),
                 ConfigValue::Float(2.5),
             ])),
-            Some(json!([2.5]))
+            None
+        );
+        assert_eq!(
+            value_to_json(&ConfigValue::Map(
+                std::iter::once(("a".into(), ConfigValue::Float(f64::NAN))).collect(),
+            )),
+            None
+        );
+        assert_eq!(
+            value_to_json(&ConfigValue::Array(vec![ConfigValue::Float(2.5)])),
+            Some(json!([2.5])),
+            "all-representable collections still convert"
+        );
+    }
+
+    #[test]
+    fn unrepresentable_collection_omits_the_whole_annotation() {
+        use crate::runtime::{Field, LeafType, Schema as RtSchema};
+        let s = generate_schema(
+            &RtSchema::object("App")
+                .field(
+                    "samples",
+                    Field::array_of_type(LeafType::Float)
+                        .default(ConfigValue::Array(vec![
+                            ConfigValue::Float(f64::NAN),
+                            ConfigValue::Float(2.5),
+                        ]))
+                        .optional(),
+                )
+                .field(
+                    "mode",
+                    Field::enum_of([ConfigValue::Float(f64::NAN), ConfigValue::Float(1.0)])
+                        .optional(),
+                )
+                .build(),
+        );
+        let samples = s["properties"]["samples"].as_object().unwrap();
+        assert!(
+            !samples.contains_key("default"),
+            "partial default would lie to validators: {samples:?}"
+        );
+        let mode = s["properties"]["mode"].as_object().unwrap();
+        assert!(
+            !mode.contains_key("enum"),
+            "narrowed enum would lie to validators: {mode:?}"
         );
     }
 

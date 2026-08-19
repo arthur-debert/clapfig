@@ -202,13 +202,27 @@ pub(crate) fn resolve(
         t
     };
 
+    // Default order: Files < Env < Url < Cli. Resolved before layer
+    // construction so omitting a layer excludes it entirely — including
+    // unknown-key validation. Building the env table first used to
+    // reject `APP__ROGUE` even when `Layer::Env` was not in the order.
+    let default_order = default_layer_order();
+    let order = input.layer_order.as_deref().unwrap_or(&default_order);
+
     // Env layer. Sources travel with the table so unknown-key errors
     // name the exact variable that produced each path, not a
-    // reconstructed uppercase spelling.
-    let env_layer = input
-        .env_prefix
-        .as_ref()
-        .map(|prefix| env::env_to_table_with_sources(prefix, input.env_vars));
+    // reconstructed uppercase spelling. Construction and validation
+    // both gate on `Layer::Env` membership: an omitted env layer must
+    // not fail (or fire `on_unknown_key`) for variables that will never
+    // merge.
+    let env_layer = if order.contains(&Layer::Env) {
+        input
+            .env_prefix
+            .as_ref()
+            .map(|prefix| env::env_to_table_with_sources(prefix, input.env_vars))
+    } else {
+        None
+    };
 
     // Validate the env-derived table against the schema. Before this pass
     // env-unknown keys merged in unnoticed: `validate_unknown` only ran
@@ -253,10 +267,6 @@ pub(crate) fn resolve(
             input.normalize_keys,
         )))
     };
-
-    // Default order: Files < Env < Url < Cli
-    let default_order = default_layer_order();
-    let order = input.layer_order.as_deref().unwrap_or(&default_order);
 
     // Merge layers in the specified order (first = lowest priority)
     let mut merged = Map::new();
@@ -729,6 +739,37 @@ mod tests {
         let (table, _) = resolve(input).unwrap();
         // Env is not in layer_order, so the file value stands
         assert_eq!(get(&table, "port").unwrap().as_integer(), Some(3000));
+    }
+
+    #[test]
+    fn omitted_env_layer_ignores_unknown_env_keys() {
+        // Omitting Layer::Env excludes the layer entirely: an unknown
+        // env key must not fail unknown-key validation or invoke the
+        // callback. The documented "omit a layer to exclude it" rule
+        // covers validation, not just merge.
+        let saw_env_unknown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw = std::sync::Arc::clone(&saw_env_unknown);
+        let spec = test_spec();
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\n".into())],
+            env_vars: vec![("MYAPP__ROGUE_KEY".into(), "1".into())],
+            env_prefix: Some("MYAPP".into()),
+            layer_order: Some(vec![Layer::Files, Layer::Cli]),
+            unknown_key_hook: Some(std::sync::Arc::new(move |ctx| {
+                if ctx.path == "rogue_key" {
+                    saw.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                crate::strict::UnknownKeyDecision::Reject
+            })),
+            ..empty_input(&spec)
+        };
+        let (table, collected) = resolve(input).expect("omitted env must not fail on APP__ROGUE");
+        assert_eq!(get(&table, "port").unwrap().as_integer(), Some(3000));
+        assert!(collected.is_empty());
+        assert!(
+            !saw_env_unknown.load(std::sync::atomic::Ordering::SeqCst),
+            "on_unknown_key must not run for env keys when Layer::Env is omitted"
+        );
     }
 
     #[test]

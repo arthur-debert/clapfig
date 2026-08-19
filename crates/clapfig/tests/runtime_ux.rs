@@ -10,14 +10,15 @@
 //! - an out-of-range integer for a sized width fails naming the key
 //!   path, never the opaque `<merged>` placeholder;
 //! - a deserialize failure inside a typed `post_validate` hook surfaces
-//!   as the type error it is, not as a hook rejection;
+//!   as the type error it is, not as a hook rejection — on `load` and
+//!   on merged `config get`/`list` via `handle`;
 //! - the exported JSON Schema's `required` arrays list exactly the
 //!   absences the runtime rejects, and its leaf schemas carry integer
 //!   bounds and the four-form datetime `anyOf`.
 
 #![cfg(feature = "derive")]
 
-use clapfig::{Clapfig, ClapfigError, Schema, SearchPath};
+use clapfig::{Clapfig, ClapfigError, ConfigAction, Schema, SearchPath};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use tempfile::TempDir;
@@ -106,6 +107,36 @@ fn post_validate_deserialize_failure_is_a_type_error_not_a_hook_rejection() {
         !err.to_string().contains("Configuration validation failed"),
         "must not wear the post_validate rejection prefix: {err}"
     );
+}
+
+#[test]
+fn handle_get_list_deserialize_failure_is_a_type_error_not_a_hook_rejection() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("uxdemo.toml"), "rule = 5\n").unwrap();
+    let builder = || {
+        Clapfig::typed::<HookCfg>()
+            .app_name("uxdemo")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .post_validate(|_cfg| Ok(()))
+    };
+    for action in [
+        ConfigAction::Get {
+            key: "rule".into(),
+            scope: None,
+        },
+        ConfigAction::List { scope: None },
+    ] {
+        let err = builder().handle(&action).unwrap_err();
+        match &err {
+            ClapfigError::InvalidValue { .. } => {}
+            other => panic!("expected InvalidValue for {action:?}, got {other:?}"),
+        }
+        assert!(
+            !err.to_string().contains("Configuration validation failed"),
+            "must not wear the post_validate rejection prefix: {err}"
+        );
+    }
 }
 
 #[derive(Schema, Serialize, Deserialize, Debug)]

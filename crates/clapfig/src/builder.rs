@@ -387,6 +387,20 @@ impl Builder {
         self
     }
 
+    /// Crate-private hook that preserves the full [`ClapfigError`]. The
+    /// public [`post_validate`] wraps `Result<(), String>` as
+    /// [`ClapfigError::PostValidationFailed`]; the typed `handle` path
+    /// uses this so a `Map → C` deserialize failure stays
+    /// [`ClapfigError::InvalidValue`] instead of being laundered into a
+    /// hook rejection.
+    pub(crate) fn post_validate_err(
+        mut self,
+        hook: impl Fn(&Map) -> Result<(), ClapfigError> + Send + Sync + 'static,
+    ) -> Self {
+        self.post_validate = Some(Box::new(hook));
+        self
+    }
+
     /// Add URL query parameters as a config layer.
     ///
     /// Parses the query string (e.g. `"port=9090&database.url=pg://prod"`)

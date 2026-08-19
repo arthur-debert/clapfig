@@ -1,0 +1,5 @@
+error: #[clapfig(rename_all = "camelCase")] conflicts with #[serde(rename_all = "kebab-case")] — the schema would convert variant names one way and serde's deserialize the other. Use the same rule in both, or drop the clapfig one (the schema follows serde's rule when only serde has one).
+ --> tests/ui/derive/enum_rename_all_directional_conflict_rejected.rs:9:6
+  |
+9 | enum Bad {
+  |      ^^^

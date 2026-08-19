@@ -215,10 +215,10 @@ impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
     /// `Deserialize` impl cannot make the validated and returned values
     /// diverge. Only the hook's rejection becomes
     /// [`ClapfigError::PostValidationFailed`]; a typed-deserialize
-    /// failure stays [`ClapfigError::InvalidValue`], hook or no hook. The
-    /// Map-out [`handle`](Self::handle) surface instead bridges the hook
-    /// into the inner builder (deserializing a throwaway `C` to run it),
-    /// since no typed value is returned there.
+    /// failure stays [`ClapfigError::InvalidValue`], hook or no hook —
+    /// including on the Map-out [`handle`](Self::handle) surface, which
+    /// bridges the hook into the inner builder (deserializing a throwaway
+    /// `C` to run it) since no typed value is returned there.
     pub fn post_validate<F>(mut self, f: F) -> Self
     where
         F: Fn(&C) -> Result<(), String> + Send + Sync + 'static,
@@ -281,7 +281,9 @@ impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
     /// [`post_validate`](Self::post_validate) hook still guards the
     /// merged `get`/`list` views: it is bridged into the Map-out builder
     /// (deserializing a `C` to run it) since no typed value is returned
-    /// here.
+    /// here. A deserialize failure on that throwaway `C` stays
+    /// [`ClapfigError::InvalidValue`]; only the hook's own rejection
+    /// becomes [`ClapfigError::PostValidationFailed`].
     pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError>
     where
         C: 'static,
@@ -309,15 +311,17 @@ impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
     /// Collapse into the Map-out builder for `handle` dispatch, bridging
     /// any typed hook into a Map-level one (the merged `get`/`list` views
     /// resolve through the Map pipeline, which cannot call a typed
-    /// closure directly).
+    /// closure directly). Deserialize failures stay
+    /// [`ClapfigError::InvalidValue`]; only the typed hook's own
+    /// rejection becomes [`ClapfigError::PostValidationFailed`].
     fn into_inner(self) -> Builder
     where
         C: 'static,
     {
         match self.post_validate {
-            Some(f) => self.inner.post_validate(move |t: &Map| {
-                let typed: C = from_value(Value::Map(t.clone())).map_err(|e| e.to_string())?;
-                f(&typed)
+            Some(f) => self.inner.post_validate_err(move |t: &Map| {
+                let typed = deserialize_table::<C>(t.clone())?;
+                run_typed_hook(Some(&f), &typed)
             }),
             None => self.inner,
         }
