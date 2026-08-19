@@ -96,10 +96,9 @@ Mistaking configuration values for TOML values has concrete costs today:
   iteration for rendering; equality and display semantics defined here, once.
 - **`format` module** — the adapter contract: a format knows how to parse text
   into `Value`, render a documented template from a schema, and serialize
-  values. The contract is also where the next epic plugs in (adapters will
-  additionally supply a path→span index; this spec only ensures the seam exists
-  and is uniform). Three implementations: `toml` (the existing behavior,
-  relocated), `yaml`, `json`.
+  values. Provenance (`docs/spec/provenance.md`, ADR-0005) folded the path→span
+  index into `parse` itself — one return, not a second walk. Three
+  implementations: `toml` (the existing behavior, relocated), `yaml`, `json`.
 - **serde bridge** — `Deserialize`/`Serialize` between `Value` and user types,
   used by the typed load path.
 - **Pipeline swap** — merge, validation walkers, defaults, env/CLI/URL layer

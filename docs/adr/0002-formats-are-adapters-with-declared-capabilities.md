@@ -50,7 +50,7 @@ call sites never branch on format names.
 
 | Operation | TOML | JSON | YAML |
 | --- | --- | --- | --- |
-| Parse → `Value` | yes | yes (comment keys stripped) | yes (aliases resolved; tags / merge keys → typed error) |
+| Parse → `Value` + spans (ADR-0005) | yes (`toml_edit`, one parse) | yes (comment keys stripped; owned span walk, ADR-0007) | yes (aliases resolved; tags / merge keys → typed error; spans via yamlpath, ADR-0008) |
 | Template generation | yes (native comments) | yes (`"//"` keys) | yes (native comments) |
 | Serialize `Value` | yes | yes (non-finite floats → typed error) | yes |
 | Edit: set / replace an existing value | yes, lossless (`toml_edit`) | yes (comments-as-data survive; formatting normalized, documented) | yes, targeted span patch (`yamlpatch`); byte-preserving outside the span |
