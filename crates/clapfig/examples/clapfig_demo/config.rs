@@ -6,7 +6,8 @@
 //!
 //! Each struct derives [`clapfig::Schema`] for defaults, type metadata, and
 //! template generation, plus [`Serialize`]/[`Deserialize`] for the merge
-//! pipeline.
+//! pipeline. [`Color`] and [`OutputFormat`] are unit-only enums so
+//! `config gen` emits `Allowed:` lines instead of prose.
 //!
 //! # Env var mapping
 //!
@@ -66,6 +67,50 @@ pub struct ServerConfig {
     pub max_connections: u32,
 }
 
+/// Terminal color for the echo command output.
+#[derive(Schema, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Color {
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+}
+
+impl Color {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Red => "red",
+            Self::Green => "green",
+            Self::Yellow => "yellow",
+            Self::Blue => "blue",
+            Self::Magenta => "magenta",
+            Self::Cyan => "cyan",
+            Self::White => "white",
+        }
+    }
+}
+
+/// Output layout for the echo command.
+#[derive(Schema, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    Pretty,
+    Plain,
+}
+
+impl OutputFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pretty => "pretty",
+            Self::Plain => "plain",
+        }
+    }
+}
+
 /// Display and output formatting configuration.
 ///
 /// Lives under the `[display]` section in TOML files. The `color` key is
@@ -73,12 +118,10 @@ pub struct ServerConfig {
 #[derive(Schema, Serialize, Deserialize, Debug)]
 pub struct DisplayConfig {
     /// Terminal color for the echo command output.
-    ///
-    /// Supported values: red, green, yellow, blue, magenta, cyan, white.
     #[clapfig(default = "yellow")]
-    pub color: String,
+    pub color: Color,
 
     /// Output format (pretty or plain).
     #[clapfig(default = "pretty")]
-    pub format: String,
+    pub format: OutputFormat,
 }

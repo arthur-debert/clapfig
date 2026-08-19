@@ -9,7 +9,7 @@ Add clapfig to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-clapfig = "0.23"
+clapfig = "0.22.1"
 ```
 
 This pulls in the `clap` feature by default, which gives you the `config`
@@ -18,7 +18,7 @@ subcommand integration, and the `derive` feature for
 
 ```toml
 [dependencies]
-clapfig = { version = "0.23", default-features = false, features = ["derive"] }
+clapfig = { version = "0.22.1", default-features = false, features = ["derive"] }
 ```
 
 ## Define your config struct
@@ -197,7 +197,7 @@ ones. Missing files are silently skipped.
 ## Add clap integration
 
 With the `clap` feature (on by default), embed `ConfigArgs` in your CLI to get
-`config gen|list|get|set|unset` for free:
+`config gen|list|get|set|unset|schema` for free:
 
 ```rust
 use clap::{Parser, Subcommand};
@@ -244,6 +244,7 @@ myapp config list             # show all resolved values
 myapp config get server.port  # show a single key with its doc comment
 myapp config set port 9090    # persist a value to the config file
 myapp config unset port       # remove a persisted value
+myapp config schema           # print a JSON Schema for the struct
 ```
 
 ## Strict mode
@@ -260,6 +261,8 @@ Turn it off with `.strict(false)` if you share config files across tools.
 
 ## Next steps
 
+- [Derive Reference](./derive-reference.md) — `#[clapfig(...)]` attributes,
+  supported types, enums, maps, and arrays.
 - [Layered Configuration](./layered-config.md) — deep dive into layers,
   search modes, and merge behavior.
 - [Runtime Schemas](./runtime-schemas.md) — building schemas at runtime for

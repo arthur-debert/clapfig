@@ -32,10 +32,9 @@ use syn::{
 ///   bounds so out-of-range values fail schema validation with the key
 ///   path; see the `LeafTypeStatic::Integer` doc comment for the
 ///   `i64::MAX` caveat on the unsigned variants), `f32`, `f64`,
-///   `clapfig::value::Datetime`, `clapfig::value::Value`. `i128` and
-///   `u128` are rejected at derive time.
-/// - `Option<T>`: marks the leaf optional
-/// - `Vec<T>` where `T` is a scalar: maps to `LeafType::Array(T)`
+///   `clapfig::value::Datetime`, `clapfig::value::Value`.
+/// - `Option<T>`: marks the leaf optional (`Option<UnitEnum>` included).
+/// - `Vec<T>` where `T` is a scalar: maps to `LeafType::Array(T)`.
 /// - `Vec<T>` where `T` derives `clapfig::Schema`: produces a
 ///   `FieldStatic::ArrayOf { .. }` (TOML `[[name]]` array of tables) for a
 ///   struct element type; a unit-only-enum element type flattens to a
@@ -45,8 +44,16 @@ use syn::{
 ///   `Option<Vec<T>>` keeps the presence signal (absent → `None`) and is
 ///   supported for unit-only-enum element types only (an absent array of
 ///   nested *objects* is already the empty array — spell it `Vec<T>`).
+/// - `HashMap<String, V>` / `BTreeMap<String, V>`: a scalar / `Value` /
+///   array-of-scalar `V` emits `LeafType::Map(V)`; a nested struct `V`
+///   emits `FieldStatic::MapOf { .. }`; a unit-only-enum `V` flattens to
+///   `LeafType::Map(Enum)`. An absent map loads as the empty map.
 /// - Nested struct: assumed to also derive `clapfig::Schema`; produces a
-///   `FieldStatic::Nested { .. }`
+///   `FieldStatic::Nested { .. }`.
+/// - Unit-only enum: flattens at every use site to a `LeafType::Enum`
+///   leaf (or `Map(Enum)` / `Array(Enum)` in the map/array positions
+///   above). Variant names are the allowed values; `rename` /
+///   `rename_all` apply to those spellings.
 ///
 /// Field types named `Datetime` / `Value` are matched *by name* (a proc
 /// macro cannot resolve paths), so the macro also emits a compile-time
@@ -54,6 +61,41 @@ use syn::{
 /// (`struct Datetime`) is a compile error instead of a silently mis-typed
 /// leaf. Raw identifiers unraw: a field `r#type` emits the schema name
 /// `type`, matching serde's spelling.
+///
+/// # Rejected at derive time
+///
+/// - `i128` / `u128` (TOML's integer width is signed 64-bit).
+/// - Generic types and `where` clauses (`static SchemaStatic` cannot
+///   reference type parameters).
+/// - Tuple structs, unit structs, tuple/struct enum variants, and
+///   non-unit enums.
+/// - `Option<Option<T>>`.
+/// - Non-`String` map keys; `HashMap`/`BTreeMap` of `Option<T>`, of
+///   another map, or of `Vec<NestedStruct>`.
+/// - `Vec<Option<T>>`, `Vec<Vec<...>>`, `Vec<clapfig::value::Value>`,
+///   `Vec<HashMap<...>>` / `Vec<BTreeMap<...>>`.
+/// - `PathBuf`, `Duration`, `char`, newtypes, type aliases, third-party
+///   maps — no TOML-faithful schema shape; the `Schema` trait's
+///   `on_unimplemented` diagnostic names the supported set and the
+///   `#[clapfig(value)]` escape hatch.
+/// - Datetime / Value lookalikes claimed by type name that are not
+///   clapfig's own types.
+/// - Unknown `#[clapfig(...)]` metas (fields, structs, enum variants).
+/// - `#[clapfig(name)]` / `#[clapfig(strict)]` on unit-only enums
+///   (flattened away).
+/// - Kind-mismatched `default` / `allowed` literals; empty `allowed`;
+///   `value` + `allowed` on the same field; `allowed` on `Vec` /
+///   nested / map-of-nested fields; defaults on map-typed fields and
+///   array-of-nested fields; leaf attrs on nested-struct fields.
+/// - Invalid or colliding rename strings; clapfig/serde rename (or
+///   `rename_all`) pairs that disagree; unsupported `rename_all` rules.
+/// - Every serde attribute the schema does not honor (see *Serde
+///   attributes*).
+///
+/// `Option<Vec<NestedStruct>>` compiles (the macro cannot resolve the
+/// element kind) and panics at the first `schema()` call with
+/// drop-the-`Option` guidance — the same deferred-panic contract as a
+/// non-variant default on an enum-typed field.
 ///
 /// # Field attributes
 ///
@@ -156,7 +198,7 @@ use syn::{
 /// `deserialize_with`/`with` (the typed deserialize runs through serde,
 /// so custom deserializers apply to every source). `deserialize_with` is
 /// honored for *shape-preserving* normalization: the schema keeps
-/// advertising the field's inferred shape and validates the merged table
+/// advertising the field's inferred shape and validates the merged map
 /// against it *before* serde runs, so a deserializer expecting a different
 /// wire shape gets its inputs rejected by schema validation with a loud
 /// type error — a load failure, never a silently mis-typed value. Pair a

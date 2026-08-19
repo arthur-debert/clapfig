@@ -130,7 +130,7 @@
 //!
 //! For [clap](https://docs.rs/clap) users, an optional adapter (the `cli`
 //! module, behind the `clap` Cargo feature, on by default) provides drop-in
-//! derive types that give your app `config gen|list|get|set|unset`
+//! derive types that give your app `config gen|list|get|set|unset|schema`
 //! subcommands with zero boilerplate. To use clapfig without clap:
 //!
 //! ```toml
@@ -422,7 +422,7 @@
 //! key (preserves quoted-key semantics — `"acme.task-due-date-missing"`
 //! stays as a single literal even though it contains dots), the parsed
 //! value as `Option<&value::Value>` (`None` in the rare case lookup can't
-//! resolve — out-of-bounds array index, path through a non-table
+//! resolve — out-of-bounds array index, path through a non-map
 //! intermediate), the source file, and the 1-indexed line number
 //! (`Some` on a best-effort match in TOML sources; always `None` for
 //! YAML/JSON and non-file sources).
@@ -455,7 +455,7 @@
 //!     )
 //!     .build();
 //!
-//! let table: clapfig::value::Map = Clapfig::builder(schema)
+//! let map: clapfig::value::Map = Clapfig::builder(schema)
 //!     .app_name("myapp")
 //!     .load()?;
 //! ```
@@ -649,7 +649,7 @@
 //!
 //! Use serde's `#[serde(deserialize_with = ...)]` on a field to normalize
 //! values during the typed deserialize step. The function runs when the
-//! merged table is deserialized into your `C` — covering values from any
+//! merged map is deserialized into your `C` — covering values from any
 //! source (config files, env vars, overrides, and schema defaults). This is
 //! useful for case-insensitive fields, path canonicalization, or unit
 //! conversion.
@@ -716,7 +716,7 @@
 //!   subcommands or flags (e.g. if your app already has a `--scope` flag).
 //!   Produces the same [`ConfigAction`], so all downstream logic is shared.
 //!
-//! Both paths give your users `config gen|list|get|set|unset` with `--scope`
+//! Both paths give your users `config gen|list|get|set|unset|schema` with `--scope`
 //! support. Pick `ConfigArgs` for simplicity; reach for `ConfigCommand` only
 //! when you hit naming conflicts.
 //!
@@ -838,7 +838,7 @@ impl Clapfig {
     ///     .field("port", Field::integer().default(8080i64))
     ///     .build();
     ///
-    /// let table: clapfig::value::Map = Clapfig::builder(schema)
+    /// let map: clapfig::value::Map = Clapfig::builder(schema)
     ///     .app_name("myapp")
     ///     .load()?;
     /// ```

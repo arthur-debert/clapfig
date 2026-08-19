@@ -2,7 +2,7 @@
 
 Rich, layered configuration for Rust applications. Define a struct, point at your files, and go.
 
-**clapfig** discovers, merges, and manages configuration from multiple sources — config files (TOML, YAML, or JSON), environment variables, and programmatic overrides — through a pure Rust builder API. The core library has **no dependency on any CLI framework**: you can use it in GUI apps, servers, or with any argument parser. For [clap](https://docs.rs/clap) users, an optional adapter provides drop-in `config gen|list|get|set|unset` subcommands with zero boilerplate.
+**clapfig** discovers, merges, and manages configuration from multiple sources — config files (TOML, YAML, or JSON), environment variables, and programmatic overrides — through a pure Rust builder API. The core library has **no dependency on any CLI framework**: you can use it in GUI apps, servers, or with any argument parser. For [clap](https://docs.rs/clap) users, an optional adapter provides drop-in `config gen|list|get|set|unset|schema` subcommands with zero boilerplate.
 
 Your struct is the schema: `#[derive(clapfig::Schema)]` captures types, defaults, enum sets, and doc comments, and every feature — loading, template generation, JSON Schema, persistence validation — reads from that one definition. Apps whose schema isn't known at compile time build the same schema at runtime instead.
 
@@ -29,7 +29,7 @@ Your struct is the schema: `#[derive(clapfig::Schema)]` captures types, defaults
 
 **Clap adapter** (`clap` feature, on by default):
 
-- **Config subcommand** — drop-in `config gen|get|set|unset|list` for clap
+- **Config subcommand** — drop-in `config gen|list|get|set|unset|schema` for clap
 - **`--scope` flag** — target a specific scope for any config subcommand
 - **Auto-matching overrides** — map clap args to config keys by name in one call
 
@@ -37,7 +37,7 @@ Your struct is the schema: `#[derive(clapfig::Schema)]` captures types, defaults
 
 ```toml
 [dependencies]
-clapfig = "0.23"
+clapfig = "0.22.1"
 ```
 
 Define your config with the `Schema` derive:
@@ -95,7 +95,7 @@ That `app_name("myapp")` call sets sensible defaults:
 Without clap:
 
 ```toml
-clapfig = { version = "0.23", default-features = false, features = ["derive"] }
+clapfig = { version = "0.22.1", default-features = false, features = ["derive"] }
 ```
 
 ## Layer Precedence
@@ -145,7 +145,7 @@ Validation, strictness, and error behavior are identical in every format. Each f
 
 ## Demo
 
-The repo includes a runnable example that exercises every feature:
+The repo includes a runnable example covering layered files, env vars, CLI overrides, nested structs, unit-enum fields (`config gen` shows `Allowed:` lines), and the `config` subcommand:
 
 ```sh
 cargo run --example clapfig_demo -- echo
@@ -153,6 +153,7 @@ cargo run --example clapfig_demo -- --color blue --port 8080 echo
 cargo run --example clapfig_demo -- config gen
 cargo run --example clapfig_demo -- config list
 cargo run --example clapfig_demo -- config get server.port
+cargo run --example clapfig_demo -- config schema
 
 # See the rich error renderer (miette) in action:
 cargo run --example clapfig_demo --features rich-errors -- echo
@@ -195,10 +196,11 @@ See the [Resolver docs](https://docs.rs/clapfig/latest/clapfig/struct.Resolver.h
 **Guides** (in [`docs/`](docs/)):
 
 - [Getting Started](docs/getting-started.md) — installation, first config struct, basic usage
+- [Derive Reference](docs/derive-reference.md) — `#[clapfig(...)]` attributes, supported types, enums, maps, arrays
 - [Layered Configuration](docs/layered-config.md) — layers, search paths, merge modes, env vars, overrides
 - [Runtime Schemas](docs/runtime-schemas.md) — building schemas at runtime for plugin hosts and generated apps
 - [Strictness Guide](docs/strictness.md) — the cascading strict-mode system
 - [Resolver Guide](docs/resolver.md) — per-directory resolution for tree-walk tools
-- [Config Command Guide](docs/config-command.md) — the `config gen|list|get|set|unset` integration
+- [Config Command Guide](docs/config-command.md) — the `config gen|list|get|set|unset|schema` integration
 
 **API reference**: the full API with design rationale lives in the [crate-level docs on docs.rs](https://docs.rs/clapfig).
