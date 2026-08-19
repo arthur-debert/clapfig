@@ -7,7 +7,7 @@
 //!
 //! The module provides two clap derive types — [`ConfigArgs`] and
 //! [`ConfigSubcommand`] — that you can embed directly into your clap
-//! `#[derive(Parser)]` struct to get `config gen|list|get|set|unset` subcommands
+//! `#[derive(Parser)]` struct to get `config gen|list|get|set|unset|schema` subcommands
 //! with no boilerplate.
 //!
 //! The only bridge to the core is [`ConfigArgs::into_action()`], which
@@ -121,6 +121,7 @@ impl ConfigArgs {
 /// # Example
 ///
 /// ```ignore
+/// use clap::CommandFactory;
 /// use clapfig::ConfigCommand;
 ///
 /// let config_cmd = ConfigCommand::new()

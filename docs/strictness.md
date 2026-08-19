@@ -1,4 +1,4 @@
-# Strict mode and the cascading strictness cascade
+# Strict mode and cascading strictness
 
 Strict mode is **on by default**. When a config file contains a key that
 doesn't match any field in your schema, loading fails with the file

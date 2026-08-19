@@ -71,9 +71,11 @@ Key points:
   out-of-set values error at load, and generated templates document the
   allowed set with an `Allowed: ...` annotation — a native comment in TOML
   and YAML, a `"//"` comment key in JSON.
-- **`Option<T>`** fields are truly optional — omitting them everywhere is
-  valid. Non-optional fields without a default must be provided by at least
-  one layer.
+- **`Option<T>`** of a supported leaf (scalar, unit enum, or the leaf
+  map/array forms) is truly optional — omitting it everywhere is valid.
+  Nested structs are not an `Option` shape; the [Derive
+  Reference](./derive-reference.md) lists the exact wrappers. Non-optional
+  fields without a default must be provided by at least one layer.
 - **`///` doc comments** are used in generated templates and `config get`
   output.
 - The struct still derives serde's `Serialize`/`Deserialize` — clapfig uses
@@ -197,7 +199,7 @@ ones. Missing files are silently skipped.
 ## Add clap integration
 
 With the `clap` feature (on by default), embed `ConfigArgs` in your CLI to get
-`config gen|list|get|set|unset` for free:
+`config gen|list|get|set|unset|schema` for free:
 
 ```rust
 use clap::{Parser, Subcommand};
@@ -244,6 +246,7 @@ myapp config list             # show all resolved values
 myapp config get server.port  # show a single key with its doc comment
 myapp config set port 9090    # persist a value to the config file
 myapp config unset port       # remove a persisted value
+myapp config schema           # print a JSON Schema for the struct
 ```
 
 ## Strict mode
@@ -260,6 +263,8 @@ Turn it off with `.strict(false)` if you share config files across tools.
 
 ## Next steps
 
+- [Derive Reference](./derive-reference.md) — `#[clapfig(...)]` attributes,
+  supported types, enums, maps, and arrays.
 - [Layered Configuration](./layered-config.md) — deep dive into layers,
   search modes, and merge behavior.
 - [Runtime Schemas](./runtime-schemas.md) — building schemas at runtime for

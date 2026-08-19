@@ -57,7 +57,7 @@ let schema = Schema::object("App")
 - **`Field::array_of_type(LeafType)`** — homogeneous array of a primitive type.
 - **`Field::map_of(LeafType)`** — string-keyed map with homogeneous values.
 - **`Field::enum_of(values)`** — constrained value: must be one of the listed TOML primitives. Used for log levels, output formats, modes.
-- **`Field::value()`** — accepts any TOML value (scalar, array, table). Escape hatch for keys whose value can take multiple incompatible shapes on the same field (e.g. a bare string *or* an array of `[string, table]`, like serde's `#[serde(untagged)]` enums). Clapfig does no shape check at the schema layer; the caller is responsible for further validation, typically via `serde` in a `post_validate` hook.
+- **`Field::value()`** — accepts any value-model value (scalar, array, map). Escape hatch for keys whose value can take multiple incompatible shapes on the same field (e.g. a bare string *or* an array of `[string, map]`, like serde's `#[serde(untagged)]` enums). Clapfig does no shape check at the schema layer; the caller is responsible for further validation, typically via `serde` in a `post_validate` hook.
 - **`Schema::object(...).nested(name, child)`** — TOML `[section]` sub-object.
 - **`Schema::object(...).array_of(name, item_schema)`** — TOML `[[name]]` array of sub-objects.
 
@@ -84,7 +84,7 @@ surface as `Clapfig::typed::<C>()`:
 ```rust,ignore
 use clapfig::{Clapfig, types::SearchPath};
 
-let table: clapfig::value::Map = Clapfig::builder(schema)
+let map: clapfig::value::Map = Clapfig::builder(schema)
     .app_name("myapp")
     .file_name("myapp.toml")
     .search_paths(vec![SearchPath::Cwd, SearchPath::Platform])
@@ -121,15 +121,20 @@ off the schema:
 
 ## What's not yet supported
 
-- `deserialize_with`-style normalizers on runtime leaves.
-- Mixing a runtime sub-schema inside a static `Config` struct.
+- `deserialize_with`-style normalizers on runtime leaves (the typed
+  path honors shape-preserving `#[serde(deserialize_with)]`; the
+  runtime `Field` builder has no equivalent).
+- Mixing a runtime-built sub-schema inside a `#[derive(clapfig::Schema)]`
+  struct — a derive field is either another Schema type or a leaf.
 - Indexed dotted-key syntax (`plugins[0].id`) for `config set` on
-  arrays of objects.
+  arrays of objects. Keys inside `ArrayOf`/`MapOf` sections refuse with
+  a targeted error; edit the config file directly.
 
-See the proposal in issue #38 for context on the deferred items.
+Arrays of nested schema types (`Vec<NestedStruct>` / `Vec<UnitEnum>`)
+and struct-level `rename_all` both derive; they are not gaps.
 
 ## Example
 
 A runnable example lives at
-[`examples/runtime_schema/`](https://github.com/arthur-debert/clapfig/tree/main/examples/runtime_schema).
+[`crates/clapfig/examples/runtime_schema/`](https://github.com/arthur-debert/clapfig/tree/main/crates/clapfig/examples/runtime_schema).
 Run with `cargo run --example runtime_schema -- load`.

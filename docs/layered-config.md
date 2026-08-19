@@ -304,7 +304,7 @@ Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .no_env()
     .search_paths(vec![])
-    .cli_override("port", 9090)
+    .cli_override("port", Some(9090))
     .load()?;
 ```
 

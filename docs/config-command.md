@@ -1,7 +1,7 @@
 # Config Command Guide
 
 Clapfig provides a drop-in `config` subcommand for clap-based CLIs. Your users
-get `config gen|list|get|set|unset` with zero hand-written command logic.
+get `config gen|list|get|set|unset|schema` with zero hand-written command logic.
 
 ## Quick setup
 
@@ -320,13 +320,25 @@ If your app already uses a `--scope` flag or has naming conflicts with
 runtime and lets you rename subcommands and flags:
 
 ```rust
+use clap::CommandFactory;
 use clapfig::ConfigCommand;
 
-let cmd = ConfigCommand::builder()
-    .name("settings")          // "myapp settings" instead of "myapp config"
-    .build();
+let config_cmd = ConfigCommand::new()
+    .scope_long("target")       // rename --scope to --target
+    .gen_name("template");      // rename "gen" to "template"
+
+let app = Cli::command()
+    .subcommand(config_cmd.as_command("settings")); // "myapp settings" …
+
+let matches = app.get_matches();
+if let Some(("settings", sub)) = matches.subcommand() {
+    let action = config_cmd.parse(sub)?;
+    builder.handle_and_print(&action)?;
+}
 ```
 
+`as_command`'s `name` argument is the top-level subcommand (`"config"`,
+`"settings"`, …). Per-item methods rename the nested subcommands and flags.
 Both paths produce the same `ConfigAction`, so all downstream logic is shared.
 Prefer `ConfigArgs` for simplicity; reach for `ConfigCommand` only when you
 hit conflicts.

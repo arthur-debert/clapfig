@@ -7,8 +7,10 @@
 
 **Migration (hard cut, per project policy):**
 
-- `Clapfig::runtime(...).load()` / `load_with_unknowns()` / `RuntimeResolver::resolve_at*` return `clapfig::value::Map` (a `BTreeMap<String, clapfig::value::Value>`) instead of `toml::Table`. `Value` keeps the familiar accessors (`as_str`, `as_integer`, …) with `as_map` replacing `as_table`, plus `Index<&str>`/`Index<usize>`. Deserialize a map into a typed struct with `clapfig::value::from_value(Value::Map(map))`.
-- The runtime `post_validate` hook receives `&clapfig::value::Map` instead of `&toml::Table`. (The typed `SchemaConfigBuilder::post_validate` still receives `&C`.)
+Names as of later DER01-WS01: `Clapfig::runtime` → `Clapfig::builder`, `RuntimeResolver` → `Resolver`, `SchemaConfigBuilder` → `TypedBuilder`. The `resolve_at` return type is `clapfig::value::Map` either way — not `toml::Table`.
+
+- `Clapfig::builder(...).load()` / `load_with_unknowns()` / `Resolver::resolve_at*` return `clapfig::value::Map` (a `BTreeMap<String, clapfig::value::Value>`) instead of `toml::Table`. `Value` keeps the familiar accessors (`as_str`, `as_integer`, …) with `as_map` replacing `as_table`, plus `Index<&str>`/`Index<usize>`. Deserialize a map into a typed struct with `clapfig::value::from_value(Value::Map(map))`. The typed path's `TypedBuilder::build_resolver()` returns `TypedResolver<C>` (DER01-WS06), whose `resolve_at` deserializes that map into `C`.
+- The runtime `post_validate` hook receives `&clapfig::value::Map` instead of `&toml::Table`. (The typed `TypedBuilder::post_validate` still receives `&C`.)
 - Schema value slots — `Field::default(...)`, `Field::enum_of(...)`, `runtime::Leaf::default`, `LeafType::Enum { values }` — hold `clapfig::value::Value` instead of `toml::Value`. `From` impls keep literal call sites (`.default(8080i64)`, `.enum_of(["a", "b"])`) source-compatible.
 - Derive field types: `toml::Value` → `clapfig::value::Value` (for `#[clapfig(value)]`-style free-form leaves) and `toml::value::Datetime` → `clapfig::value::Datetime`. The derive no longer recognizes the `toml` spellings.
 - `UnknownKeyContext::value` and `CollectedUnknown::value` carry the owned `clapfig::value::Value`.
