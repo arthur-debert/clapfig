@@ -74,17 +74,21 @@ Both failure modes are one missing capability seen from different ends:
 
 ## Goals
 
-1. Every *schema-driven* post-merge error (required, type, enum, shape) names
-   the winning origin: layer + file + line when the value came from a file;
-   the env var name for env-sourced values; the override key for programmatic
-   overrides. `PostValidationFailed` (the opaque user hook) is excluded.
+1. Every *schema-driven* post-merge error **on a value that exists** (type,
+   enum, shape) names the winning origin of that value: layer + file + line
+   when it came from a file; env var name; URL query key; override key;
+   or schema default. `PostValidationFailed` (the opaque user hook) is
+   excluded.
 2. File-sourced location works in **every shipped format** (TOML, YAML, JSON),
    including unknown keys inside arrays-of-tables and inline tables. The
    `find_key_line` heuristic is deleted. Line/column are derived from byte
    spans at render time.
-3. Missing-required errors enumerate the file probes (with outcomes) and the
-   non-file input types consulted. Under `SearchMode::FirstMatch`, candidates
-   the search never reached are reported as `not probed`, never as consulted.
+3. `MissingRequired` does **not** name a winning origin — an absent key has
+   none, including when a parent map exists from some input type (no
+   nearest-ancestor rule). The error enumerates the file probes (with
+   outcomes) and the non-file input types consulted (env, URL when
+   enabled, overrides). Under `SearchMode::FirstMatch`, candidates the
+   search never reached are reported as `not probed`, never as consulted.
 4. Origin identity is a structured path (`ConfigPath`), not a dotted string:
    a quoted literal key `"a.b"` is distinct from the nested path `[a] b`, and
    array entries have index segments. With `normalize_keys(true)`, provenance
@@ -162,8 +166,10 @@ An origin names:
   uses). The parse index also carries an optional key span
   ([ADR-0006](../adr/0006-span-index-entries-are-key-and-value.md)) for
   unknown-key carets; array elements have no key token (`key: None`).
-- for non-file input types: whatever they know (env var name, override key),
-  with file/span/text as `None`.
+- for non-file input types: whatever they know, with file/span/text as
+  `None`. Env carries the original variable name(s). URL carries the
+  query-parameter key as received (dotted, percent-decoded). Override
+  carries the override key. Default carries the schema key.
 
 Schema-filled defaults (`fill_defaults_into`) and schema-shaped absences
 (empty map/array materialization) carry `Default`. Coercion in `finalize`
@@ -225,8 +231,10 @@ directory; the record names the paths actually probed.
    #100/#101/#102 prerequisite. Renderers already draw snippets from retained
    source text; they switch from 1-indexed heuristic lines to byte spans
    (caret over the value, or over the key for unknown-key diagnostics).
-   Non-file origins render as `set by environment variable …` / `set by a
-   programmatic override for key …`.
+   Non-file origins render as `set by environment variable …` / `set by
+   URL query parameter …` / `set by a programmatic override for key …` /
+   `set by schema default for key …`. `MissingRequired` renders the
+   discovery record, not an origin line.
 2. **Tracing** — the pipeline narrates itself per the doctrine, including
    merge losers and discovery misses. Persistence (`config set` and friends)
    emits events too; it does not grow an origin tree.
@@ -236,13 +244,16 @@ directory; the record names the paths actually probed.
 ## User / Agent Stories
 
 1. As an **end user** editing a config file, I want a post-merge validation
-   error (wrong enum, wrong type, missing required) to name the file and
-   line — or the env var / override that actually won — so I do not grep
-   three files to find a typo I just made.
+   error on a value I wrote (wrong enum, wrong type, wrong shape) to name
+   the file and line — or the env var / URL query key / override / schema
+   default that actually won — so I do not grep three files to find a typo
+   I just made.
 2. As an **end user** whose required key is unset, I want the error to name
    every place clapfig looked (files probed, found or missing; env prefix;
-   overrides), including the case where the file I thought I wrote was never
-   discovered, so I know where to add the key.
+   URL query when enabled; overrides), including a nested leaf whose parent
+   map exists and the case where the file I thought I wrote was never
+   discovered, so I know where to add the key. No origin is claimed for
+   the missing leaf.
 3. As an **app developer** whose resolved config is silently wrong, I want
    `RUST_LOG=clapfig=trace cargo run` to name every merge override with both
    candidates' origins and types (never values), so a forgotten env var or
@@ -306,19 +317,22 @@ directory; the record names the paths actually probed.
 
 Signature evidence, all automated:
 
-- **Located post-merge errors** — type, enum, shape, and required — name
-  file + line for a file origin, the env var for an env origin, and the
-  override key for a programmatic override. One case per input type, not
-  only TOML.
+- **Located post-merge errors on existing values** — type, enum, shape —
+  name file + line for a file origin, the env var, the URL query key
+  (`url` feature), the override key, or the schema default. One case per
+  origin kind, not only TOML. The Default case is a runtime schema whose
+  declared default fails the leaf's type or enum check.
 - **Unknown keys in hostile shapes** — arrays-of-tables and inline tables
   — carry a correct line in TOML, YAML, and JSON. `find_key_line` is gone
   (no remaining callers).
 - **Path identity** — `"a.b"` vs `[a] b`; `normalize_keys(true)` on
   top-level, nested, inline-table, and array-of-tables keys; the original
   spelling appears in the rendered snippet.
-- **Discovery** — `MissingRequired` lists probes with outcomes; under
+- **Discovery** — `MissingRequired` lists probes with outcomes and the
+  non-file input types consulted; it does not name a winning origin. Under
   `FirstMatch`, unprobed lower-priority candidates are `not probed`, not
-  `missing`.
+  `missing`. A nested missing leaf (parent map present from some input)
+  is the same diagnostic, not a nearest-ancestor origin.
 - **Tracing** — a capturing subscriber over a two-file + env resolution
   sees probes (hits and misses), `debug` stage summaries, and every
   override with both origins named. A config containing a sentinel secret
