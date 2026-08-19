@@ -1,5 +1,0 @@
-error: #[serde(rename_all)] on a struct deriving clapfig::Schema is not supported — the schema would expect the Rust field identifiers while serde's deserialize expects the converted names. Rename fields individually with #[serde(rename = "...")] (the schema follows it).
- --> tests/ui/derive/struct_serde_rename_all_rejected.rs:5:8
-  |
-5 | struct Bad {
-  |        ^^^

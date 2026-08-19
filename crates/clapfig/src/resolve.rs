@@ -6,13 +6,13 @@
 //!
 //! 1. Build each layer independently (files, env, URL, CLI)
 //! 2. Merge layers in the configured order (default: files < env < URL < CLI)
-//! 3. Hand the merged table to a [`ConfigSpec`] for finalization (defaults +
-//!    required-field and type checks)
+//! 3. Finalize the merged table against the schema (defaults +
+//!    required-field and type checks, via [`crate::schema_walk`])
 //!
-//! The layer order is configurable via [`ResolveInput::layer_order`]. The
-//! spec parameter decouples this pipeline from the schema source: both
-//! `Clapfig::runtime(schema)` and the derive-driven
-//! `Clapfig::schema_builder::<C>()` thread in a `DynamicSpec`.
+//! The layer order is configurable via [`ResolveInput::layer_order`]. Both
+//! entry points — `Clapfig::builder(schema)` and the derive-driven
+//! `Clapfig::typed::<C>()` — thread in the same [`Schema`]; the typed path
+//! deserializes the returned [`Map`] afterwards.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,20 +23,17 @@ use crate::format::{self, FormatRegistry};
 use crate::merge::deep_merge;
 use crate::normalize::{normalize_key, normalize_table};
 use crate::overrides;
-use crate::spec::ConfigSpec;
+use crate::runtime::Schema;
+use crate::schema_walk;
 use crate::strict::{CollectedUnknown, StrictnessOverrides, UnknownKeyHook};
 use crate::types::Layer;
-use crate::validate::ValidateContext;
+use crate::validate::{UnknownKeySource, ValidateContext, validate_unknown};
 use crate::value::{Map, Value};
 
 /// All pre-loaded data needed to resolve a config. No I/O happens here.
-///
-/// Generic over [`ConfigSpec`], keeping the pipeline decoupled from how the
-/// schema was produced (runtime builder or derive macro).
-pub(crate) struct ResolveInput<'a, S: ConfigSpec> {
-    /// Schema-walking strategy: validate unknown keys, finalize the merged
-    /// table into the spec's `Output`.
-    pub spec: &'a S,
+pub(crate) struct ResolveInput<'a> {
+    /// The schema every layer is validated and finalized against.
+    pub schema: &'a Schema,
     /// Enabled format adapters — the routing seam every file parse goes
     /// through. Per-file adapter selection is by extension; extensionless
     /// files (rc-style names) fall back to the preferred
@@ -107,15 +104,15 @@ pub(crate) fn default_layer_order() -> Vec<Layer> {
 /// Resolve configuration from pre-loaded inputs.
 ///
 /// Builds each layer independently, merges them in the configured order
-/// (default: files < env < URL < CLI), then hands the merged table to the
-/// spec for finalization. Returns the typed output plus any keys the
+/// (default: files < env < URL < CLI), then finalizes the merged table
+/// against the schema. Returns the merged [`Map`] plus any keys the
 /// `on_unknown_key` callback elected to
 /// [`UnknownKeyDecision::Collect`](crate::UnknownKeyDecision::Collect);
 /// callers that don't need the collected list (the plain `load()`
 /// surface) simply discard it via `let (out, _) = resolve(...)?;`.
-pub(crate) fn resolve<S: ConfigSpec>(
-    input: ResolveInput<'_, S>,
-) -> Result<(S::Output, Vec<CollectedUnknown>), ClapfigError> {
+pub(crate) fn resolve(
+    input: ResolveInput<'_>,
+) -> Result<(Map, Vec<CollectedUnknown>), ClapfigError> {
     // Build each layer independently, then merge in the configured order.
 
     let validate_ctx = ValidateContext {
@@ -189,10 +186,15 @@ pub(crate) fn resolve<S: ConfigSpec>(
                 normalize_table(&mut table).map_err(|c| c.into_error(path))?;
             }
             if cascade_active {
-                let mut per_file =
-                    input
-                        .spec
-                        .validate_unknown(&table, content, path, &validate_ctx)?;
+                let mut per_file = validate_unknown(
+                    &table,
+                    input.schema,
+                    &UnknownKeySource::File {
+                        path,
+                        source: content,
+                    },
+                    &validate_ctx,
+                )?;
                 collected_unknowns.append(&mut per_file);
             }
             t = deep_merge(t, table);
@@ -200,37 +202,50 @@ pub(crate) fn resolve<S: ConfigSpec>(
         t
     };
 
-    // Env layer
-    let env_table = input
-        .env_prefix
-        .as_ref()
-        .map(|prefix| env::env_to_table(prefix, input.env_vars));
+    // Default order: Files < Env < Url < Cli. Resolved before layer
+    // construction so omitting a layer excludes it entirely — including
+    // unknown-key validation. Building the env table first used to
+    // reject `APP__ROGUE` even when `Layer::Env` was not in the order.
+    let default_order = default_layer_order();
+    let order = input.layer_order.as_deref().unwrap_or(&default_order);
+
+    // Env layer. Sources travel with the table so unknown-key errors
+    // name the exact variable that produced each path, not a
+    // reconstructed uppercase spelling. Construction and validation
+    // both gate on `Layer::Env` membership: an omitted env layer must
+    // not fail (or fire `on_unknown_key`) for variables that will never
+    // merge.
+    let env_layer = if order.contains(&Layer::Env) {
+        input
+            .env_prefix
+            .as_ref()
+            .map(|prefix| env::env_to_table_with_sources(prefix, input.env_vars))
+    } else {
+        None
+    };
 
     // Validate the env-derived table against the schema. Before this pass
     // env-unknown keys merged in unnoticed: `validate_unknown` only ran
     // per-file, the env layer landed afterwards, and `finalize` doesn't
     // re-check unknown keys. Now an env var like `MYAPP__ROGUE` flows
     // through the same cascade (and `on_unknown_key` callback) as a
-    // file-supplied `rogue = 1` key, with the source path rendered as
-    // `<env>` and no line number.
+    // file-supplied `rogue = 1` key, and a violation renders as an env
+    // error naming the exact variable to unset.
     //
     // The walker is schema-driven (no typed deserialize) so type
     // mismatches between env's heuristic value parsing (e.g. string
     // "1.5" for an integer field) don't fail validation — that's
     // still the job of the final-merge type check inside `finalize`.
-    if cascade_active && let Some(env_table_ref) = env_table.as_ref() {
-        let env_unknowns =
-            crate::validate::collect_unknown_paths_ref(env_table_ref, input.spec.schema(), "");
-        let env_path = std::path::PathBuf::from("<env>");
-        let mut env_filtered = crate::validate::filter_through_cascade(
+    if cascade_active && let Some((env_table_ref, sources)) = env_layer.as_ref() {
+        let mut env_filtered = validate_unknown(
             env_table_ref,
-            "",
-            &env_path,
-            env_unknowns,
+            input.schema,
+            &UnknownKeySource::Env { sources },
             &validate_ctx,
         )?;
         collected_unknowns.append(&mut env_filtered);
     }
+    let env_table = env_layer.map(|(table, _)| table);
 
     // URL layer
     #[cfg(feature = "url")]
@@ -253,10 +268,6 @@ pub(crate) fn resolve<S: ConfigSpec>(
         )))
     };
 
-    // Default order: Files < Env < Url < Cli
-    let default_order = default_layer_order();
-    let order = input.layer_order.as_deref().unwrap_or(&default_order);
-
     // Merge layers in the specified order (first = lowest priority)
     let mut merged = Map::new();
     for layer in order {
@@ -272,11 +283,11 @@ pub(crate) fn resolve<S: ConfigSpec>(
         }
     }
 
-    // Spec-driven default injection: populate the table from the schema's
+    // Schema-driven default injection: populate the table from the schema's
     // declared defaults so `finalize` only has to check required fields.
-    input.spec.fill_defaults(&mut merged)?;
+    schema_walk::fill_defaults_into(&mut merged, input.schema);
 
-    let output = input.spec.finalize(merged)?;
+    let output = schema_walk::finalize(merged, input.schema)?;
     Ok((output, collected_unknowns))
 }
 
@@ -284,10 +295,9 @@ pub(crate) fn resolve<S: ConfigSpec>(
 mod tests {
     use super::*;
     use crate::fixtures::test::test_schema;
-    use crate::runtime_spec::DynamicSpec;
 
-    fn test_spec() -> DynamicSpec {
-        DynamicSpec::new(test_schema())
+    fn test_spec() -> Schema {
+        test_schema()
     }
 
     fn toml_only_registry() -> &'static FormatRegistry {
@@ -300,9 +310,9 @@ mod tests {
         })
     }
 
-    fn empty_input<S: ConfigSpec>(spec: &S) -> ResolveInput<'_, S> {
+    fn empty_input(schema: &Schema) -> ResolveInput<'_> {
         ResolveInput {
-            spec,
+            schema,
             registry: toml_only_registry(),
             files: vec![],
             env_vars: vec![],
@@ -513,6 +523,54 @@ mod tests {
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key, "rogue_key");
+        // The violation is reported as an env problem naming the exact
+        // variable to unset, never dressed as a config-file error.
+        assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__ROGUE_KEY"));
+        let msg = err.to_string();
+        assert!(msg.contains("MYAPP__ROGUE_KEY"), "{msg}");
+        assert!(!msg.contains("config file"), "{msg}");
+    }
+
+    #[test]
+    fn env_unknown_key_names_the_mixed_case_variable() {
+        // The suffix is accepted in any case and lowercased for the
+        // table path. The error must name the spelling that is actually
+        // set — unsetting a reconstructed MYAPP__ROGUE_KEY would leave
+        // MYAPP__rogue_key in place on a case-sensitive platform.
+        let spec = test_spec();
+        let input = ResolveInput {
+            env_vars: vec![("MYAPP__rogue_key".into(), "1".into())],
+            env_prefix: Some("MYAPP".into()),
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "rogue_key");
+        assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__rogue_key"));
+        let msg = err.to_string();
+        assert!(msg.contains("MYAPP__rogue_key"), "{msg}");
+        assert!(!msg.contains("MYAPP__ROGUE_KEY"), "{msg}");
+    }
+
+    #[test]
+    fn env_unknown_nested_section_names_the_variable() {
+        // No `database` field: the walker reports `database`, not
+        // `database.rogue`. The original variable must still be named.
+        use crate::runtime::{Field, Schema};
+        let spec = Schema::object("App")
+            .field("host", Field::string().default("localhost"))
+            .build();
+        let input = ResolveInput {
+            env_vars: vec![("MYAPP__DATABASE__ROGUE".into(), "1".into())],
+            env_prefix: Some("MYAPP".into()),
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "database");
+        assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__DATABASE__ROGUE"));
     }
 
     #[test]
@@ -681,6 +739,37 @@ mod tests {
         let (table, _) = resolve(input).unwrap();
         // Env is not in layer_order, so the file value stands
         assert_eq!(get(&table, "port").unwrap().as_integer(), Some(3000));
+    }
+
+    #[test]
+    fn omitted_env_layer_ignores_unknown_env_keys() {
+        // Omitting Layer::Env excludes the layer entirely: an unknown
+        // env key must not fail unknown-key validation or invoke the
+        // callback. The documented "omit a layer to exclude it" rule
+        // covers validation, not just merge.
+        let saw_env_unknown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw = std::sync::Arc::clone(&saw_env_unknown);
+        let spec = test_spec();
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\n".into())],
+            env_vars: vec![("MYAPP__ROGUE_KEY".into(), "1".into())],
+            env_prefix: Some("MYAPP".into()),
+            layer_order: Some(vec![Layer::Files, Layer::Cli]),
+            unknown_key_hook: Some(std::sync::Arc::new(move |ctx| {
+                if ctx.path == "rogue_key" {
+                    saw.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                crate::strict::UnknownKeyDecision::Reject
+            })),
+            ..empty_input(&spec)
+        };
+        let (table, collected) = resolve(input).expect("omitted env must not fail on APP__ROGUE");
+        assert_eq!(get(&table, "port").unwrap().as_integer(), Some(3000));
+        assert!(collected.is_empty());
+        assert!(
+            !saw_env_unknown.load(std::sync::atomic::Ordering::SeqCst),
+            "on_unknown_key must not run for env keys when Layer::Env is omitted"
+        );
     }
 
     #[test]

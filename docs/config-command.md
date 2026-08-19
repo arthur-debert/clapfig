@@ -1,7 +1,7 @@
 # Config Command Guide
 
 Clapfig provides a drop-in `config` subcommand for clap-based CLIs. Your users
-get `config gen|list|get|set|unset` with zero hand-written command logic.
+get `config gen|list|get|set|unset|schema` with zero hand-written command logic.
 
 ## Quick setup
 
@@ -25,7 +25,7 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let builder = Clapfig::schema_builder::<AppConfig>()
+    let builder = Clapfig::typed::<AppConfig>()
         .app_name("myapp")
         .persist_scope("local", SearchPath::Cwd)
         .persist_scope("global", SearchPath::Platform);
@@ -73,7 +73,11 @@ pool_size = 10
 ```
 
 Fields with defaults are real assignments; fields without one are commented
-placeholders. Enum-typed fields additionally carry an `Allowed:` line.
+placeholders. Enum-typed fields additionally carry an `Allowed:` line;
+array/map fields carry an `Elements:`/`Values:` line naming the element
+type. A `Required.` line marks a placeholder the runtime rejects if left
+commented (a non-optional scalar with no default). Absent arrays and maps
+load as empty, so they do not get that line.
 
 Write to a file with `--output` — the path's **extension selects the
 format**, independent of the enabled-formats list:
@@ -153,15 +157,37 @@ database.pool_size = 10
 ### `config set <key> <value>`
 
 Persists a value to the config file. The key is validated against the struct
-and the value is type-checked before writing:
+and the value is **parsed according to the leaf's declared type** before
+writing — a string field takes `123` verbatim (no way needed to "force a
+string"), a numeric or bool field refuses non-matching input naming the
+expected type:
 
 ```sh
 $ myapp config set port 9090
 Set port = 9090
 
 $ myapp config set port hello
-# Error: invalid type for key 'port'
+# Error: Invalid value for 'port': expected integer, got 'hello'
+
+$ myapp config set host 123        # host is a String field
+Set host = 123                     # persists as the string "123"
 ```
+
+Array and map leaves take TOML inline syntax — the value model's baseline
+vocabulary, whatever format the target file uses; the parsed value is
+written through that file's own adapter:
+
+```sh
+myapp config set tags '["a", "b"]'
+myapp config set limits '{cpu = 2, mem = 8}'
+```
+
+Keys inside `ArrayOf`/`MapOf` sections (arrays or maps **of sections**,
+e.g. `servers.web.host` where `servers` is a `HashMap<String, Server>`)
+are not addressable with a dotted CLI key — the entry key is user data,
+not a schema field, so `set` refuses with a targeted error telling you to
+edit the config file directly. (An indexed path syntax is a possible
+future extension.)
 
 With `--scope`:
 
@@ -201,7 +227,7 @@ Scopes name where `config set` and `config unset` write. The first scope
 added to the builder is the default; users select others with `--scope`:
 
 ```rust
-let builder = Clapfig::schema_builder::<AppConfig>()
+let builder = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .persist_scope("local", SearchPath::Cwd)       // default
     .persist_scope("global", SearchPath::Platform);
@@ -267,10 +293,10 @@ use clapfig::ConfigResult;
 
 let result = builder.handle(&action)?;
 match result {
-    ConfigResult::KeyValue { key, value, doc } => {
+    ConfigResult::KeyValue { key, value, doc, .. } => {
         // custom rendering
     }
-    ConfigResult::Listing { entries } => {
+    ConfigResult::Listing { entries, .. } => {
         for (key, value) in entries {
             // ...
         }
@@ -279,6 +305,14 @@ match result {
 }
 ```
 
+The `KeyValue`, `Listing`, and `ValueSet` variants also carry a
+`rendered` field — the display block spelled in the **active format**
+(the scope file's format for scoped operations, the preferred format for
+merged views): `key = value` under TOML, `key: value` under YAML,
+`"key": value` under JSON. `Display` (and therefore `handle_and_print` /
+`handle_to_string`) prints that spelling, so `config get`/`list` output
+matches the format your users actually write.
+
 ## ConfigCommand (runtime builder)
 
 If your app already uses a `--scope` flag or has naming conflicts with
@@ -286,13 +320,25 @@ If your app already uses a `--scope` flag or has naming conflicts with
 runtime and lets you rename subcommands and flags:
 
 ```rust
+use clap::CommandFactory;
 use clapfig::ConfigCommand;
 
-let cmd = ConfigCommand::builder()
-    .name("settings")          // "myapp settings" instead of "myapp config"
-    .build();
+let config_cmd = ConfigCommand::new()
+    .scope_long("target")       // rename --scope to --target
+    .gen_name("template");      // rename "gen" to "template"
+
+let app = Cli::command()
+    .subcommand(config_cmd.as_command("settings")); // "myapp settings" …
+
+let matches = app.get_matches();
+if let Some(("settings", sub)) = matches.subcommand() {
+    let action = config_cmd.parse(sub)?;
+    builder.handle_and_print(&action)?;
+}
 ```
 
+`as_command`'s `name` argument is the top-level subcommand (`"config"`,
+`"settings"`, …). Per-item methods rename the nested subcommands and flags.
 Both paths produce the same `ConfigAction`, so all downstream logic is shared.
 Prefer `ConfigArgs` for simplicity; reach for `ConfigCommand` only when you
 hit conflicts.

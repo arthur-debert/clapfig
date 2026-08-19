@@ -1,6 +1,6 @@
 # Resolver Guide
 
-The `RuntimeResolver` is clapfig's answer to the `.editorconfig` /
+The `Resolver` is clapfig's answer to the `.editorconfig` /
 `.eslintrc` / `.htaccess` pattern: tools that walk a file tree where every
 directory can carry its own configuration, with ancestor configs layering in
 from above.
@@ -23,7 +23,7 @@ build systems — you need:
 ```rust
 use clapfig::{Clapfig, SearchPath, Boundary, SearchMode};
 
-let resolver = Clapfig::runtime(site_schema())
+let resolver = Clapfig::builder(site_schema())
     .app_name("myssg")
     .file_name(".myssg.toml")
     .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
@@ -31,13 +31,29 @@ let resolver = Clapfig::runtime(site_schema())
     .build_resolver()?;
 ```
 
-Each `resolve_at()` call returns the merged `clapfig::value::Map`;
-deserialize it into your typed struct where you need one via
-`clapfig::value::from_value(Value::Map(map))`.
+Each `resolve_at()` call returns the merged `clapfig::value::Map`.
 
 `build_resolver()` captures the builder's state — search paths, env vars,
 overrides, strict mode, post_validate hook — into a reusable handle. The
 builder is consumed, just like `load()`.
+
+The typed path mirrors this: `Clapfig::typed::<C>() … .build_resolver()`
+returns a `TypedResolver<C>` wrapping the same machinery, whose
+`resolve_at()` deserializes each merged map into a typed `C` and runs the
+typed `post_validate(&C)` hook per call:
+
+```rust
+let resolver = Clapfig::typed::<SiteConfig>()
+    .app_name("myssg")
+    .file_name(".myssg.toml")
+    .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
+    .build_resolver()?;
+
+for leaf in walk_content_tree("./site") {
+    let config: SiteConfig = resolver.resolve_at(&leaf)?;
+    render_page(&leaf, &config);
+}
+```
 
 ## Resolving per directory
 
@@ -62,7 +78,7 @@ Files read during `resolve_at()` are cached by absolute path inside the
 resolver. A tree walk that visits 1000 leaves sharing 5 ancestor config files
 pays the disk+parse cost once per unique file, not 1000 times.
 
-The cache lives for the lifetime of the `RuntimeResolver` instance. There is
+The cache lives for the lifetime of the `Resolver` instance. There is
 no mtime-based invalidation — if files change on disk and you need
 freshness, build a new resolver. This is a deliberate simplicity choice.
 
@@ -99,7 +115,7 @@ Uses only the single nearest file found. Good when configs are self-contained
 and should not layer:
 
 ```rust
-let resolver = Clapfig::runtime(schema)
+let resolver = Clapfig::builder(schema)
     .app_name("fmt")
     .search_paths(vec![SearchPath::Ancestors(Boundary::Root)])
     .search_mode(SearchMode::FirstMatch)
@@ -131,7 +147,7 @@ and fires on every `resolve_at()` call — not just once. This means per-leaf
 semantic validation works automatically:
 
 ```rust
-let resolver = Clapfig::runtime(site_schema())
+let resolver = Clapfig::builder(site_schema())
     .app_name("myssg")
     .file_name(".myssg.toml")
     .search_paths(vec![SearchPath::Ancestors(Boundary::Marker(".git"))])
@@ -157,7 +173,7 @@ or `Path`) contribute the same files to every `resolve_at()` call, while
 `Ancestors` and `Cwd` vary per call:
 
 ```rust
-let resolver = Clapfig::runtime(schema)
+let resolver = Clapfig::builder(schema)
     .app_name("mytool")
     .file_name(".mytool.toml")
     .search_paths(vec![

@@ -1,4 +1,4 @@
-# Strict mode and the cascading strictness cascade
+# Strict mode and cascading strictness
 
 Strict mode is **on by default**. When a config file contains a key that
 doesn't match any field in your schema, loading fails with the file
@@ -15,11 +15,11 @@ re-tightens. Clapfig models all of these with three composable knobs.
 ### Knob 1 — `.strict(bool)`: the whole-resolution default
 
 ```rust,ignore
-Clapfig::schema_builder::<AppConfig>()
+Clapfig::typed::<AppConfig>()
     .strict(true)   // unknown keys are errors (the default)
     .load()?;
 
-Clapfig::schema_builder::<AppConfig>()
+Clapfig::typed::<AppConfig>()
     .strict(false)  // unknown keys are silently dropped
     .load()?;
 ```
@@ -31,15 +31,15 @@ carry an explicit override.
 
 Two equivalent surfaces:
 
-- `strict_at(path, bool)` (on both the typed `SchemaConfigBuilder` and
-  the `RuntimeBuilder`) — sets an override on a dotted path, validated
+- `strict_at(path, bool)` (on both the typed `TypedBuilder` and
+  the `Builder`) — sets an override on a dotted path, validated
   against the schema.
 - `Schema::strict(bool)` — sets an override on a runtime schema node
   inline (`#[clapfig(strict = ...)]` on a derived struct).
 
 ```rust,ignore
 // Typed path
-Clapfig::schema_builder::<AppConfig>()
+Clapfig::typed::<AppConfig>()
     .strict_at("plugins", false)        // plugins.* subtree: lenient
     .strict_at("plugins.audit", true)   // …but plugins.audit re-tightens
     .load()?;
@@ -59,7 +59,7 @@ unknown path errors at `build_resolver()` time with
 ```rust,ignore
 use clapfig::{UnknownKeyContext, UnknownKeyDecision};
 
-Clapfig::schema_builder::<AppConfig>()
+Clapfig::typed::<AppConfig>()
     .strict(true)
     .on_unknown_key(|c: &UnknownKeyContext<'_>| {
         if c.leaf.contains('.') {

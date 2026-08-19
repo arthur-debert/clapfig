@@ -2,13 +2,11 @@
 //! fluent builder, for callers without a compile-time
 //! `#[derive(clapfig::Schema)]` struct.
 //!
-//! Pairs with a crate-private schema abstraction introduced in Phase 1
-//! (a borrowed `SchemaRef` view). The runtime-side `Schema` is converted
-//! to that view internally, and every consumer that already walks the
-//! borrowed view — strict-mode validation, doc lookup, valid-key
-//! enumeration, JSON Schema generation, template generation, persistence
-//! validation — works over either source without a recompile-time
-//! struct.
+//! This is the crate's one schema model: every consumer — strict-mode
+//! validation, doc lookup, valid-key enumeration, JSON Schema
+//! generation, template generation, persistence validation — walks
+//! `&Schema` directly, whether it was built here or emitted by
+//! `#[derive(clapfig::Schema)]`.
 //!
 //! # Example
 //!
@@ -42,7 +40,7 @@ use crate::value::Value;
 /// Constructed via [`Schema::object`] and the fluent builder, or directly
 /// as a plain data struct. The clapfig resolve pipeline borrows from
 /// this internally — callers normally only need to build it and hand it
-/// to [`Clapfig::runtime`](crate::Clapfig::runtime).
+/// to [`Clapfig::builder`](crate::Clapfig::builder).
 #[derive(Debug, Clone)]
 pub struct Schema {
     pub name: String,
@@ -54,8 +52,8 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// Start building a schema with the given object name (analogous to the
-    /// struct name in the static path).
+    /// Start building a schema with the given object name (the derive
+    /// macro emits the struct's name here).
     pub fn object(name: impl Into<String>) -> SchemaBuilder {
         SchemaBuilder {
             schema: Schema {
@@ -169,7 +167,9 @@ pub enum Field {
     Leaf(Leaf),
     /// A single nested object — TOML `[section]`.
     Nested(Schema),
-    /// An array of nested objects — TOML `[[plugins]]`.
+    /// An array of nested objects — TOML `[[plugins]]`. Deserializes to
+    /// `Vec<T>` where `T` is a struct deriving [`Schema`](crate::Schema);
+    /// an absent array loads as the empty `Vec`.
     ArrayOf(Schema),
     /// A string-keyed map of nested objects — TOML `[plugins.<key>]` with
     /// arbitrary `<key>` names. Sibling of [`ArrayOf`](Field::ArrayOf) for
@@ -185,9 +185,32 @@ impl Field {
         FieldBuilder::new(LeafType::String)
     }
 
-    /// Start a leaf builder for an integer value.
+    /// Start a leaf builder for an integer value (unbounded — the full
+    /// signed 64-bit range). Construct
+    /// [`LeafType::Integer`] directly to declare bounds.
     pub fn integer() -> FieldBuilder {
-        FieldBuilder::new(LeafType::Integer)
+        FieldBuilder::new(LeafType::Integer {
+            min: None,
+            max: None,
+        })
+    }
+
+    /// Start a leaf builder for a range-bounded integer value. `None` on
+    /// either end leaves that end open. Out-of-range values fail schema
+    /// validation naming the key, and JSON Schema export carries the
+    /// bounds as `minimum`/`maximum` — the runtime-schema counterpart of
+    /// the width bounds the derive macro emits for sized integer fields.
+    ///
+    /// Panics if both ends are set and `min > max` — the same class of
+    /// construction-time check as [`SchemaBuilder::field`] field names.
+    pub fn integer_in(min: Option<i64>, max: Option<i64>) -> FieldBuilder {
+        if let (Some(lo), Some(hi)) = (min, max) {
+            assert!(
+                lo <= hi,
+                "clapfig: integer_in min ({lo}) must be <= max ({hi})"
+            );
+        }
+        FieldBuilder::new(LeafType::Integer { min, max })
     }
 
     /// Start a leaf builder for a floating-point value.
@@ -233,7 +256,7 @@ impl Field {
     /// `#[serde(untagged)]` enums). Clapfig will not type-check the value
     /// at this layer; the caller is responsible for any further validation
     /// or deserialization, typically inside a `post_validate` hook or
-    /// after `RuntimeResolver::resolve`.
+    /// after `load()` / `Resolver::resolve_at`.
     ///
     /// Strict mode is unaffected — `Value` is about *value shape* on a
     /// known key, not about whether unknown sibling keys are allowed.
@@ -261,7 +284,15 @@ pub struct Leaf {
 #[derive(Debug, Clone)]
 pub enum LeafType {
     String,
-    Integer,
+    /// Signed 64-bit integer, optionally range-bounded. The derive macro
+    /// emits the source Rust width's range here (`u8` → `0..=255`), so
+    /// out-of-range values fail the schema check with the key path
+    /// instead of a post-merge deserialize failure. `None` on either end
+    /// leaves that end open ([`Field::integer`] leaves both open).
+    Integer {
+        min: Option<i64>,
+        max: Option<i64>,
+    },
     Float,
     Bool,
     /// Datetime in one of the baseline's four lexical forms (offset
@@ -291,7 +322,7 @@ impl LeafType {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             LeafType::String => "string",
-            LeafType::Integer => "integer",
+            LeafType::Integer { .. } => "integer",
             LeafType::Float => "float",
             LeafType::Bool => "bool",
             LeafType::DateTime => "datetime",
@@ -305,14 +336,31 @@ impl LeafType {
     /// Check whether a [`Value`] is shape-compatible with this leaf type.
     ///
     /// Containers (`Array`, `Map`) recurse into their elements. `Enum` checks
-    /// literal equality against the allowed-value set. Returns `Ok(())` on
-    /// match; on mismatch, returns a human-readable reason suitable for
+    /// literal equality against the allowed-value set. `Integer` also
+    /// enforces its declared bounds, and `Float` accepts integer values
+    /// (serde accepts them for `f64` fields; the finalize pass coerces the
+    /// stored value to a float). Returns `Ok(())` on match; on mismatch,
+    /// returns a human-readable reason suitable for
     /// `ClapfigError::InvalidValue::reason`.
     pub(crate) fn check(&self, value: &Value) -> Result<(), String> {
         match (self, value) {
             (LeafType::String, Value::String(_)) => Ok(()),
-            (LeafType::Integer, Value::Integer(_)) => Ok(()),
+            (LeafType::Integer { min, max }, Value::Integer(i)) => {
+                if min.is_some_and(|lo| *i < lo) || max.is_some_and(|hi| *i > hi) {
+                    Err(format!(
+                        "value {i} is out of range (allowed: {})",
+                        format_bounds(*min, *max)
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
             (LeafType::Float, Value::Float(_)) => Ok(()),
+            // Integer-for-float: serde accepts `timeout = 5` for an `f64`
+            // field, so the schema check does too. The finalize pass
+            // rewrites the value to `Value::Float` (see
+            // `schema_walk::coerce_value`).
+            (LeafType::Float, Value::Integer(_)) => Ok(()),
             (LeafType::Bool, Value::Boolean(_)) => Ok(()),
             (LeafType::DateTime, Value::Datetime(_)) => Ok(()),
             (LeafType::Array(elem), Value::Array(items)) => {
@@ -433,6 +481,18 @@ fn validate_field_name(schema: &Schema, name: &str) {
     );
 }
 
+/// Human-readable spelling of an integer leaf's declared bounds for error
+/// messages: `0..=255`, `>= 0`, or `<= 100`. Callers never pass
+/// `(None, None)` (an unbounded integer has no range to violate).
+fn format_bounds(min: Option<i64>, max: Option<i64>) -> String {
+    match (min, max) {
+        (Some(lo), Some(hi)) => format!("{lo}..={hi}"),
+        (Some(lo), None) => format!(">= {lo}"),
+        (None, Some(hi)) => format!("<= {hi}"),
+        (None, None) => unreachable!("unbounded integers cannot be out of range"),
+    }
+}
+
 /// Pretty-print a [`Value`] for error messages.
 fn format_value(v: &Value) -> String {
     match v {
@@ -512,20 +572,62 @@ mod tests {
         }
     }
 
+    fn unbounded_integer() -> LeafType {
+        LeafType::Integer {
+            min: None,
+            max: None,
+        }
+    }
+
     #[test]
     fn leaf_type_check_accepts_matching_primitives() {
         assert!(LeafType::String.check(&Value::String("x".into())).is_ok());
-        assert!(LeafType::Integer.check(&Value::Integer(1)).is_ok());
+        assert!(unbounded_integer().check(&Value::Integer(1)).is_ok());
         assert!(LeafType::Bool.check(&Value::Boolean(true)).is_ok());
     }
 
     #[test]
     fn leaf_type_check_rejects_mismatched_type() {
-        let err = LeafType::Integer
+        let err = unbounded_integer()
             .check(&Value::String("nope".into()))
             .unwrap_err();
         assert!(err.contains("expected integer"));
         assert!(err.contains("got string"));
+    }
+
+    #[test]
+    fn leaf_type_check_float_accepts_integer_value() {
+        // serde accepts `timeout = 5` for an f64 field; the schema check
+        // must not be stricter than the deserializer.
+        assert!(LeafType::Float.check(&Value::Integer(5)).is_ok());
+        assert!(LeafType::Float.check(&Value::Float(5.0)).is_ok());
+        let err = LeafType::Float
+            .check(&Value::String("5".into()))
+            .unwrap_err();
+        assert!(err.contains("expected float"));
+    }
+
+    #[test]
+    fn leaf_type_check_integer_enforces_bounds() {
+        let u8_like = LeafType::Integer {
+            min: Some(0),
+            max: Some(255),
+        };
+        assert!(u8_like.check(&Value::Integer(0)).is_ok());
+        assert!(u8_like.check(&Value::Integer(255)).is_ok());
+        let err = u8_like.check(&Value::Integer(300)).unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+        assert!(err.contains("0..=255"), "{err}");
+        let err = u8_like.check(&Value::Integer(-1)).unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+
+        let non_negative = LeafType::Integer {
+            min: Some(0),
+            max: None,
+        };
+        assert!(non_negative.check(&Value::Integer(i64::MAX)).is_ok());
+        let err = non_negative.check(&Value::Integer(-5)).unwrap_err();
+        assert!(err.contains(">= 0"), "{err}");
     }
 
     #[test]
@@ -574,8 +676,22 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "integer_in min")]
+    fn integer_in_rejects_min_greater_than_max() {
+        let _ = Field::integer_in(Some(10), Some(1));
+    }
+
+    #[test]
+    fn integer_in_accepts_open_and_equal_ends() {
+        let _ = Field::integer_in(Some(0), None);
+        let _ = Field::integer_in(None, Some(10));
+        let _ = Field::integer_in(Some(5), Some(5));
+        let _ = Field::integer_in(None, None);
+    }
+
+    #[test]
     fn leaf_type_check_array_recurses() {
-        let arr = LeafType::Array(Box::new(LeafType::Integer));
+        let arr = LeafType::Array(Box::new(unbounded_integer()));
         let good = Value::Array(vec![Value::Integer(1), Value::Integer(2)]);
         assert!(arr.check(&good).is_ok());
 
@@ -632,7 +748,7 @@ mod tests {
 
     #[test]
     fn leaf_type_check_map_recurses() {
-        let map = LeafType::Map(Box::new(LeafType::Integer));
+        let map = LeafType::Map(Box::new(unbounded_integer()));
         let mut t = crate::value::Map::new();
         t.insert("a".into(), Value::Integer(1));
         assert!(map.check(&Value::Map(t.clone())).is_ok());

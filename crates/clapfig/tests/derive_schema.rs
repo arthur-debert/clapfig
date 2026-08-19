@@ -1,7 +1,7 @@
 //! End-to-end tests for `#[derive(clapfig::Schema)]`.
 //!
-//! These exercise the static-path schema-metadata symmetry contract from
-//! `docs/proposals/schema-metadata-symmetry.md`:
+//! These exercise the derive path's schema-metadata symmetry contract
+//! from `docs/proposals/schema-metadata-symmetry.md`:
 //!
 //! - JSON Schema `"type"` is emitted for every leaf, including those
 //!   without defaults (gap #1).
@@ -66,7 +66,7 @@ fn schema_runtime_view_matches_static_view() {
 #[test]
 fn load_returns_typed_struct_with_defaults() {
     let dir = TempDir::new().unwrap();
-    let cfg: AppConfig = Clapfig::schema_builder::<AppConfig>()
+    let cfg: AppConfig = Clapfig::typed::<AppConfig>()
         .app_name("myapp")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -88,7 +88,7 @@ fn load_file_overrides_defaults() {
     )
     .unwrap();
 
-    let cfg: AppConfig = Clapfig::schema_builder::<AppConfig>()
+    let cfg: AppConfig = Clapfig::typed::<AppConfig>()
         .app_name("myapp")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -104,7 +104,7 @@ fn strict_rejects_unknown_top_level_key() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("myapp.toml"), "typo_key = 1\n").unwrap();
 
-    let result: Result<AppConfig, _> = Clapfig::schema_builder::<AppConfig>()
+    let result: Result<AppConfig, _> = Clapfig::typed::<AppConfig>()
         .app_name("myapp")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -115,7 +115,7 @@ fn strict_rejects_unknown_top_level_key() {
 #[test]
 fn cli_override_wins() {
     let dir = TempDir::new().unwrap();
-    let cfg: AppConfig = Clapfig::schema_builder::<AppConfig>()
+    let cfg: AppConfig = Clapfig::typed::<AppConfig>()
         .app_name("myapp")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -128,7 +128,7 @@ fn cli_override_wins() {
 #[test]
 fn typed_post_validate_sees_merged_c() {
     let dir = TempDir::new().unwrap();
-    let result: Result<AppConfig, _> = Clapfig::schema_builder::<AppConfig>()
+    let result: Result<AppConfig, _> = Clapfig::typed::<AppConfig>()
         .app_name("myapp")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -158,7 +158,7 @@ struct RequiredFieldsConfig {
 
 #[test]
 fn json_schema_emits_type_for_required_fields_without_defaults() {
-    let result = Clapfig::schema_builder::<RequiredFieldsConfig>()
+    let result = Clapfig::typed::<RequiredFieldsConfig>()
         .app_name("test")
         .no_env()
         .handle(&ConfigAction::Schema { output: None })
@@ -187,7 +187,7 @@ struct EnumConfig {
 
 #[test]
 fn json_schema_emits_enum_for_allowed_constrained_leaf() {
-    let result = Clapfig::schema_builder::<EnumConfig>()
+    let result = Clapfig::typed::<EnumConfig>()
         .app_name("test")
         .no_env()
         .handle(&ConfigAction::Schema { output: None })
@@ -206,7 +206,7 @@ fn json_schema_emits_enum_for_allowed_constrained_leaf() {
 
 #[test]
 fn template_emits_allowed_line_for_enum_leaf() {
-    let result = Clapfig::schema_builder::<EnumConfig>()
+    let result = Clapfig::typed::<EnumConfig>()
         .app_name("test")
         .no_env()
         .handle(&ConfigAction::Gen { output: None })
@@ -225,7 +225,7 @@ fn template_emits_allowed_line_for_enum_leaf() {
 fn enum_constraint_rejects_out_of_set_value_at_load() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("test.toml"), "level = \"garbage\"\n").unwrap();
-    let result: Result<EnumConfig, _> = Clapfig::schema_builder::<EnumConfig>()
+    let result: Result<EnumConfig, _> = Clapfig::typed::<EnumConfig>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -237,7 +237,7 @@ fn enum_constraint_rejects_out_of_set_value_at_load() {
 
 #[test]
 fn template_emits_placeholder_for_required_leaf_without_default() {
-    let result = Clapfig::schema_builder::<RequiredFieldsConfig>()
+    let result = Clapfig::typed::<RequiredFieldsConfig>()
         .app_name("test")
         .no_env()
         .handle(&ConfigAction::Gen { output: None })
@@ -263,7 +263,7 @@ fn template_emits_placeholder_for_required_leaf_without_default() {
 
 #[test]
 fn doc_comments_become_descriptions() {
-    let result = Clapfig::schema_builder::<AppConfig>()
+    let result = Clapfig::typed::<AppConfig>()
         .app_name("test")
         .no_env()
         .handle(&ConfigAction::Schema { output: None })
@@ -325,7 +325,7 @@ fn value_leaf_accepts_any_shape_at_load() {
         "rule = [\"warn\", { max = 80 }]\n",
     )
     .unwrap();
-    let cfg: ValueConfig = Clapfig::schema_builder::<ValueConfig>()
+    let cfg: ValueConfig = Clapfig::typed::<ValueConfig>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -404,7 +404,7 @@ fn serde_directional_rename_uses_deserialize_spelling() {
 fn serde_directional_rename_loads_end_to_end() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("test.toml"), "listen-port = 9090\n").unwrap();
-    let cfg: DirectionalRenameConfig = Clapfig::schema_builder::<DirectionalRenameConfig>()
+    let cfg: DirectionalRenameConfig = Clapfig::typed::<DirectionalRenameConfig>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -454,7 +454,7 @@ struct LenientConfig {
 fn struct_strict_attribute_cascades_to_unknown_keys() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("t.toml"), "x = 2\nrogue = 99\n").unwrap();
-    let cfg: LenientConfig = Clapfig::schema_builder::<LenientConfig>()
+    let cfg: LenientConfig = Clapfig::typed::<LenientConfig>()
         .app_name("t")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -492,7 +492,7 @@ fn vec_of_string_field_emits_array_leaf_type() {
 #[test]
 fn vec_default_loads_via_runtime_pipeline() {
     let dir = TempDir::new().unwrap();
-    let cfg: VecConfig = Clapfig::schema_builder::<VecConfig>()
+    let cfg: VecConfig = Clapfig::typed::<VecConfig>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -545,7 +545,7 @@ fn unit_enum_field_flattens_to_runtime_leaf_enum() {
 
 #[test]
 fn unit_enum_template_emits_allowed_hint() {
-    let result = Clapfig::schema_builder::<PdfDoc>()
+    let result = Clapfig::typed::<PdfDoc>()
         .app_name("test")
         .no_env()
         .handle(&ConfigAction::Gen { output: None })
@@ -564,7 +564,7 @@ fn unit_enum_template_emits_allowed_hint() {
 fn unit_enum_load_accepts_known_variant() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("test.toml"), "page_size = \"letter\"\n").unwrap();
-    let cfg: PdfDoc = Clapfig::schema_builder::<PdfDoc>()
+    let cfg: PdfDoc = Clapfig::typed::<PdfDoc>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -577,7 +577,7 @@ fn unit_enum_load_accepts_known_variant() {
 fn unit_enum_load_rejects_unknown_variant() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("test.toml"), "page_size = \"a3\"\n").unwrap();
-    let result: Result<PdfDoc, _> = Clapfig::schema_builder::<PdfDoc>()
+    let result: Result<PdfDoc, _> = Clapfig::typed::<PdfDoc>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -587,7 +587,7 @@ fn unit_enum_load_rejects_unknown_variant() {
 
 #[test]
 fn unit_enum_json_schema_carries_enum_array() {
-    let result = Clapfig::schema_builder::<PdfDoc>()
+    let result = Clapfig::typed::<PdfDoc>()
         .app_name("test")
         .no_env()
         .handle(&ConfigAction::Schema { output: None })
@@ -724,7 +724,7 @@ fn map_of_nested_struct_emits_map_of_field() {
     let plugins = &s.fields[0];
     assert!(matches!(
         plugins.field,
-        clapfig::static_schema::FieldStatic::MapOf(_)
+        clapfig::static_schema::FieldStatic::MapOf { .. }
     ));
 }
 
@@ -736,7 +736,7 @@ fn map_of_nested_struct_loads_user_keyed_entries() {
         "[plugins.audit]\nseverity = \"warn\"\n[plugins.fmt]\nenabled = true\nseverity = \"error\"\n",
     )
     .unwrap();
-    let cfg: PluginHost = Clapfig::schema_builder::<PluginHost>()
+    let cfg: PluginHost = Clapfig::typed::<PluginHost>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -756,7 +756,7 @@ fn map_of_nested_struct_rejects_unknown_key_in_entry() {
         "[plugins.audit]\nseverity = \"warn\"\nrogue = 1\n",
     )
     .unwrap();
-    let result: Result<PluginHost, _> = Clapfig::schema_builder::<PluginHost>()
+    let result: Result<PluginHost, _> = Clapfig::typed::<PluginHost>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -840,7 +840,7 @@ fn default_on_enum_typed_field_round_trips_through_schema() {
 #[test]
 fn default_on_enum_typed_field_applies_when_no_layer_provides_value() {
     let dir = TempDir::new().unwrap();
-    let cfg: DocWithDefaultEnum = Clapfig::schema_builder::<DocWithDefaultEnum>()
+    let cfg: DocWithDefaultEnum = Clapfig::typed::<DocWithDefaultEnum>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -853,7 +853,7 @@ fn default_on_enum_typed_field_applies_when_no_layer_provides_value() {
 fn default_on_enum_typed_field_loses_to_user_supplied_value() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("test.toml"), "page_size = \"a4\"\n").unwrap();
-    let cfg: DocWithDefaultEnum = Clapfig::schema_builder::<DocWithDefaultEnum>()
+    let cfg: DocWithDefaultEnum = Clapfig::typed::<DocWithDefaultEnum>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -885,7 +885,7 @@ fn option_of_unit_enum_emits_optional_leaf_enum() {
 #[test]
 fn option_of_unit_enum_load_accepts_absence() {
     let dir = TempDir::new().unwrap();
-    let cfg: DocWithOptionalEnum = Clapfig::schema_builder::<DocWithOptionalEnum>()
+    let cfg: DocWithOptionalEnum = Clapfig::typed::<DocWithOptionalEnum>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -898,7 +898,7 @@ fn option_of_unit_enum_load_accepts_absence() {
 fn option_of_unit_enum_load_accepts_known_variant() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("test.toml"), "page_size = \"a4\"\n").unwrap();
-    let cfg: DocWithOptionalEnum = Clapfig::schema_builder::<DocWithOptionalEnum>()
+    let cfg: DocWithOptionalEnum = Clapfig::typed::<DocWithOptionalEnum>()
         .app_name("test")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
         .no_env()
@@ -965,6 +965,13 @@ fn option_of_struct_typed_field_panic_mentions_option_wrapper() {
 // applies to values from every source — files, env, CLI overrides, and
 // schema defaults (defaults are injected into the merged table before the
 // typed deserialize, so they pass through the deserializer too).
+//
+// The contract is *shape-preserving* normalization: the schema keeps
+// advertising the field's inferred shape and validates the merged table
+// against it BEFORE serde runs. A deserializer expecting a different wire
+// shape never sees its input — schema validation rejects it loudly first
+// (pinned below) — and `#[clapfig(value)]` is the opt-out that hands the
+// wire shape to the deserializer.
 
 fn normalize_lowercase<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -991,7 +998,7 @@ fn deserialize_with_normalizes_from_file() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("norm.toml"), "color = \"BLUE\"\n").unwrap();
 
-    let cfg: NormalizedConfig = Clapfig::schema_builder::<NormalizedConfig>()
+    let cfg: NormalizedConfig = Clapfig::typed::<NormalizedConfig>()
         .app_name("norm")
         .file_name("norm.toml")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
@@ -1006,7 +1013,7 @@ fn deserialize_with_normalizes_from_file() {
 #[test]
 fn deserialize_with_normalizes_from_cli_override() {
     let dir = TempDir::new().unwrap();
-    let cfg: NormalizedConfig = Clapfig::schema_builder::<NormalizedConfig>()
+    let cfg: NormalizedConfig = Clapfig::typed::<NormalizedConfig>()
         .app_name("norm")
         .file_name("norm.toml")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
@@ -1024,7 +1031,7 @@ fn deserialize_with_applies_to_schema_defaults_too() {
     // through serde, so they pass through deserialize_with as well. A
     // pre-normalized default round-trips unchanged.
     let dir = TempDir::new().unwrap();
-    let cfg: NormalizedConfig = Clapfig::schema_builder::<NormalizedConfig>()
+    let cfg: NormalizedConfig = Clapfig::typed::<NormalizedConfig>()
         .app_name("norm")
         .file_name("norm.toml")
         .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
@@ -1033,4 +1040,79 @@ fn deserialize_with_applies_to_schema_defaults_too() {
         .unwrap();
 
     assert_eq!(cfg.color, "red");
+}
+
+/// A shape-*changing* deserializer: accepts a TOML string and parses it
+/// into the numeric field. The schema still declares the field as an
+/// integer, so its string wire shape disagrees with what validation checks.
+fn port_from_string<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum PortRepr {
+        Num(u16),
+        Str(String),
+    }
+
+    match PortRepr::deserialize(deserializer)? {
+        PortRepr::Num(n) => Ok(n),
+        PortRepr::Str(s) => s.parse().map_err(D::Error::custom),
+    }
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
+struct ShapeChangingConfig {
+    /// Port, permissively parsed.
+    #[serde(deserialize_with = "port_from_string")]
+    port: u16,
+}
+
+#[test]
+fn shape_changing_deserializer_input_is_rejected_loudly_before_serde() {
+    // The schema advertises `port` as an integer; schema validation runs
+    // before the typed deserialize, so the deserializer's extra string
+    // shape is rejected with a loud type error — a load failure, never a
+    // silently mis-typed value.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("shape.toml"), "port = \"8080\"\n").unwrap();
+
+    let result: Result<ShapeChangingConfig, _> = Clapfig::typed::<ShapeChangingConfig>()
+        .app_name("shape")
+        .file_name("shape.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load();
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("expected integer, got string"),
+        "expected the schema type-check error, got: {msg}"
+    );
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
+struct ValueOptOutConfig {
+    /// Port, permissively parsed; `value` hands the wire shape to the
+    /// deserializer (the schema declares a free-form leaf).
+    #[serde(deserialize_with = "port_from_string")]
+    #[clapfig(value)]
+    port: u16,
+}
+
+#[test]
+fn clapfig_value_opts_a_shape_changing_deserializer_out_of_the_type_check() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("shape.toml"), "port = \"8080\"\n").unwrap();
+
+    let cfg: ValueOptOutConfig = Clapfig::typed::<ValueOptOutConfig>()
+        .app_name("shape")
+        .file_name("shape.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+        .unwrap();
+    assert_eq!(cfg.port, 8080);
 }

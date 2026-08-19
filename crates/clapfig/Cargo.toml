@@ -54,6 +54,7 @@ yamlpatch = ">=1.26, <1.28"
 yaml_serde = "0.10"
 
 [dev-dependencies]
+regex = "1"
 tempfile = "3"
 trybuild = "1"
 

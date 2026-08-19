@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::error::{ClapfigError, UnknownKeyInfo};
 use crate::normalize::normalize_key;
-use crate::spec::{FieldKindRef, SchemaRef};
+use crate::runtime::Schema;
 use crate::strict::{
     CollectedUnknown, StrictnessOverrides, UnknownKeyContext, UnknownKeyDecision, UnknownKeyHook,
 };
@@ -20,17 +20,31 @@ use crate::value::{Map, Value};
 /// Per-resolution strictness configuration passed into the validate path.
 ///
 /// Bundles the cascade overrides, the builder-level default ([Knob 1]),
-/// and the optional [`on_unknown_key`](crate::RuntimeBuilder::on_unknown_key)
+/// and the optional [`on_unknown_key`](crate::Builder::on_unknown_key)
 /// callback. The `normalize_keys` flag is forwarded to the line-number
 /// heuristic so error snippets still point at the user's original line
 /// when keys round-trip through kebab → snake normalization.
 ///
-/// [Knob 1]: crate::RuntimeBuilder::strict
+/// [Knob 1]: crate::Builder::strict
 pub(crate) struct ValidateContext<'a> {
     pub overrides: &'a StrictnessOverrides,
     pub default_strict: bool,
     pub callback: Option<&'a UnknownKeyHook>,
     pub normalize_keys: bool,
+}
+
+/// Where the table under validation came from — decides how an
+/// unknown-key violation is reported.
+///
+/// A `File` source carries the raw text (for the TOML line-number
+/// heuristic and renderer snippets) and the file path. An `Env` source
+/// carries the original variable name(s) for each dotted path so each
+/// violation can name the exact variable to unset (`MYAPP__rogue_key`,
+/// not a reconstructed `MYAPP__ROGUE_KEY`) instead of wearing
+/// config-file clothing.
+pub(crate) enum UnknownKeySource<'a> {
+    File { path: &'a Path, source: &'a str },
+    Env { sources: &'a crate::env::EnvSources },
 }
 
 /// Single unknown-key entry passed to `filter_through_cascade`.
@@ -47,88 +61,33 @@ pub(crate) struct UnknownKey {
     pub leaf: String,
 }
 
-/// Schema-driven unknown-key walker that works against any
-/// [`SchemaRef`]. The walker recurses through
-/// [`FieldKindRef::Nested`] and [`FieldKindRef::MapOf`] subtrees; arrays-
-/// of-tables don't show up in non-file layers (env / CLI / URL), so
-/// `ArrayOf` is skipped at this layer.
+/// Detect unknown keys in a parsed config table: walk `table` against
+/// `schema` ([`crate::schema_walk::collect_unknown_paths`]), then resolve
+/// every hit through the strictness cascade and the optional
+/// `on_unknown_key` callback ([`filter_through_cascade`]).
 ///
-/// Used by the env-layer validator: env vars are merged after the
-/// per-file validate pass, so an `MYAPP__ROGUE_KEY=...` would otherwise
-/// slip into the merged result without ever reaching the cascade or the
-/// `on_unknown_key` callback. The same walker can be reused for any
-/// layer whose values are already a `Table` without source text — the
-/// caller threads the resulting `UnknownKey` list through
-/// [`filter_through_cascade`].
-pub(crate) fn collect_unknown_paths_ref(
+/// One entry point serves every layer. The per-file pass supplies an
+/// [`UnknownKeySource::File`] (source text and path, for line-number
+/// rendering); the env-layer pass supplies [`UnknownKeySource::Env`] with
+/// the original variable names — env vars are merged after the per-file
+/// pass, so without this call an `MYAPP__ROGUE_KEY=...` would slip into
+/// the merged result without ever reaching the cascade or the
+/// `on_unknown_key` callback, and violations render as env errors naming
+/// the exact variable that produced the key.
+///
+/// Returns the keys the callback opted to
+/// [`UnknownKeyDecision::Collect`] — empty for callers that don't use
+/// the collect path. Reject decisions surface as
+/// `ClapfigError::UnknownKeys`.
+pub(crate) fn validate_unknown(
     table: &Map,
-    schema: SchemaRef<'_>,
-    prefix: &str,
-) -> Vec<UnknownKey> {
-    let mut out = Vec::new();
-    walk_against_schema(table, schema, prefix, &mut out);
-    out
-}
-
-fn walk_against_schema<'a>(
-    table: &Map,
-    schema: SchemaRef<'a>,
-    prefix: &str,
-    out: &mut Vec<UnknownKey>,
-) {
-    // Snapshot the schema's fields into a `Vec` of `&str`-borrowed
-    // entries up front, so we can iterate `table` (a borrow) without
-    // re-running the schema iterator's setup on every key. Schemas in
-    // practice are small enough that a linear `iter().find(...)` per
-    // key is fast; if a hot path appears with a wide schema we can
-    // switch to `HashMap<&str, ...>` here without touching callers.
-    let fields: Vec<(&'a str, FieldKindRef<'a>)> =
-        schema.fields().map(|f| (f.name, f.kind)).collect();
-    for (key, value) in table {
-        let full = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        let kind = fields
-            .iter()
-            .find(|(n, _)| *n == key.as_str())
-            .map(|(_, k)| *k);
-        match kind {
-            None => {
-                out.push(UnknownKey {
-                    path: full,
-                    leaf: key.clone(),
-                });
-            }
-            Some(FieldKindRef::Leaf(_)) => {
-                // Leaf — type checking is the merged-table's job, not ours.
-            }
-            Some(FieldKindRef::Nested { schema: nested }) => {
-                if let Value::Map(t) = value {
-                    walk_against_schema(t, nested, &full, out);
-                }
-            }
-            Some(FieldKindRef::MapOf {
-                schema: item_schema,
-            }) => {
-                if let Value::Map(entries) = value {
-                    for (entry_key, entry_value) in entries {
-                        if let Value::Map(t) = entry_value {
-                            let entry_path = format!("{full}.{entry_key}");
-                            walk_against_schema(t, item_schema, &entry_path, out);
-                        }
-                    }
-                }
-            }
-            Some(FieldKindRef::ArrayOf { .. }) => {
-                // Arrays-of-tables can't be expressed via env / CLI / URL
-                // dotted-key syntax; nothing to recurse into for non-file
-                // layers. If the value happens to be a table here, the
-                // type check at finalize will surface the mismatch.
-            }
-        }
-    }
+    schema: &Schema,
+    origin: &UnknownKeySource<'_>,
+    ctx: &ValidateContext<'_>,
+) -> Result<Vec<CollectedUnknown>, ClapfigError> {
+    let mut unknown: Vec<UnknownKey> = Vec::new();
+    crate::schema_walk::collect_unknown_paths(table, schema, "", &mut unknown);
+    filter_through_cascade(table, origin, unknown, ctx)
 }
 
 /// Resolve an already-collected list of unknown paths against the cascade
@@ -151,15 +110,17 @@ fn walk_against_schema<'a>(
 /// instead).
 pub(crate) fn filter_through_cascade(
     table: &Map,
-    source: &str,
-    path: &Path,
+    origin: &UnknownKeySource<'_>,
     unknown_keys: Vec<UnknownKey>,
     ctx: &ValidateContext<'_>,
 ) -> Result<Vec<CollectedUnknown>, ClapfigError> {
     if unknown_keys.is_empty() {
         return Ok(Vec::new());
     }
-    let source_arc: Arc<str> = Arc::from(source);
+    let source_arc: Option<Arc<str>> = match origin {
+        UnknownKeySource::File { source, .. } => Some(Arc::from(*source)),
+        UnknownKeySource::Env { .. } => None,
+    };
     let mut rejected: Vec<UnknownKeyInfo> = Vec::new();
     let mut collected: Vec<CollectedUnknown> = Vec::new();
     for entry in unknown_keys {
@@ -172,7 +133,19 @@ pub(crate) fn filter_through_cascade(
             continue;
         }
 
-        let line = find_key_line(source, &key, &leaf, ctx.normalize_keys);
+        // The line heuristic and the file identity only exist for file
+        // sources; env-derived keys instead carry the variable name so
+        // errors name the thing to unset.
+        let (file, line, env_var) = match origin {
+            UnknownKeySource::File { path, source } => (
+                Some(*path),
+                find_key_line(source, &key, &leaf, ctx.normalize_keys),
+                None,
+            ),
+            UnknownKeySource::Env { sources } => {
+                (None, 0, crate::env::env_source_names(sources, &key))
+            }
+        };
         let value_ref = lookup_value(table, &key, &leaf);
 
         if let Some(callback) = ctx.callback {
@@ -184,12 +157,13 @@ pub(crate) fn filter_through_cascade(
             // entry value. `value` is `None` when the lookup genuinely
             // can't resolve (out-of-bounds index, path through a
             // non-table) — the callback still runs and can decide based
-            // on path/leaf/file/line alone.
+            // on path/leaf/file/line alone. Env-derived keys arrive with
+            // `file: None`.
             let context = UnknownKeyContext {
                 path: &key,
                 leaf: &leaf,
                 value: value_ref,
-                file: Some(path),
+                file,
                 line: if line > 0 { Some(line) } else { None },
             };
             match callback(&context) {
@@ -199,7 +173,7 @@ pub(crate) fn filter_through_cascade(
                         path: key,
                         leaf,
                         value: value_ref.cloned(),
-                        file: Some(path.to_path_buf()),
+                        file: file.map(Path::to_path_buf),
                         line: if line > 0 { Some(line) } else { None },
                     });
                     continue;
@@ -210,9 +184,12 @@ pub(crate) fn filter_through_cascade(
 
         rejected.push(UnknownKeyInfo {
             key,
-            path: path.to_path_buf(),
+            path: file
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from("<env>")),
             line,
-            source: Some(Arc::clone(&source_arc)),
+            source: source_arc.clone(),
+            env_var,
         });
     }
     if rejected.is_empty() {
@@ -385,7 +362,6 @@ fn keys_match(a: &str, b: &str, normalize_keys: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::ConfigSpec;
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
@@ -405,8 +381,12 @@ mod tests {
         path: &Path,
         ctx: &ValidateContext<'_>,
     ) -> Result<Vec<CollectedUnknown>, ClapfigError> {
-        let spec = crate::runtime_spec::DynamicSpec::new(crate::fixtures::test::test_schema());
-        spec.validate_unknown(table, source, path, ctx)
+        validate_unknown(
+            table,
+            &crate::fixtures::test::test_schema(),
+            &UnknownKeySource::File { path, source },
+            ctx,
+        )
     }
 
     /// Default validate context: strict on, no overrides, no callback.
@@ -421,6 +401,166 @@ mod tests {
             callback: None,
             normalize_keys,
         }
+    }
+
+    #[test]
+    fn env_origin_reports_variable_name_not_file() {
+        // An env-derived unknown key is reported as an env problem: the
+        // original variable name is taken from the source map (not
+        // reconstructed), no source text or line is attached, and no
+        // file path leaks in.
+        let mut table = Map::new();
+        let mut db = Map::new();
+        db.insert("rogue".into(), crate::value::Value::Integer(1));
+        table.insert("database".into(), crate::value::Value::Map(db));
+        let mut sources = crate::env::EnvSources::new();
+        sources.insert(
+            "database.rogue".into(),
+            vec!["MYAPP__DATABASE__ROGUE".into()],
+        );
+        let err = validate_unknown(
+            &table,
+            &crate::fixtures::test::test_schema(),
+            &UnknownKeySource::Env { sources: &sources },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "database.rogue");
+        assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__DATABASE__ROGUE"));
+        assert_eq!(keys[0].line, 0);
+        assert!(keys[0].source.is_none());
+    }
+
+    #[test]
+    fn env_origin_names_the_mixed_case_variable_that_produced_the_value() {
+        // Reconstructing an uppercased path would tell the user to
+        // unset MYAPP__ROGUE_KEY, which does not remove MYAPP__rogue_key
+        // on a case-sensitive platform.
+        let (table, sources) = crate::env::env_to_table_with_sources(
+            "MYAPP",
+            [("MYAPP__rogue_key".into(), "1".into())],
+        );
+        let err = validate_unknown(
+            &table,
+            &crate::fixtures::test::test_schema(),
+            &UnknownKeySource::Env { sources: &sources },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "rogue_key");
+        assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__rogue_key"));
+    }
+
+    #[test]
+    fn env_origin_lists_every_source_name_that_collapsed_onto_the_path() {
+        let (table, sources) = crate::env::env_to_table_with_sources(
+            "MYAPP",
+            [
+                ("MYAPP__rogue_key".into(), "1".into()),
+                ("MYAPP__ROGUE_KEY".into(), "2".into()),
+            ],
+        );
+        let err = validate_unknown(
+            &table,
+            &crate::fixtures::test::test_schema(),
+            &UnknownKeySource::Env { sources: &sources },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].env_var.as_deref(),
+            Some("MYAPP__rogue_key, MYAPP__ROGUE_KEY")
+        );
+    }
+
+    /// Schema with no `database` section — unknown-key traversal stops
+    /// at that ancestor instead of walking to `database.rogue`.
+    fn schema_without_database() -> Schema {
+        use crate::runtime::{Field, Schema};
+        Schema::object("App")
+            .field("host", Field::string().default("localhost"))
+            .build()
+    }
+
+    #[test]
+    fn env_origin_names_variable_when_unknown_is_a_nested_section() {
+        // MYAPP__DATABASE__ROGUE is stored under `database.rogue`, but
+        // with no `database` field the walker reports `database`.
+        let (table, sources) = crate::env::env_to_table_with_sources(
+            "MYAPP",
+            [("MYAPP__DATABASE__ROGUE".into(), "1".into())],
+        );
+        let err = validate_unknown(
+            &table,
+            &schema_without_database(),
+            &UnknownKeySource::Env { sources: &sources },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "database");
+        assert_eq!(keys[0].env_var.as_deref(), Some("MYAPP__DATABASE__ROGUE"));
+    }
+
+    #[test]
+    fn env_origin_lists_flat_and_nested_names_after_nested_overwrite() {
+        // Flat then nested: the table is the nested section, but both
+        // original names touched this path and must be listed.
+        let (table, sources) = crate::env::env_to_table_with_sources(
+            "MYAPP",
+            [
+                ("MYAPP__DATABASE".into(), "flat".into()),
+                ("MYAPP__DATABASE__ROGUE".into(), "1".into()),
+            ],
+        );
+        assert!(table["database"].as_map().is_some());
+        let err = validate_unknown(
+            &table,
+            &schema_without_database(),
+            &UnknownKeySource::Env { sources: &sources },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "database");
+        assert_eq!(
+            keys[0].env_var.as_deref(),
+            Some("MYAPP__DATABASE, MYAPP__DATABASE__ROGUE")
+        );
+    }
+
+    #[test]
+    fn env_origin_lists_flat_and_nested_names_after_flat_overwrite() {
+        // Nested then flat: the table holds the flat value, but the
+        // nested variable is still set in the environment.
+        let (table, sources) = crate::env::env_to_table_with_sources(
+            "MYAPP",
+            [
+                ("MYAPP__DATABASE__ROGUE".into(), "1".into()),
+                ("MYAPP__DATABASE".into(), "flat".into()),
+            ],
+        );
+        assert_eq!(table["database"].as_str(), Some("flat"));
+        let err = validate_unknown(
+            &table,
+            &schema_without_database(),
+            &UnknownKeySource::Env { sources: &sources },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "database");
+        assert_eq!(
+            keys[0].env_var.as_deref(),
+            Some("MYAPP__DATABASE, MYAPP__DATABASE__ROGUE")
+        );
     }
 
     #[test]

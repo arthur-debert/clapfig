@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use crate::spec::{FieldKindRef, SchemaRef};
+use crate::runtime::{Field, Schema};
 use crate::value::{Map, Value};
 
 /// Convert dotted-key overrides into a nested config value [`Map`].
@@ -41,27 +41,27 @@ fn set_nested(table: &mut Map, dotted_key: &str, value: Value) {
 ///
 /// Returns dotted paths like `"host"`, `"database.url"`, `"database.pool_size"`.
 /// Section names (nested structs) are excluded — only leaf fields are returned.
-pub fn valid_keys(schema: SchemaRef<'_>) -> HashSet<String> {
+pub fn valid_keys(schema: &Schema) -> HashSet<String> {
     let mut keys = HashSet::new();
     collect_keys(schema, "", &mut keys);
     keys
 }
 
-fn collect_keys(schema: SchemaRef<'_>, prefix: &str, keys: &mut HashSet<String>) {
-    for field in schema.fields() {
+fn collect_keys(schema: &Schema, prefix: &str, keys: &mut HashSet<String>) {
+    for field in &schema.fields {
         let dotted = if prefix.is_empty() {
             field.name.to_string()
         } else {
             format!("{prefix}.{}", field.name)
         };
-        match field.kind {
-            FieldKindRef::Leaf(_) => {
+        match &field.field {
+            Field::Leaf(_) => {
                 keys.insert(dotted);
             }
-            FieldKindRef::Nested { schema: nested } => {
+            Field::Nested(nested) => {
                 collect_keys(nested, &dotted, keys);
             }
-            FieldKindRef::ArrayOf { .. } => {
+            Field::ArrayOf(_) => {
                 // Skip ArrayOf subtrees. Dotted-key consumers (cli_overrides,
                 // url_query, persist set/unset) build nested tables, not
                 // arrays-of-tables, so listing `plugins.name` as valid would
@@ -73,7 +73,7 @@ fn collect_keys(schema: SchemaRef<'_>, prefix: &str, keys: &mut HashSet<String>)
                 // consumers parses. Until then, ArrayOf keys are not
                 // addressable by dotted path.
             }
-            FieldKindRef::MapOf { .. } => {
+            Field::MapOf(_) => {
                 // Skip MapOf subtrees for the same reason ArrayOf is
                 // skipped: dotted-key consumers can't tell whether
                 // `plugins.audit` means "set the `audit` entry" (a real
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn valid_keys_collects_all_leaf_paths() {
         let schema = crate::fixtures::test::test_schema();
-        let keys = valid_keys(SchemaRef::from_dynamic(&schema));
+        let keys = valid_keys(&schema);
         assert!(keys.contains("host"));
         assert!(keys.contains("port"));
         assert!(keys.contains("debug"));
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn valid_keys_excludes_section_names() {
         let schema = crate::fixtures::test::test_schema();
-        let keys = valid_keys(SchemaRef::from_dynamic(&schema));
+        let keys = valid_keys(&schema);
         assert!(!keys.contains("database"));
     }
 }

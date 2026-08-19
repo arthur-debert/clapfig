@@ -1,5 +1,0 @@
-error: #[clapfig(rename_all)] applies only to unit-only enums — schema field names are not rewritten through rename rules. Rename fields individually with #[serde(rename = "...")] (the schema follows it).
- --> tests/ui/derive/struct_clapfig_rename_all_rejected.rs:5:8
-  |
-5 | struct Bad {
-  |        ^^^

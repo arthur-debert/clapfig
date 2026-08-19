@@ -455,10 +455,12 @@ port = 8080
 level = "info"
 
 # Required name.
+# Required.
 #name = ""
 
 # Any value.
 # Accepts: any TOML value
+# Required.
 #rule = ""
 
 # Database settings

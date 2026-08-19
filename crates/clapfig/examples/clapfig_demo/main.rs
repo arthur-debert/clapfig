@@ -27,6 +27,8 @@
 //! | `config get`             | `cargo run --example clapfig_demo -- config get server.port`        |
 //! | `config set`             | `cargo run --example clapfig_demo -- config set server.port 8080`   |
 //! | `config list`            | `cargo run --example clapfig_demo -- config list`                   |
+//! | `config schema`          | `cargo run --example clapfig_demo -- config schema`                 |
+//! | Unit-enum `Allowed:`     | `cargo run --example clapfig_demo -- config gen` (`display.color` / `display.format`) |
 //! | Single key echo          | `cargo run --example clapfig_demo -- echo --key display.color`      |
 //! | Colored output           | Default is yellow; override `display.color` to change it            |
 //! | Error rendering (plain)  | Put a typo in `clapfig-demo.toml`, then run `echo` — errors flow through [`clapfig::render::render_plain`] |
@@ -50,9 +52,9 @@ mod config;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use clapfig::{Clapfig, ClapfigError, ConfigArgs, SchemaConfigBuilder, SearchPath, render};
+use clapfig::{Clapfig, ClapfigError, ConfigArgs, SearchPath, TypedBuilder, render};
 
-use config::DemoConfig;
+use config::{Color, DemoConfig, OutputFormat};
 
 /// Render a [`ClapfigError`] for terminal display.
 ///
@@ -111,13 +113,13 @@ enum Commands {
 }
 
 /// Serializable projection of CLI flags for
-/// [`SchemaConfigBuilder::cli_overrides_from`].
+/// [`TypedBuilder::cli_overrides_from`].
 ///
 /// Only includes fields whose names match top-level config keys.
 /// `cli_overrides_from` auto-matches by field name and silently ignores
 /// the rest, so we only need `verbose` here (it matches `DemoConfig::verbose`).
 /// The other CLI flags (`color`, `host`, `port`) map to *nested* config keys
-/// and must be wired with [`SchemaConfigBuilder::cli_override`] instead.
+/// and must be wired with [`TypedBuilder::cli_override`] instead.
 #[derive(Serialize)]
 struct CliOverrides {
     verbose: bool,
@@ -127,7 +129,7 @@ struct CliOverrides {
 // Builder helper
 // ---------------------------------------------------------------------------
 
-/// Create a [`SchemaConfigBuilder`] wired up for the demo app.
+/// Create a [`TypedBuilder`] wired up for the demo app.
 ///
 /// Search paths: Platform (XDG / Library) → `~/.clapfig-demo/` → cwd.
 /// Env prefix: `CLAPFIG_DEMO` (auto-derived).
@@ -139,12 +141,12 @@ struct CliOverrides {
 /// 2. **`cli_override`** — manually maps `--color` → `display.color`,
 ///    `--host` → `server.host`, `--port` → `server.port` (nested keys that
 ///    don't match by flat name).
-fn make_builder(cli: &Cli) -> SchemaConfigBuilder<DemoConfig> {
+fn make_builder(cli: &Cli) -> TypedBuilder<DemoConfig> {
     let overrides = CliOverrides {
         verbose: cli.verbose,
     };
 
-    Clapfig::schema_builder::<DemoConfig>()
+    Clapfig::typed::<DemoConfig>()
         .app_name("clapfig-demo")
         .env_prefix("CLAPFIG_DEMO")
         .search_paths(vec![
@@ -165,16 +167,15 @@ fn make_builder(cli: &Cli) -> SchemaConfigBuilder<DemoConfig> {
 // ANSI color helpers
 // ---------------------------------------------------------------------------
 
-fn ansi_color_code(name: &str) -> &str {
-    match name {
-        "red" => "\x1b[31m",
-        "green" => "\x1b[32m",
-        "yellow" => "\x1b[33m",
-        "blue" => "\x1b[34m",
-        "magenta" => "\x1b[35m",
-        "cyan" => "\x1b[36m",
-        "white" => "\x1b[37m",
-        _ => "\x1b[0m",
+fn ansi_color_code(color: Color) -> &'static str {
+    match color {
+        Color::Red => "\x1b[31m",
+        Color::Green => "\x1b[32m",
+        Color::Yellow => "\x1b[33m",
+        Color::Blue => "\x1b[34m",
+        Color::Magenta => "\x1b[35m",
+        Color::Cyan => "\x1b[36m",
+        Color::White => "\x1b[37m",
     }
 }
 
@@ -185,7 +186,7 @@ const RESET: &str = "\x1b[0m";
 // ---------------------------------------------------------------------------
 
 fn echo_all(config: &DemoConfig) {
-    let color = ansi_color_code(&config.display.color);
+    let color = ansi_color_code(config.display.color);
 
     if config.verbose {
         println!(
@@ -195,20 +196,20 @@ fn echo_all(config: &DemoConfig) {
         println!();
     }
 
+    let verbose = config.verbose.to_string();
+    let port = config.server.port.to_string();
+    let max_connections = config.server.max_connections.to_string();
     let entries = [
         ("name", config.name.as_str()),
-        ("verbose", &config.verbose.to_string()),
+        ("verbose", verbose.as_str()),
         ("server.host", config.server.host.as_str()),
-        ("server.port", &config.server.port.to_string()),
-        (
-            "server.max_connections",
-            &config.server.max_connections.to_string(),
-        ),
+        ("server.port", port.as_str()),
+        ("server.max_connections", max_connections.as_str()),
         ("display.color", config.display.color.as_str()),
         ("display.format", config.display.format.as_str()),
     ];
 
-    if config.display.format == "plain" {
+    if config.display.format == OutputFormat::Plain {
         for (key, value) in &entries {
             println!("{key}={value}");
         }
@@ -221,15 +222,15 @@ fn echo_all(config: &DemoConfig) {
 }
 
 fn echo_key(config: &DemoConfig, key: &str) {
-    let color = ansi_color_code(&config.display.color);
+    let color = ansi_color_code(config.display.color);
     let value: String = match key {
         "name" => config.name.clone(),
         "verbose" => config.verbose.to_string(),
         "server.host" => config.server.host.clone(),
         "server.port" => config.server.port.to_string(),
         "server.max_connections" => config.server.max_connections.to_string(),
-        "display.color" => config.display.color.clone(),
-        "display.format" => config.display.format.clone(),
+        "display.color" => config.display.color.as_str().to_string(),
+        "display.format" => config.display.format.as_str().to_string(),
         _ => {
             eprintln!("Unknown key: {key}");
             std::process::exit(1);

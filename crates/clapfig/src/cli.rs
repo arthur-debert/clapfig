@@ -7,13 +7,13 @@
 //!
 //! The module provides two clap derive types — [`ConfigArgs`] and
 //! [`ConfigSubcommand`] — that you can embed directly into your clap
-//! `#[derive(Parser)]` struct to get `config gen|list|get|set|unset` subcommands
+//! `#[derive(Parser)]` struct to get `config gen|list|get|set|unset|schema` subcommands
 //! with no boilerplate.
 //!
 //! The only bridge to the core is [`ConfigArgs::into_action()`], which
 //! converts clap-parsed arguments into a [`ConfigAction`](crate::ConfigAction).
 //! From there, all logic flows through the clap-free
-//! [`handle()`](crate::RuntimeBuilder::handle) API.
+//! [`handle()`](crate::Builder::handle) API.
 //!
 //! If you use a different CLI parser (or no CLI at all), you can skip this
 //! module entirely and construct [`ConfigAction`](crate::ConfigAction) values
@@ -121,6 +121,7 @@ impl ConfigArgs {
 /// # Example
 ///
 /// ```ignore
+/// use clap::CommandFactory;
 /// use clapfig::ConfigCommand;
 ///
 /// let config_cmd = ConfigCommand::new()

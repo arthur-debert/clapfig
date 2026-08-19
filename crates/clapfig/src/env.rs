@@ -4,8 +4,27 @@
 //! Env vars matching `{PREFIX}__*` are collected, with `__` as the nesting separator
 //! and segments lowercased to match Rust field names. Values are parsed heuristically
 //! (bool > integer > float > string). Takes an iterator for testability.
+//!
+//! Each inserted dotted path also records the original environment
+//! variable name that produced it. Case-sensitive platforms accept
+//! `MYAPP__rogue_key` as well as `MYAPP__ROGUE_KEY`; both collapse to
+//! the same table path, but unknown-key errors must name the variable
+//! the user actually has to unset — reconstructing an uppercased
+//! spelling from the path would point at a different name. When several
+//! source names collapse onto one path, the table last-wins (matching
+//! insert order) and every source name is retained so the error can
+//! list them all.
+
+use std::collections::BTreeMap;
 
 use crate::value::{Map, Value};
+
+/// Dotted table path → the original environment variable name(s) that
+/// produced it, in first-seen order. Several names can collapse onto
+/// one path (`MYAPP__HOST` and `MYAPP__host` both become `host`); the
+/// table last-wins, and this map keeps every spelling so unknown-key
+/// reporting can name each variable to unset.
+pub(crate) type EnvSources = BTreeMap<String, Vec<String>>;
 
 /// Build a config value [`Map`] from environment variables matching `{PREFIX}__*`.
 ///
@@ -15,10 +34,26 @@ use crate::value::{Map, Value};
 ///
 /// Values are parsed heuristically: bool > integer > float > string.
 ///
-/// Takes an iterator so tests can pass synthetic data instead of `std::env::vars()`.
-pub fn env_to_table(prefix: &str, vars: impl IntoIterator<Item = (String, String)>) -> Map {
+/// When the environment sets the same key both flat and nested
+/// (`MYAPP__DATABASE=x` AND `MYAPP__DATABASE__URL=y`), the shapes
+/// conflict and the **last-processed variable wins** — a nested var
+/// replaces an earlier flat scalar with a table, and a flat var replaces
+/// an earlier nested table with its scalar. Environment iteration order
+/// is unspecified, so which variable is "last" is not guaranteed; the
+/// semantics are last-writer, not an ordering promise. Don't mix the two
+/// shapes for one key.
+///
+/// Takes an iterator so tests can pass synthetic data instead of
+/// `std::env::vars()`. Also returns the original variable name for
+/// each dotted path so unknown-key errors can name the exact variable
+/// to unset.
+pub(crate) fn env_to_table_with_sources(
+    prefix: &str,
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> (Map, EnvSources) {
     let needle = format!("{prefix}__");
     let mut table = Map::new();
+    let mut sources = EnvSources::new();
 
     for (key, value) in vars {
         let Some(rest) = key.strip_prefix(&needle) else {
@@ -29,19 +64,69 @@ pub fn env_to_table(prefix: &str, vars: impl IntoIterator<Item = (String, String
         }
 
         let segments: Vec<&str> = rest.split("__").collect();
-        insert_nested(&mut table, &segments, parse_env_value(&value));
+        insert_nested(
+            &mut table,
+            &mut sources,
+            &segments,
+            parse_env_value(&value),
+            &mut String::new(),
+            &key,
+        );
     }
 
-    table
+    (table, sources)
 }
 
-fn insert_nested(table: &mut Map, segments: &[&str], value: Value) {
+/// Original variable names that produced `path` or any descendant of it.
+///
+/// Unknown-key traversal stops at the first unknown schema ancestor, so
+/// `MYAPP__DATABASE__ROGUE` is stored under `database.rogue` while
+/// validation reports `database`. An exact-path lookup would miss it;
+/// this walks descendants (`path` or `path.`) and deduplicates names
+/// in first-seen (path-sorted, then recorded) order so the error can
+/// still name every variable to unset.
+pub(crate) fn env_source_names(sources: &EnvSources, path: &str) -> Option<String> {
+    let prefix = format!("{path}.");
+    let mut names = Vec::new();
+    for (key, vars) in sources {
+        if key == path || key.starts_with(&prefix) {
+            for name in vars {
+                if !names.iter().any(|existing| existing == name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join(", "))
+    }
+}
+
+fn insert_nested(
+    table: &mut Map,
+    sources: &mut EnvSources,
+    segments: &[&str],
+    value: Value,
+    dotted: &mut String,
+    original: &str,
+) {
     debug_assert!(!segments.is_empty());
 
     let key = segments[0].to_lowercase();
+    let restore = dotted.len();
+    if !dotted.is_empty() {
+        dotted.push('.');
+    }
+    dotted.push_str(&key);
 
     if segments.len() == 1 {
         table.insert(key, value);
+        let entry = sources.entry(dotted.clone()).or_default();
+        if !entry.iter().any(|name| name == original) {
+            entry.push(original.to_string());
+        }
     } else {
         let sub = table.entry(key).or_insert_with(|| Value::Map(Map::new()));
         // If a flat var (e.g. MYAPP__DATABASE=x) already set this key to a
@@ -50,9 +135,10 @@ fn insert_nested(table: &mut Map, segments: &[&str], value: Value) {
             *sub = Value::Map(Map::new());
         }
         if let Value::Map(sub_map) = sub {
-            insert_nested(sub_map, &segments[1..], value);
+            insert_nested(sub_map, sources, &segments[1..], value, dotted, original);
         }
     }
+    dotted.truncate(restore);
 }
 
 /// Parse a string value into a typed config value.
@@ -86,6 +172,10 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    fn env_to_table(prefix: &str, vars: impl IntoIterator<Item = (String, String)>) -> Map {
+        env_to_table_with_sources(prefix, vars).0
     }
 
     #[test]
@@ -181,8 +271,10 @@ mod tests {
 
     #[test]
     fn flat_key_replaced_by_nested() {
-        // If MYAPP__DATABASE (flat) and MYAPP__DATABASE__URL (nested) both exist,
-        // the nested key should win — the flat value is replaced by a table.
+        // Flat vs nested on the same key is last-writer-wins (env
+        // iteration order is unspecified; this iterator fixes it): here
+        // the nested var is processed last, so it replaces the flat
+        // scalar with a table.
         let table = env_to_table(
             "MYAPP",
             vars(&[
@@ -196,7 +288,8 @@ mod tests {
 
     #[test]
     fn nested_key_then_flat_overwrites() {
-        // Reverse order: nested first, then flat. Flat replaces the table.
+        // Reverse order: nested first, then flat. The flat var is last,
+        // so it replaces the table — same last-writer rule, other winner.
         let table = env_to_table(
             "MYAPP",
             vars(&[
@@ -205,5 +298,62 @@ mod tests {
             ]),
         );
         assert_eq!(table["database"].as_str().unwrap(), "flat_value");
+    }
+
+    #[test]
+    fn mixed_case_suffix_keeps_original_variable_name() {
+        // The suffix is lowercased for the table path; the recorded
+        // source name is the spelling that produced the value.
+        let (table, sources) = env_to_table_with_sources(
+            "MYAPP",
+            vars(&[("MYAPP__rogue_key", "1"), ("MYAPP__Database__Rogue", "x")]),
+        );
+        assert_eq!(table["rogue_key"].as_integer().unwrap(), 1);
+        assert_eq!(
+            sources.get("rogue_key"),
+            Some(&vec!["MYAPP__rogue_key".to_string()])
+        );
+        let db = table["database"].as_map().unwrap();
+        assert_eq!(db["rogue"].as_str().unwrap(), "x");
+        assert_eq!(
+            sources.get("database.rogue"),
+            Some(&vec!["MYAPP__Database__Rogue".to_string()])
+        );
+    }
+
+    #[test]
+    fn source_names_include_descendants_of_an_unknown_ancestor() {
+        // Stored under the leaf path; validation reports the unknown
+        // ancestor. Both the exact path and its descendants must name
+        // the variable.
+        let (_, sources) =
+            env_to_table_with_sources("MYAPP", vars(&[("MYAPP__DATABASE__ROGUE", "1")]));
+        assert_eq!(
+            env_source_names(&sources, "database.rogue").as_deref(),
+            Some("MYAPP__DATABASE__ROGUE")
+        );
+        assert_eq!(
+            env_source_names(&sources, "database").as_deref(),
+            Some("MYAPP__DATABASE__ROGUE")
+        );
+        // A sibling prefix must not steal the name.
+        assert_eq!(env_source_names(&sources, "data"), None);
+        assert_eq!(env_source_names(&sources, "database_backup"), None);
+    }
+
+    #[test]
+    fn colliding_source_names_last_win_the_value_and_keep_every_spelling() {
+        // Two names collapse onto `host`. The later value wins; both
+        // spellings stay on the source list so an unknown-key error
+        // can name every variable to unset.
+        let (table, sources) = env_to_table_with_sources(
+            "MYAPP",
+            vars(&[("MYAPP__host", "first"), ("MYAPP__HOST", "second")]),
+        );
+        assert_eq!(table["host"].as_str().unwrap(), "second");
+        assert_eq!(
+            sources.get("host"),
+            Some(&vec!["MYAPP__host".to_string(), "MYAPP__HOST".to_string()])
+        );
     }
 }

@@ -1,0 +1,5 @@
+error: leaf attributes (default, env, allowed, optional) are not valid on array-of-nested-schema fields — array entries are user-supplied (an absent array is the empty array), and a per-field scalar attribute has no meaning across a list of entries. For an optional list of a unit-only enum, use `Option<Vec<T>>`.
+  --> tests/ui/derive/leaf_attrs_on_vec_nested_rejected.rs:12:5
+   |
+12 |     #[clapfig(default = "audit")]
+   |     ^

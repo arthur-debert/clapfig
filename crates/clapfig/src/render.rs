@@ -56,22 +56,50 @@ fn render_unknown_keys_plain(infos: &[crate::error::UnknownKeyInfo]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let n = infos.len();
-    let header = if n == 1 {
-        "error: unknown key in config file".to_string()
+    // Env-derived keys are env problems, not file problems — name the
+    // variable to unset instead of dressing them in config-file clothing.
+    let all_env = infos.iter().all(|i| i.env_var.is_some());
+    let source_noun = if all_env {
+        "environment"
     } else {
-        format!("error: {n} unknown keys in config file")
+        "config file"
+    };
+    let header = if n == 1 {
+        format!("error: unknown key in {source_noun}")
+    } else {
+        format!("error: {n} unknown keys in {source_noun}")
     };
     out.push_str(&header);
     out.push('\n');
 
     for info in infos {
-        let _ = write!(
-            out,
-            "\n  --> {}:{}\n     key: {}",
-            info.path.display(),
-            info.line,
-            info.key,
-        );
+        if let Some(var) = &info.env_var {
+            let _ = write!(
+                out,
+                "\n  --> environment variable {var}\n     key: {}",
+                info.key,
+            );
+            out.push('\n');
+            continue;
+        }
+        // Line 0 means "could not be located" (the line heuristic is
+        // TOML-only) — render the path alone, never a bogus `:0`.
+        if info.line > 0 {
+            let _ = write!(
+                out,
+                "\n  --> {}:{}\n     key: {}",
+                info.path.display(),
+                info.line,
+                info.key,
+            );
+        } else {
+            let _ = write!(
+                out,
+                "\n  --> {}\n     key: {}",
+                info.path.display(),
+                info.key
+            );
+        }
         if let Some(src) = info.source.as_deref()
             && info.line > 0
             && let Some(line_text) = src.lines().nth(info.line - 1)
@@ -88,7 +116,11 @@ fn render_unknown_keys_plain(infos: &[crate::error::UnknownKeyInfo]) -> String {
         out.push('\n');
     }
 
-    out.push_str("\nhint: check for typos, or remove the unrecognized keys.");
+    if all_env {
+        out.push_str("\nhint: check for typos, or unset the unrecognized environment variables.");
+    } else {
+        out.push_str("\nhint: check for typos, or remove the unrecognized keys.");
+    }
     out
 }
 
@@ -295,6 +327,7 @@ mod tests {
             path: "/home/user/.config/myapp/config.toml".into(),
             line: 2,
             source: Some(source),
+            env_var: None,
         }]
     }
 
@@ -325,12 +358,14 @@ mod tests {
                 path: "/p.toml".into(),
                 line: 1,
                 source: Some(Arc::clone(&source)),
+                env_var: None,
             },
             UnknownKeyInfo {
                 key: "typo2".into(),
                 path: "/p.toml".into(),
                 line: 2,
                 source: Some(source),
+                env_var: None,
             },
         ];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
@@ -344,6 +379,7 @@ mod tests {
             path: "/p.toml".into(),
             line: 0,
             source: None,
+            env_var: None,
         }];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
         assert!(out.contains("x"));
@@ -351,8 +387,46 @@ mod tests {
     }
 
     #[test]
+    fn plain_line_zero_renders_path_without_line() {
+        // YAML/JSON sources have no line heuristic — never render `:0`.
+        let infos = vec![UnknownKeyInfo {
+            key: "typo".into(),
+            path: "/p.yaml".into(),
+            line: 0,
+            source: Some(Arc::from("typo: 1\n")),
+            env_var: None,
+        }];
+        let out = render_plain(&ClapfigError::UnknownKeys(infos));
+        assert!(out.contains("--> /p.yaml\n"), "{out}");
+        assert!(!out.contains(":0"), "{out}");
+    }
+
+    #[test]
+    fn plain_env_key_renders_as_env_error_naming_variable() {
+        let infos = vec![UnknownKeyInfo {
+            key: "rogue_key".into(),
+            path: "<env>".into(),
+            line: 0,
+            source: None,
+            env_var: Some("MYAPP__ROGUE_KEY".into()),
+        }];
+        let out = render_plain(&ClapfigError::UnknownKeys(infos));
+        assert!(out.contains("unknown key in environment"), "{out}");
+        assert!(
+            out.contains("--> environment variable MYAPP__ROGUE_KEY"),
+            "{out}"
+        );
+        assert!(out.contains("unset the unrecognized environment"), "{out}");
+        assert!(!out.contains("<env>"), "{out}");
+        assert!(!out.contains("config file"), "{out}");
+    }
+
+    #[test]
     fn plain_passes_through_non_source_errors() {
-        let err = ClapfigError::KeyNotFound("database.url".into());
+        let err = ClapfigError::KeyNotFound {
+            key: "database.url".into(),
+            suggestion: None,
+        };
         let out = render_plain(&err);
         assert!(out.contains("database.url"));
     }
@@ -369,7 +443,10 @@ mod tests {
     #[cfg(feature = "rich-errors")]
     #[test]
     fn rich_handles_errors_without_source() {
-        let err = ClapfigError::KeyNotFound("x.y".into());
+        let err = ClapfigError::KeyNotFound {
+            key: "x.y".into(),
+            suggestion: None,
+        };
         let out = render_rich(&err);
         assert!(out.contains("x.y"));
     }
@@ -388,6 +465,7 @@ mod tests {
             path: "/crlf.toml".into(),
             line: 2,
             source: Some(source),
+            env_var: None,
         }];
         let out = render_rich(&ClapfigError::UnknownKeys(infos));
         assert!(out.contains("typo_key"), "missing key: {out}");

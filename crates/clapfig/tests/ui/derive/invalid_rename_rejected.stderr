@@ -1,0 +1,17 @@
+error: invalid schema field name "a.b" from #[clapfig(rename)]: the name contains '.', which conflicts with the dotted-path separator. Pick a non-empty name without '.', '[' or ']'.
+ --> tests/ui/derive/invalid_rename_rejected.rs:9:5
+  |
+9 |     field: String,
+  |     ^^^^^
+
+error: invalid schema field name "" from #[clapfig(rename)]: the name is empty. Pick a non-empty name without '.', '[' or ']'.
+  --> tests/ui/derive/invalid_rename_rejected.rs:15:5
+   |
+15 |     field: String,
+   |     ^^^^^
+
+error: invalid schema field name "a[0]" from #[serde(rename)]: the name contains '[', which conflicts with array-index syntax. Pick a non-empty name without '.', '[' or ']'.
+  --> tests/ui/derive/invalid_rename_rejected.rs:21:5
+   |
+21 |     field: String,
+   |     ^^^^^

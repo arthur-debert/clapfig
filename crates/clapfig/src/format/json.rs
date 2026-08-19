@@ -97,6 +97,19 @@ impl FormatAdapter for JsonAdapter {
         ]
     }
 
+    fn display_entry(&self, key: &str, value: &str) -> String {
+        // Encode the key as a JSON string rather than wrapping it in
+        // literal quotes: runtime-schema key names may contain quotes,
+        // backslashes, or control characters, and hand-rolled quoting
+        // would render them misleadingly.
+        let encoded = serde_json::to_string(key).expect("serializing a string to JSON cannot fail");
+        format!("{encoded}: {value}")
+    }
+
+    fn display_comment(&self, line: &str) -> String {
+        format!("// {line}")
+    }
+
     fn parse(&self, text: &str) -> Result<Value, FormatError> {
         // An empty (or whitespace-only) file is "no config", matching
         // TOML's empty document — not a JSON syntax error.
@@ -652,6 +665,30 @@ mod tests {
     use super::super::SetTarget;
     use super::*;
 
+    // --- display spelling ------------------------------------------------
+
+    #[test]
+    fn display_entry_json_escapes_the_key() {
+        // The ordinary dotted path renders as before…
+        assert_eq!(
+            JsonAdapter.display_entry("server.host", "localhost"),
+            r#""server.host": localhost"#
+        );
+        // …and a runtime-schema key with JSON-special characters is
+        // escaped, not interpolated between bare quotes. Control
+        // characters stay one-line (`\n`/`\r`/`\t`/`\uXXXX`), matching
+        // the YAML adapter's display contract.
+        assert_eq!(JsonAdapter.display_entry(r#"a"b"#, "1"), r#""a\"b": 1"#);
+        assert_eq!(JsonAdapter.display_entry(r"a\b", "1"), r#""a\\b": 1"#);
+        assert_eq!(JsonAdapter.display_entry("a\nb", "1"), r#""a\nb": 1"#);
+        assert_eq!(JsonAdapter.display_entry("a\rb", "1"), r#""a\rb": 1"#);
+        assert_eq!(JsonAdapter.display_entry("a\tb", "1"), r#""a\tb": 1"#);
+        assert_eq!(
+            JsonAdapter.display_entry("a\u{1}b", "1"),
+            r#""a\u0001b": 1"#
+        );
+    }
+
     // --- capabilities ----------------------------------------------------
 
     #[test]
@@ -1127,11 +1164,13 @@ mod tests {
   "level": "info",
   "//name": [
     "Required name.",
+    "Required.",
     "\"name\": \"\""
   ],
   "//rule": [
     "Any value.",
     "Accepts: any JSON value",
+    "Required.",
     "\"rule\": \"\""
   ],
   "db": {
@@ -1395,7 +1434,7 @@ mod tests {
         // document is the generated template (comment keys included) with
         // the set applied.
         use crate::fixtures::test::test_schema;
-        let out = crate::persist::set_in_document_runtime(
+        let out = crate::persist::set_in_document(
             &JsonAdapter,
             &test_schema(),
             None,

@@ -1,0 +1,5 @@
+error: unsupported #[clapfig(...)] variant attribute: `renmae`. Supported: rename = "..."
+ --> tests/ui/derive/variant_unknown_attr_rejected.rs:8:15
+  |
+8 |     #[clapfig(renmae = "fast")]
+  |               ^^^^^^

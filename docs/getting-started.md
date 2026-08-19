@@ -71,9 +71,11 @@ Key points:
   out-of-set values error at load, and generated templates document the
   allowed set with an `Allowed: ...` annotation — a native comment in TOML
   and YAML, a `"//"` comment key in JSON.
-- **`Option<T>`** fields are truly optional — omitting them everywhere is
-  valid. Non-optional fields without a default must be provided by at least
-  one layer.
+- **`Option<T>`** of a supported leaf (scalar, unit enum, or the leaf
+  map/array forms) is truly optional — omitting it everywhere is valid.
+  Nested structs are not an `Option` shape; the [Derive
+  Reference](./derive-reference.md) lists the exact wrappers. Non-optional
+  fields without a default must be provided by at least one layer.
 - **`///` doc comments** are used in generated templates and `config get`
   output.
 - The struct still derives serde's `Serialize`/`Deserialize` — clapfig uses
@@ -82,10 +84,20 @@ Key points:
   is shared with the schema: `#[serde(rename = "...")]` on a field renames
   the config key too (the schema follows serde's spelling; the directional
   `rename(deserialize = "...")` form contributes its deserialize name),
-  while struct-level `#[serde(rename_all = ...)]`, including
-  `rename_all(deserialize = "...")`, is rejected at compile time — rename
-  fields individually. (A serialize-only `rename_all(serialize = "...")`
-  is allowed: it doesn't affect config loading.)
+  and struct-level `#[serde(rename_all = "...")]` converts every config
+  key the same way serde converts its deserialize names, for the full
+  serde rule set (`lowercase`, `UPPERCASE`, `PascalCase`, `camelCase`,
+  `snake_case`, `SCREAMING_SNAKE_CASE`, `kebab-case`,
+  `SCREAMING-KEBAB-CASE`). Explicit field renames win over the rule, and
+  the directional `rename_all(deserialize = "...")` form contributes its
+  deserialize rule. (A serialize-only `rename_all(serialize = "...")`
+  doesn't affect config loading and leaves the keys on the Rust
+  spellings.) For typed structs use the serde spelling:
+  `#[clapfig(rename_all = "...")]` converts the *schema only* — it can't
+  change serde's generated `Deserialize` — so on its own it fits
+  schema-only types that don't derive `Deserialize`; pairing it with
+  `#[serde(rename_all)]` works too, but both must name the same rule (a
+  differing pair is a derive-time error).
 
 ## Load it
 
@@ -93,7 +105,7 @@ Key points:
 use clapfig::Clapfig;
 
 fn main() -> anyhow::Result<()> {
-    let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+    let config: AppConfig = Clapfig::typed::<AppConfig>()
         .app_name("myapp")
         .load()?;
 
@@ -115,7 +127,7 @@ switch from an exact file name to a **stem** plus an ordered list of enabled
 formats:
 
 ```rust
-let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+let config: AppConfig = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .file_stem("myapp")
     .formats(["toml", "yaml", "json"])
@@ -158,7 +170,7 @@ MYAPP__DATABASE__URL=postgres://localhost/mydb cargo run
 Disable env loading with `.no_env()` when you don't want it:
 
 ```rust
-let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+let config: AppConfig = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .no_env()
     .load()?;
@@ -171,7 +183,7 @@ Control where clapfig looks for config files:
 ```rust
 use clapfig::{Clapfig, SearchPath};
 
-let config: AppConfig = Clapfig::schema_builder::<AppConfig>()
+let config: AppConfig = Clapfig::typed::<AppConfig>()
     .app_name("myapp")
     .search_paths(vec![
         SearchPath::Platform,             // XDG / Library / AppData
@@ -187,7 +199,7 @@ ones. Missing files are silently skipped.
 ## Add clap integration
 
 With the `clap` feature (on by default), embed `ConfigArgs` in your CLI to get
-`config gen|list|get|set|unset` for free:
+`config gen|list|get|set|unset|schema` for free:
 
 ```rust
 use clap::{Parser, Subcommand};
@@ -209,7 +221,7 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let builder = Clapfig::schema_builder::<AppConfig>()
+    let builder = Clapfig::typed::<AppConfig>()
         .app_name("myapp")
         .persist_scope("local", SearchPath::Cwd);
 
@@ -234,6 +246,7 @@ myapp config list             # show all resolved values
 myapp config get server.port  # show a single key with its doc comment
 myapp config set port 9090    # persist a value to the config file
 myapp config unset port       # remove a persisted value
+myapp config schema           # print a JSON Schema for the struct
 ```
 
 ## Strict mode
@@ -250,6 +263,8 @@ Turn it off with `.strict(false)` if you share config files across tools.
 
 ## Next steps
 
+- [Derive Reference](./derive-reference.md) — `#[clapfig(...)]` attributes,
+  supported types, enums, maps, and arrays.
 - [Layered Configuration](./layered-config.md) — deep dive into layers,
   search modes, and merge behavior.
 - [Runtime Schemas](./runtime-schemas.md) — building schemas at runtime for

@@ -8,7 +8,7 @@
 //! files, classifying each set request onto its capability-matrix row
 //! ([`SetTarget`] — replace vs create-key vs create-file, so refusals
 //! name the operation actually attempted), key-spelling resolution under
-//! [`normalize_keys`](crate::RuntimeBuilder::normalize_keys) (dash and
+//! [`normalize_keys`](crate::Builder::normalize_keys) (dash and
 //! underscore spellings are equivalent; the spelling already present in
 //! the document is the one edited, and a document holding both
 //! equivalent spellings anywhere errors as a collision rather than one
@@ -28,11 +28,15 @@ use crate::value::Value;
 /// `raw_value`, through `adapter`.
 ///
 /// Validates the key against an owned [`Schema`](crate::runtime::Schema)
-/// and the value against the leaf's declared
-/// [`LeafType`](crate::runtime::LeafType) — with schema-driven datetime
-/// coercion for `DateTime` leaves (ADR-0001) — so a typo in the key name
-/// or a string where an integer is expected fails before the file is
-/// touched.
+/// and parses the raw value **according to the leaf's declared
+/// [`LeafType`](crate::runtime::LeafType)** (see [`parse_raw_value`]) —
+/// with schema-driven datetime coercion for `DateTime` leaves (ADR-0001)
+/// — so a typo in the key name or a value the leaf type cannot accept
+/// fails, naming the expected type, before the file is touched. A key
+/// addressing an `ArrayOf`/`MapOf` section (or its interior) fails with
+/// the targeted [`ClapfigError::UnaddressableKey`] instead of a bare
+/// key-not-found: dotted CLI keys cannot say which entry they mean, so
+/// the config file is the surface for editing those sections.
 ///
 /// With `normalize_keys`, the action key follows the load path's
 /// acceptance: dash and underscore spellings are equivalent. The key is
@@ -63,13 +67,14 @@ use crate::value::Value;
 /// error.
 ///
 /// Schema/key validation failures are [`ClapfigError::KeyNotFound`] /
-/// [`ClapfigError::InvalidValue`]; adapter edit failures — including the
+/// [`ClapfigError::UnaddressableKey`] / [`ClapfigError::InvalidValue`];
+/// adapter edit failures — including the
 /// typed [`UnsupportedByFormat`](crate::format::UnsupportedByFormat)
 /// refusal and path conflicts — propagate as [`ClapfigError::Format`],
 /// preserving the full [`FormatError`](crate::format::FormatError).
 ///
 /// Returns the modified document string.
-pub fn set_in_document_runtime(
+pub fn set_in_document(
     adapter: &dyn FormatAdapter,
     schema: &crate::runtime::Schema,
     content: Option<&str>,
@@ -78,14 +83,29 @@ pub fn set_in_document_runtime(
     normalize_keys: bool,
 ) -> Result<String, ClapfigError> {
     let canonical = canonical_key(key, normalize_keys);
-    let valid_keys = crate::overrides::valid_keys(crate::spec::SchemaRef::from_dynamic(schema));
+    let valid_keys = crate::overrides::valid_keys(schema);
     if !valid_keys.contains(&canonical) {
-        return Err(ClapfigError::KeyNotFound(key.into()));
+        if let Some((section, kind)) = unaddressable_container(schema, &canonical) {
+            return Err(ClapfigError::UnaddressableKey {
+                key: key.into(),
+                section,
+                kind,
+            });
+        }
+        return Err(ClapfigError::KeyNotFound {
+            key: key.into(),
+            suggestion: crate::meta::nearest_key(schema, &canonical, normalize_keys),
+        });
     }
 
-    let mut value = parse_raw_value(raw_value);
-    if let Some(leaf_ty) = lookup_leaf_type(schema, &canonical) {
-        crate::runtime_spec::coerce_datetime_value(&mut value, leaf_ty);
+    let leaf_ty = lookup_leaf_type(schema, &canonical);
+    let mut value =
+        parse_raw_value(raw_value, leaf_ty).map_err(|reason| ClapfigError::InvalidValue {
+            key: key.into(),
+            reason,
+        })?;
+    if let Some(leaf_ty) = leaf_ty {
+        crate::schema_walk::coerce_value(&mut value, leaf_ty);
         leaf_ty
             .check(&value)
             .map_err(|reason| ClapfigError::InvalidValue {
@@ -169,10 +189,10 @@ fn stamp_collision_path(err: ClapfigError, file_path: &Path) -> ClapfigError {
     }
 }
 
-/// Wrapper around [`set_in_document_runtime`] with file I/O: reads the file
+/// Wrapper around [`set_in_document`] with file I/O: reads the file
 /// (if it exists), patches it, writes back. Creates parent directories if
 /// needed. Collision errors from the document layer get this file's path.
-pub fn persist_value_runtime(
+pub fn persist_value(
     adapter: &dyn FormatAdapter,
     schema: &crate::runtime::Schema,
     file_path: &Path,
@@ -191,7 +211,7 @@ pub fn persist_value_runtime(
         }
     };
 
-    let new_content = set_in_document_runtime(
+    let new_content = set_in_document(
         adapter,
         schema,
         content.as_deref(),
@@ -212,10 +232,7 @@ pub fn persist_value_runtime(
         source: e,
     })?;
 
-    Ok(ConfigResult::ValueSet {
-        key: key.into(),
-        value: value.into(),
-    })
+    Ok(ConfigResult::value_set(adapter, key.into(), value.into()))
 }
 
 /// Descend a runtime schema by dotted key path and return the target leaf's
@@ -409,14 +426,117 @@ fn dotted_config_path(key: &str) -> ConfigPath {
     path
 }
 
-/// Parse a raw `config set` string into a typed config value with the
-/// same bool > integer > float > string heuristic as env/URL values.
+/// If the canonical dotted key targets an `ArrayOf`/`MapOf` schema field
+/// or a path inside one, return that section's dotted path and a kind
+/// label (`"an array"` / `"a map"`) for [`ClapfigError::UnaddressableKey`].
+/// `None` means the key misses the schema some other way (a plain
+/// key-not-found).
+fn unaddressable_container(
+    schema: &crate::runtime::Schema,
+    canonical: &str,
+) -> Option<(String, &'static str)> {
+    let mut current = schema;
+    let mut walked: Vec<&str> = Vec::new();
+    for seg in canonical.split('.') {
+        let nf = current.fields.iter().find(|f| f.name == seg)?;
+        walked.push(seg);
+        match &nf.field {
+            crate::runtime::Field::ArrayOf(_) => return Some((walked.join("."), "an array")),
+            crate::runtime::Field::MapOf(_) => return Some((walked.join("."), "a map")),
+            crate::runtime::Field::Nested(inner) => current = inner,
+            crate::runtime::Field::Leaf(_) => return None,
+        }
+    }
+    None
+}
+
+/// Parse a raw `config set` string into a typed config value **according
+/// to the target leaf's declared [`LeafType`](crate::runtime::LeafType)**
+/// — never by sniffing the string's shape when the schema already says
+/// what the leaf holds:
 ///
-/// The parsed value is checked against the target leaf's declared
-/// [`LeafType`](crate::runtime::LeafType) to catch type mismatches before
-/// persisting.
-fn parse_raw_value(s: &str) -> Value {
-    crate::env::parse_env_value(s)
+/// - `String` takes the raw string verbatim, so values that *look* like
+///   numbers or bools (`"123"`, `"true"`) are settable on string leaves.
+/// - `Integer` / `Float` / `Bool` parse the raw string as that type and
+///   fail naming the expected type.
+/// - `Array` / `Map` parse the raw string as a TOML inline value (`[1,
+///   2]`, `{a = 1}` — the value model's baseline vocabulary, whatever
+///   the file format), then the caller's [`LeafType::check`] validates
+///   element types.
+/// - `DateTime` passes the raw string through; the caller's
+///   schema-driven coercion (ADR-0001) plus `check` accept or reject it.
+/// - `Enum` uses the env-style bool > integer > float > string heuristic
+///   (its members carry their own types), falling back to the raw string
+///   so string members that look numeric stay reachable; membership is
+///   the caller's `check`.
+/// - `Value` leaves (and keys without a resolvable leaf type) keep the
+///   env-style heuristic — the schema declares no shape to parse toward.
+///
+/// Errors are human-readable reasons for
+/// [`ClapfigError::InvalidValue`](crate::error::ClapfigError::InvalidValue).
+fn parse_raw_value(raw: &str, ty: Option<&crate::runtime::LeafType>) -> Result<Value, String> {
+    use crate::runtime::LeafType;
+    let Some(ty) = ty else {
+        return Ok(crate::env::parse_env_value(raw));
+    };
+    match ty {
+        LeafType::String => Ok(Value::String(raw.to_owned())),
+        LeafType::Integer { .. } => raw
+            .parse::<i64>()
+            .map(Value::Integer)
+            .map_err(|_| format!("expected integer, got '{raw}'")),
+        LeafType::Float => raw
+            .parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| format!("expected float, got '{raw}'")),
+        LeafType::Bool => {
+            if raw.eq_ignore_ascii_case("true") {
+                Ok(Value::Boolean(true))
+            } else if raw.eq_ignore_ascii_case("false") {
+                Ok(Value::Boolean(false))
+            } else {
+                Err(format!("expected bool ('true' or 'false'), got '{raw}'"))
+            }
+        }
+        LeafType::DateTime => Ok(Value::String(raw.to_owned())),
+        LeafType::Enum { values } => {
+            let sniffed = crate::env::parse_env_value(raw);
+            if values.contains(&sniffed) {
+                Ok(sniffed)
+            } else {
+                Ok(Value::String(raw.to_owned()))
+            }
+        }
+        LeafType::Array(_) | LeafType::Map(_) => parse_inline_container(raw, ty),
+        LeafType::Value => Ok(crate::env::parse_env_value(raw)),
+    }
+}
+
+/// Parse a raw `config set` string destined for an `Array`/`Map` leaf as
+/// a TOML inline value. TOML is the value model's baseline vocabulary
+/// (ADR-0001), so the CLI accepts one container syntax regardless of the
+/// file's format; the resulting [`Value`] is then written through the
+/// active format's adapter like any other. A raw string TOML cannot
+/// parse as a value errors naming the expected container type with an
+/// example spelling.
+fn parse_inline_container(raw: &str, ty: &crate::runtime::LeafType) -> Result<Value, String> {
+    let example = match ty {
+        crate::runtime::LeafType::Array(_) => "[\"a\", \"b\"]",
+        _ => "{key = \"value\"}",
+    };
+    let refuse = || {
+        format!(
+            "expected {} in TOML inline syntax (e.g. {example}), got '{raw}'",
+            ty.name()
+        )
+    };
+    let doc = format!("v = {raw}");
+    match crate::format::TomlAdapter.parse(&doc) {
+        // Require exactly the probe key back: a raw string smuggling
+        // extra TOML (newlines, additional keys) is not one value.
+        Ok(Value::Map(mut map)) if map.len() == 1 => map.remove("v").ok_or_else(refuse),
+        _ => Err(refuse()),
+    }
 }
 
 #[cfg(test)]
@@ -427,20 +547,16 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn set_in_document(
-        content: Option<&str>,
-        key: &str,
-        value: &str,
-    ) -> Result<String, ClapfigError> {
-        set_in_document_runtime(&TomlAdapter, &test_schema(), content, key, value, false)
+    fn set_toml(content: Option<&str>, key: &str, value: &str) -> Result<String, ClapfigError> {
+        set_in_document(&TomlAdapter, &test_schema(), content, key, value, false)
     }
 
-    fn persist_value(
+    fn persist_toml(
         path: &std::path::Path,
         key: &str,
         value: &str,
     ) -> Result<ConfigResult, ClapfigError> {
-        persist_value_runtime(&TomlAdapter, &test_schema(), path, key, value, false)
+        persist_value(&TomlAdapter, &test_schema(), path, key, value, false)
     }
 
     // --- validation tests ---
@@ -523,7 +639,7 @@ mod tests {
         let schema = test_schema();
 
         // Key exists in the document → replacing an existing value.
-        let u = refusal(set_in_document_runtime(
+        let u = refusal(set_in_document(
             &ParseOnly,
             &schema,
             Some("port = 1\n"),
@@ -534,7 +650,7 @@ mod tests {
         assert_eq!(u.operation, Operation::EditSet);
 
         // File exists, key does not → creating a missing key.
-        let u = refusal(set_in_document_runtime(
+        let u = refusal(set_in_document(
             &ParseOnly,
             &schema,
             Some("port = 1\n"),
@@ -547,7 +663,7 @@ mod tests {
         // No file at all → creating a missing file, refused before any
         // template seeding (ParseOnly's template also refuses; the
         // create-file refusal must win).
-        let u = refusal(set_in_document_runtime(
+        let u = refusal(set_in_document(
             &ParseOnly, &schema, None, "port", "1", false,
         ));
         assert_eq!(u.operation, Operation::EditCreateFile);
@@ -622,7 +738,7 @@ mod tests {
         // A format that cannot parse at all fails classification at its
         // parse refusal — editing an existing file begins with reading
         // it, so that is the honest earliest error.
-        let u = refusal(set_in_document_runtime(
+        let u = refusal(set_in_document(
             &RefusesAll,
             &test_schema(),
             Some("port = 1\n"),
@@ -635,13 +751,33 @@ mod tests {
 
     #[test]
     fn set_rejects_unknown_key() {
-        let result = set_in_document(Some(""), "nonexistent", "value");
-        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
+        let result = set_toml(Some(""), "nonexistent", "value");
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound { .. })));
+    }
+
+    #[test]
+    fn set_kebab_key_suggests_snake_when_normalization_is_off() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &test_schema(),
+            Some(""),
+            "database.pool-size",
+            "10",
+            false,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::KeyNotFound { key, suggestion } => {
+                assert_eq!(key, "database.pool-size");
+                assert_eq!(suggestion.as_deref(), Some("database.pool_size"));
+            }
+            other => panic!("expected KeyNotFound, got {other:?}"),
+        }
     }
 
     #[test]
     fn set_rejects_invalid_enum_value() {
-        let result = set_in_document_runtime(
+        let result = set_in_document(
             &TomlAdapter,
             &enum_schema(),
             Some(""),
@@ -663,7 +799,7 @@ mod tests {
 
     #[test]
     fn set_accepts_valid_enum_value() {
-        let result = set_in_document_runtime(
+        let result = set_in_document(
             &TomlAdapter,
             &enum_schema(),
             Some(""),
@@ -676,7 +812,7 @@ mod tests {
 
     #[test]
     fn set_rejects_wrong_type() {
-        let result = set_in_document(Some(""), "port", "not_a_number");
+        let result = set_toml(Some(""), "port", "not_a_number");
         assert!(matches!(result, Err(ClapfigError::InvalidValue { .. })));
     }
 
@@ -689,7 +825,7 @@ mod tests {
         // propagates as ClapfigError::Format (never collapsed into
         // InvalidValue — that variant is for schema/type validation).
         let content = "database = \"oops\"\n";
-        let result = set_in_document(Some(content), "database.url", "pg://x");
+        let result = set_toml(Some(content), "database.url", "pg://x");
         match result {
             Err(ClapfigError::Format(crate::format::FormatError::Edit {
                 format, message, ..
@@ -706,7 +842,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
-        let result = persist_value_runtime(
+        let result = persist_value(
             &TomlAdapter,
             &enum_schema(),
             &path,
@@ -722,7 +858,7 @@ mod tests {
     #[test]
     fn set_existing_key() {
         let content = "port = 8080\nhost = \"localhost\"\n";
-        let result = set_in_document(Some(content), "port", "3000").unwrap();
+        let result = set_toml(Some(content), "port", "3000").unwrap();
         assert!(result.contains("port = 3000"));
         assert!(result.contains("host = \"localhost\""));
     }
@@ -730,38 +866,347 @@ mod tests {
     #[test]
     fn set_nested_key() {
         let content = "[database]\npool_size = 5\n";
-        let result = set_in_document(Some(content), "database.pool_size", "20").unwrap();
+        let result = set_toml(Some(content), "database.pool_size", "20").unwrap();
         assert!(result.contains("pool_size = 20"));
     }
 
     #[test]
     fn set_new_key_in_existing_file() {
         let content = "port = 8080\n";
-        let result = set_in_document(Some(content), "debug", "true").unwrap();
+        let result = set_toml(Some(content), "debug", "true").unwrap();
         assert!(result.contains("debug = true"));
         assert!(result.contains("port = 8080"));
     }
 
     #[test]
     fn set_creates_from_template_when_none() {
-        let result = set_in_document(None, "port", "3000").unwrap();
+        let result = set_toml(None, "port", "3000").unwrap();
         assert!(result.contains("port = 3000"));
     }
 
     #[test]
     fn preserves_comments() {
         let content = "# This is my config\nport = 8080\n# end\n";
-        let result = set_in_document(Some(content), "port", "3000").unwrap();
+        let result = set_toml(Some(content), "port", "3000").unwrap();
         assert!(result.contains("# This is my config"));
         assert!(result.contains("port = 3000"));
     }
 
+    // --- schema-directed value parsing (the leaf type decides, not a
+    // --- sniff of the raw string's shape) ---
+
     #[test]
-    fn value_parsing_heuristics() {
-        assert!(matches!(parse_raw_value("42"), Value::Integer(42)));
-        assert!(matches!(parse_raw_value("true"), Value::Boolean(true)));
-        assert!(matches!(parse_raw_value("hello"), Value::String(_)));
-        assert!(matches!(parse_raw_value("1.5"), Value::Float(_)));
+    fn value_parsing_follows_declared_leaf_type() {
+        use crate::runtime::LeafType;
+        // The same raw string lands as different types depending on the
+        // declared leaf — never on what the string looks like.
+        assert_eq!(
+            parse_raw_value("123", Some(&LeafType::String)).unwrap(),
+            Value::String("123".into())
+        );
+        assert_eq!(
+            parse_raw_value(
+                "123",
+                Some(&LeafType::Integer {
+                    min: None,
+                    max: None,
+                }),
+            )
+            .unwrap(),
+            Value::Integer(123)
+        );
+        assert_eq!(
+            parse_raw_value("123", Some(&LeafType::Float)).unwrap(),
+            Value::Float(123.0)
+        );
+        assert_eq!(
+            parse_raw_value("TRUE", Some(&LeafType::Bool)).unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn value_parsing_errors_name_the_expected_type() {
+        use crate::runtime::LeafType;
+        for (raw, ty, expected) in [
+            (
+                "abc",
+                LeafType::Integer {
+                    min: None,
+                    max: None,
+                },
+                "expected integer",
+            ),
+            ("abc", LeafType::Float, "expected float"),
+            ("yes", LeafType::Bool, "expected bool"),
+            (
+                "a,b",
+                LeafType::Array(Box::new(LeafType::String)),
+                "expected array",
+            ),
+            (
+                "a=1",
+                LeafType::Map(Box::new(LeafType::Integer {
+                    min: None,
+                    max: None,
+                })),
+                "expected map",
+            ),
+        ] {
+            let err = parse_raw_value(raw, Some(&ty)).unwrap_err();
+            assert!(err.contains(expected), "{raw}: {err}");
+            assert!(err.contains(raw), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn value_parsing_without_leaf_type_keeps_the_heuristic() {
+        // `Value` leaves and unresolvable keys have no declared shape to
+        // parse toward — the env-style sniff stays.
+        use crate::runtime::LeafType;
+        assert_eq!(parse_raw_value("42", None).unwrap(), Value::Integer(42));
+        assert_eq!(
+            parse_raw_value("1.5", Some(&LeafType::Value)).unwrap(),
+            Value::Float(1.5)
+        );
+        assert_eq!(
+            parse_raw_value("hello", None).unwrap(),
+            Value::String("hello".into())
+        );
+    }
+
+    #[test]
+    fn set_string_leaf_accepts_numeric_looking_value() {
+        // The pre-fix failure mode: `config set host 123` on a String
+        // leaf sniffed 123 as an integer and refused with "expected
+        // string, got integer" — with no way to force a string.
+        let result = set_toml(Some(""), "host", "123").unwrap();
+        assert!(result.contains("host = \"123\""), "{result}");
+    }
+
+    #[test]
+    fn set_array_leaf_parses_toml_inline_array() {
+        use crate::runtime::{Field, Schema};
+        let schema = Schema::object("T")
+            .field(
+                "tags",
+                Field::array_of_type(crate::runtime::LeafType::String).optional(),
+            )
+            .build();
+        let result = set_in_document(
+            &TomlAdapter,
+            &schema,
+            Some(""),
+            "tags",
+            "[\"a\", \"b\"]",
+            false,
+        )
+        .unwrap();
+        assert!(result.contains("tags = [\"a\", \"b\"]"), "{result}");
+
+        // Element types are still checked against the declared element.
+        let err =
+            set_in_document(&TomlAdapter, &schema, Some(""), "tags", "[1, 2]", false).unwrap_err();
+        match err {
+            ClapfigError::InvalidValue { reason, .. } => {
+                assert!(reason.contains("expected string"), "{reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_map_leaf_parses_toml_inline_table() {
+        use crate::runtime::{Field, Schema};
+        let schema = Schema::object("T")
+            .field(
+                "limits",
+                Field::map_of(crate::runtime::LeafType::Integer {
+                    min: None,
+                    max: None,
+                })
+                .optional(),
+            )
+            .build();
+        let result = set_in_document(
+            &TomlAdapter,
+            &schema,
+            Some(""),
+            "limits",
+            "{cpu = 2, mem = 8}",
+            false,
+        )
+        .unwrap();
+        assert!(result.contains("cpu = 2"), "{result}");
+        assert!(result.contains("mem = 8"), "{result}");
+    }
+
+    #[test]
+    fn set_container_rejects_smuggled_extra_toml() {
+        // A raw string that parses as MORE than one value (an injected
+        // second key) is not one value — refuse rather than silently
+        // keeping the first.
+        use crate::runtime::{Field, Schema};
+        let schema = Schema::object("T")
+            .field(
+                "tags",
+                Field::array_of_type(crate::runtime::LeafType::String).optional(),
+            )
+            .build();
+        let err = set_in_document(
+            &TomlAdapter,
+            &schema,
+            Some(""),
+            "tags",
+            "[]\nother = 1",
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ClapfigError::InvalidValue { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn set_enum_of_numeric_strings_stays_reachable() {
+        // An enum whose members are strings that LOOK numeric: the raw
+        // value must still match the string member, not die as a sniffed
+        // integer.
+        use crate::runtime::{Field, Schema};
+        let schema = Schema::object("T")
+            .field("gear", Field::enum_of(["1", "2", "reverse"]).optional())
+            .build();
+        let result = set_in_document(&TomlAdapter, &schema, Some(""), "gear", "1", false).unwrap();
+        assert!(result.contains("gear = \"1\""), "{result}");
+    }
+
+    #[test]
+    fn set_enum_of_integers_matches_typed_member() {
+        use crate::runtime::{Field, Schema};
+        let schema = Schema::object("T")
+            .field("level", Field::enum_of([1i64, 2i64, 3i64]).optional())
+            .build();
+        let result = set_in_document(&TomlAdapter, &schema, Some(""), "level", "2", false).unwrap();
+        assert!(result.contains("level = 2"), "{result}");
+    }
+
+    // --- ArrayOf/MapOf interior addressing (targeted refusal) ---
+
+    /// Schema with an `ArrayOf` and a `MapOf` section plus one nested
+    /// object wrapping a `MapOf`, for interior-path refusal tests.
+    fn container_schema() -> crate::runtime::Schema {
+        use crate::runtime::{Field, Schema};
+        Schema::object("T")
+            .array_of(
+                "plugins",
+                Schema::object("Plugin").field("name", Field::string()),
+            )
+            .map_of(
+                "servers",
+                Schema::object("Server").field("host", Field::string()),
+            )
+            .nested(
+                "outer",
+                Schema::object("Outer").map_of(
+                    "inner",
+                    Schema::object("Entry").field("port", Field::integer()),
+                ),
+            )
+            .build()
+    }
+
+    #[test]
+    fn set_into_map_of_interior_names_the_section() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &container_schema(),
+            Some(""),
+            "servers.web.host",
+            "example.com",
+            false,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::UnaddressableKey { key, section, kind } => {
+                assert_eq!(key, "servers.web.host");
+                assert_eq!(section, "servers");
+                assert_eq!(kind, "a map");
+            }
+            other => panic!("expected UnaddressableKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_into_array_of_interior_names_the_section() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &container_schema(),
+            Some(""),
+            "plugins.name",
+            "x",
+            false,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::UnaddressableKey { section, kind, .. } => {
+                assert_eq!(section, "plugins");
+                assert_eq!(kind, "an array");
+            }
+            other => panic!("expected UnaddressableKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_on_nested_container_section_reports_full_path() {
+        // The section path walks through Nested wrappers, and targeting
+        // the container field itself (no interior segment) refuses too.
+        for key in ["outer.inner.web.port", "outer.inner"] {
+            let err = set_in_document(&TomlAdapter, &container_schema(), Some(""), key, "1", false)
+                .unwrap_err();
+            match err {
+                ClapfigError::UnaddressableKey { section, kind, .. } => {
+                    assert_eq!(section, "outer.inner", "{key}");
+                    assert_eq!(kind, "a map", "{key}");
+                }
+                other => panic!("{key}: expected UnaddressableKey, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_unknown_key_off_containers_is_still_key_not_found() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &container_schema(),
+            Some(""),
+            "nonexistent.path",
+            "1",
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ClapfigError::KeyNotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn normalized_set_into_container_interior_refuses_kebab_spelling_too() {
+        use crate::runtime::{Field, Schema};
+        let schema = Schema::object("T")
+            .map_of(
+                "my_servers",
+                Schema::object("Server").field("host", Field::string()),
+            )
+            .build();
+        let err = set_in_document(
+            &TomlAdapter,
+            &schema,
+            Some(""),
+            "my-servers.web.host",
+            "h",
+            true,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::UnaddressableKey { section, .. } => assert_eq!(section, "my_servers"),
+            other => panic!("expected UnaddressableKey, got {other:?}"),
+        }
     }
 
     #[test]
@@ -773,7 +1218,7 @@ mod tests {
         let schema = Schema::object("T")
             .field("stamp", Field::datetime().optional())
             .build();
-        let result = set_in_document_runtime(
+        let result = set_in_document(
             &TomlAdapter,
             &schema,
             Some(""),
@@ -787,7 +1232,7 @@ mod tests {
             "datetime must persist unquoted (typed), got: {result}"
         );
 
-        let err = set_in_document_runtime(
+        let err = set_in_document(
             &TomlAdapter,
             &schema,
             Some(""),
@@ -804,7 +1249,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
-        let result = persist_value(&path, "port", "3000").unwrap();
+        let result = persist_toml(&path, "port", "3000").unwrap();
         assert!(matches!(result, ConfigResult::ValueSet { .. }));
 
         let content = fs::read_to_string(&path).unwrap();
@@ -817,11 +1262,39 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "port = 8080\n").unwrap();
 
-        persist_value(&path, "port", "3000").unwrap();
+        persist_toml(&path, "port", "3000").unwrap();
 
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("port = 3000"));
         assert!(!content.contains("8080"));
+    }
+
+    /// Guard (FIXME.md #13, test dropped by an earlier refactor): an
+    /// unreadable target file is an IO error naming the file — never
+    /// treated like a missing file, which would silently overwrite it
+    /// with a fresh template-seeded document.
+    #[cfg(unix)]
+    #[test]
+    fn persist_unreadable_file_surfaces_io_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "port = 8080\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_to_string(&path).is_ok() {
+            // Running as root: permissions don't bind, nothing to test.
+            return;
+        }
+
+        let result = persist_toml(&path, "port", "3000");
+        match result {
+            Err(ClapfigError::IoError { path: reported, .. }) => assert_eq!(reported, path),
+            other => panic!("expected IoError, got {other:?}"),
+        }
+
+        // The unreadable file was not replaced.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "port = 8080\n");
     }
 
     #[test]
@@ -829,7 +1302,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sub").join("dir").join("config.toml");
 
-        persist_value(&path, "port", "3000").unwrap();
+        persist_toml(&path, "port", "3000").unwrap();
         assert!(path.exists());
     }
 
@@ -872,15 +1345,9 @@ mod tests {
         // the next load). The kebab action key must work too.
         for (adapter, doc) in docs("pool-size") {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let out = set_in_document_runtime(
-                    adapter,
-                    &test_schema(),
-                    Some(&doc),
-                    action_key,
-                    "20",
-                    true,
-                )
-                .unwrap();
+                let out =
+                    set_in_document(adapter, &test_schema(), Some(&doc), action_key, "20", true)
+                        .unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -905,15 +1372,9 @@ mod tests {
         // not rewrite the document to kebab.
         for (adapter, doc) in docs("pool_size") {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let out = set_in_document_runtime(
-                    adapter,
-                    &test_schema(),
-                    Some(&doc),
-                    action_key,
-                    "20",
-                    true,
-                )
-                .unwrap();
+                let out =
+                    set_in_document(adapter, &test_schema(), Some(&doc), action_key, "20", true)
+                        .unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -941,7 +1402,7 @@ mod tests {
             (&JsonAdapter, "{\n  \"host\": \"h\"\n}\n"),
         ];
         for (adapter, base) in bases {
-            let out = set_in_document_runtime(
+            let out = set_in_document(
                 adapter,
                 &test_schema(),
                 Some(base),
@@ -972,8 +1433,7 @@ mod tests {
         for adapter in adapters {
             for action_key in ["database.pool-size", "database.pool_size"] {
                 let out =
-                    set_in_document_runtime(adapter, &test_schema(), None, action_key, "20", true)
-                        .unwrap();
+                    set_in_document(adapter, &test_schema(), None, action_key, "20", true).unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -1001,7 +1461,7 @@ mod tests {
         // The kebab action key is accepted (normalized before the
         // valid-keys check) and its value is still type-checked against
         // the canonical leaf.
-        let result = set_in_document_runtime(
+        let result = set_in_document(
             &TomlAdapter,
             &test_schema(),
             Some(""),
@@ -1016,8 +1476,8 @@ mod tests {
     fn kebab_action_key_still_rejected_without_normalization() {
         // Acceptance boundary: with normalization off, the load path
         // rejects kebab keys, so the persistence path does too.
-        let result = set_in_document(Some(""), "database.pool-size", "20");
-        assert!(matches!(result, Err(ClapfigError::KeyNotFound(_))));
+        let result = set_toml(Some(""), "database.pool-size", "20");
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound { .. })));
     }
 
     #[test]
@@ -1082,14 +1542,8 @@ mod tests {
         // editing one of the two entries and leaving the file unloadable.
         for (adapter, doc) in colliding_docs() {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let result = set_in_document_runtime(
-                    adapter,
-                    &test_schema(),
-                    Some(doc),
-                    action_key,
-                    "20",
-                    true,
-                );
+                let result =
+                    set_in_document(adapter, &test_schema(), Some(doc), action_key, "20", true);
                 assert_collision(
                     result,
                     "database",
@@ -1114,8 +1568,7 @@ mod tests {
             )
             .build();
         let doc = "[my-db]\nsize = 1\n\n[my_db]\nsize = 2\n";
-        let result =
-            set_in_document_runtime(&TomlAdapter, &schema, Some(doc), "my_db.size", "3", true);
+        let result = set_in_document(&TomlAdapter, &schema, Some(doc), "my_db.size", "3", true);
         assert_collision(result, "", "my_db", &["my-db", "my_db"], "intermediate");
     }
 
@@ -1128,8 +1581,7 @@ mod tests {
         // edited.
         for (adapter, doc) in colliding_docs() {
             let doc = with_host(adapter, doc);
-            let result =
-                set_in_document_runtime(adapter, &test_schema(), Some(&doc), "host", "h2", true);
+            let result = set_in_document(adapter, &test_schema(), Some(&doc), "host", "h2", true);
             assert_collision(
                 result,
                 "database",
@@ -1195,7 +1647,7 @@ mod tests {
         fs::write(&path, "[database]\npool-size = 5\npool_size = 6\n").unwrap();
 
         for result in [
-            persist_value_runtime(
+            persist_value(
                 &TomlAdapter,
                 &test_schema(),
                 &path,

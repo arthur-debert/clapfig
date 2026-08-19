@@ -4,11 +4,11 @@ Some apps don't have a single compile-time config struct. Plugin hosts
 assemble their schema from loaded plugins. Scripting hosts read it from
 a config descriptor file. Generated apps build it programmatically. For
 those cases, clapfig exposes a runtime-schema entry point next to the
-typed `Clapfig::schema_builder::<C>()` one.
+typed `Clapfig::typed::<C>()` one.
 
 ## When to reach for it
 
-Use `Clapfig::runtime(schema)` when **the set of valid keys is not known
+Use `Clapfig::builder(schema)` when **the set of valid keys is not known
 at compile time**. Examples:
 
 - A linter whose rule keys come from a directory of plugin manifests.
@@ -20,7 +20,7 @@ at compile time**. Examples:
   combination of fields without writing a Rust type for it.
 
 If your config schema is known at compile time, use
-`Clapfig::schema_builder::<C>()` instead — the typed path is simpler,
+`Clapfig::typed::<C>()` instead — the typed path is simpler,
 gives you typed access to the result, and benefits from
 `#[derive(clapfig::Schema)]` ergonomics. Both paths produce identical
 schema metadata and share one resolve pipeline.
@@ -53,10 +53,11 @@ let schema = Schema::object("App")
 ### Field kinds
 
 - **`Field::string()`, `Field::integer()`, `Field::float()`, `Field::boolean()`, `Field::datetime()`** — TOML primitive leaves.
+- **`Field::integer_in(min, max)`** — range-bounded integer (`None` leaves an end open). Both ends set with `min > max` panics when the field is built (an authoring error, same class as a duplicate field name). Out-of-range values fail validation naming the key, and `config schema` exports the bounds as `minimum`/`maximum` — the runtime counterpart of the width bounds the derive macro emits for sized integer fields (`u8` → `0..=255`).
 - **`Field::array_of_type(LeafType)`** — homogeneous array of a primitive type.
 - **`Field::map_of(LeafType)`** — string-keyed map with homogeneous values.
 - **`Field::enum_of(values)`** — constrained value: must be one of the listed TOML primitives. Used for log levels, output formats, modes.
-- **`Field::value()`** — accepts any TOML value (scalar, array, table). Escape hatch for keys whose value can take multiple incompatible shapes on the same field (e.g. a bare string *or* an array of `[string, table]`, like serde's `#[serde(untagged)]` enums). Clapfig does no shape check at the schema layer; the caller is responsible for further validation, typically via `serde` in a `post_validate` hook.
+- **`Field::value()`** — accepts any value-model value (scalar, array, map). Escape hatch for keys whose value can take multiple incompatible shapes on the same field (e.g. a bare string *or* an array of `[string, map]`, like serde's `#[serde(untagged)]` enums). Clapfig does no shape check at the schema layer; the caller is responsible for further validation, typically via `serde` in a `post_validate` hook.
 - **`Schema::object(...).nested(name, child)`** — TOML `[section]` sub-object.
 - **`Schema::object(...).array_of(name, item_schema)`** — TOML `[[name]]` array of sub-objects.
 
@@ -77,13 +78,13 @@ consumer.
 
 ## Using a schema
 
-`Clapfig::runtime(schema)` returns a `RuntimeBuilder` with the same
-surface as `Clapfig::schema_builder::<C>()`:
+`Clapfig::builder(schema)` returns a `Builder` with the same
+surface as `Clapfig::typed::<C>()`:
 
 ```rust,ignore
 use clapfig::{Clapfig, types::SearchPath};
 
-let table: clapfig::value::Map = Clapfig::runtime(schema)
+let map: clapfig::value::Map = Clapfig::builder(schema)
     .app_name("myapp")
     .file_name("myapp.toml")
     .search_paths(vec![SearchPath::Cwd, SearchPath::Platform])
@@ -95,7 +96,7 @@ Differences from the typed path:
 
 - `load()` returns `clapfig::value::Map`, not a typed struct.
 - `post_validate` receives `&clapfig::value::Map` instead of `&C`.
-- `build_resolver()` returns a `RuntimeResolver` for tree-walk use
+- `build_resolver()` returns a `Resolver` for tree-walk use
   cases (see the [Resolver Guide](./resolver.md)).
 
 Everything else — `search_paths`, `search_mode`, `env_prefix`,
@@ -105,7 +106,7 @@ Everything else — `search_paths`, `search_mode`, `env_prefix`,
 
 ## Subcommand support
 
-`RuntimeBuilder::handle(&ConfigAction)` drives the same
+`Builder::handle(&ConfigAction)` drives the same
 `config gen|list|get|set|unset|schema` actions the typed path
 supports. Doc comments and enum allowed-value lists are read straight
 off the schema:
@@ -114,21 +115,26 @@ off the schema:
   `# Allowed: "debug" | "info" | "warn" | "error"`.
 - `config schema` emits a JSON Schema document with the same enum
   values as `enum: [...]` on the property.
-- `meta::doc_for_runtime(&schema, "db.pool_size")` reads doc-comment
-  lines from the schema the same way `meta::doc_for::<C>(...)` reads
-  them from `C::META`.
+- `meta::doc_for(&schema, "db.pool_size")` reads doc-comment
+  lines from the schema; derive users pass `C::schema()` for the same
+  lookup.
 
 ## What's not yet supported
 
-- `deserialize_with`-style normalizers on runtime leaves.
-- Mixing a runtime sub-schema inside a static `Config` struct.
+- `deserialize_with`-style normalizers on runtime leaves (the typed
+  path honors shape-preserving `#[serde(deserialize_with)]`; the
+  runtime `Field` builder has no equivalent).
+- Mixing a runtime-built sub-schema inside a `#[derive(clapfig::Schema)]`
+  struct — a derive field is either another Schema type or a leaf.
 - Indexed dotted-key syntax (`plugins[0].id`) for `config set` on
-  arrays of objects.
+  arrays of objects. Keys inside `ArrayOf`/`MapOf` sections refuse with
+  a targeted error; edit the config file directly.
 
-See the proposal in issue #38 for context on the deferred items.
+Arrays of nested schema types (`Vec<NestedStruct>` / `Vec<UnitEnum>`)
+and struct-level `rename_all` both derive; they are not gaps.
 
 ## Example
 
 A runnable example lives at
-[`examples/runtime_schema/`](https://github.com/arthur-debert/clapfig/tree/main/examples/runtime_schema).
+[`crates/clapfig/examples/runtime_schema/`](https://github.com/arthur-debert/clapfig/tree/main/crates/clapfig/examples/runtime_schema).
 Run with `cargo run --example runtime_schema -- load`.
