@@ -33,7 +33,10 @@ use syn::{
 ///   path; see the `LeafTypeStatic::Integer` doc comment for the
 ///   `i64::MAX` caveat on the unsigned variants), `f32`, `f64`,
 ///   `clapfig::value::Datetime`, `clapfig::value::Value`.
-/// - `Option<T>`: marks the leaf optional (`Option<UnitEnum>` included).
+/// - `Option<T>` of a supported leaf: scalar, `Value`, or unit-only enum
+///   (`Option<UnitEnum>` included). Unqualified `Option<T>` is not the
+///   contract — nested structs are not an Option shape (see deferred
+///   panics below).
 /// - `Vec<T>` where `T` is a scalar: maps to `LeafType::Array(T)`.
 /// - `Vec<T>` where `T` derives `clapfig::Schema`: produces a
 ///   `FieldStatic::ArrayOf { .. }` (TOML `[[name]]` array of tables) for a
@@ -41,13 +44,21 @@ use syn::{
 ///   `LeafType::Array(Enum)` leaf (allowed-values on items). Support is
 ///   trait-resolved — the compiler, not a syntactic guess, decides
 ///   whether `T` qualifies. An absent array loads as the empty `Vec`;
-///   `Option<Vec<T>>` keeps the presence signal (absent → `None`) and is
-///   supported for unit-only-enum element types only (an absent array of
-///   nested *objects* is already the empty array — spell it `Vec<T>`).
+///   `Option<Vec<T>>` of a scalar or unit-only enum keeps the presence
+///   signal (absent → `None`). `Option<Vec<NestedStruct>>` has no
+///   representation (an absent array of nested objects is already the
+///   empty array — spell it `Vec<T>`) and panics at the first
+///   `schema()` call.
 /// - `HashMap<String, V>` / `BTreeMap<String, V>`: a scalar / `Value` /
 ///   array-of-scalar `V` emits `LeafType::Map(V)`; a nested struct `V`
 ///   emits `FieldStatic::MapOf { .. }`; a unit-only-enum `V` flattens to
 ///   `LeafType::Map(Enum)`. An absent map loads as the empty map.
+///   `Option<HashMap<String, V>>` / `Option<BTreeMap<String, V>>` keeps
+///   the presence signal when `V` is a scalar / `Value` /
+///   array-of-scalar. `Option` around a MapOf shape
+///   (`Option<HashMap<String, NestedStruct>>`, including a unit-enum `V`
+///   routed through the same Nested classification) is a derive-time
+///   error.
 /// - Nested struct: assumed to also derive `clapfig::Schema`; produces a
 ///   `FieldStatic::Nested { .. }`.
 /// - Unit-only enum: flattens at every use site to a `LeafType::Enum`
@@ -86,16 +97,33 @@ use syn::{
 /// - Kind-mismatched `default` / `allowed` literals; empty `allowed`;
 ///   `value` + `allowed` on the same field; `allowed` on `Vec` /
 ///   nested / map-of-nested fields; defaults on map-typed fields and
-///   array-of-nested fields; leaf attrs on nested-struct fields.
+///   array-of-nested fields; leaf attrs (`default` / `env` / `allowed` /
+///   `optional`) on map-of-nested and array-of-nested fields;
+///   `Option<HashMap<String, NestedStruct>>` /
+///   `Option<BTreeMap<String, NestedStruct>>` (unit-enum values
+///   included — they classify as Nested at the field site).
 /// - Invalid or colliding rename strings; clapfig/serde rename (or
 ///   `rename_all`) pairs that disagree; unsupported `rename_all` rules.
 /// - Every serde attribute the schema does not honor (see *Serde
 ///   attributes*).
 ///
-/// `Option<Vec<NestedStruct>>` compiles (the macro cannot resolve the
-/// element kind) and panics at the first `schema()` call with
-/// drop-the-`Option` guidance — the same deferred-panic contract as a
-/// non-variant default on an enum-typed field.
+/// # Deferred panics at the first `schema()` call
+///
+/// Authoring errors the macro cannot catch at derive time (enum-vs-struct
+/// kind, datetime parsing). Same first-`schema()`-call failure mode as
+/// each other:
+///
+/// - `Option<NestedStruct>` — drop the `Option`; an absent nested
+///   section is already the empty-table state.
+/// - `Option<Vec<NestedStruct>>` — drop the `Option`; an absent array
+///   of nested objects is already the empty array.
+/// - Leaf attributes (`default` / `env` / `optional`) on a struct-typed
+///   nested field — drop the attributes; struct fields are nested-section
+///   shaped. (`allowed` on a nested field is a derive-time error.)
+/// - A default on an enum-typed field that is not a variant (post-rename
+///   spelling) — see *Field attributes*.
+/// - A malformed datetime default literal — see the datetime caveat
+///   under *Field attributes*.
 ///
 /// # Field attributes
 ///

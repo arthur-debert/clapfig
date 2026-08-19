@@ -37,7 +37,7 @@ Your struct is the schema: `#[derive(clapfig::Schema)]` captures types, defaults
 
 ```toml
 [dependencies]
-clapfig = "0.22.1"
+clapfig = "0.23"
 ```
 
 Define your config with the `Schema` derive:
@@ -95,7 +95,7 @@ That `app_name("myapp")` call sets sensible defaults:
 Without clap:
 
 ```toml
-clapfig = { version = "0.22.1", default-features = false, features = ["derive"] }
+clapfig = { version = "0.23", default-features = false, features = ["derive"] }
 ```
 
 ## Layer Precedence

@@ -121,6 +121,7 @@ impl ConfigArgs {
 /// # Example
 ///
 /// ```ignore
+/// use clap::CommandFactory;
 /// use clapfig::ConfigCommand;
 ///
 /// let config_cmd = ConfigCommand::new()

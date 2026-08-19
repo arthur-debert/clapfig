@@ -246,9 +246,12 @@ color: Color,
 Fix the literal before shipping; this is an authoring error, not a
 runtime config error.
 
-`Option<UnitEnum>` is supported (absent → `None`). `Vec<UnitEnum>`
-flattens to `LeafType::Array(Enum)`; `HashMap<String, UnitEnum>` /
-`BTreeMap<String, UnitEnum>` flatten to `LeafType::Map(Enum)`.
+`Option<UnitEnum>` is supported (absent → `None`). `Option<NestedStruct>`
+is not: it compiles and panics at the first `schema()` call — drop the
+`Option`; an absent nested section is already the empty-table state.
+`Vec<UnitEnum>` flattens to `LeafType::Array(Enum)`;
+`HashMap<String, UnitEnum>` / `BTreeMap<String, UnitEnum>` flatten to
+`LeafType::Map(Enum)`.
 
 ## Maps
 
@@ -261,10 +264,14 @@ String-keyed maps only — TOML map keys are strings.
   `Field::MapOf` section (map of nested objects).
 - `HashMap<String, UnitEnum>`: flattens to `LeafType::Map(Enum)`.
 
-An absent map loads as the empty map. `Option<HashMap<...>>` keeps the
-presence signal (absent → `None`). Non-`String` keys, map-of-map,
-map-of-`Option`, and map of arrays of nested schema types are derive-time
-errors.
+An absent map loads as the empty map. `Option<HashMap<String, V>>` /
+`Option<BTreeMap<String, V>>` keeps the presence signal (absent → `None`)
+when `V` is a scalar, `Value`, or array-of-scalar. `Option` around a
+`MapOf` shape — `Option<HashMap<String, NestedStruct>>`, including a
+unit-enum value syntactically routed through the same Nested
+classification — is a derive-time error (an absent map is already the
+empty map). Non-`String` keys, map-of-map, map-of-`Option`, and map of
+arrays of nested schema types are also derive-time errors.
 
 Keys inside a `MapOf` section (`servers.web.host` where `servers` is a
 `HashMap<String, Server>`) are not addressable with a dotted `config set`
@@ -286,10 +293,10 @@ Support for nested element types is **trait-resolved**: the macro emits
 non-qualifying element (`Vec<PathBuf>`) fails with the trait's
 `on_unimplemented` guidance naming `#[clapfig(value)]`.
 
-An absent array loads as the empty `Vec`. `Option<Vec<UnitEnum>>` keeps
-the presence signal. `Option<Vec<NestedStruct>>` has no representation
-(absence is already the empty array) and fails at the first `schema()`
-call with drop-the-`Option` guidance.
+An absent array loads as the empty `Vec`. `Option<Vec<T>>` of a scalar or
+`Option<Vec<UnitEnum>>` keeps the presence signal. `Option<Vec<NestedStruct>>`
+has no representation (absence is already the empty array) and fails at
+the first `schema()` call with drop-the-`Option` guidance.
 
 Still rejected at derive time: `Vec<Vec<...>>`, `Vec<Option<T>>`,
 `Vec<clapfig::value::Value>`, `Vec<HashMap<...>>`. Use `#[clapfig(value)]`.
@@ -348,21 +355,47 @@ runs first and rejects the unexpected wire shape with a type error.
 **Supported:** `String`, `bool`, integers `i8`–`i64` / `u8`–`u64` /
 `usize` / `isize` (mapped to a signed 64-bit integer carrying the source
 width's bounds), `f32`/`f64`, `clapfig::value::Datetime`,
-`clapfig::value::Value`, `Option<T>`, `Vec<T>` (scalar or Schema-deriving
-element), `HashMap<String, V>` / `BTreeMap<String, V>`, nested structs
-that also derive `Schema`, unit-only enums.
+`clapfig::value::Value`, `Vec<T>` (scalar or Schema-deriving element),
+`HashMap<String, V>` / `BTreeMap<String, V>`, nested structs that also
+derive `Schema`, unit-only enums.
+
+**Supported `Option` wrappers:** `Option<T>` where `T` is a scalar,
+`Value`, or unit-only enum; `Option<Vec<T>>` of a scalar or unit-only
+enum; `Option<HashMap<String, V>>` / `Option<BTreeMap<String, V>>` where
+`V` is a scalar, `Value`, or array-of-scalar. Omitting a supported
+`Option` field everywhere is valid (`None`). Unqualified `Option<T>` is
+not the contract — see the rejected and deferred-panic cases below.
 
 **Rejected at derive time:** `i128`/`u128`; generic types and `where`
 clauses; tuple/unit structs and non-unit enums; `Option<Option<T>>`;
-non-`String` map keys; map-of-map / map-of-`Option` / map of arrays of
-nested types; `Vec<Option<T>>` / `Vec<Vec<...>>` / `Vec<Value>` / maps
-inside `Vec`; `PathBuf`, `Duration`, `char`, newtypes, type aliases,
-third-party maps (the `Schema` trait's `on_unimplemented` diagnostic
-names the `#[clapfig(value)]` escape hatch); Datetime/Value lookalikes;
-unknown clapfig metas; `name`/`strict` on unit-only enums; kind-mismatched
-or empty `allowed`; `value` + `allowed`; leaf attrs on nested-struct
-fields; defaults on maps and array-of-nested fields; invalid or colliding
-renames; serde attributes the schema does not honor.
+`Option<HashMap<String, NestedStruct>>` / `Option<BTreeMap<String,
+NestedStruct>>` (unit-enum values included — they classify as Nested at
+the field site); non-`String` map keys; map-of-map / map-of-`Option` /
+map of arrays of nested types; `Vec<Option<T>>` / `Vec<Vec<...>>` /
+`Vec<Value>` / maps inside `Vec`; `PathBuf`, `Duration`, `char`,
+newtypes, type aliases, third-party maps (the `Schema` trait's
+`on_unimplemented` diagnostic names the `#[clapfig(value)]` escape
+hatch); Datetime/Value lookalikes; unknown clapfig metas; `name`/`strict`
+on unit-only enums; kind-mismatched or empty `allowed`; `value` +
+`allowed`; `allowed` on nested-struct fields; leaf attrs
+(`default`/`env`/`allowed`/`optional`) on map-of-nested and
+array-of-nested fields; defaults on maps and array-of-nested fields;
+invalid or colliding renames; serde attributes the schema does not honor.
+
+**Deferred panics at the first `Schema::schema()` call** (authoring
+errors, not load errors — the macro cannot resolve enum-vs-struct kind
+or parse datetimes at derive time):
+
+- `Option<NestedStruct>` — drop the `Option`; an absent nested section
+  is already the empty-table state.
+- `Option<Vec<NestedStruct>>` — drop the `Option`; an absent array of
+  nested objects is already the empty array.
+- Leaf attributes (`default` / `env` / `optional`) on a struct-typed
+  nested field — drop the attributes; struct fields are nested-section
+  shaped. (`allowed` on a nested field is a derive-time error.)
+- A default on an enum-typed field that is not a variant (post-rename
+  spelling) — see [Enums](#enums).
+- A malformed datetime default literal — see [Datetimes](#datetimes).
 
 The derive rustdoc on [`Schema`](https://docs.rs/clapfig) is the
 authoritative list and stays in lockstep with the implementation.

@@ -9,7 +9,7 @@ Add clapfig to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-clapfig = "0.22.1"
+clapfig = "0.23"
 ```
 
 This pulls in the `clap` feature by default, which gives you the `config`
@@ -18,7 +18,7 @@ subcommand integration, and the `derive` feature for
 
 ```toml
 [dependencies]
-clapfig = { version = "0.22.1", default-features = false, features = ["derive"] }
+clapfig = { version = "0.23", default-features = false, features = ["derive"] }
 ```
 
 ## Define your config struct
@@ -71,9 +71,11 @@ Key points:
   out-of-set values error at load, and generated templates document the
   allowed set with an `Allowed: ...` annotation — a native comment in TOML
   and YAML, a `"//"` comment key in JSON.
-- **`Option<T>`** fields are truly optional — omitting them everywhere is
-  valid. Non-optional fields without a default must be provided by at least
-  one layer.
+- **`Option<T>`** of a supported leaf (scalar, unit enum, or the leaf
+  map/array forms) is truly optional — omitting it everywhere is valid.
+  Nested structs are not an `Option` shape; the [Derive
+  Reference](./derive-reference.md) lists the exact wrappers. Non-optional
+  fields without a default must be provided by at least one layer.
 - **`///` doc comments** are used in generated templates and `config get`
   output.
 - The struct still derives serde's `Serialize`/`Deserialize` — clapfig uses

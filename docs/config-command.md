@@ -320,6 +320,7 @@ If your app already uses a `--scope` flag or has naming conflicts with
 runtime and lets you rename subcommands and flags:
 
 ```rust
+use clap::CommandFactory;
 use clapfig::ConfigCommand;
 
 let config_cmd = ConfigCommand::new()

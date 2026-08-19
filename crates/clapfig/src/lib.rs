@@ -65,9 +65,11 @@
 //!   out-of-set values error at load, templates document the allowed set
 //!   with an `Allowed: ...` annotation (native comments in TOML/YAML,
 //!   `"//"` comment keys in JSON), and the JSON Schema emits `enum: [...]`.
-//! - **`Option<T>` fields** are truly optional — omitting them in every source
-//!   is valid. Fields without `Option` and without a default must be provided
-//!   by at least one layer or loading fails.
+//! - **`Option<T>` of a supported leaf** (scalar, unit enum, or the leaf
+//!   map/array forms) is truly optional — omitting it in every source is
+//!   valid. Nested structs are not an `Option` shape; the `Schema` derive
+//!   rustdoc lists the exact wrappers. Fields without `Option` and without
+//!   a default must be provided by at least one layer or loading fails.
 //!
 //! This means there is no separate schema file, no key registry, and no
 //! chance of the template drifting from the code. The full schema — types,
