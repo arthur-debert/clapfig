@@ -1,7 +1,8 @@
 # Proposal: provenance and observability
 
-Status: accepted. Builds on #104 (confique-path removal, landed in PR #105): one
-schema model, one resolution pipeline.
+Status: superseded by [`docs/spec/provenance.md`](../spec/provenance.md).
+Kept as historical. Builds on #104 (confique-path removal, landed in PR #105):
+one schema model, one resolution pipeline.
 
 Amendment (2026-08-17): the value-model refactor (`docs/spec/value-model.md`)
 now precedes this work. Where this proposal says `toml_edit` supplies spans,
