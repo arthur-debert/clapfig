@@ -277,7 +277,8 @@ impl StrictnessOverrides {
     }
 
     /// Phase-2 map: schema-derived strictness from the selected tagged
-    /// branch (and nested selected tagged objects), then builder overlays.
+    /// branch, including tagged items inside arrays and maps (recorded at
+    /// indexed/keyed runtime paths), then builder overlays.
     pub(crate) fn for_selected_branch(&self, root: DocumentRoot<'_>, merged: &Map) -> Self {
         let mut out = Self::new();
         out.skip_root_entry = self.skip_root_entry;
@@ -529,13 +530,37 @@ fn walk_selected_shape(
             if let Some(v) = array.strict {
                 out.insert_schema(dotted.to_string(), v);
             }
-            walk_shape_strict(&array.item, dotted, out);
+            match value {
+                Some(Value::Array(items)) => {
+                    for (i, item) in items.iter().enumerate() {
+                        walk_selected_shape(
+                            &array.item,
+                            Some(item),
+                            &format!("{dotted}[{i}]"),
+                            out,
+                        );
+                    }
+                }
+                _ => walk_shape_strict(&array.item, dotted, out),
+            }
         }
         Shape::Map(map) => {
             if let Some(v) = map.strict {
                 out.insert_schema(dotted.to_string(), v);
             }
-            walk_shape_strict(&map.item, dotted, out);
+            match value {
+                Some(Value::Map(entries)) => {
+                    for (key, entry) in entries {
+                        walk_selected_shape(
+                            &map.item,
+                            Some(entry),
+                            &format!("{dotted}.{key}"),
+                            out,
+                        );
+                    }
+                }
+                _ => walk_shape_strict(&map.item, dotted, out),
+            }
         }
         Shape::Tagged(tagged) => {
             walk_selected_tagged(tagged, value.and_then(Value::as_map), dotted, out);
@@ -1095,6 +1120,88 @@ mod tests {
         assert_eq!(
             resolve_path_kind_root(DocumentRoot::Tagged(&tagged), "params"),
             PathKind::Section
+        );
+    }
+
+    fn opposing_meta_tagged() -> crate::runtime::TaggedShape {
+        Shape::tagged("Plugin", "kind")
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .nested(
+                        "meta",
+                        Schema::object("RM")
+                            .strict(false)
+                            .field("crate_path", Field::string().optional()),
+                    )
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .nested(
+                        "meta",
+                        Schema::object("PM")
+                            .strict(true)
+                            .field("artifact", Field::string().optional()),
+                    )
+                    .build(),
+            )
+            .build()
+    }
+
+    fn tagged_item_table(kind: &str) -> Map {
+        let mut item = Map::new();
+        item.insert("kind".into(), Value::String(kind.into()));
+        item
+    }
+
+    #[test]
+    fn selected_branch_strictness_follows_each_array_item_variant() {
+        let tagged = opposing_meta_tagged();
+        let schema = Schema::object("App")
+            .field("plugins", Shape::array("plugins", Shape::from(tagged)))
+            .build();
+        let mut table = Map::new();
+        table.insert(
+            "plugins".into(),
+            Value::Array(vec![
+                Value::Map(tagged_item_table("rust")),
+                Value::Map(tagged_item_table("payload")),
+            ]),
+        );
+        let overrides = StrictnessOverrides::from_root(DocumentRoot::Object(&schema))
+            .for_selected_branch(DocumentRoot::Object(&schema), &table);
+        assert!(
+            !overrides.effective_strict("plugins[0].meta.artifact", "artifact", true),
+            "rust item's meta.strict(false) must govern that occurrence"
+        );
+        assert!(
+            overrides.effective_strict("plugins[1].meta.crate_path", "crate_path", false),
+            "payload item's meta.strict(true) must govern that occurrence"
+        );
+    }
+
+    #[test]
+    fn selected_branch_strictness_follows_each_map_entry_variant() {
+        let tagged = opposing_meta_tagged();
+        let schema = Schema::object("App")
+            .field("plugins", Shape::map("plugins", Shape::from(tagged)))
+            .build();
+        let mut entries = Map::new();
+        entries.insert("core".into(), Value::Map(tagged_item_table("rust")));
+        entries.insert("edge".into(), Value::Map(tagged_item_table("payload")));
+        let mut table = Map::new();
+        table.insert("plugins".into(), Value::Map(entries));
+        let overrides = StrictnessOverrides::from_root(DocumentRoot::Object(&schema))
+            .for_selected_branch(DocumentRoot::Object(&schema), &table);
+        assert!(
+            !overrides.effective_strict("plugins.core.meta.artifact", "artifact", true),
+            "rust entry's meta.strict(false) must govern that occurrence"
+        );
+        assert!(
+            overrides.effective_strict("plugins.edge.meta.crate_path", "crate_path", false),
+            "payload entry's meta.strict(true) must govern that occurrence"
         );
     }
 }
