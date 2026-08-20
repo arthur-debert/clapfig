@@ -170,16 +170,16 @@ pub(crate) fn resolve(
                     source: Box::new(e),
                     source_text: Some(Arc::from(content.as_str())),
                 })?;
-            let mut table = match parsed {
+            let mut table = match parsed.value {
                 Value::Map(map) => map,
                 other => {
-                    return Err(ClapfigError::InvalidValue {
-                        key: path.display().to_string(),
-                        reason: format!(
+                    return Err(ClapfigError::invalid_value(
+                        path.display().to_string(),
+                        format!(
                             "config documents must be maps at the root, got {}",
                             other.type_str()
                         ),
-                    });
+                    ));
                 }
             };
             if input.normalize_keys {

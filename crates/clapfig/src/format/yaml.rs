@@ -37,24 +37,22 @@ use std::fmt::Write;
 use crate::runtime::{Field, Leaf, Schema};
 use crate::value::{Map, Value};
 
-use std::collections::BTreeMap;
-
 use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
     walk_level,
 };
 use super::{
-    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
-    UnsupportedByFormat, WalkSegment, walk_label,
+    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
+    UnsupportedByFormat, walk_label,
 };
 
 /// The YAML format behind the adapter contract.
 ///
-/// Declares every operation except [`Operation::SpanIndex`] (undeclared and
-/// refused typed until the provenance epic builds the index). The declared
-/// edit operations still refuse specific shapes at runtime — sequence-item
-/// edits and flow-style shapes the patch stack cannot rewrite honestly —
-/// per ADR-0002's known-refusals row; see the [module docs](self).
+/// Declares every ADR-0002 matrix row; known refusals are shape-level,
+/// inside the declared edits — sequence-item edits and flow-style shapes
+/// the patch stack cannot rewrite honestly. Span indexing rides on
+/// [`parse`](YamlAdapter::parse) (ADR-0005); this workstream returns an
+/// empty index as holding state. See the [module docs](self).
 pub struct YamlAdapter;
 
 impl FormatAdapter for YamlAdapter {
@@ -67,8 +65,6 @@ impl FormatAdapter for YamlAdapter {
     }
 
     fn capabilities(&self) -> &'static [Operation] {
-        // The provenance epic adds Operation::SpanIndex when it
-        // implements span_index.
         &[
             Operation::Parse,
             Operation::Template,
@@ -91,17 +87,17 @@ impl FormatAdapter for YamlAdapter {
         format!("{}: {value}", inline_scalar(key))
     }
 
-    fn parse(&self, text: &str) -> Result<Value, FormatError> {
+    fn parse(&self, text: &str) -> Result<Parsed, FormatError> {
         // An empty or comments-only file (bare document markers included)
         // is an empty config: absence, not null. serde_norway would read
         // these as a root Null (or reject a lone `...`); only a document
         // with actual non-comment content gets the null error below.
         if is_blank_or_comments(text) {
-            return Ok(Value::Map(Map::new()));
+            return Ok(Parsed::from_value(Value::Map(Map::new())));
         }
         let raw: serde_norway::Value =
             serde_norway::from_str(text).map_err(|e| parse_error(&e, text))?;
-        norway_to_value(raw, &mut Vec::new())
+        norway_to_value(raw, &mut Vec::new()).map(Parsed::from_value)
     }
 
     fn serialize(&self, value: &Value) -> Result<String, FormatError> {
@@ -135,15 +131,6 @@ impl FormatAdapter for YamlAdapter {
                 unset_in_source(source, &keys)
             }
         }
-    }
-
-    fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
-        // Provenance epic: build the path → span index from parser spans.
-        Err(UnsupportedByFormat {
-            format: self.name(),
-            operation: Operation::SpanIndex,
-        }
-        .into())
     }
 }
 
@@ -209,7 +196,7 @@ fn mapping_error(message: String) -> FormatError {
 /// error.
 fn norway_to_value(
     value: serde_norway::Value,
-    path: &mut Vec<WalkSegment>,
+    path: &mut Vec<PathSegment>,
 ) -> Result<Value, FormatError> {
     match value {
         serde_norway::Value::Null => Err(mapping_error(format!(
@@ -240,7 +227,7 @@ fn norway_to_value(
         serde_norway::Value::Sequence(items) => {
             let mut array = Vec::with_capacity(items.len());
             for (i, item) in items.into_iter().enumerate() {
-                path.push(WalkSegment::Index(i));
+                path.push(PathSegment::Index(i));
                 let converted = norway_to_value(item, path)?;
                 path.pop();
                 array.push(converted);
@@ -263,7 +250,7 @@ fn norway_to_value(
                         walk_label(path)
                     )));
                 }
-                path.push(WalkSegment::Key(key.clone()));
+                path.push(PathSegment::Key(key.clone()));
                 let converted = norway_to_value(entry, path)?;
                 path.pop();
                 map.insert(key, converted);
@@ -316,7 +303,12 @@ fn value_to_norway(value: &Value) -> serde_norway::Value {
 fn key_segments(path: &ConfigPath) -> Vec<&str> {
     path.segments()
         .iter()
-        .map(|PathSegment::Key(k)| k.as_str())
+        .filter_map(|seg| match seg {
+            PathSegment::Key(k) => Some(k.as_str()),
+            // File edits address map keys via dotted persist paths;
+            // index segments belong to span/origin trees.
+            PathSegment::Index(_) => None,
+        })
         .collect()
 }
 
@@ -462,7 +454,7 @@ fn remove_from_tree(map: &mut Map, keys: &[&str]) -> bool {
 /// Parse the file under edit into its value tree. Empty and comments-only
 /// sources are the empty map (same rule as [`YamlAdapter::parse`]).
 fn parse_edit_source(source: &str) -> Result<Map, FormatError> {
-    match YamlAdapter.parse(source)? {
+    match YamlAdapter.parse(source)?.value {
         Value::Map(map) => Ok(map),
         other => Err(FormatError::Edit {
             format: "yaml",
@@ -953,7 +945,7 @@ mod tests {
     }
 
     fn parse_map(text: &str) -> Map {
-        match YamlAdapter.parse(text).expect("fixture must parse") {
+        match YamlAdapter.parse(text).expect("fixture must parse").value {
             Value::Map(map) => map,
             other => panic!("expected map root, got {other:?}"),
         }
@@ -1038,9 +1030,9 @@ mod tests {
     fn empty_and_comments_only_documents_are_the_empty_map() {
         // Absence, not null: a blank or fully commented file is an empty
         // config — the case every all-commented generated template hits.
-        assert_eq!(YamlAdapter.parse("").unwrap(), Value::Map(Map::new()));
+        assert_eq!(YamlAdapter.parse("").unwrap().value, Value::Map(Map::new()));
         assert_eq!(
-            YamlAdapter.parse("# just\n\n# comments\n").unwrap(),
+            YamlAdapter.parse("# just\n\n# comments\n").unwrap().value,
             Value::Map(Map::new())
         );
     }
@@ -1051,7 +1043,7 @@ mod tests {
         // serde_norway; both are "no content" here — absence, not null.
         for source in ["---\n", "...\n", "---\n# note\n", "# note\n---\n"] {
             assert_eq!(
-                YamlAdapter.parse(source).unwrap(),
+                YamlAdapter.parse(source).unwrap().value,
                 Value::Map(Map::new()),
                 "source: {source:?}"
             );
@@ -1163,9 +1155,9 @@ mod tests {
     #[test]
     fn serialize_round_trips_parse() {
         let source = "b: true\ni: 3\ns: x\nt:\n  n: 1\n";
-        let value = YamlAdapter.parse(source).unwrap();
+        let value = YamlAdapter.parse(source).unwrap().value;
         let text = YamlAdapter.serialize(&value).unwrap();
-        let reparsed = YamlAdapter.parse(&text).unwrap();
+        let reparsed = YamlAdapter.parse(&text).unwrap().value;
         assert_eq!(value, reparsed);
     }
 
@@ -1175,7 +1167,7 @@ mod tests {
         map.insert("port_str".into(), Value::String("8080".into()));
         map.insert("country".into(), Value::String("no".into()));
         let text = YamlAdapter.serialize(&Value::Map(map.clone())).unwrap();
-        assert_eq!(YamlAdapter.parse(&text).unwrap(), Value::Map(map));
+        assert_eq!(YamlAdapter.parse(&text).unwrap().value, Value::Map(map));
     }
 
     #[test]
@@ -1679,7 +1671,10 @@ db:
             .edit("# note\nonly: 1\n", FileEdit::Unset { path: &path })
             .unwrap();
         assert!(out.contains("# note"), "out: {out}");
-        assert_eq!(YamlAdapter.parse(&out).unwrap(), Value::Map(Map::new()));
+        assert_eq!(
+            YamlAdapter.parse(&out).unwrap().value,
+            Value::Map(Map::new())
+        );
     }
 
     #[test]

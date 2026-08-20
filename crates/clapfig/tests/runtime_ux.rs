@@ -70,7 +70,7 @@ fn out_of_range_integer_fails_naming_the_key_path() {
     .unwrap();
     let err = load_from(&dir).unwrap_err();
     match err {
-        ClapfigError::InvalidValue { key, reason } => {
+        ClapfigError::InvalidValue { key, reason, .. } => {
             assert_eq!(key, "server.retries", "must name the key, not <merged>");
             assert!(reason.contains("out of range"), "{reason}");
             assert!(reason.contains("0..=255"), "{reason}");
@@ -225,7 +225,7 @@ fn exported_required_matches_what_the_runtime_rejects_when_absent() {
         .load()
         .unwrap_err();
     match err {
-        ClapfigError::MissingRequired { key } => assert_eq!(key, "auth.token"),
+        ClapfigError::MissingRequired { key, .. } => assert_eq!(key, "auth.token"),
         other => panic!("expected MissingRequired, got {other:?}"),
     }
 }

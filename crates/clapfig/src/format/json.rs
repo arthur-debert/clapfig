@@ -50,12 +50,10 @@ use serde_json::{Map as JsonMap, Value as Json};
 use crate::runtime::{Field, Leaf, LeafType, Schema};
 use crate::value::{Map, Value};
 
-use std::collections::BTreeMap;
-
 use super::template::{TemplateRenderer, doc_lines, leaf_annotations, walk_level};
 use super::{
-    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
-    UnsupportedByFormat, WalkSegment, walk_label,
+    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
+    walk_label,
 };
 
 /// The canonical format name used in error messages.
@@ -67,9 +65,9 @@ const COMMENT_PREFIX: &str = "//";
 
 /// The JSON format behind the adapter contract.
 ///
-/// Declares every ADR-0002 matrix row (JSON has no refusal rows). The one
-/// gap is [`span_index`](JsonAdapter::span_index) — undeclared and
-/// refused typed until the provenance epic builds the index. See the
+/// Declares every ADR-0002 matrix row (JSON has no refusal rows). Span
+/// indexing rides on [`parse`](JsonAdapter::parse) (ADR-0005); this
+/// workstream returns an empty index as holding state. See the
 /// [module docs](self) for the comment-key convention and the baseline
 /// mapping rules this adapter applies.
 pub struct JsonAdapter;
@@ -84,8 +82,6 @@ impl FormatAdapter for JsonAdapter {
     }
 
     fn capabilities(&self) -> &'static [Operation] {
-        // The provenance epic adds Operation::SpanIndex when it
-        // implements span_index.
         &[
             Operation::Parse,
             Operation::Template,
@@ -110,15 +106,15 @@ impl FormatAdapter for JsonAdapter {
         format!("// {line}")
     }
 
-    fn parse(&self, text: &str) -> Result<Value, FormatError> {
+    fn parse(&self, text: &str) -> Result<Parsed, FormatError> {
         // An empty (or whitespace-only) file is "no config", matching
         // TOML's empty document — not a JSON syntax error.
         if text.trim().is_empty() {
-            return Ok(Value::Map(Map::new()));
+            return Ok(Parsed::from_value(Value::Map(Map::new())));
         }
         let json: Json = serde_json::from_str(text).map_err(|e| syntax_error(text, &e))?;
         let mut path = Vec::new();
-        json_to_value(json, &mut path)
+        json_to_value(json, &mut path).map(Parsed::from_value)
     }
 
     fn serialize(&self, value: &Value) -> Result<String, FormatError> {
@@ -145,11 +141,7 @@ impl FormatAdapter for JsonAdapter {
         match edit {
             FileEdit::Set { path, value, .. } => {
                 let keys = key_segments(path)?;
-                let mut value_path: Vec<WalkSegment> = path
-                    .segments()
-                    .iter()
-                    .map(|PathSegment::Key(k)| WalkSegment::Key(k.clone()))
-                    .collect();
+                let mut value_path: Vec<PathSegment> = path.segments().to_vec();
                 let json_value = value_to_json(value, &mut value_path)?;
                 super::edit::write_at_path(&mut doc, &keys, json_value)?;
             }
@@ -159,15 +151,6 @@ impl FormatAdapter for JsonAdapter {
             }
         }
         Ok(render(&doc))
-    }
-
-    fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
-        // Provenance epic: build the path → span index from parser spans.
-        Err(UnsupportedByFormat {
-            format: self.name(),
-            operation: Operation::SpanIndex,
-        }
-        .into())
     }
 }
 
@@ -230,7 +213,7 @@ fn span_at(text: &str, line: usize, column: usize) -> Option<Span> {
 /// baseline mapping rules: `//`-prefixed members are stripped (before the
 /// [`Value`] tree exists), `null` and out-of-`i64` integers are typed
 /// errors naming the offending path.
-fn json_to_value(json: Json, path: &mut Vec<WalkSegment>) -> Result<Value, FormatError> {
+fn json_to_value(json: Json, path: &mut Vec<PathSegment>) -> Result<Value, FormatError> {
     Ok(match json {
         Json::Null => {
             return Err(FormatError::Parse {
@@ -284,7 +267,7 @@ fn json_to_value(json: Json, path: &mut Vec<WalkSegment>) -> Result<Value, Forma
         Json::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.into_iter().enumerate() {
-                path.push(WalkSegment::Index(i));
+                path.push(PathSegment::Index(i));
                 let converted = json_to_value(item, path)?;
                 path.pop();
                 out.push(converted);
@@ -300,7 +283,7 @@ fn json_to_value(json: Json, path: &mut Vec<WalkSegment>) -> Result<Value, Forma
                 if key.starts_with(COMMENT_PREFIX) {
                     continue;
                 }
-                path.push(WalkSegment::Key(key.clone()));
+                path.push(PathSegment::Key(key.clone()));
                 let converted = json_to_value(entry, path)?;
                 path.pop();
                 map.insert(key, converted);
@@ -313,7 +296,7 @@ fn json_to_value(json: Json, path: &mut Vec<WalkSegment>) -> Result<Value, Forma
 /// Convert an owned [`Value`] into a `serde_json::Value`. The one
 /// unrepresentable shape is a non-finite float (JSON has no literal for
 /// it) — a typed error naming the offending path.
-fn value_to_json(value: &Value, path: &mut Vec<WalkSegment>) -> Result<Json, FormatError> {
+fn value_to_json(value: &Value, path: &mut Vec<PathSegment>) -> Result<Json, FormatError> {
     Ok(match value {
         Value::String(s) => Json::String(s.clone()),
         Value::Integer(i) => Json::Number((*i).into()),
@@ -338,7 +321,7 @@ fn value_to_json(value: &Value, path: &mut Vec<WalkSegment>) -> Result<Json, For
         Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
-                path.push(WalkSegment::Index(i));
+                path.push(PathSegment::Index(i));
                 let converted = value_to_json(item, path)?;
                 path.pop();
                 out.push(converted);
@@ -348,7 +331,7 @@ fn value_to_json(value: &Value, path: &mut Vec<WalkSegment>) -> Result<Json, For
         Value::Map(map) => {
             let mut out = JsonMap::new();
             for (key, entry) in map {
-                path.push(WalkSegment::Key(key.clone()));
+                path.push(PathSegment::Key(key.clone()));
                 // The reserved comment namespace cuts both ways: a
                 // `//`-prefixed key written here would be stripped as a
                 // comment at the next parse — refuse loudly instead of
@@ -376,15 +359,18 @@ fn value_to_json(value: &Value, path: &mut Vec<WalkSegment>) -> Result<Json, For
 fn key_segments(path: &ConfigPath) -> Result<Vec<&str>, FormatError> {
     path.segments()
         .iter()
-        .map(|PathSegment::Key(k)| {
-            if k.starts_with(COMMENT_PREFIX) {
+        .filter_map(|seg| match seg {
+            PathSegment::Key(k) => Some(if k.starts_with(COMMENT_PREFIX) {
                 Err(FormatError::Edit {
                     format: FORMAT,
                     message: reserved_key_message(&format!("'{k}'")),
                 })
             } else {
                 Ok(k.as_str())
-            }
+            }),
+            // File edits address map keys via dotted persist paths;
+            // index segments belong to span/origin trees.
+            PathSegment::Index(_) => None,
         })
         .collect()
 }
@@ -499,7 +485,7 @@ impl TemplateRenderer for JsonTemplate {
                 if !lines.is_empty() {
                     out.insert(comment_key(name), comment_value(lines));
                 }
-                let mut path = vec![WalkSegment::Key(name.to_string())];
+                let mut path = vec![PathSegment::Key(name.to_string())];
                 out.insert(name.to_string(), value_to_json(default, &mut path)?);
             }
             None => {
@@ -588,7 +574,7 @@ fn example_object(
         let value = match &nf.field {
             Field::Leaf(leaf) => match &leaf.default {
                 Some(default) => {
-                    let mut path = vec![WalkSegment::Key(context_key.to_string())];
+                    let mut path = vec![PathSegment::Key(context_key.to_string())];
                     value_to_json(default, &mut path)?
                 }
                 None => placeholder_value(&leaf.ty),
@@ -644,7 +630,7 @@ fn compact(json: &Json) -> String {
 /// Render one owned value as inline JSON (for `Allowed:` enum listings),
 /// naming `key` in conversion errors.
 fn inline_json(value: &Value, key: &str) -> Result<String, FormatError> {
-    let mut path = vec![WalkSegment::Key(key.to_string())];
+    let mut path = vec![PathSegment::Key(key.to_string())];
     Ok(compact(&value_to_json(value, &mut path)?))
 }
 
@@ -694,8 +680,8 @@ mod tests {
     #[test]
     fn json_adapter_declares_its_matrix_rows() {
         // The ADR-0002 matrix has no refusal rows for JSON, so the adapter
-        // declares every implemented operation. SpanIndex stays undeclared
-        // (and refuses typed) until the provenance epic builds the index.
+        // declares every implemented operation. Spans ride on parse
+        // (ADR-0005), not a separate operation.
         for operation in [
             Operation::Parse,
             Operation::Template,
@@ -710,11 +696,6 @@ mod tests {
                 "json should declare {operation}"
             );
         }
-        assert!(!JsonAdapter.supports(Operation::SpanIndex));
-        assert!(matches!(
-            JsonAdapter.span_index("{}").unwrap_err(),
-            FormatError::Unsupported(_)
-        ));
     }
 
     // --- parse: direct rows ----------------------------------------------
@@ -723,7 +704,8 @@ mod tests {
     fn parse_scalars_and_containers() {
         let value = JsonAdapter
             .parse(r#"{"s": "x", "i": 3, "f": 1.5, "b": true, "t": {"n": 1, "arr": [1, 2]}}"#)
-            .unwrap();
+            .unwrap()
+            .value;
         let map = value.as_map().unwrap();
         assert_eq!(map["s"], Value::String("x".into()));
         assert_eq!(map["i"], Value::Integer(3));
@@ -741,7 +723,8 @@ mod tests {
     fn parse_number_forms() {
         let value = JsonAdapter
             .parse(r#"{"exp": 1e3, "neg": -7, "max": 9223372036854775807}"#)
-            .unwrap();
+            .unwrap()
+            .value;
         let map = value.as_map().unwrap();
         // An exponent literal is a float, an integer literal an integer.
         assert_eq!(map["exp"], Value::Float(1000.0));
@@ -751,8 +734,11 @@ mod tests {
 
     #[test]
     fn parse_whitespace_only_is_empty_map() {
-        assert_eq!(JsonAdapter.parse("").unwrap(), Value::Map(Map::new()));
-        assert_eq!(JsonAdapter.parse("  \n\t").unwrap(), Value::Map(Map::new()));
+        assert_eq!(JsonAdapter.parse("").unwrap().value, Value::Map(Map::new()));
+        assert_eq!(
+            JsonAdapter.parse("  \n\t").unwrap().value,
+            Value::Map(Map::new())
+        );
     }
 
     #[test]
@@ -761,7 +747,7 @@ mod tests {
         // non-map roots with one shared error); the adapter maps what the
         // text says.
         assert_eq!(
-            JsonAdapter.parse("[1, 2]").unwrap(),
+            JsonAdapter.parse("[1, 2]").unwrap().value,
             Value::Array(vec![Value::Integer(1), Value::Integer(2)])
         );
     }
@@ -784,7 +770,8 @@ mod tests {
                     "servers": [{"//name": "docs in an array element", "name": "a"}]
                 }"#,
             )
-            .unwrap();
+            .unwrap()
+            .value;
         let map = value.as_map().unwrap();
         assert_eq!(
             map.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -806,7 +793,8 @@ mod tests {
         // comment value must not trip the mapping-table errors.
         let value = JsonAdapter
             .parse(r#"{"//weird": null, "//huge": 18446744073709551615, "ok": 1}"#)
-            .unwrap();
+            .unwrap()
+            .value;
         assert_eq!(
             value
                 .as_map()
@@ -961,10 +949,10 @@ mod tests {
     #[test]
     fn serialize_round_trips_parse() {
         let source = r#"{"b": true, "i": 3, "s": "x", "t": {"n": 1}}"#;
-        let value = JsonAdapter.parse(source).unwrap();
+        let value = JsonAdapter.parse(source).unwrap().value;
         let text = JsonAdapter.serialize(&value).unwrap();
         assert!(text.ends_with('\n'));
-        let reparsed = JsonAdapter.parse(&text).unwrap();
+        let reparsed = JsonAdapter.parse(&text).unwrap().value;
         assert_eq!(value, reparsed);
     }
 
@@ -1221,7 +1209,7 @@ mod tests {
         // schema key with its default value.
         use crate::fixtures::test::test_schema;
         let text = JsonAdapter.template(&test_schema()).unwrap();
-        let value = JsonAdapter.parse(&text).unwrap();
+        let value = JsonAdapter.parse(&text).unwrap().value;
         let map = value.as_map().unwrap();
         assert_eq!(
             map.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -1290,7 +1278,7 @@ mod tests {
         assert!(edited.contains(r#""//": "file prose""#));
         assert!(edited.contains(r#""//port": "docs""#));
         // And parse still owns the namespace: comments never reach the tree.
-        let tree = JsonAdapter.parse(&edited).unwrap();
+        let tree = JsonAdapter.parse(&edited).unwrap().value;
         let map = tree.as_map().unwrap();
         assert_eq!(map.keys().map(String::as_str).collect::<Vec<_>>(), ["port"]);
         assert_eq!(map["port"], Value::Integer(2));
@@ -1365,7 +1353,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let reparsed = JsonAdapter.parse(&out).unwrap();
+        let reparsed = JsonAdapter.parse(&out).unwrap().value;
         assert_eq!(
             reparsed.as_map().unwrap()["database"].as_map().unwrap()["url"],
             Value::String("pg://x".into())
@@ -1447,7 +1435,7 @@ mod tests {
             out.contains(r#""//host": "The application host.""#),
             "{out}"
         );
-        let tree = JsonAdapter.parse(&out).unwrap();
+        let tree = JsonAdapter.parse(&out).unwrap().value;
         assert_eq!(tree.as_map().unwrap()["port"], Value::Integer(9090));
     }
 }

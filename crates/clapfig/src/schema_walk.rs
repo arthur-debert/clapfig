@@ -326,16 +326,13 @@ fn check_required_and_types(
             Field::Leaf(leaf) => match table.get(&nf.name) {
                 None => {
                     if !leaf.optional {
-                        return Err(ClapfigError::MissingRequired { key: path });
+                        return Err(ClapfigError::missing_required(path));
                     }
                 }
                 Some(value) => {
                     leaf.ty
                         .check(value)
-                        .map_err(|reason| ClapfigError::InvalidValue {
-                            key: path.clone(),
-                            reason,
-                        })?;
+                        .map_err(|reason| ClapfigError::invalid_value(path.clone(), reason))?;
                 }
             },
             Field::Nested(nested) => match table.get(&nf.name) {
@@ -350,10 +347,10 @@ fn check_required_and_types(
                     check_required_and_types(inner, nested, &path)?;
                 }
                 Some(other) => {
-                    return Err(ClapfigError::InvalidValue {
-                        key: path,
-                        reason: format!("expected map, got {}", value_type_name(other)),
-                    });
+                    return Err(ClapfigError::invalid_value(
+                        path,
+                        format!("expected map, got {}", value_type_name(other)),
+                    ));
                 }
             },
             Field::ArrayOf(item_schema) => match table.get(&nf.name) {
@@ -370,19 +367,19 @@ fn check_required_and_types(
                                 check_required_and_types(inner, item_schema, &indexed)?;
                             }
                             other => {
-                                return Err(ClapfigError::InvalidValue {
-                                    key: indexed,
-                                    reason: format!("expected map, got {}", value_type_name(other)),
-                                });
+                                return Err(ClapfigError::invalid_value(
+                                    indexed,
+                                    format!("expected map, got {}", value_type_name(other)),
+                                ));
                             }
                         }
                     }
                 }
                 Some(other) => {
-                    return Err(ClapfigError::InvalidValue {
-                        key: path,
-                        reason: format!("expected array, got {}", value_type_name(other)),
-                    });
+                    return Err(ClapfigError::invalid_value(
+                        path,
+                        format!("expected array, got {}", value_type_name(other)),
+                    ));
                 }
             },
             Field::MapOf(item_schema) => match table.get(&nf.name) {
@@ -399,19 +396,19 @@ fn check_required_and_types(
                                 check_required_and_types(inner, item_schema, &entry_path)?;
                             }
                             other => {
-                                return Err(ClapfigError::InvalidValue {
-                                    key: entry_path,
-                                    reason: format!("expected map, got {}", value_type_name(other)),
-                                });
+                                return Err(ClapfigError::invalid_value(
+                                    entry_path,
+                                    format!("expected map, got {}", value_type_name(other)),
+                                ));
                             }
                         }
                     }
                 }
                 Some(other) => {
-                    return Err(ClapfigError::InvalidValue {
-                        key: path,
-                        reason: format!("expected map, got {}", value_type_name(other)),
-                    });
+                    return Err(ClapfigError::invalid_value(
+                        path,
+                        format!("expected map, got {}", value_type_name(other)),
+                    ));
                 }
             },
         }
@@ -614,7 +611,7 @@ mod tests {
         fill_defaults_into(&mut table, &schema);
         let err = finalize(table, &schema).unwrap_err();
         match err {
-            ClapfigError::MissingRequired { key } => assert_eq!(key, "name"),
+            ClapfigError::MissingRequired { key, .. } => assert_eq!(key, "name"),
             other => panic!("expected MissingRequired, got {other:?}"),
         }
     }
@@ -638,7 +635,7 @@ mod tests {
         fill_defaults_into(&mut table, &schema);
         let err = finalize(table, &schema).unwrap_err();
         match err {
-            ClapfigError::InvalidValue { key, reason } => {
+            ClapfigError::InvalidValue { key, reason, .. } => {
                 assert_eq!(key, "port");
                 assert!(reason.contains("expected integer"));
             }
@@ -653,7 +650,7 @@ mod tests {
         fill_defaults_into(&mut table, &schema);
         let err = finalize(table, &schema).unwrap_err();
         match err {
-            ClapfigError::InvalidValue { key, reason } => {
+            ClapfigError::InvalidValue { key, reason, .. } => {
                 assert_eq!(key, "level");
                 assert!(reason.contains("not in allowed set"));
             }
@@ -719,7 +716,7 @@ mod tests {
             let mut table = Map::new();
             table.insert("dt".into(), Value::String(bad.into()));
             match finalize(table, &schema) {
-                Err(ClapfigError::InvalidValue { key, reason }) => {
+                Err(ClapfigError::InvalidValue { key, reason, .. }) => {
                     assert_eq!(key, "dt");
                     assert!(reason.contains("expected datetime"), "{bad}: {reason}");
                 }
@@ -797,7 +794,7 @@ mod tests {
         let table = parse("[server]\nretries = 300\n");
         let err = finalize(table, &schema).unwrap_err();
         match err {
-            ClapfigError::InvalidValue { key, reason } => {
+            ClapfigError::InvalidValue { key, reason, .. } => {
                 assert_eq!(key, "server.retries");
                 assert!(reason.contains("out of range"), "{reason}");
                 assert!(reason.contains("0..=255"), "{reason}");
@@ -816,7 +813,7 @@ mod tests {
         let table = parse("name = \"x\"\nport = 8080\nhost = \"h\"\nlevel = \"info\"\n[db]\n");
         let err = finalize(table, &schema).unwrap_err();
         match err {
-            ClapfigError::MissingRequired { key } => assert_eq!(key, "db.pool_size"),
+            ClapfigError::MissingRequired { key, .. } => assert_eq!(key, "db.pool_size"),
             other => panic!("expected MissingRequired(db.pool_size), got {other:?}"),
         }
     }

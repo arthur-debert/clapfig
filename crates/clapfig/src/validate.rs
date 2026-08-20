@@ -165,6 +165,10 @@ pub(crate) fn filter_through_cascade(
                 value: value_ref,
                 file,
                 line: if line > 0 { Some(line) } else { None },
+                span: None,
+                env_var: None,
+                url_key: None,
+                input_type: None,
             };
             match callback(&context) {
                 UnknownKeyDecision::Accept => continue,
@@ -175,6 +179,10 @@ pub(crate) fn filter_through_cascade(
                         value: value_ref.cloned(),
                         file: file.map(Path::to_path_buf),
                         line: if line > 0 { Some(line) } else { None },
+                        span: None,
+                        env_var: None,
+                        url_key: None,
+                        input_type: None,
                     });
                     continue;
                 }
@@ -190,6 +198,9 @@ pub(crate) fn filter_through_cascade(
             line,
             source: source_arc.clone(),
             env_var,
+            span: None,
+            url_key: None,
+            input_type: None,
         });
     }
     if rejected.is_empty() {

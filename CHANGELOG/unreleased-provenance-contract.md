@@ -1,0 +1,12 @@
+**Provenance contract** ([#147](https://github.com/arthur-debert/clapfig/issues/147), epic [#146](https://github.com/arthur-debert/clapfig/issues/146)) — public error types grow origin facts. Hard cut, no shims (per project policy).
+
+- **`FormatAdapter::parse` returns `{ value, spans }`** (`clapfig::format::Parsed`): the value tree and a path → `SpanEntry` index together (ADR-0005). `FormatAdapter::span_index` and `Operation::SpanIndex` are gone. Each index entry is `{ key: Option<Span>, value: Span }` (ADR-0006); `key` is `None` on array elements. Shipped adapters return today's `Value` with an **empty** span map this release (holding state; later slices fill it). Callers that only want the tree use `.value`.
+- **`PathSegment::Index` is back on `ConfigPath`**, with `ConfigPath::index(n)` next to `.key(...)`. Display is one-way: dotted keys, `[n]` indexes, quoted non-bare keys (`plugins[3].host`, `"a.b"` vs `a.b`).
+- **`ClapfigError::InvalidValue`** gains `origin: Box<OriginFacts>` (file, span, env var, URL query key, `input_type`). **`UnknownKeyInfo`**, **`UnknownKeyContext`**, and **`CollectedUnknown`** gain the same facts as flattened fields (`span`, `url_key`, `input_type`; `env_var` was already on `UnknownKeyInfo`). `InputType` is `File` / `Env` / `Url` / `Override` / `Default` — not [`Layer`](https://docs.rs/clapfig/latest/clapfig/enum.Layer.html). New fields are unset until later provenance slices fill them. The `InvalidValue` facts are boxed so `ClapfigError` stays a small `Result` error.
+- **`ClapfigError::MissingRequired`** gains a `discovery: DiscoveryRecord` field (file probes with `loaded` / `missing` / `error` / `not probed` outcomes, plus which non-file input types were consulted). It does **not** gain an origin — an absent key has none. The record is empty until the discovery slice fills it.
+
+**Migration (hard cut, per project policy):**
+
+- `adapter.parse(text)` is now `Result<Parsed, FormatError>`. Use `parsed.value` (or `adapter.parse(text)?.value`) wherever you previously used the `Value`.
+- Struct-update / match arms that name `InvalidValue { key, reason }`, `MissingRequired { key }`, `UnknownKeyInfo { ... }`, `UnknownKeyContext { ... }`, or `CollectedUnknown { ... }` must include the new fields or `..`. `ClapfigError` remains `#[non_exhaustive]`.
+- Do not match `Operation::SpanIndex` or call `span_index`; those entry points no longer exist.

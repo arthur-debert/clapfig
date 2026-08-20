@@ -11,6 +11,7 @@ pub mod test {
         match crate::format::TomlAdapter
             .parse(text)
             .expect("test fixture TOML must parse")
+            .value
         {
             Value::Map(map) => map,
             _ => unreachable!("TOML documents are maps at the root"),
