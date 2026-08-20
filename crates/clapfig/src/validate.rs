@@ -3,14 +3,15 @@
 //! Operates on an already-parsed value [`Map`] so it sees exactly the same
 //! keys that will reach the merge step. When kebab-case normalization is
 //! enabled the table arrives with `-` already rewritten to `_`, and the
-//! line-number lookup is taught to match keys regardless of dash/underscore
-//! spelling so error messages still point at the user's original line.
+//! file's span index is rewritten with the same walk so unknown-key errors
+//! still caret the user's original spelling.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{ClapfigError, UnknownKeyInfo};
-use crate::normalize::normalize_key;
+use crate::format::{ConfigPath, SpanEntry, byte_offset_to_line_col};
 use crate::runtime::Schema;
 use crate::strict::{
     CollectedUnknown, StrictnessOverrides, UnknownKeyContext, UnknownKeyDecision, UnknownKeyHook,
@@ -21,9 +22,9 @@ use crate::value::{Map, Value};
 ///
 /// Bundles the cascade overrides, the builder-level default ([Knob 1]),
 /// and the optional [`on_unknown_key`](crate::Builder::on_unknown_key)
-/// callback. The `normalize_keys` flag is forwarded to the line-number
-/// heuristic so error snippets still point at the user's original line
-/// when keys round-trip through kebab → snake normalization.
+/// callback. The `normalize_keys` flag records that the table (and its
+/// span index) have already been rewritten kebab → snake; line/caret
+/// come from the key span, which still points at the original spelling.
 ///
 /// [Knob 1]: crate::Builder::strict
 pub(crate) struct ValidateContext<'a> {
@@ -36,15 +37,21 @@ pub(crate) struct ValidateContext<'a> {
 /// Where the table under validation came from — decides how an
 /// unknown-key violation is reported.
 ///
-/// A `File` source carries the raw text (for the TOML line-number
-/// heuristic and renderer snippets) and the file path. An `Env` source
-/// carries the original variable name(s) for each dotted path so each
-/// violation can name the exact variable to unset (`MYAPP__rogue_key`,
-/// not a reconstructed `MYAPP__ROGUE_KEY`) instead of wearing
-/// config-file clothing.
+/// A `File` source carries the raw text (for renderer snippets), the
+/// file path, and that file's span index (key span for the caret). An
+/// `Env` source carries the original variable name(s) for each dotted
+/// path so each violation can name the exact variable to unset
+/// (`MYAPP__rogue_key`, not a reconstructed `MYAPP__ROGUE_KEY`) instead
+/// of wearing config-file clothing.
 pub(crate) enum UnknownKeySource<'a> {
-    File { path: &'a Path, source: &'a str },
-    Env { sources: &'a crate::env::EnvSources },
+    File {
+        path: &'a Path,
+        source: &'a str,
+        spans: &'a BTreeMap<ConfigPath, SpanEntry>,
+    },
+    Env {
+        sources: &'a crate::env::EnvSources,
+    },
 }
 
 /// Single unknown-key entry passed to `filter_through_cascade`.
@@ -67,8 +74,8 @@ pub(crate) struct UnknownKey {
 /// `on_unknown_key` callback ([`filter_through_cascade`]).
 ///
 /// One entry point serves every layer. The per-file pass supplies an
-/// [`UnknownKeySource::File`] (source text and path, for line-number
-/// rendering); the env-layer pass supplies [`UnknownKeySource::Env`] with
+/// [`UnknownKeySource::File`] (source text, path, and that file's span
+/// index); the env-layer pass supplies [`UnknownKeySource::Env`] with
 /// the original variable names — env vars are merged after the per-file
 /// pass, so without this call an `MYAPP__ROGUE_KEY=...` would slip into
 /// the merged result without ever reaching the cascade or the
@@ -133,17 +140,27 @@ pub(crate) fn filter_through_cascade(
             continue;
         }
 
-        // The line heuristic and the file identity only exist for file
-        // sources; env-derived keys instead carry the variable name so
-        // errors name the thing to unset.
-        let (file, line, env_var) = match origin {
-            UnknownKeySource::File { path, source } => (
-                Some(*path),
-                find_key_line(source, &key, &leaf, ctx.normalize_keys),
-                None,
-            ),
+        // File identity and the key span live on the file source;
+        // env-derived keys instead carry the variable name so errors
+        // name the thing to unset. YAML/JSON still ship an empty span
+        // index (holding state), so they omit the line rather than
+        // inventing a heuristic.
+        let _ = ctx.normalize_keys;
+        let (file, line, env_var, span) = match origin {
+            UnknownKeySource::File {
+                path,
+                source,
+                spans,
+            } => {
+                let config_path = config_path_of(&key, &leaf);
+                let key_span = spans.get(&config_path).and_then(|e| e.key);
+                let line = key_span
+                    .map(|s| byte_offset_to_line_col(source, s.start).0)
+                    .unwrap_or(0);
+                (Some(*path), line, None, key_span)
+            }
             UnknownKeySource::Env { sources } => {
-                (None, 0, crate::env::env_source_names(sources, &key))
+                (None, 0, crate::env::env_source_names(sources, &key), None)
             }
         };
         let value_ref = lookup_value(table, &key, &leaf);
@@ -165,7 +182,7 @@ pub(crate) fn filter_through_cascade(
                 value: value_ref,
                 file,
                 line: if line > 0 { Some(line) } else { None },
-                span: None,
+                span,
                 env_var: env_var.as_deref(),
                 url_key: None,
                 input_type: None,
@@ -179,7 +196,7 @@ pub(crate) fn filter_through_cascade(
                         value: value_ref.cloned(),
                         file: file.map(Path::to_path_buf),
                         line: if line > 0 { Some(line) } else { None },
-                        span: None,
+                        span,
                         env_var: env_var.clone(),
                         url_key: None,
                         input_type: None,
@@ -198,7 +215,7 @@ pub(crate) fn filter_through_cascade(
             line,
             source: source_arc.clone(),
             env_var,
-            span: None,
+            span,
             url_key: None,
             input_type: None,
         });
@@ -266,113 +283,32 @@ fn parse_segment(seg: &str) -> (&str, Option<usize>) {
     (seg, None)
 }
 
-/// Find the 1-indexed line number for a key in TOML content.
+/// Reconstruct the [`ConfigPath`] of an unknown key from the dotted
+/// `path` plus the raw `leaf` the walker captured.
 ///
-/// For a dotted key like `"database.typo"`, tracks the current `[section]` header
-/// while scanning and only matches the leaf key when inside the correct section.
-///
-/// `leaf` is the raw TOML key as the parser saw it — distinct from the
-/// trailing dot-split segment when the key is a literal quoted key that
-/// contains dots (e.g. `"acme.task-due-date-missing"`). Passing the leaf
-/// separately preserves the line-number lookup for that case.
-///
-/// When `normalize_keys` is true, the comparison treats `-` and `_` as the same
-/// character — so a normalized lookup key like `"pool_size"` still locates a
-/// source line that reads `pool-size = 5`.
-///
-/// This is a best-effort heuristic — it handles standard `[section]` headers and
-/// bare key assignments but does not handle inline tables.
-/// Returns 0 if the key cannot be located.
-fn find_key_line(content: &str, dotted_path: &str, leaf: &str, normalize_keys: bool) -> usize {
-    // Section path = dotted path with the leaf stripped off the end (plus
-    // the `.` separator if any). Shared helper so quoted keys containing
-    // dots still resolve to the correct enclosing section.
-    let section_path = crate::strict::section_path_of(dotted_path, leaf);
-    let expected_section: Vec<&str> = if section_path.is_empty() {
-        Vec::new()
-    } else {
-        section_path.split('.').collect()
-    };
-
-    let mut current_section: Vec<String> = Vec::new();
-
-    for (i, line) in content.lines().enumerate() {
-        let trimmed = line.trim();
-
-        // Track [section] headers
-        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            let header = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
-            current_section = header.split('.').map(|s| s.trim().to_string()).collect();
-            continue;
-        }
-
-        // Check if we're in the right section
-        let in_right_section = expected_section.len() == current_section.len()
-            && expected_section
-                .iter()
-                .zip(&current_section)
-                .all(|(a, b)| keys_match(a, b, normalize_keys));
-
-        if !in_right_section {
-            continue;
-        }
-
-        // Manually pull "<key> = ..." so we can compare the key under the
-        // normalization rule rather than relying on a literal prefix match.
-        // `leaf_matches_source_key` also accepts the quoted-key form so
-        // a TOML line like `"acme.task" = 1` matches a leaf
-        // `acme.task` (the parser strips the quotes; the source line
-        // still carries them).
-        if let Some((candidate, rest)) = trimmed.split_once('=')
-            && leaf_matches_source_key(candidate.trim_end(), leaf, normalize_keys)
-            && !rest.is_empty()
-        {
-            return i + 1;
+/// Mirrors [`lookup_value`]: strip the leaf (so a quoted `"a.b"` stays
+/// one segment) and walk remaining `[N]`-suffixed section segments.
+/// Display of a [`ConfigPath`] is one-way; this is not parsing Display
+/// back, it is the same encoding `collect_unknown_paths` wrote.
+fn config_path_of(path: &str, leaf: &str) -> ConfigPath {
+    let section = crate::strict::section_path_of(path, leaf);
+    let mut out = ConfigPath::new();
+    if !section.is_empty() {
+        for seg in section.split('.') {
+            let (name, idx) = parse_segment(seg);
+            out = out.key(name);
+            if let Some(i) = idx {
+                out = out.index(i);
+            }
         }
     }
-    0
-}
-
-/// Match a parsed `leaf` against the candidate-key text from a source
-/// line. Accepts both the bare form (`name`) and the basic quoted form
-/// (`"name"`) — TOML's parser strips the surrounding `"`/`'`, but our
-/// source-text matcher must accept either.
-fn leaf_matches_source_key(candidate: &str, leaf: &str, normalize_keys: bool) -> bool {
-    let candidate = candidate.trim();
-    if keys_match(candidate, leaf, normalize_keys) {
-        return true;
-    }
-    // Strip a surrounding pair of `"` or `'` and retry — covers basic
-    // TOML quoted keys. Literal-string keys (`'`) and escape sequences
-    // inside basic strings are heuristic matches only; close enough for
-    // line-number rendering.
-    let bytes = candidate.as_bytes();
-    if bytes.len() >= 2
-        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
-    {
-        let inner = &candidate[1..candidate.len() - 1];
-        return keys_match(inner, leaf, normalize_keys);
-    }
-    false
-}
-
-/// Compare two keys for equality, optionally treating `-` and `_` as the
-/// same character. The trim allows callers to hand in raw section/key
-/// fragments without pre-trimming.
-fn keys_match(a: &str, b: &str, normalize_keys: bool) -> bool {
-    let a = a.trim();
-    let b = b.trim();
-    if normalize_keys {
-        normalize_key(a) == normalize_key(b)
-    } else {
-        a == b
-    }
+    out.key(leaf)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::FormatAdapter;
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
@@ -380,22 +316,34 @@ mod tests {
         PathBuf::from("/test/config.toml")
     }
 
-    fn parse(content: &str) -> Map {
-        crate::fixtures::test::parse_toml(content)
-    }
-
     /// Run unknown-key validation against the shared test schema, the way
-    /// the resolve pipeline does per file.
+    /// the resolve pipeline does per file: parse (TOML spans filled),
+    /// optionally normalize table + span paths, then validate.
     fn validate(
-        table: &Map,
-        source: &str,
+        content: &str,
         path: &Path,
         ctx: &ValidateContext<'_>,
     ) -> Result<Vec<CollectedUnknown>, ClapfigError> {
+        let parsed = crate::format::TomlAdapter
+            .parse(content)
+            .expect("test fixture TOML must parse");
+        let mut table = match parsed.value {
+            crate::value::Value::Map(map) => map,
+            _ => unreachable!("TOML documents are maps at the root"),
+        };
+        let mut spans = parsed.spans;
+        if ctx.normalize_keys {
+            crate::normalize::normalize_table_and_spans(&mut table, &mut spans)
+                .expect("test fixtures must not contain collisions");
+        }
         validate_unknown(
-            table,
+            &table,
             &crate::fixtures::test::test_schema(),
-            &UnknownKeySource::File { path, source },
+            &UnknownKeySource::File {
+                path,
+                source: content,
+                spans: &spans,
+            },
             ctx,
         )
     }
@@ -620,14 +568,14 @@ debug = true
 url = "postgres://localhost"
 pool_size = 10
 "#;
-        let result = validate(&parse(content), content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(false));
         assert!(result.is_ok());
     }
 
     #[test]
     fn unknown_top_level_key() {
         let content = "host = \"localhost\"\ntypo_key = 42\n";
-        let result = validate(&parse(content), content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
@@ -639,7 +587,7 @@ pool_size = 10
     #[test]
     fn unknown_nested_key() {
         let content = "[database]\nurl = \"pg://\"\ntypo = \"bad\"\n";
-        let result = validate(&parse(content), content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
@@ -650,7 +598,7 @@ pool_size = 10
     #[test]
     fn multiple_unknown_keys() {
         let content = "typo1 = 1\ntypo2 = 2\n";
-        let result = validate(&parse(content), content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 2);
@@ -659,7 +607,7 @@ pool_size = 10
     #[test]
     fn line_number_accuracy() {
         let content = "host = \"x\"\nport = 8080\ndebug = false\n\n# comment\nbad_key = 1\n";
-        let result = validate(&parse(content), content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys[0].line, 6);
@@ -667,22 +615,21 @@ pool_size = 10
 
     #[test]
     fn empty_content_ok() {
-        let table = Map::new();
-        let result = validate(&table, "", &path(), &test_ctx(false));
+        let result = validate("", &path(), &test_ctx(false));
         assert!(result.is_ok());
     }
 
     #[test]
     fn known_optional_field_ok() {
         let content = "[database]\nurl = \"pg://\"\n";
-        let result = validate(&parse(content), content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(false));
         assert!(result.is_ok());
     }
 
     #[test]
     fn sparse_config_ok() {
         let content = "port = 3000\n";
-        let result = validate(&parse(content), content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(false));
         assert!(result.is_ok());
     }
 
@@ -690,7 +637,7 @@ pool_size = 10
     fn error_includes_file_path() {
         let content = "typo = 1\n";
         let p = PathBuf::from("/home/user/.config/myapp/config.toml");
-        let err = validate(&parse(content), content, &p, &test_ctx(false)).unwrap_err();
+        let err = validate(content, &p, &test_ctx(false)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("config.toml") || msg.contains("Unknown keys"));
     }
@@ -698,7 +645,7 @@ pool_size = 10
     #[test]
     fn line_number_finds_correct_section_for_duplicate_leaf() {
         let content = "host = \"x\"\nport = 8080\n[database]\ntypo = \"bad\"\n";
-        let result = validate(&parse(content), content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys[0].key, "database.typo");
@@ -708,7 +655,7 @@ pool_size = 10
     #[test]
     fn line_number_top_level_not_confused_by_nested_same_name() {
         let content = "typo = 99\n[database]\npool_size = 5\n";
-        let result = validate(&parse(content), content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(false));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys[0].key, "typo");
@@ -716,14 +663,6 @@ pool_size = 10
     }
 
     // -- normalize_keys = true ------------------------------------------------
-
-    use crate::normalize::normalize_table;
-
-    fn parse_and_normalize(content: &str) -> Map {
-        let mut t = parse(content);
-        normalize_table(&mut t).expect("test fixtures must not contain collisions");
-        t
-    }
 
     #[test]
     fn normalize_kebab_top_level_key_is_valid() {
@@ -733,8 +672,7 @@ pool_size = 10
         // through nested database.pool-size — see the next test for the real
         // pool_size case.
         let content = "host = \"x\"\n";
-        let table = parse_and_normalize(content);
-        let result = validate(&table, content, &path(), &test_ctx(true));
+        let result = validate(content, &path(), &test_ctx(true));
         assert!(result.is_ok());
     }
 
@@ -743,8 +681,7 @@ pool_size = 10
         // `pool-size` in source → `pool_size` after normalize_table → matches
         // the `pool_size` field on TestDbConfig.
         let content = "[database]\npool-size = 25\n";
-        let table = parse_and_normalize(content);
-        let result = validate(&table, content, &path(), &test_ctx(true));
+        let result = validate(content, &path(), &test_ctx(true));
         assert!(result.is_ok(), "kebab key should be accepted: {result:?}");
     }
 
@@ -754,8 +691,7 @@ pool_size = 10
         // in snake form. The line-number lookup must still locate the kebab
         // line in the original source.
         let content = "host = \"x\"\n[database]\npool-zize = 99\n";
-        let table = parse_and_normalize(content);
-        let result = validate(&table, content, &path(), &test_ctx(true));
+        let result = validate(content, &path(), &test_ctx(true));
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
@@ -763,21 +699,21 @@ pool_size = 10
         assert_eq!(keys[0].key, "database.pool_zize");
         // … but the line still points at the kebab line in the original file.
         assert_eq!(keys[0].line, 3);
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&content[span.start..span.end], "pool-zize");
     }
 
     #[test]
     fn normalize_kebab_section_header_resolves_line() {
-        // Section header itself is kebab in the source. `find_key_line` must
-        // match it against the normalized expected section name.
+        // Section header itself is kebab in the source. The span index
+        // path is rewritten with the table; the key span still points at
+        // `my-section` in the header.
         let content = "[my-section]\nfoo = 1\n";
-        let table = parse_and_normalize(content);
-        // `my-section` isn't a known field; we just want to confirm the
-        // unknown-key lookup found a line (non-zero) using kebab matching on
-        // the section header.
-        let err = validate(&table, content, &path(), &test_ctx(true)).unwrap_err();
+        let err = validate(content, &path(), &test_ctx(true)).unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         // Top-level `my_section` is the unknown key here.
-        assert!(keys.iter().any(|k| k.key == "my_section"));
+        let hit = keys.iter().find(|k| k.key == "my_section").unwrap();
+        assert_eq!(hit.line, 1);
     }
 
     #[test]
@@ -785,8 +721,174 @@ pool_size = 10
         // Sanity check: with normalization disabled, `pool-size` still fails
         // strict validation the way it always has.
         let content = "[database]\npool-size = 25\n";
-        let table = parse(content);
-        let result = validate(&table, content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(false));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_key_in_array_of_tables_has_line_and_key_span() {
+        use crate::runtime::{Field, Schema};
+        let schema = Schema::object("App")
+            .array_of(
+                "servers",
+                Schema::object("Server").field("host", Field::string().optional()),
+            )
+            .build();
+        let content = "[[servers]]\nhost = \"a\"\n[[servers]]\nrogue = 1\n";
+        let parsed = crate::format::TomlAdapter.parse(content).unwrap();
+        let table = match parsed.value {
+            crate::value::Value::Map(map) => map,
+            _ => unreachable!(),
+        };
+        let err = validate_unknown(
+            &table,
+            &schema,
+            &UnknownKeySource::File {
+                path: &path(),
+                source: content,
+                spans: &parsed.spans,
+            },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "servers[1].rogue");
+        assert_eq!(keys[0].line, 4);
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&content[span.start..span.end], "rogue");
+        let out = crate::render::render_plain(&err);
+        assert!(out.contains("rogue = 1"), "{out}");
+        assert!(out.contains("^"), "{out}");
+        assert!(out.contains(":4"), "{out}");
+    }
+
+    #[test]
+    fn unknown_key_in_inline_table_has_line_and_key_span() {
+        let content = "host = \"x\"\ndatabase = { url = \"pg://\", typo = 1 }\n";
+        let err = validate(content, &path(), &test_ctx(false)).unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "database.typo");
+        assert_eq!(keys[0].line, 2);
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&content[span.start..span.end], "typo");
+    }
+
+    #[test]
+    fn quoted_dotted_key_is_distinct_from_nested() {
+        use crate::runtime::{Field, Schema};
+        let schema = Schema::object("App")
+            .nested(
+                "a",
+                Schema::object("A").field("c", Field::integer().optional()),
+            )
+            .build();
+        let quoted = "\"a.b\" = 1\n";
+        let parsed = crate::format::TomlAdapter.parse(quoted).unwrap();
+        let table = match parsed.value {
+            crate::value::Value::Map(map) => map,
+            _ => unreachable!(),
+        };
+        let err = validate_unknown(
+            &table,
+            &schema,
+            &UnknownKeySource::File {
+                path: &path(),
+                source: quoted,
+                spans: &parsed.spans,
+            },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "a.b");
+        let span = keys[0].span.expect("quoted key span");
+        assert_eq!(&quoted[span.start..span.end], "\"a.b\"");
+
+        let nested = "[a]\nb = 1\n";
+        let parsed = crate::format::TomlAdapter.parse(nested).unwrap();
+        let table = match parsed.value {
+            crate::value::Value::Map(map) => map,
+            _ => unreachable!(),
+        };
+        let err = validate_unknown(
+            &table,
+            &schema,
+            &UnknownKeySource::File {
+                path: &path(),
+                source: nested,
+                spans: &parsed.spans,
+            },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "a.b");
+        let span = keys[0].span.expect("nested key span");
+        assert_eq!(&nested[span.start..span.end], "b");
+    }
+
+    #[test]
+    fn yaml_and_json_unknown_keys_use_the_span_index() {
+        use crate::format::FormatAdapter;
+        let yaml = "typo: 1\n";
+        let parsed = crate::format::YamlAdapter.parse(yaml).unwrap();
+        let table = match parsed.value {
+            crate::value::Value::Map(map) => map,
+            _ => panic!("expected map"),
+        };
+        let err = validate_unknown(
+            &table,
+            &crate::fixtures::test::test_schema(),
+            &UnknownKeySource::File {
+                path: Path::new("/p.yaml"),
+                source: yaml,
+                spans: &parsed.spans,
+            },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].line, 1);
+        let span = keys[0].span.expect("YAML key span");
+        assert_eq!(&yaml[span.start..span.end], "typo");
+
+        let json = "{\"typo\": 1}\n";
+        let parsed = crate::format::JsonAdapter.parse(json).unwrap();
+        let table = match parsed.value {
+            crate::value::Value::Map(map) => map,
+            _ => panic!("expected map"),
+        };
+        let err = validate_unknown(
+            &table,
+            &crate::fixtures::test::test_schema(),
+            &UnknownKeySource::File {
+                path: Path::new("/p.json"),
+                source: json,
+                spans: &parsed.spans,
+            },
+            &test_ctx(false),
+        )
+        .unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].line, 1);
+        let span = keys[0].span.expect("JSON key span");
+        assert_eq!(&json[span.start..span.end], "\"typo\"");
+    }
+
+    #[test]
+    fn normalize_keys_snippet_carets_the_original_quoted_spelling() {
+        let content = "\"my-key\" = 1\n";
+        let err = validate(content, &path(), &test_ctx(true)).unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "my_key");
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&content[span.start..span.end], "\"my-key\"");
+        let out = crate::render::render_plain(&err);
+        assert!(out.contains("\"my-key\" = 1"), "{out}");
+        let caret = out.lines().find(|l| l.contains('^')).expect("{out}");
+        assert!(
+            caret.contains("^^^^^^^^"),
+            "caret should cover the quoted original spelling, got: {out}"
+        );
     }
 }

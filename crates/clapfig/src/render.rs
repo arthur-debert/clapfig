@@ -82,14 +82,16 @@ fn render_unknown_keys_plain(infos: &[crate::error::UnknownKeyInfo]) -> String {
             out.push('\n');
             continue;
         }
-        // Line 0 means "could not be located" (the line heuristic is
-        // TOML-only) — render the path alone, never a bogus `:0`.
-        if info.line > 0 {
+        let snippet = unknown_key_snippet(info);
+        // Line 0 means "could not be located" (empty span index, e.g.
+        // YAML/JSON holding state) — render the path alone, never a
+        // bogus `:0`.
+        if snippet.line > 0 {
             let _ = write!(
                 out,
                 "\n  --> {}:{}\n     key: {}",
                 info.path.display(),
-                info.line,
+                snippet.line,
                 info.key,
             );
         } else {
@@ -100,17 +102,11 @@ fn render_unknown_keys_plain(infos: &[crate::error::UnknownKeyInfo]) -> String {
                 info.key
             );
         }
-        if let Some(src) = info.source.as_deref()
-            && info.line > 0
-            && let Some(line_text) = src.lines().nth(info.line - 1)
-        {
-            let gutter = format!("{:>4} | ", info.line);
+        if let Some((line_text, col, caret_len)) = snippet.body {
+            let gutter = format!("{:>4} | ", snippet.line);
             let _ = write!(out, "\n{gutter}{line_text}");
-            let caret_col = line_text
-                .find(info.leaf())
-                .unwrap_or_else(|| line_text.len() - line_text.trim_start().len());
-            let pad = " ".repeat("     | ".len() + caret_col);
-            let carets = "^".repeat(info.leaf().len().max(1));
+            let pad = " ".repeat("     | ".len() + col);
+            let carets = "^".repeat(caret_len);
             let _ = write!(out, "\n{pad}{carets} unknown key");
         }
         out.push('\n');
@@ -138,7 +134,7 @@ fn render_parse_error_plain(
     if let Some(span) = source.parse_span()
         && let Some(src) = source_text
     {
-        let (line, col) = byte_offset_to_line_col(src, span.start);
+        let (line, col) = crate::format::byte_offset_to_line_col(src, span.start);
         let _ = write!(out, ":{}:{}", line, col);
         if let Some(line_text) = src.lines().nth(line - 1) {
             let gutter = format!("\n{:>4} | ", line);
@@ -155,21 +151,47 @@ fn render_parse_error_plain(
     out
 }
 
-fn byte_offset_to_line_col(src: &str, offset: usize) -> (usize, usize) {
-    let mut line = 1;
-    let mut col = 1;
-    for (i, c) in src.char_indices() {
-        if i >= offset {
-            break;
-        }
-        if c == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
+struct UnknownKeySnippet<'a> {
+    line: usize,
+    body: Option<(&'a str, usize, usize)>,
+}
+
+/// Line/column and caret length from the key span when present; otherwise
+/// the stored 1-indexed line and a leaf-text find (synthetic tests that
+/// only set `line`). YAML/JSON empty indexes yield line 0 and no body.
+fn unknown_key_snippet(info: &crate::error::UnknownKeyInfo) -> UnknownKeySnippet<'_> {
+    let Some(src) = info.source.as_deref() else {
+        return UnknownKeySnippet {
+            line: info.line,
+            body: None,
+        };
+    };
+    if let Some(span) = info.span {
+        let (line, col) = crate::format::byte_offset_to_line_col(src, span.start);
+        let col0 = col.saturating_sub(1);
+        let line_text = src.lines().nth(line.saturating_sub(1)).unwrap_or("");
+        let max_len = line_text.len().saturating_sub(col0).max(1);
+        let caret_len = (span.end.saturating_sub(span.start)).max(1).min(max_len);
+        return UnknownKeySnippet {
+            line,
+            body: Some((line_text, col0, caret_len)),
+        };
     }
-    (line, col)
+    if info.line > 0
+        && let Some(line_text) = src.lines().nth(info.line - 1)
+    {
+        let caret_col = line_text
+            .find(info.leaf())
+            .unwrap_or_else(|| line_text.len() - line_text.trim_start().len());
+        return UnknownKeySnippet {
+            line: info.line,
+            body: Some((line_text, caret_col, info.leaf().len().max(1))),
+        };
+    }
+    UnknownKeySnippet {
+        line: info.line,
+        body: None,
+    }
 }
 
 /// Render an error with colors, source snippets, and aligned gutters.
@@ -245,8 +267,16 @@ fn build_diagnostic(err: &ClapfigError) -> RichDiagnostic {
 
             let labels: Vec<LabeledSpan> = infos
                 .iter()
-                .filter(|i| i.line > 0)
                 .filter_map(|info| {
+                    if let Some(span) = info.span {
+                        return Some(LabeledSpan::at(
+                            span.start..span.end,
+                            format!("unknown key '{}'", info.key),
+                        ));
+                    }
+                    if info.line == 0 {
+                        return None;
+                    }
                     let line_idx = info.line - 1;
                     // Use split_inclusive so byte offsets stay correct on
                     // CRLF files — str::lines() strips both \n and \r\n,
@@ -396,6 +426,29 @@ mod tests {
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
         assert!(out.contains("x"));
         assert!(out.contains("p.toml"));
+    }
+
+    #[test]
+    fn plain_span_carets_the_key_token() {
+        use crate::format::Span;
+        let source: Arc<str> = Arc::from("\"my-key\" = 1\n");
+        let infos = vec![UnknownKeyInfo {
+            key: "my_key".into(),
+            path: "/p.toml".into(),
+            line: 1,
+            source: Some(source),
+            env_var: None,
+            span: Some(Span { start: 0, end: 8 }),
+            url_key: None,
+            input_type: None,
+        }];
+        let out = render_plain(&ClapfigError::UnknownKeys(infos));
+        assert!(out.contains("\"my-key\" = 1"), "{out}");
+        let caret = out.lines().find(|l| l.contains('^')).expect("{out}");
+        assert!(
+            caret.contains("^^^^^^^^"),
+            "caret should cover the quoted key token, got: {out}"
+        );
     }
 
     #[test]

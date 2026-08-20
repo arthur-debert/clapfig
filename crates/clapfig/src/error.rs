@@ -55,10 +55,11 @@ pub struct UnknownKeyInfo {
     /// instead.
     pub path: PathBuf,
     /// 1-indexed line number where the key was found, or `0` if the line
-    /// could not be located. The `find_key_line` heuristic only recognizes
-    /// TOML syntax, so keys from YAML/JSON sources are always `0` (and
-    /// renderers suppress the line entirely rather than print a bogus
-    /// `line 0`); env-derived keys have no line either.
+    /// could not be located. Derived from [`span`](Self::span) (the key
+    /// token) when the file's span index has an entry; `0` when the
+    /// index has no entry for the path or the origin is not a file.
+    /// Renderers suppress the line entirely rather than print a bogus
+    /// `line 0`.
     pub line: usize,
     /// Full contents of the config file, shared across all infos from the
     /// same file. Used by renderers for source snippets. `None` for
@@ -69,9 +70,9 @@ pub struct UnknownKeyInfo {
     /// this to describe the error as an env problem — naming the variable
     /// to unset — instead of dressing it in config-file clothing.
     pub env_var: Option<String>,
-    /// Byte span of the **key** token in `source` (ADR-0006). `None` until
-    /// a format adapter fills the span index, and `None` for non-file
-    /// origins.
+    /// Byte span of the **key** token in `source` (ADR-0006). Set from
+    /// the file's span index when that path has a key token; `None` when
+    /// the index has no entry or the origin is not a file.
     pub span: Option<Span>,
     /// URL query-parameter key that supplied this unknown key, when it
     /// came from the URL layer.
@@ -469,9 +470,9 @@ fn format_unknown_keys(infos: &[UnknownKeyInfo]) -> String {
             (Some(var), _) => {
                 let _ = write!(out, "\n  - '{}' from environment variable {var}", info.key);
             }
-            // Line 0 means "could not be located" (YAML/JSON sources have
-            // no TOML line heuristic) — omit it rather than render a
-            // bogus `(line 0)`.
+            // Line 0 means "could not be located" (no span-index entry
+            // for the path) — omit it rather than render a bogus
+            // `(line 0)`.
             (None, 0) => {
                 let _ = write!(out, "\n  - '{}' in {}", info.key, info.path.display());
             }
@@ -563,7 +564,7 @@ mod tests {
 
     #[test]
     fn unknown_key_line_zero_is_suppressed() {
-        // YAML/JSON sources have no line heuristic; never print `(line 0)`.
+        // Line 0 means "could not be located"; never print `(line 0)`.
         let msg = ClapfigError::UnknownKeys(vec![info("typo", 0)]).to_string();
         assert!(msg.contains("'typo' in"), "{msg}");
         assert!(!msg.contains("line"), "{msg}");

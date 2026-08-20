@@ -22,7 +22,7 @@ use crate::env;
 use crate::error::{ClapfigError, DiscoveryRecord};
 use crate::format::{self, FormatRegistry};
 use crate::merge::deep_merge;
-use crate::normalize::{normalize_key, normalize_table};
+use crate::normalize::{normalize_key, normalize_table_and_spans};
 use crate::overrides;
 use crate::runtime::Schema;
 use crate::schema_walk;
@@ -199,8 +199,10 @@ pub(crate) fn resolve(
                     ));
                 }
             };
+            let mut spans = parsed.spans;
             if input.normalize_keys {
-                normalize_table(&mut table).map_err(|c| c.into_error(path))?;
+                normalize_table_and_spans(&mut table, &mut spans)
+                    .map_err(|c| c.into_error(path))?;
             }
             if cascade_active {
                 let mut per_file = validate_unknown(
@@ -209,6 +211,7 @@ pub(crate) fn resolve(
                     &UnknownKeySource::File {
                         path,
                         source: content,
+                        spans: &spans,
                     },
                     &validate_ctx,
                 )?;
@@ -518,6 +521,31 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("typo") || msg.contains("Unknown"));
+    }
+
+    #[test]
+    fn toml_unknown_key_in_array_of_tables_carets_the_right_line() {
+        use crate::runtime::Field;
+        let schema = Schema::object("App")
+            .array_of(
+                "servers",
+                Schema::object("Server").field("host", Field::string().optional()),
+            )
+            .build();
+        let source = "[[servers]]\nhost = \"a\"\n[[servers]]\nrogue = 1\n";
+        let input = ResolveInput {
+            files: vec![("config.toml".into(), source.into())],
+            ..empty_input(&schema)
+        };
+        let err = resolve(input).unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "servers[1].rogue");
+        assert_eq!(keys[0].line, 4);
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&source[span.start..span.end], "rogue");
+        let out = crate::render::render_plain(&err);
+        assert!(out.contains("rogue = 1"), "{out}");
+        assert!(out.contains(":4"), "{out}");
     }
 
     #[test]

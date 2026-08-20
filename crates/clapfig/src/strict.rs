@@ -84,11 +84,8 @@ pub struct UnknownKeyContext<'a> {
     pub file: Option<&'a Path>,
 
     /// 1-indexed line number in `file` where the key appears. `None` when
-    /// the `find_key_line` heuristic could not locate it. The heuristic
-    /// only recognizes TOML `key = value` / `[section]` syntax, so this is
-    /// always `None` for YAML/JSON and non-file sources, and `None` in
-    /// rare TOML cases (quoted keys, inline tables). Later provenance
-    /// slices replace this with [`span`](Self::span).
+    /// the file's span index has no entry for the key, or the origin is
+    /// not a file. Derived from [`span`](Self::span).
     pub line: Option<usize>,
 
     /// Byte span of the **key** token (ADR-0006). `None` until a format
@@ -148,8 +145,8 @@ pub struct CollectedUnknown {
     pub value: Option<Value>,
     /// File the key came from, when sourced from a config file.
     pub file: Option<std::path::PathBuf>,
-    /// 1-indexed line number in `file`, if the `find_key_line` heuristic
-    /// located the key. TOML-only — see [`UnknownKeyContext::line`].
+    /// 1-indexed line number in `file`, if the span index located the
+    /// key. See [`UnknownKeyContext::line`].
     pub line: Option<usize>,
     /// Byte span of the **key** token (ADR-0006). `None` until a format
     /// adapter fills the span index.
@@ -347,7 +344,7 @@ fn parent_path(path: &str) -> &str {
 /// Section path of `(path, leaf)`: `path` with the trailing leaf stripped
 /// (plus the `.` separator if any). Returns `""` for a top-level key.
 ///
-/// Shared with `validate::lookup_value` and `validate::find_key_line` —
+/// Shared with `validate::lookup_value` —
 /// dot-splitting `path` would miscount segments when the leaf is a
 /// quoted TOML key containing literal dots (e.g.
 /// `"acme.task-due-date-missing"`). Stripping the known leaf off the
