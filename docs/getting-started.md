@@ -71,6 +71,12 @@ Key points:
   out-of-set values error at load, and generated templates document the
   allowed set with an `Allowed: ...` annotation — a native comment in TOML
   and YAML, a `"//"` comment key in JSON.
+- **Internally tagged enums** (`#[serde(tag = "kind")]`) are unions of
+  objects: clapfig validates the selected variant, JSON Schema exports
+  `oneOf` with a `const` on the tag, and `config gen` emits one commented
+  example per variant. There is no `#[clapfig(tag)]`.
+- **Root maps** — `Clapfig::typed::<BTreeMap<String, T>>()` (or `HashMap`)
+  where `T: Schema` loads `[core]` / `[site]` with no parent field.
 - **`Option<T>`** of a supported leaf (scalar, unit enum, or the leaf
   map/array forms) is truly optional — omitting it everywhere is valid.
   Nested structs are not an `Option` shape; the [Derive
@@ -264,7 +270,7 @@ Turn it off with `.strict(false)` if you share config files across tools.
 ## Next steps
 
 - [Derive Reference](./derive-reference.md) — `#[clapfig(...)]` attributes,
-  supported types, enums, maps, and arrays.
+  supported types, enums, maps, arrays, tagged unions, and root maps.
 - [Layered Configuration](./layered-config.md) — deep dive into layers,
   search modes, and merge behavior.
 - [Runtime Schemas](./runtime-schemas.md) — building schemas at runtime for

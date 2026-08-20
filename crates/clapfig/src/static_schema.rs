@@ -11,9 +11,12 @@
 //!
 //! [`ShapeStatic`] is the const mirror of [`runtime::Shape`](crate::runtime::Shape),
 //! the schema node. [`SchemaStatic`] remains the named-field object
-//! constructor (ADR-0010). Derive still emits [`SchemaStatic`] trees
-//! today; later slices emit const [`ShapeStatic`] roots (root Map /
-//! Tagged).
+//! constructor (ADR-0010). Derive emits [`SchemaStatic`] trees
+//! (named-field objects, unit-only enums, and internally tagged enums
+//! via `tagged_tag` / `tagged_variants`). `HashMap`/`BTreeMap` typed
+//! roots construct [`Shape::Map`](crate::runtime::Shape::Map) at
+//! [`Schema::shape`](Schema::shape) time. Walkers take
+//! [`runtime::Shape`](crate::runtime::Shape).
 //!
 //! This file is the single source of truth for that mirror.
 

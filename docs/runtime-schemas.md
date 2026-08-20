@@ -23,7 +23,14 @@ If your config schema is known at compile time, use
 `Clapfig::typed::<C>()` instead — the typed path is simpler,
 gives you typed access to the result, and benefits from
 `#[derive(clapfig::Schema)]` ergonomics. Both paths produce identical
-schema metadata and share one resolve pipeline.
+schema metadata and share one resolve pipeline. Walkers take
+[`Shape`](https://docs.rs/clapfig/latest/clapfig/runtime/enum.Shape.html)
+(leaf, object, map, array, tagged union);
+[`Schema`](https://docs.rs/clapfig/latest/clapfig/runtime/struct.Schema.html)
+is the named-field object constructor, not the node.
+`Clapfig::builder` accepts `impl Into<Shape>`, so object-root callers
+keep passing a `Schema`. Legal document roots are Object, Map, and
+Tagged.
 
 ## Building a schema
 
@@ -52,14 +59,21 @@ let schema = Schema::object("App")
 
 ### Field kinds
 
+An object's field value is a `Shape`. `Field::string()` and friends are
+constructors that produce one; homogeneous maps and arrays of leaves or
+of objects are the same `Shape::Map` / `Shape::Array` constructor with a
+different item.
+
 - **`Field::string()`, `Field::integer()`, `Field::float()`, `Field::boolean()`, `Field::datetime()`** — TOML primitive leaves.
 - **`Field::integer_in(min, max)`** — range-bounded integer (`None` leaves an end open). Both ends set with `min > max` panics when the field is built (an authoring error, same class as a duplicate field name). Out-of-range values fail validation naming the key, and `config schema` exports the bounds as `minimum`/`maximum` — the runtime counterpart of the width bounds the derive macro emits for sized integer fields (`u8` → `0..=255`).
-- **`Field::array_of_type(LeafType)`** — homogeneous array of a primitive type.
-- **`Field::map_of(LeafType)`** — string-keyed map with homogeneous values.
+- **`Field::array_of_type(item)`** — homogeneous array (`Shape::Array`). `item` is `impl Into<Shape>` (a `LeafType` still converts). An array of objects uses `Schema::object(...).array_of(name, item_schema)` — same constructor, object item.
+- **`Field::map_of(item)`** — string-keyed homogeneous map (`Shape::Map`). Same `impl Into<Shape>` item. A map of objects uses `Schema::object(...).map_of(name, item_schema)`.
 - **`Field::enum_of(values)`** — constrained value: must be one of the listed TOML primitives. Used for log levels, output formats, modes.
 - **`Field::value()`** — accepts any value-model value (scalar, array, map). Escape hatch for keys whose value can take multiple incompatible shapes on the same field (e.g. a bare string *or* an array of `[string, map]`, like serde's `#[serde(untagged)]` enums). Clapfig does no shape check at the schema layer; the caller is responsible for further validation, typically via `serde` in a `post_validate` hook.
 - **`Schema::object(...).nested(name, child)`** — TOML `[section]` sub-object.
-- **`Schema::object(...).array_of(name, item_schema)`** — TOML `[[name]]` array of sub-objects.
+- **`Schema::object(...).array_of(name, item_schema)`** — TOML `[[name]]` array of sub-objects (`Shape::Array` of that object).
+- **`Shape::map(name, item)`** — a homogeneous map as the **document root** (no parent field). `Clapfig::builder` loads `[core]` / `[site]` as map entries. JSON Schema is `additionalProperties` of the item at the root; `config gen` shows a commented example entry.
+- **`Shape::tagged(name, tag).variant(disc, object)...`** — internally tagged union of objects (the runtime twin of `#[serde(tag = "...")]`). JSON Schema is `oneOf` with a `const` on the tag; `config gen` emits one commented example per variant.
 
 ### Per-leaf modifiers
 
@@ -127,8 +141,9 @@ off the schema:
 - Mixing a runtime-built sub-schema inside a `#[derive(clapfig::Schema)]`
   struct — a derive field is either another Schema type or a leaf.
 - Indexed dotted-key syntax (`plugins[0].id`) for `config set` on
-  arrays of objects. Keys inside `ArrayOf`/`MapOf` sections refuse with
-  a targeted error; edit the config file directly.
+  arrays of objects. Keys inside `Shape::Array` / `Shape::Map` of
+  objects (and keys inside a root map) refuse with a targeted error;
+  edit the config file directly.
 
 Arrays of nested schema types (`Vec<NestedStruct>` / `Vec<UnitEnum>`)
 and struct-level `rename_all` both derive; they are not gaps.

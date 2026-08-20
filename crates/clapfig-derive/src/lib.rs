@@ -37,34 +37,39 @@ use syn::{
 ///   (`Option<UnitEnum>` included). Unqualified `Option<T>` is not the
 ///   contract — nested structs are not an Option shape (see deferred
 ///   panics below).
-/// - `Vec<T>` where `T` is a scalar: maps to `LeafType::Array(T)`.
-/// - `Vec<T>` where `T` derives `clapfig::Schema`: produces a
-///   `FieldStatic::ArrayOf { .. }` (TOML `[[name]]` array of tables) for a
-///   struct element type; a unit-only-enum element type flattens to a
-///   `LeafType::Array(Enum)` leaf (allowed-values on items). Support is
-///   trait-resolved — the compiler, not a syntactic guess, decides
-///   whether `T` qualifies. An absent array loads as the empty `Vec`;
-///   `Option<Vec<T>>` of a scalar or unit-only enum keeps the presence
-///   signal (absent → `None`). `Option<Vec<NestedStruct>>` has no
-///   representation (an absent array of nested objects is already the
+/// - `Vec<T>` where `T` is a scalar: runtime `Shape::Array` of that leaf
+///   (derive emits `LeafTypeStatic::Array`).
+/// - `Vec<T>` where `T` derives `clapfig::Schema`: runtime `Shape::Array`
+///   of the item (TOML `[[name]]` array of tables) for a struct element
+///   type; a unit-only-enum element type is `Shape::Array` of an enum
+///   leaf (allowed-values on items). Derive emits `FieldStatic::ArrayOf`.
+///   Support is trait-resolved — the compiler, not a syntactic guess,
+///   decides whether `T` qualifies. An absent array loads as the empty
+///   `Vec`; `Option<Vec<T>>` of a scalar or unit-only enum keeps the
+///   presence signal (absent → `None`). `Option<Vec<NestedStruct>>` has
+///   no representation (an absent array of nested objects is already the
 ///   empty array — spell it `Vec<T>`) and panics at the first
 ///   `schema()` call.
 /// - `HashMap<String, V>` / `BTreeMap<String, V>`: a scalar / `Value` /
-///   array-of-scalar `V` emits `LeafType::Map(V)`; a nested struct `V`
-///   emits `FieldStatic::MapOf { .. }`; a unit-only-enum `V` flattens to
-///   `LeafType::Map(Enum)`. An absent map loads as the empty map.
+///   array-of-scalar `V` is runtime `Shape::Map` of that leaf; a nested
+///   struct `V` is `Shape::Map` of that object; a unit-only-enum `V` is
+///   `Shape::Map` of an enum leaf. Derive emits `LeafTypeStatic::Map` or
+///   `FieldStatic::MapOf`; conversion collapses both to `Shape::Map`.
+///   An absent map loads as the empty map. As the **document root**,
+///   `Clapfig::typed::<BTreeMap<String, T>>()` / `HashMap<String, T>`
+///   where `T: Schema` loads without a parent field.
 ///   `Option<HashMap<String, V>>` / `Option<BTreeMap<String, V>>` keeps
 ///   the presence signal when `V` is a scalar / `Value` /
-///   array-of-scalar. `Option` around a MapOf shape
+///   array-of-scalar. `Option` around a map of objects
 ///   (`Option<HashMap<String, NestedStruct>>`, including a unit-enum `V`
 ///   routed through the same Nested classification) is a derive-time
 ///   error.
 /// - Nested struct: assumed to also derive `clapfig::Schema`; produces a
 ///   `FieldStatic::Nested { .. }`.
 /// - Unit-only enum: flattens at every use site to a `LeafType::Enum`
-///   leaf (or `Map(Enum)` / `Array(Enum)` in the map/array positions
-///   above). Variant names are the allowed values; `rename` /
-///   `rename_all` apply to those spellings.
+///   leaf (or `Shape::Map` / `Shape::Array` of that leaf in the
+///   map/array positions above). Variant names are the allowed values;
+///   `rename` / `rename_all` apply to those spellings.
 /// - Internally tagged enum (`#[serde(tag = "...")]`): emits
 ///   `Shape::Tagged`. Unit variants are the empty object; named-field
 ///   struct variants are that object. The tag is reserved (not a field
@@ -1429,19 +1434,21 @@ enum TypeShape {
     /// `Option<T>` where T is itself a TypeShape; the inner shape is folded
     /// and `optional` is set.
     Optional(Box<TypeShape>),
-    /// `Vec<T>` where T is a scalar — emits `LeafType::Array(T)`. Carries
-    /// the element's [`ScalarKind`] so array-literal defaults can be
-    /// kind-checked per element at derive time.
+    /// `Vec<T>` where T is a scalar — runtime `Shape::Array` of that leaf
+    /// (emits `LeafTypeStatic::Array`). Carries the element's
+    /// [`ScalarKind`] so array-literal defaults can be kind-checked per
+    /// element at derive time.
     Array(ScalarKind, TokenStream2),
     /// `HashMap<String, V>` / `BTreeMap<String, V>` where V is a leaf shape —
-    /// emits `LeafType::Map(V)`. TOML map keys must be strings.
+    /// runtime `Shape::Map` of that leaf (emits `LeafTypeStatic::Map`).
+    /// TOML map keys must be strings.
     Map(TokenStream2),
     /// `HashMap<String, NestedStruct>` / `BTreeMap<String, NestedStruct>` —
     /// emits `FieldStatic::MapOf { schema: <NestedStruct as Schema>::STATIC, .. }`. The
     /// inner token is the same `<T as Schema>::STATIC` reference produced
-    /// for plain nested fields; the converter routes it into a `Field::MapOf`
+    /// for plain nested fields; the converter routes it into a `Shape::Map`
     /// at the runtime layer — or, when the referenced type is a unit-only
-    /// enum, flattens it to a `LeafType::Map(Enum)` leaf (the map-shaped
+    /// enum, flattens it to a `Shape::Map` of an enum leaf (the map-shaped
     /// sibling of the `Nested` enum flatten).
     MapOfNested(TokenStream2),
     /// `Vec<NestedType>` where the element derives [`Schema`] — emits
@@ -1450,9 +1457,9 @@ enum TypeShape {
     /// `<T as Schema>::STATIC` reference makes the *compiler* decide
     /// whether the element type qualifies (a non-`Schema` element fails
     /// with the trait's `on_unimplemented` guidance). The converter routes
-    /// it into a `Field::ArrayOf` at the runtime layer — or, when the
+    /// it into a `Shape::Array` at the runtime layer — or, when the
     /// element type is a unit-only enum, flattens it to a
-    /// `LeafType::Array(Enum)` leaf (the array-shaped sibling of the
+    /// `Shape::Array` of an enum leaf (the array-shaped sibling of the
     /// `MapOf` enum flatten).
     ArrayOfNested(TokenStream2),
     /// Nested type referencing another struct's `clapfig::Schema` impl.
@@ -1559,7 +1566,7 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
     }
     if name == "HashMap" || name == "BTreeMap" {
         let (key_ty, value_ty) = two_generic_arguments(&last.arguments, &name)?;
-        // TOML map keys are strings — `LeafType::Map(V)` has no key-type
+        // TOML map keys are strings — `Shape::Map` of a leaf has no key-type
         // discriminant on the value level. Reject any non-String key at
         // derive time with a clear message instead of letting the schema
         // emit something the deserializer can't satisfy.
@@ -1603,10 +1610,10 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
                      Use `#[clapfig(value)]` with `clapfig::value::Value` for free-form nested shapes."
                 ),
             )),
-            // {Hash,BTree}Map<String, NestedStruct> → `FieldStatic::MapOf` at the
-            // runtime layer. The inner expression is the same `<T as Schema>::STATIC`
+            // {Hash,BTree}Map<String, NestedStruct> → `FieldStatic::MapOf`.
+            // The inner expression is the same `<T as Schema>::STATIC`
             // we use for plain Nested fields; the converter sees a `MapOf` and
-            // emits `Field::MapOf(schema)`.
+            // emits `Shape::Map` of that object.
             TypeShape::Nested(inner_expr) => Ok(TypeShape::MapOfNested(inner_expr)),
         };
     }

@@ -48,8 +48,15 @@
 //!
 //! # Design: struct as source of truth
 //!
-//! Your config struct (via `#[derive(clapfig::Schema)]`) is the schema for
-//! everything:
+//! Your config type (via `#[derive(clapfig::Schema)]`) is the schema for
+//! everything. The node every consumer walks is
+//! [`runtime::Shape`] — leaf, named-field object, homogeneous map,
+//! homogeneous array, or internally tagged union.
+//! [`runtime::Schema`](runtime::Schema) stays the named-field object
+//! constructor, not the node. Legal typed document roots are a
+//! named-field struct, an internally tagged `#[serde(tag = "...")]`
+//! enum, or `BTreeMap<String, T>` / `HashMap<String, T>` where
+//! `T: Schema`.
 //!
 //! - **`#[clapfig(default = ...)]`** provides compiled defaults — the lowest
 //!   layer, always present. Works with scalars (`default = 8080`), strings
@@ -65,6 +72,14 @@
 //!   out-of-set values error at load, templates document the allowed set
 //!   with an `Allowed: ...` annotation (native comments in TOML/YAML,
 //!   `"//"` comment keys in JSON), and the JSON Schema emits `enum: [...]`.
+//! - **Internally tagged enums** (`#[serde(tag = "...")]`) are unions of
+//!   objects: clapfig validates the selected variant, JSON Schema exports
+//!   `oneOf` with a `const` on the tag, and `config gen` emits one
+//!   commented example per variant. There is no `#[clapfig(tag)]`.
+//! - **Root maps** — `Clapfig::typed::<BTreeMap<String, T>>()` (or
+//!   `HashMap`) where `T: Schema` loads `[core]` / `[site]` with no
+//!   parent field. JSON Schema is `additionalProperties` of the item at
+//!   the document root.
 //! - **`Option<T>` of a supported leaf** (scalar, unit enum, or the leaf
 //!   map/array forms) is truly optional — omitting it in every source is
 //!   valid. Nested structs are not an `Option` shape; the `Schema` derive
@@ -698,7 +713,7 @@
 //! # Template generation
 //!
 //! `config gen` (or [`ConfigAction::Gen`]) produces a documented config
-//! file derived from the struct's `///` doc comments and
+//! file derived from the schema's `///` doc comments and
 //! `#[clapfig(default)]` values, rendered in the preferred format (or, with
 //! an output path, the format the path's extension selects). The template
 //! stays in sync with code — change a doc comment or a default, the
@@ -707,6 +722,8 @@
 //! `Elements:`/`Values:` element-type hint; a `Required.` marker marks a
 //! placeholder the runtime rejects if left commented (non-optional,
 //! defaultless, not an array or map — absent arrays/maps load as empty).
+//! A tagged shape emits one commented example per variant; a root map
+//! shows a commented example entry, not an invented parent table.
 //! TOML and YAML carry docs as native comments; JSON carries them as `"//"`
 //! comment keys (ADR-0002's convention: at most one `"//"` per object,
 //! suffixed `"//field"` keys per field, arrays of strings for multi-line
@@ -770,9 +787,10 @@
 //!   leaf takes `123` verbatim, an integer leaf refuses `abc` naming the
 //!   expected type, and array/map leaves accept TOML inline syntax
 //!   (`["a", "b"]`, `{cpu = 2}`) whatever the file's format — before
-//!   touching the file. Keys inside `ArrayOf`/`MapOf` sections are not
-//!   addressable by dotted CLI key (entry keys are user data, not schema
-//!   fields) and refuse with a targeted error pointing at the config file.
+//!   touching the file. Keys inside arrays or maps of objects (and keys
+//!   inside a root map) are not addressable by dotted
+//!   CLI key (entry keys are user data, not schema fields) and refuse
+//!   with a targeted error pointing at the config file.
 //! - **Scoped reads**: `config list --scope global` and `config get key
 //!   --scope local` read from a single scope's file rather than the merged
 //!   view, letting users inspect where values come from.
@@ -866,7 +884,7 @@ impl Clapfig {
     ///
     /// Walkers take [`Shape`](crate::runtime::Shape). A root Map loads as
     /// a homogeneous map of the item shape (no synthetic parent field).
-    /// Tagged object-root load is the two-phase walk (SHP01-WS04).
+    /// Tagged object-root load is the two-phase unknown-key walk.
     /// Object-root `load()` is unchanged.
     ///
     /// Returns a [`Builder`] with the same surface as
@@ -902,8 +920,10 @@ impl Clapfig {
     }
 
     /// Entry point for the typed path: build a config pipeline from a
-    /// struct whose schema was emitted by the `#[derive(clapfig::Schema)]`
-    /// macro.
+    /// type that is a legal [`DocumentRoot`](crate::static_schema::DocumentRoot):
+    /// a named-field struct deriving `#[derive(clapfig::Schema)]`, an
+    /// internally tagged `#[serde(tag = "...")]` enum, or
+    /// `BTreeMap<String, T>` / `HashMap<String, T>` where `T: Schema`.
     ///
     /// Same builder surface as [`Self::builder`], but `load()` returns the
     /// typed `C`. The schema metadata available to JSON Schema, template,

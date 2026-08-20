@@ -242,20 +242,23 @@ pub enum ClapfigError {
         suggestion: Option<String>,
     },
 
-    /// A `config set` action key targets an `ArrayOf`/`MapOf` schema
-    /// section or a path inside one. A dotted CLI key cannot say which
-    /// entry it means — entry keys and array indexes are user data, not
-    /// schema fields — so these paths are deliberately not settable and
-    /// the config file is the surface for editing them. (An indexed path
-    /// syntax like `servers[0].host` is a possible future extension.)
+    /// A `config set` action key targets a
+    /// [`Shape::Array`](crate::runtime::Shape::Array) /
+    /// [`Shape::Map`](crate::runtime::Shape::Map) of objects (or a root
+    /// map) or a path inside one.
+    /// A dotted CLI key cannot say which entry it means — entry keys and
+    /// array indexes are user data, not schema fields — so these paths
+    /// are deliberately not settable and the config file is the surface
+    /// for editing them. (An indexed path syntax like `servers[0].host`
+    /// is a possible future extension.)
     #[error(
         "Key '{key}' cannot be set: '{section}' is {kind} of sections, and keys inside it cannot be addressed with a dotted CLI key — edit the config file directly"
     )]
     UnaddressableKey {
         /// The dotted action key as the caller supplied it.
         key: String,
-        /// Canonical dotted path of the `ArrayOf`/`MapOf` section the key
-        /// runs into.
+        /// Canonical dotted path of the array/map-of-objects section the
+        /// key runs into.
         section: String,
         /// `"an array"` or `"a map"` — which container kind refused.
         kind: &'static str,

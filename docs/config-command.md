@@ -77,7 +77,11 @@ placeholders. Enum-typed fields additionally carry an `Allowed:` line;
 array/map fields carry an `Elements:`/`Values:` line naming the element
 type. A `Required.` line marks a placeholder the runtime rejects if left
 commented (a non-optional scalar with no default). Absent arrays and maps
-load as empty, so they do not get that line.
+load as empty, so they do not get that line. A tagged schema emits **one
+commented example per variant**, each a complete object for that
+discriminator — not one uncommented object that mixes keys from several
+variants. A root map shows a commented example entry, not an invented
+parent table.
 
 Write to a file with `--output` — the path's **extension selects the
 format**, independent of the enabled-formats list:
@@ -123,6 +127,9 @@ flip side is that the `//` key namespace is **reserved** — a `//`-prefixed
 member in a JSON config file is always a comment, never a configuration
 key. The exported JSON Schema (`config schema`) allowlists the `^//`
 pattern so third-party validators accept documented templates too.
+Tagged unions export as `oneOf` with a `const` on the tag field; a root
+map is `type: object` plus `additionalProperties` of the item at the
+document root.
 
 ### `config list`
 
@@ -182,8 +189,8 @@ myapp config set tags '["a", "b"]'
 myapp config set limits '{cpu = 2, mem = 8}'
 ```
 
-Keys inside `ArrayOf`/`MapOf` sections (arrays or maps **of sections**,
-e.g. `servers.web.host` where `servers` is a `HashMap<String, Server>`)
+Keys inside arrays or maps **of objects** (e.g. `servers.web.host` where
+`servers` is a `HashMap<String, Server>`), and keys inside a root map,
 are not addressable with a dotted CLI key — the entry key is user data,
 not a schema field, so `set` refuses with a targeted error telling you to
 edit the config file directly. (An indexed path syntax is a possible

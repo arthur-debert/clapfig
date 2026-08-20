@@ -56,7 +56,7 @@ use crate::value::{Map, Value};
 /// `prefix` is the dotted display form (cascade / error rendering).
 /// `path` is the structured address of `table` — the same [`ConfigPath`]
 /// the adapter indexed — so span lookup does not reconstruct from the
-/// display string (a quoted dotted MapOf key stays one segment).
+/// display string (a quoted dotted map-entry key stays one segment).
 ///
 /// For nested objects (`Shape::Object`) the recursion descends into the
 /// sub-table; for `Shape::Array`, each entry is validated against the
@@ -65,8 +65,9 @@ use crate::value::{Map, Value};
 /// user-supplied key forming a path segment).
 ///
 /// The same walker serves the per-file pass and the env layer. Env
-/// dotted-key syntax cannot express arrays-of-tables, so the `ArrayOf`
-/// arm simply never fires there — recursion support is harmless.
+/// dotted-key syntax cannot express arrays-of-tables, so the
+/// `Shape::Array` arm simply never fires there — recursion support is
+/// harmless.
 pub(crate) fn collect_unknown_paths(
     table: &Map,
     schema: &Schema,

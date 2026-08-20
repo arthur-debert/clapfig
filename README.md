@@ -17,15 +17,17 @@ Your struct is the schema: `#[derive(clapfig::Schema)]` captures types, defaults
 - **Search modes** — merge all found configs or use the first match
 - **Ancestor walk** — walk up from cwd to find project configs, with configurable boundary (`.git`, filesystem root)
 - **Tree-walk resolution** — build a reusable [`Resolver`](https://docs.rs/clapfig/latest/clapfig/struct.Resolver.html) once, call `.resolve_at(&dir)` for every leaf in a dynamic file tree (`.htaccess`/`.editorconfig` pattern). Per-call `Cwd`/`Ancestors` anchoring, instance-scoped file cache so repeated walks pay disk+parse once per unique file.
-- **Runtime-defined schemas** — plugin hosts and generated apps build an owned [`Schema`](https://docs.rs/clapfig/latest/clapfig/runtime/struct.Schema.html) with a fluent builder and get the exact same pipeline; `load()` returns a value [`Map`](https://docs.rs/clapfig/latest/clapfig/value/type.Map.html)
+- **Runtime-defined schemas** — plugin hosts and generated apps build an owned [`Schema`](https://docs.rs/clapfig/latest/clapfig/runtime/struct.Schema.html) (the named-field object constructor) with a fluent builder and get the exact same pipeline; walkers take [`Shape`](https://docs.rs/clapfig/latest/clapfig/runtime/enum.Shape.html); `load()` returns a value [`Map`](https://docs.rs/clapfig/latest/clapfig/value/type.Map.html)
+- **Root maps** — `Clapfig::typed::<BTreeMap<String, T>>()` / `HashMap<String, T>` where `T: Schema` loads `[core]` / `[site]` with no parent field; JSON Schema is `additionalProperties` of the item at the document root
+- **Internally tagged unions** — `#[serde(tag = "...")]` enums derive `Schema` (no `#[clapfig(tag)]`); JSON Schema is `oneOf` with a `const` on the tag; `config gen` emits one commented example per variant
 - **Prefix-based env vars** — `MYAPP__DATABASE__URL` maps to `database.url` automatically
 - **Kebab-case keys** — opt-in `.normalize_keys(true)` lets users write `pool-size = 5` in config files (or `--set database.pool-size=5` on the CLI) and have it map to a `pool_size` Rust field
 - **Strict mode** — unknown keys error with file path, key name, and line number when the span index locates the key; on by default, with a cascading per-subtree override system and a per-key callback for the edge cases
 - **Post-merge validation hook** — `.post_validate(|c| ...)` closes the gap between structural validation and the semantic constraints every real app has: port ranges, cross-field invariants, enum combinations, filesystem preconditions
 - **Structured errors + rendering** — [`ClapfigError`](https://docs.rs/clapfig/latest/clapfig/error/enum.ClapfigError.html) carries data (keys, paths, lines, source text); the [`render`](https://docs.rs/clapfig/latest/clapfig/render/index.html) module turns it into plain text or [`miette`](https://docs.rs/miette)-style output with snippets and carets (rich mode behind the `rich-errors` feature)
 - **Tracing** — with a subscriber that honors `RUST_LOG`, `RUST_LOG=clapfig=trace` narrates discovery, merge, and origin decisions; values never appear in logs
-- **Template generation** — emit a documented sample config from the struct's doc comments in any enabled format, including `Allowed:` lines for enum fields and typed placeholders for required fields; TOML and YAML use native comments, JSON carries docs via the community `"//"` comment-key convention
-- **JSON Schema generation** — [`clapfig::json_schema::generate_schema`](https://docs.rs/clapfig/latest/clapfig/json_schema/fn.generate_schema.html) produces a Draft 2020-12 JSON Schema — with `type` on every field and `enum` sets — for UI editors, external validators, and IDE integrations; also exposed as `app config schema`
+- **Template generation** — emit a documented sample config from the struct's doc comments in any enabled format, including `Allowed:` lines for enum fields, typed placeholders for required fields, and one commented example per tagged-union variant; TOML and YAML use native comments, JSON carries docs via the community `"//"` comment-key convention
+- **JSON Schema generation** — [`clapfig::json_schema::generate_schema`](https://docs.rs/clapfig/latest/clapfig/json_schema/fn.generate_schema.html) produces a Draft 2020-12 JSON Schema — with `type` on every field, `enum` sets, tagged unions as `oneOf` + `const` on the tag, and a root map as `additionalProperties` of the item at the document root — for UI editors, external validators, and IDE integrations; also exposed as `app config schema`
 - **Persistence with named scopes** — global/local config file patterns with `--scope` targeting
 
 **Clap adapter** (`clap` feature, on by default):
@@ -197,7 +199,7 @@ See the [Resolver docs](https://docs.rs/clapfig/latest/clapfig/struct.Resolver.h
 **Guides** (in [`docs/`](docs/)):
 
 - [Getting Started](docs/getting-started.md) — installation, first config struct, basic usage
-- [Derive Reference](docs/derive-reference.md) — `#[clapfig(...)]` attributes, supported types, enums, maps, arrays
+- [Derive Reference](docs/derive-reference.md) — `#[clapfig(...)]` attributes, supported types, enums, maps, arrays, tagged unions, root maps
 - [Layered Configuration](docs/layered-config.md) — layers, search paths, merge modes, env vars, overrides
 - [Runtime Schemas](docs/runtime-schemas.md) — building schemas at runtime for plugin hosts and generated apps
 - [Strictness Guide](docs/strictness.md) — the cascading strict-mode system
