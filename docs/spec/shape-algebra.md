@@ -358,8 +358,7 @@ callback; cascade-strict keys go through `on_unknown_key` (`Reject` /
 `Accept` / `Collect`) the same way a named-field object's unknown keys
 do today. `Collect` entries from either phase append to the same
 `load_with_unknowns` list. A given key is a candidate of at most one
-phase, so it is never collected twice. Cascade-lenient keys never
-reach the callback in either phase.
+phase, so it is never collected or callback-invoked twice.
 
 **Layered discriminator.** File A supplies `kind = "rust"`. File B
 supplies rust-only keys. An env var later sets `kind = "payload"`. Merge
