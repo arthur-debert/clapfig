@@ -1524,6 +1524,22 @@ mod tests {
     }
 
     #[test]
+    fn tagged_discriminator_values_are_not_path_segments() {
+        // Discriminators are closed enum values: serde-valid spellings
+        // with `.` / `[` / `]` must construct, matching derive.
+        let tagged = Shape::tagged("Block", "kind")
+            .variant("rust.v2", Schema::object("RustV2").build())
+            .variant("[legacy]", Schema::object("Legacy").build())
+            .build();
+        let names: Vec<&str> = tagged
+            .variants
+            .iter()
+            .map(|v| v.discriminator.as_str())
+            .collect();
+        assert_eq!(names, ["rust.v2", "[legacy]"]);
+    }
+
+    #[test]
     fn map_of_tagged_objects_constructs() {
         let tagged = Shape::from(
             Shape::tagged("Block", "kind")

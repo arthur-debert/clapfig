@@ -640,7 +640,11 @@ fn expand_tagged_enum(
     for variant in &data.variants {
         check_serde_attrs(&variant.attrs, SerdeCtx::Variant)?;
         let discriminator = variant_schema_name(variant, rename_all.as_deref())?;
-        validate_schema_field_name(&discriminator, "tagged discriminator", variant.ident.span())?;
+        // Discriminators are closed enum *values*, not dotted-path
+        // segments: serde-valid spellings like `rust.v2` or `[legacy]`
+        // are legal. The tag *field name* still uses
+        // `validate_schema_field_name` at the `#[serde(tag)]` site.
+        validate_tagged_discriminator(&discriminator, variant.ident.span())?;
         if !seen.insert(discriminator.clone()) {
             return Err(syn::Error::new(
                 variant.ident.span(),
@@ -2359,6 +2363,9 @@ fn expand_field(field: &syn::Field, rename_all: Option<&str>) -> syn::Result<Exp
 /// `source` names the attribute the string came from, for the diagnostic.
 /// Rust-identifier-derived names can't violate these rules and skip this
 /// check.
+///
+/// Not used for tagged-union discriminator *values* — those are a closed
+/// enum set, not path segments. See [`validate_tagged_discriminator`].
 fn validate_schema_field_name(
     name: &str,
     source: &str,
@@ -2382,6 +2389,20 @@ fn validate_schema_field_name(
             ),
         )),
         None => Ok(()),
+    }
+}
+
+/// Tagged discriminators must be non-empty; uniqueness is the caller's
+/// post-rename `seen` set. Path characters (`.`, `[`, `]`) are legal —
+/// the discriminator is a value, matching the runtime builder and serde.
+fn validate_tagged_discriminator(name: &str, span: proc_macro2::Span) -> syn::Result<()> {
+    if name.is_empty() {
+        Err(syn::Error::new(
+            span,
+            "invalid tagged discriminator \"\": discriminators must be non-empty",
+        ))
+    } else {
+        Ok(())
     }
 }
 

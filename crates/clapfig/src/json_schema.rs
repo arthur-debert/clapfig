@@ -123,16 +123,21 @@ fn comment_key_allowlist() -> Value {
     json!({ COMMENT_KEY_PATTERN: {} })
 }
 
-/// Generate a JSON Schema document from a config schema.
+/// Generate a JSON Schema document from an **object-root** config schema.
 ///
-/// Works for both entry points: pass the schema handed to
+/// Object-root only: pass the schema handed to
 /// [`Clapfig::builder`](crate::Clapfig::builder), or a derive-emitted
-/// schema via `C::schema()`.
+/// schema via `C::schema()`. Root [`Shape::Map`] / [`Shape::Tagged`]
+/// documents use [`generate_from_shape`].
 ///
 /// Returns a `serde_json::Value` — the caller serializes it to a string,
 /// writes it to a file, or embeds it wherever needed.
 pub fn generate_schema(schema: &Schema) -> Value {
-    generate_from_shape(&Shape::Object(schema.clone()))
+    let mut root = schema_to_object(schema);
+    if let Value::Object(map) = &mut root {
+        map.insert("$schema".into(), Value::String(SCHEMA_DIALECT.into()));
+    }
+    root
 }
 
 /// Generate a JSON Schema document from a document-root [`Shape`].

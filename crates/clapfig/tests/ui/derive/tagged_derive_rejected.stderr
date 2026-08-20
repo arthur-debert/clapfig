@@ -19,7 +19,7 @@ error: invalid schema field name "" from #[serde(tag)]: the name is empty. Pick 
 16 | enum EmptyTag {
    |      ^^^^^^^^
 
-error: invalid schema field name "" from tagged discriminator: the name is empty. Pick a non-empty name without '.', '[' or ']'.
+error: invalid tagged discriminator "": discriminators must be non-empty
   --> tests/ui/derive/tagged_derive_rejected.rs:24:5
    |
 24 |     Rust { mount: String },

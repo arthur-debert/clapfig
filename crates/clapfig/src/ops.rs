@@ -139,15 +139,24 @@ fn kebab_rename_shape(shape: &mut crate::runtime::Shape) {
         Shape::Object(child) => kebab_rename_fields(child),
         Shape::Array(array) => kebab_rename_shape(&mut array.item),
         Shape::Map(map) => kebab_rename_shape(&mut map.item),
-        Shape::Leaf(_) | Shape::Tagged(_) => {}
+        Shape::Tagged(tagged) => {
+            if tagged.tag.contains('_') {
+                tagged.tag = crate::normalize::kebab_key(&tagged.tag);
+            }
+            for variant in &mut tagged.variants {
+                kebab_rename_fields(&mut variant.schema);
+            }
+        }
+        Shape::Leaf(_) => {}
     }
 }
 
 /// Template generator: renders the documented config template for a
 /// schema through the given format adapter. With `kebab` set, the schema's
 /// field names are structurally renamed to kebab-case first (see
-/// [`kebab_renamed`]) so the rendered keys — in any format — match what a
-/// `normalize_keys(true)` builder accepts.
+/// [`kebab_renamed_shape`]) so the rendered keys — in any format — match what a
+/// `normalize_keys(true)` builder accepts. Tagged unions rename the tag
+/// key and every variant field; discriminator *values* are unchanged.
 ///
 /// The template body — doc comments, `Allowed:` enum lines, commented
 /// placeholders for defaultless leaves — is the adapter's
@@ -169,14 +178,8 @@ pub(crate) fn generate_template(
 
 /// Recursively rewrite field names in a document-root shape to kebab-case.
 fn kebab_renamed_shape(shape: &crate::runtime::Shape) -> crate::runtime::Shape {
-    use crate::runtime::Shape;
     let mut shaped = shape.clone();
-    match &mut shaped {
-        Shape::Object(schema) => kebab_rename_fields(schema),
-        Shape::Map(map) => kebab_rename_shape(&mut map.item),
-        Shape::Array(array) => kebab_rename_shape(&mut array.item),
-        Shape::Leaf(_) | Shape::Tagged(_) => {}
-    }
+    kebab_rename_shape(&mut shaped);
     shaped
 }
 

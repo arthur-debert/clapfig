@@ -34,7 +34,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::ClapfigError;
-use crate::format::Span;
+use crate::format::{ConfigPath, PathSegment, Span};
 use crate::runtime::{DocumentRoot, Schema, Shape, TaggedShape};
 use crate::types::InputType;
 use crate::value::{Map, Value};
@@ -362,12 +362,38 @@ impl StrictnessOverrides {
     /// The cascade walks from the leaf's section path upward, returning
     /// the first explicit override found. With no override on any
     /// ancestor, `default` is returned.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn effective_strict(&self, path: &str, leaf: &str, default: bool) -> bool {
-        // Walk subslices of the original `path` to avoid an allocation per
-        // step — `HashMap<String, _>::get` accepts `&str` via the `Borrow`
-        // impl. The only allocation in the loop body is `strip_brackets`,
-        // which we now skip when the cursor has no brackets to strip.
-        let mut cursor: &str = section_path_of(path, leaf);
+        self.effective_strict_at(path, leaf, None, default)
+    }
+
+    /// Like [`effective_strict`], but a root-map lookup strips the
+    /// structured first key rather than the first textual `.` segment —
+    /// a quoted entry `"acme.prod"` must not be split into `acme` / `prod`.
+    pub(crate) fn effective_strict_at(
+        &self,
+        path: &str,
+        leaf: &str,
+        config_path: Option<&ConfigPath>,
+        default: bool,
+    ) -> bool {
+        // Walk subslices of the (possibly schema-relative) path to avoid
+        // an allocation per step — `HashMap<String, _>::get` accepts
+        // `&str` via the `Borrow` impl. The only allocation in the loop
+        // body is `strip_brackets`, which we now skip when the cursor
+        // has no brackets to strip.
+        let section = section_path_of(path, leaf);
+        let relative;
+        let mut cursor: &str = if self.skip_root_entry {
+            let entry = config_path.and_then(|p| match p.segments().first() {
+                Some(PathSegment::Key(k)) => Some(k.as_str()),
+                _ => None,
+            });
+            relative = strip_root_map_entry(section, entry);
+            &relative
+        } else {
+            section
+        };
         loop {
             if let Some(v) = self.probe(cursor) {
                 return v;
@@ -380,18 +406,6 @@ impl StrictnessOverrides {
     }
 
     fn probe(&self, cursor: &str) -> Option<bool> {
-        if self.skip_root_entry {
-            if cursor.is_empty() {
-                return self.entries.get("").copied();
-            }
-            if cursor.contains('[') {
-                let schema_form = strip_brackets(cursor);
-                if let Some(v) = self.entries.get(strip_first_segment(&schema_form)) {
-                    return Some(*v);
-                }
-            }
-            return self.entries.get(strip_first_segment(cursor)).copied();
-        }
         if let Some(v) = self.entries.get(cursor) {
             return Some(*v);
         }
@@ -622,6 +636,21 @@ fn strip_first_segment(path: &str) -> &str {
         Some(i) => &path[i + 1..],
         None => "",
     }
+}
+
+/// Drop the root-map entry key from a display section path. `entry` is
+/// the structured first key (may contain `.`); without it, fall back to
+/// first-dot splitting.
+fn strip_root_map_entry(section: &str, entry: Option<&str>) -> String {
+    if let Some(entry) = entry {
+        if section == entry {
+            return String::new();
+        }
+        if let Some(rest) = section.strip_prefix(entry) {
+            return rest.strip_prefix('.').unwrap_or(rest).to_string();
+        }
+    }
+    strip_first_segment(section).to_string()
 }
 
 fn resolve_path_kind_root(root: DocumentRoot<'_>, dotted: &str) -> PathKind {
@@ -888,6 +917,37 @@ mod tests {
         let mut overrides = StrictnessOverrides::new();
         overrides.insert("plugins.audit", false);
         assert!(!overrides.effective_strict("plugins[0].audit.rogue", "rogue", true,));
+    }
+
+    #[test]
+    fn root_map_strips_structured_entry_not_first_dot() {
+        use crate::format::ConfigPath;
+        use crate::runtime::Shape;
+        let item = Schema::object("Site").nested(
+            "db",
+            Schema::object("Db")
+                .strict(false)
+                .field("url", Field::string().optional()),
+        );
+        let map = Shape::map("sites", item).build();
+        let overrides = StrictnessOverrides::from_root(DocumentRoot::Map(&map));
+        let path = ConfigPath::new().key("acme.prod").key("db").key("rogue");
+        assert!(
+            !overrides.effective_strict_at("acme.prod.db.rogue", "rogue", Some(&path), true),
+            "db.strict(false) must govern a quoted dotted entry"
+        );
+        let tight = Schema::object("Site").nested(
+            "db",
+            Schema::object("Db")
+                .strict(true)
+                .field("url", Field::string().optional()),
+        );
+        let tight_map = Shape::map("sites", tight).build();
+        let tight_ov = StrictnessOverrides::from_root(DocumentRoot::Map(&tight_map));
+        assert!(
+            tight_ov.effective_strict_at("acme.prod.db.rogue", "rogue", Some(&path), false),
+            "db.strict(true) must govern a quoted dotted entry"
+        );
     }
 
     #[test]

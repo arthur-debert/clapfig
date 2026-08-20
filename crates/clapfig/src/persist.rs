@@ -101,7 +101,36 @@ pub fn set_in_document(
         });
     }
 
-    let field = lookup_field_shape_root(shape, &canonical);
+    // Parse an existing document before typed lookup so a tagged
+    // object's selected discriminator can resolve variant fields.
+    // Classification reuses the same tree.
+    let parsed = match content {
+        Some(c) => Some(adapter.parse(c).map_err(ClapfigError::from)?),
+        None => None,
+    };
+    let existing = parsed.as_ref().map(|p| &p.value);
+
+    let disc_shape;
+    let field = match persist_target(shape, &canonical, existing) {
+        PersistTarget::Shape(s) => Some(s),
+        PersistTarget::Discriminator(tagged) => {
+            disc_shape = crate::runtime::Shape::leaf(tagged.discriminator_leaf_type());
+            Some(&disc_shape)
+        }
+        PersistTarget::Unaddressable { section, kind } => {
+            return Err(ClapfigError::UnaddressableKey {
+                key: key.into(),
+                section,
+                kind,
+            });
+        }
+        PersistTarget::Missing => {
+            return Err(ClapfigError::KeyNotFound {
+                key: key.into(),
+                suggestion: crate::meta::nearest_key_shape(shape, &canonical, normalize_keys),
+            });
+        }
+    };
     let mut value = parse_raw_value(raw_value, field)
         .map_err(|reason| ClapfigError::invalid_value(key, reason))?;
     if let Some(shape) = field {
@@ -111,16 +140,13 @@ pub fn set_in_document(
             .map_err(|reason| ClapfigError::invalid_value(key, reason))?;
     }
 
-    let (base, target, path) = match content {
-        Some(c) => {
+    let (base, target, path) = match (content, parsed) {
+        (Some(c), Some(parsed)) => {
             // Replace vs create-key depends on whether the path already
-            // resolves; classification parses the document — the edit's
-            // own first step, so parse failures (including a format that
-            // cannot parse at all) surface as-is. The same parsed tree
-            // resolves the concrete key spellings the edit targets.
-            let tree = adapter.parse(c).map_err(ClapfigError::from)?.value;
-            let (segments, exists) = resolve_document_path(&tree, &canonical, normalize_keys)
-                .map_err(|c| c.into_error(Path::new("")))?;
+            // resolves; classification uses the document parsed above.
+            let (segments, exists) =
+                resolve_document_path(&parsed.value, &canonical, normalize_keys)
+                    .map_err(|c| c.into_error(Path::new("")))?;
             let target = if exists {
                 SetTarget::ExistingValue
             } else {
@@ -128,7 +154,7 @@ pub fn set_in_document(
             };
             (c.to_string(), target, config_path(&segments))
         }
-        None => {
+        _ => {
             // Missing file: require the matrix row before template
             // seeding, so the refusal names the attempted operation
             // rather than template generation.
@@ -235,27 +261,17 @@ pub fn persist_value(
     Ok(ConfigResult::value_set(adapter, key.into(), value.into()))
 }
 
-/// Descend a runtime schema by dotted key path and return the target leaf's
-/// declared type. `None` when the path doesn't resolve to a leaf.
-fn lookup_field_shape<'a>(
-    schema: &'a crate::runtime::Schema,
-    dotted: &str,
-) -> Option<&'a crate::runtime::Shape> {
-    let mut current = schema;
-    let mut segments = dotted.split('.').peekable();
-    while let Some(seg) = segments.next() {
-        let nf = current.fields.iter().find(|f| f.name == seg)?;
-        match &nf.field {
-            shape if shape.is_value_field() && segments.peek().is_none() => {
-                return Some(shape);
-            }
-            crate::runtime::Shape::Object(inner) if segments.peek().is_some() => {
-                current = inner;
-            }
-            _ => return None,
-        }
-    }
-    None
+/// Typed persist target for a canonical dotted key.
+enum PersistTarget<'a> {
+    /// A declared value-shaped field.
+    Shape(&'a crate::runtime::Shape),
+    /// The synthetic tag leaf of a tagged union (closed discriminator enum).
+    Discriminator(&'a crate::runtime::TaggedShape),
+    /// Variant-specific or conflicting field with no unique type, or a
+    /// selected variant that does not own the key.
+    Unaddressable { section: String, kind: &'static str },
+    /// Path does not resolve (should not happen after `valid_keys`).
+    Missing,
 }
 
 /// Pure function: remove a key from a config document string through
@@ -449,9 +465,8 @@ fn unaddressable_container_shape(
             // path inside one). Same refuse as a named Map field.
             Some((root_map_section_label(map), "a map"))
         }
-        crate::runtime::Shape::Tagged(_)
-        | crate::runtime::Shape::Leaf(_)
-        | crate::runtime::Shape::Array(_) => None,
+        crate::runtime::Shape::Tagged(tagged) => unaddressable_in_tagged(tagged, canonical, ""),
+        crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => None,
     }
 }
 
@@ -463,16 +478,21 @@ fn root_map_section_label(map: &crate::runtime::MapShape) -> String {
     }
 }
 
-fn lookup_field_shape_root<'a>(
+fn persist_target<'a>(
     shape: &'a crate::runtime::Shape,
     dotted: &str,
-) -> Option<&'a crate::runtime::Shape> {
+    existing: Option<&Value>,
+) -> PersistTarget<'a> {
     match shape {
-        crate::runtime::Shape::Object(schema) => lookup_field_shape(schema, dotted),
-        crate::runtime::Shape::Map(_) => None,
-        crate::runtime::Shape::Tagged(_)
+        crate::runtime::Shape::Object(schema) => {
+            persist_target_schema(schema, dotted, existing.and_then(Value::as_map), "")
+        }
+        crate::runtime::Shape::Tagged(tagged) => {
+            persist_target_tagged(tagged, dotted, existing.and_then(Value::as_map), "")
+        }
+        crate::runtime::Shape::Map(_)
         | crate::runtime::Shape::Leaf(_)
-        | crate::runtime::Shape::Array(_) => None,
+        | crate::runtime::Shape::Array(_) => PersistTarget::Missing,
     }
 }
 
@@ -480,26 +500,256 @@ fn unaddressable_container(
     schema: &crate::runtime::Schema,
     canonical: &str,
 ) -> Option<(String, &'static str)> {
-    let mut current = schema;
-    let mut walked: Vec<&str> = Vec::new();
-    for seg in canonical.split('.') {
-        let nf = current.fields.iter().find(|f| f.name == seg)?;
-        walked.push(seg);
-        match &nf.field {
-            crate::runtime::Shape::Array(array) if !array.item.is_value_field() => {
-                return Some((walked.join("."), "an array"));
+    unaddressable_in_schema(schema, canonical, "")
+}
+
+fn unaddressable_in_schema(
+    schema: &crate::runtime::Schema,
+    canonical: &str,
+    prefix: &str,
+) -> Option<(String, &'static str)> {
+    let (head, rest) = split_first(canonical)?;
+    let nf = schema.fields.iter().find(|f| f.name == head)?;
+    unaddressable_in_shape(&nf.field, rest, &join_prefix(prefix, head))
+}
+
+fn unaddressable_in_shape(
+    shape: &crate::runtime::Shape,
+    rest: &str,
+    walked: &str,
+) -> Option<(String, &'static str)> {
+    match shape {
+        crate::runtime::Shape::Array(array) if !array.item.is_value_field() => {
+            Some((walked.to_string(), "an array"))
+        }
+        crate::runtime::Shape::Map(map) if !map.item.is_value_field() => {
+            Some((walked.to_string(), "a map"))
+        }
+        crate::runtime::Shape::Object(inner) => unaddressable_in_schema(inner, rest, walked),
+        crate::runtime::Shape::Tagged(tagged) => unaddressable_in_tagged(tagged, rest, walked),
+        crate::runtime::Shape::Leaf(_)
+        | crate::runtime::Shape::Array(_)
+        | crate::runtime::Shape::Map(_) => None,
+    }
+}
+
+fn unaddressable_in_tagged(
+    tagged: &crate::runtime::TaggedShape,
+    rest: &str,
+    prefix: &str,
+) -> Option<(String, &'static str)> {
+    if rest.is_empty() {
+        return None;
+    }
+    let (head, _) = split_first(rest)?;
+    if head == tagged.tag {
+        return None;
+    }
+    tagged
+        .variants
+        .iter()
+        .find_map(|variant| unaddressable_in_schema(&variant.schema, rest, prefix))
+}
+
+fn persist_target_schema<'a>(
+    schema: &'a crate::runtime::Schema,
+    dotted: &str,
+    table: Option<&crate::value::Map>,
+    prefix: &str,
+) -> PersistTarget<'a> {
+    let Some((head, rest)) = split_first(dotted) else {
+        return PersistTarget::Missing;
+    };
+    let Some(nf) = schema.fields.iter().find(|f| f.name == head) else {
+        return PersistTarget::Missing;
+    };
+    persist_target_in_shape(
+        &nf.field,
+        rest,
+        table.and_then(|t| t.get(head)),
+        &join_prefix(prefix, head),
+    )
+}
+
+fn persist_target_in_shape<'a>(
+    shape: &'a crate::runtime::Shape,
+    rest: &str,
+    value: Option<&Value>,
+    walked: &str,
+) -> PersistTarget<'a> {
+    if rest.is_empty() {
+        return if shape.is_value_field() {
+            PersistTarget::Shape(shape)
+        } else {
+            PersistTarget::Missing
+        };
+    }
+    match shape {
+        crate::runtime::Shape::Object(inner) => {
+            persist_target_schema(inner, rest, value.and_then(Value::as_map), walked)
+        }
+        crate::runtime::Shape::Tagged(tagged) => {
+            persist_target_tagged(tagged, rest, value.and_then(Value::as_map), walked)
+        }
+        _ => PersistTarget::Missing,
+    }
+}
+
+fn persist_target_tagged<'a>(
+    tagged: &'a crate::runtime::TaggedShape,
+    dotted: &str,
+    table: Option<&crate::value::Map>,
+    prefix: &str,
+) -> PersistTarget<'a> {
+    let Some((head, rest)) = split_first(dotted) else {
+        return PersistTarget::Missing;
+    };
+    if head == tagged.tag {
+        return if rest.is_empty() {
+            PersistTarget::Discriminator(tagged)
+        } else {
+            PersistTarget::Missing
+        };
+    }
+    let section = tagged_section(prefix, tagged);
+    if let Some(variant) = table.and_then(|t| tagged.selected(t)) {
+        if variant.schema.fields.iter().all(|f| f.name != head) {
+            return PersistTarget::Unaddressable {
+                section,
+                kind: "a tagged union",
+            };
+        }
+        return persist_target_schema(&variant.schema, dotted, table, prefix);
+    }
+    let declared = tagged.field_shapes(head);
+    if declared.is_empty() {
+        return PersistTarget::Missing;
+    }
+    // A field missing from some variants is variant-specific: refuse
+    // until a discriminator selects a branch (spec: targeted refuse).
+    if declared.len() != tagged.variants.len() {
+        return PersistTarget::Unaddressable {
+            section,
+            kind: "a tagged union",
+        };
+    }
+    let walked = join_prefix(prefix, head);
+    let child = table.and_then(|t| t.get(head));
+    if rest.is_empty() {
+        return unambiguous_value_shapes(declared, section);
+    }
+    let mut agreed: Option<PersistTarget<'a>> = None;
+    for shape in declared {
+        let next = persist_target_in_shape(shape, rest, child, &walked);
+        agreed = Some(match (agreed, next) {
+            (None, t) => t,
+            (Some(PersistTarget::Shape(a)), PersistTarget::Shape(b))
+                if same_persist_shape(a, b) =>
+            {
+                PersistTarget::Shape(a)
             }
-            crate::runtime::Shape::Map(map) if !map.item.is_value_field() => {
-                return Some((walked.join("."), "a map"));
+            (Some(PersistTarget::Discriminator(a)), PersistTarget::Discriminator(b))
+                if a.tag == b.tag =>
+            {
+                PersistTarget::Discriminator(a)
             }
-            crate::runtime::Shape::Object(inner) => current = inner,
-            crate::runtime::Shape::Leaf(_)
-            | crate::runtime::Shape::Array(_)
-            | crate::runtime::Shape::Map(_)
-            | crate::runtime::Shape::Tagged(_) => return None,
+            _ => {
+                return PersistTarget::Unaddressable {
+                    section,
+                    kind: "a tagged union",
+                };
+            }
+        });
+    }
+    agreed.unwrap_or(PersistTarget::Missing)
+}
+
+fn unambiguous_value_shapes<'a>(
+    declared: Vec<&'a crate::runtime::Shape>,
+    section: String,
+) -> PersistTarget<'a> {
+    if !declared.iter().all(|s| s.is_value_field()) {
+        return PersistTarget::Unaddressable {
+            section,
+            kind: "a tagged union",
+        };
+    }
+    let first = declared[0];
+    if declared
+        .iter()
+        .skip(1)
+        .all(|s| same_persist_shape(first, s))
+    {
+        PersistTarget::Shape(first)
+    } else {
+        PersistTarget::Unaddressable {
+            section,
+            kind: "a tagged union",
         }
     }
-    None
+}
+
+fn tagged_section(prefix: &str, tagged: &crate::runtime::TaggedShape) -> String {
+    if !prefix.is_empty() {
+        prefix.to_string()
+    } else if !tagged.name.is_empty() {
+        tagged.name.clone()
+    } else {
+        tagged.tag.clone()
+    }
+}
+
+fn join_prefix(prefix: &str, head: &str) -> String {
+    if prefix.is_empty() {
+        head.to_string()
+    } else {
+        format!("{prefix}.{head}")
+    }
+}
+
+fn split_first(dotted: &str) -> Option<(&str, &str)> {
+    if dotted.is_empty() {
+        return None;
+    }
+    match dotted.find('.') {
+        Some(i) => Some((&dotted[..i], &dotted[i + 1..])),
+        None => Some((dotted, "")),
+    }
+}
+
+fn same_persist_shape(a: &crate::runtime::Shape, b: &crate::runtime::Shape) -> bool {
+    use crate::runtime::Shape;
+    match (a, b) {
+        (Shape::Leaf(la), Shape::Leaf(lb)) => leaf_types_match(&la.ty, &lb.ty),
+        (Shape::Array(aa), Shape::Array(ab)) => same_persist_shape(&aa.item, &ab.item),
+        (Shape::Map(ma), Shape::Map(mb)) => same_persist_shape(&ma.item, &mb.item),
+        (Shape::Object(_), Shape::Object(_)) => true,
+        (Shape::Tagged(ta), Shape::Tagged(tb)) => ta.tag == tb.tag,
+        _ => false,
+    }
+}
+
+fn leaf_types_match(a: &crate::runtime::LeafType, b: &crate::runtime::LeafType) -> bool {
+    use crate::runtime::LeafType;
+    match (a, b) {
+        (LeafType::String, LeafType::String)
+        | (LeafType::Float, LeafType::Float)
+        | (LeafType::Bool, LeafType::Bool)
+        | (LeafType::DateTime, LeafType::DateTime)
+        | (LeafType::Value, LeafType::Value) => true,
+        (
+            LeafType::Integer {
+                min: a_min,
+                max: a_max,
+            },
+            LeafType::Integer {
+                min: b_min,
+                max: b_max,
+            },
+        ) => a_min == b_min && a_max == b_max,
+        (LeafType::Enum { values: a }, LeafType::Enum { values: b }) => a == b,
+        _ => false,
+    }
 }
 
 /// Parse a raw `config set` string into a typed config value **according
@@ -1847,5 +2097,120 @@ mod tests {
 
         let result = unset_value(&TomlAdapter, &path, "port", false).unwrap();
         assert!(matches!(result, ConfigResult::ValueUnset { .. }));
+    }
+
+    fn tagged_block() -> Shape {
+        use crate::runtime::{Field, Schema};
+        Shape::from(
+            Shape::tagged("Block", "kind")
+                .variant(
+                    "rust",
+                    Schema::object("Rust")
+                        .field("mount", Field::string())
+                        .field("crate_path", Field::string().optional())
+                        .build(),
+                )
+                .variant(
+                    "payload",
+                    Schema::object("Payload")
+                        .field("mount", Field::string())
+                        .field("artifact", Field::string())
+                        .build(),
+                )
+                .build(),
+        )
+    }
+
+    fn nested_tagged_app() -> Shape {
+        use crate::runtime::Schema;
+        Shape::from(Schema::object("App").field("block", tagged_block()).build())
+    }
+
+    #[test]
+    fn set_tagged_tag_rejects_numeric_looking_invalid_discriminator() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &tagged_block(),
+            Some("kind = \"rust\"\nmount = \".\"\n"),
+            "kind",
+            "123",
+            false,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::InvalidValue { key, reason, .. } => {
+                assert_eq!(key, "kind");
+                assert!(reason.contains("not in allowed set"), "{reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_tagged_string_field_keeps_numeric_looking_value() {
+        let result = set_in_document(
+            &TomlAdapter,
+            &tagged_block(),
+            Some("kind = \"rust\"\nmount = \".\"\n"),
+            "mount",
+            "123",
+            false,
+        )
+        .unwrap();
+        assert!(result.contains("mount = \"123\""), "{result}");
+    }
+
+    #[test]
+    fn set_nested_tagged_tag_rejects_numeric_looking_invalid_discriminator() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &nested_tagged_app(),
+            Some("[block]\nkind = \"rust\"\nmount = \".\"\n"),
+            "block.kind",
+            "123",
+            false,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::InvalidValue { key, reason, .. } => {
+                assert_eq!(key, "block.kind");
+                assert!(reason.contains("not in allowed set"), "{reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_variant_exclusive_field_without_discriminator_refuses() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &tagged_block(),
+            Some(""),
+            "artifact",
+            "out",
+            false,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::UnaddressableKey { key, kind, .. } => {
+                assert_eq!(key, "artifact");
+                assert_eq!(kind, "a tagged union");
+            }
+            other => panic!("expected UnaddressableKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_variant_exclusive_field_uses_selected_discriminator() {
+        let result = set_in_document(
+            &TomlAdapter,
+            &tagged_block(),
+            Some("kind = \"payload\"\nmount = \".\"\nartifact = \"old\"\n"),
+            "artifact",
+            "123",
+            false,
+        )
+        .unwrap();
+        assert!(result.contains("artifact = \"123\""), "{result}");
     }
 }

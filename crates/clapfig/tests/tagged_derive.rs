@@ -203,6 +203,102 @@ fn tagged_field_paths_union_nested_descendants_of_shared_names() {
 }
 
 #[test]
+fn tagged_normalize_keys_renames_tag_and_variant_fields_not_discriminators() {
+    use clapfig::format::{FormatAdapter, JsonAdapter, TomlAdapter, YamlAdapter};
+    use clapfig::runtime::{Field, Schema as RtSchema};
+
+    let tagged = Shape::from(
+        Shape::tagged("Block", "block_kind")
+            .variant(
+                "rust",
+                RtSchema::object("Rust")
+                    .field("crate_path", Field::string())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                RtSchema::object("Payload")
+                    .field("artifact_name", Field::string())
+                    .build(),
+            )
+            .build(),
+    );
+    let nested = Shape::from(
+        RtSchema::object("App")
+            .field("site_block", tagged.clone())
+            .build(),
+    );
+
+    for (adapter, tag_needle, field_needle, disc_needle) in [
+        (
+            &TomlAdapter as &dyn FormatAdapter,
+            "block-kind",
+            "crate-path",
+            "rust",
+        ),
+        (&YamlAdapter, "block-kind", "crate-path", "rust"),
+        (&JsonAdapter, "block-kind", "crate-path", "rust"),
+    ] {
+        for shape in [&tagged, &nested] {
+            let text = Clapfig::builder(shape.clone())
+                .app_name("demo")
+                .formats([adapter.name()])
+                .normalize_keys(true)
+                .no_env()
+                .handle(&clapfig::ConfigAction::Gen { output: None })
+                .unwrap();
+            let text = match text {
+                clapfig::ConfigResult::Template(t) => t,
+                other => panic!("expected Template, got {other:?}"),
+            };
+            assert!(
+                text.contains(tag_needle),
+                "{}: tag key should kebab: {text}",
+                adapter.name()
+            );
+            assert!(
+                text.contains(field_needle),
+                "{}: variant field should kebab: {text}",
+                adapter.name()
+            );
+            assert!(
+                text.contains(disc_needle),
+                "{}: discriminator values stay: {text}",
+                adapter.name()
+            );
+            assert!(
+                !text.contains("block_kind") && !text.contains("crate_path"),
+                "{}: snake keys must not remain: {text}",
+                adapter.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn tagged_config_get_returns_tag_documentation() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("app.toml"), "kind = \"off\"\n").unwrap();
+    let result = Clapfig::typed::<Block>()
+        .app_name("app")
+        .file_name("app.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .handle(&clapfig::ConfigAction::Get {
+            key: "kind".into(),
+            scope: None,
+        })
+        .unwrap();
+    match result {
+        clapfig::ConfigResult::KeyValue { key, value, .. } => {
+            assert_eq!(key, "kind");
+            assert_eq!(value, "off");
+        }
+        other => panic!("expected KeyValue, got {other:?}"),
+    }
+}
+
+#[test]
 fn tagged_config_gen_one_commented_example_per_variant() {
     use clapfig::format::{FormatAdapter, TomlAdapter};
 
@@ -248,6 +344,41 @@ fn object_root_without_tagged_stays_byte_identical() {
     assert!(
         !text.contains("kind ="),
         "object-root must not invent a tagged example: {text}"
+    );
+}
+
+#[test]
+fn tagged_discriminators_may_contain_path_characters() {
+    #[derive(Schema, Serialize, Deserialize, Debug, Clone, PartialEq)]
+    #[serde(tag = "kind")]
+    enum Versioned {
+        #[serde(rename = "rust.v2")]
+        RustV2 { mount: String },
+        #[serde(rename = "[legacy]")]
+        Legacy { mount: String },
+    }
+
+    match Versioned::shape() {
+        Shape::Tagged(tagged) => {
+            let names: Vec<&str> = tagged
+                .variants
+                .iter()
+                .map(|v| v.discriminator.as_str())
+                .collect();
+            assert_eq!(names, ["rust.v2", "[legacy]"]);
+        }
+        other => panic!("expected Tagged, got {other:?}"),
+    }
+
+    let dotted: Versioned = write_and_load_typed("kind = \"rust.v2\"\nmount = \".\"\n").unwrap();
+    assert_eq!(dotted, Versioned::RustV2 { mount: ".".into() });
+    let bracket: Versioned =
+        write_and_load_typed("kind = \"[legacy]\"\nmount = \"/old\"\n").unwrap();
+    assert_eq!(
+        bracket,
+        Versioned::Legacy {
+            mount: "/old".into(),
+        }
     );
 }
 

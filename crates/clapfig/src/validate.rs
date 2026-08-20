@@ -183,9 +183,9 @@ pub(crate) fn filter_through_cascade(
             leaf,
             config_path,
         } = entry;
-        let strict = ctx
-            .overrides
-            .effective_strict(&key, &leaf, ctx.default_strict);
+        let strict =
+            ctx.overrides
+                .effective_strict_at(&key, &leaf, Some(&config_path), ctx.default_strict);
         if !strict {
             // Lenient subtree — drop silently.
             continue;
