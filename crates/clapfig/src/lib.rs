@@ -97,9 +97,9 @@
 //!   keys, ordered maps) do not get to, and formats that express less map into
 //!   the baseline by explicit adapter rules. A config file means the same
 //!   thing in every format: identical schema validation and strict-mode
-//!   accept/reject decisions. (Unknown-key line numbers and source
-//!   snippets are TOML-only today — YAML/JSON strict errors name the key
-//!   and file but carry no source line.)
+//!   accept/reject decisions. Unknown-key and `InvalidValue` errors
+//!   locate the offending token from the adapter's byte-span index in
+//!   TOML, YAML, and JSON (line/column at render time).
 //! - **Datetimes cross formats by schema, not by sniffing.** TOML has
 //!   first-class datetimes; in YAML and JSON they are written as strings
 //!   in TOML's four datetime spellings (offset date-time, local
@@ -367,7 +367,7 @@
 //!
 //! Strict mode is **on by default**. When a config file contains a key that
 //! doesn't match any field in your schema, loading fails with the file path,
-//! key name, and — for TOML sources — the line number:
+//! key name, and the line number:
 //!
 //! ```text
 //! Unknown key 'typo_key' in /home/user/.config/myapp/myapp.toml (line 5)
@@ -452,8 +452,8 @@
 //! value as `Option<&value::Value>` (`None` in the rare case lookup can't
 //! resolve — out-of-bounds array index, path through a non-map
 //! intermediate), the source file, and the 1-indexed line number
-//! (`Some` on a best-effort match in TOML sources; always `None` for
-//! YAML/JSON and non-file sources).
+//! (`Some` when the file's span index locates the key; `None` for
+//! non-file sources and missing lookup).
 //!
 //! # Runtime-defined schemas
 //!
@@ -780,8 +780,8 @@
 //! # Error handling
 //!
 //! All fallible operations return [`ClapfigError`]. Errors are designed to
-//! be user-facing: unknown keys include file paths (and, for TOML sources,
-//! line numbers), unknown scopes list the available ones, and missing
+//! be user-facing: unknown keys include file paths and line numbers
+//! (TOML, YAML, and JSON), unknown scopes list the available ones, and missing
 //! prerequisites reference the builder method to call. See the [`error`]
 //! module for the full set.
 

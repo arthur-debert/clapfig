@@ -14,10 +14,10 @@
 //! the single typed refusal, [`UnsupportedByFormat`] — never a silent
 //! lossy fallback.
 //!
-//! The trait also carries the seam the provenance epic consumes:
-//! [`FormatAdapter::parse`] returns the value tree and a path → span
-//! index together ([`Parsed`], ADR-0005), so source-mapping attaches at
-//! this one seam instead of per-format branches.
+//! Parse returns `{value, spans}`: [`FormatAdapter::parse`] returns the
+//! value tree and a path → span index together ([`Parsed`], ADR-0005).
+//! Shipped adapters (TOML, YAML, JSON) fill the index so unknown-key
+//! and `InvalidValue` errors locate the token from byte spans.
 //!
 //! This module holds the contract and its pure data structures; the
 //! adapters themselves live in [`toml`], [`yaml`], and [`json`], and the

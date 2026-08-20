@@ -42,7 +42,7 @@ use crate::value::Value;
 /// Context handed to an [`on_unknown_key`](crate::Builder::on_unknown_key)
 /// callback. Carries every signal the callback needs to make a per-key
 /// decision: where the key lives in the merged tree, what it was, what
-/// file produced it, and — for TOML sources — which line.
+/// file produced it, and which line (from the file's span index).
 #[derive(Debug)]
 pub struct UnknownKeyContext<'a> {
     /// Full dotted path with every segment unquoted, e.g.
@@ -88,8 +88,9 @@ pub struct UnknownKeyContext<'a> {
     /// not a file. Derived from [`span`](Self::span).
     pub line: Option<usize>,
 
-    /// Byte span of the **key** token (ADR-0006). `None` until a format
-    /// adapter fills the span index, and `None` for non-file origins.
+    /// Byte span of the **key** token (ADR-0006). Set from the file's
+    /// span index when that path has a key token; `None` when the index
+    /// has no entry or the origin is not a file.
     pub span: Option<Span>,
 
     /// Environment variable that supplied this key, when it came from
@@ -100,8 +101,7 @@ pub struct UnknownKeyContext<'a> {
     /// the URL layer.
     pub url_key: Option<&'a str>,
 
-    /// Which input type produced the key. `None` until later provenance
-    /// slices fill origin facts.
+    /// Which input type produced the key. `None` when unset.
     pub input_type: Option<InputType>,
 }
 
@@ -148,8 +148,9 @@ pub struct CollectedUnknown {
     /// 1-indexed line number in `file`, if the span index located the
     /// key. See [`UnknownKeyContext::line`].
     pub line: Option<usize>,
-    /// Byte span of the **key** token (ADR-0006). `None` until a format
-    /// adapter fills the span index.
+    /// Byte span of the **key** token (ADR-0006). Set from the file's
+    /// span index when that path has a key token; `None` when the index
+    /// has no entry or the origin is not a file.
     pub span: Option<Span>,
     /// Environment variable that supplied this key, when it came from
     /// the env layer.
@@ -157,8 +158,7 @@ pub struct CollectedUnknown {
     /// URL query-parameter key that supplied this key, when it came from
     /// the URL layer.
     pub url_key: Option<String>,
-    /// Which input type produced the key. `None` until later provenance
-    /// slices fill origin facts.
+    /// Which input type produced the key. `None` when unset.
     pub input_type: Option<InputType>,
 }
 
