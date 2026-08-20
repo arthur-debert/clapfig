@@ -1275,11 +1275,6 @@ fn check_tagged(
             let variant = tagged
                 .variant(disc)
                 .expect("enum check passed: discriminator names a variant");
-            if let Some(origin) = crate::origin::lookup(origins, &tag_path) {
-                crate::trace::tagged_branch_selected(&tag_path, &origin.label(), value.type_str());
-            } else {
-                crate::trace::tagged_branch_selected(&tag_path, "unknown", value.type_str());
-            }
             check_required_and_types(
                 table,
                 origins,
@@ -1288,6 +1283,125 @@ fn check_tagged(
                 path,
                 discovery,
             )
+        }
+    }
+}
+
+/// Emit `tagged branch selected` for every tagged node whose discriminator
+/// already names a known variant. Missing, mistyped, or unknown tags emit
+/// nothing. Called after merge/defaults and before phase-2 exclusive-key
+/// filtering so a rejected exclusive key still records that selection
+/// happened. Nested tagged objects, array items, and map entries are
+/// walked the same way [`check_tagged`] would on the success path.
+pub(crate) fn trace_selected_tagged_root(table: &Map, root: DocumentRoot<'_>, origins: &OriginMap) {
+    match root {
+        DocumentRoot::Object(schema) => {
+            trace_selected_tagged_object(table, schema, &ConfigPath::new(), origins);
+        }
+        DocumentRoot::Map(map) => {
+            let path = ConfigPath::new();
+            for (key, value) in table {
+                trace_selected_tagged_in_shape(value, &map.item, &path.clone().key(key), origins);
+            }
+        }
+        DocumentRoot::Tagged(tagged) => {
+            trace_selected_tagged(table, tagged, &ConfigPath::new(), origins);
+        }
+    }
+}
+
+fn emit_tagged_branch_selected(
+    table: &Map,
+    tagged: &TaggedShape,
+    path: &ConfigPath,
+    origins: &OriginMap,
+) {
+    let Some(value) = table.get(&tagged.tag) else {
+        return;
+    };
+    if tagged.selected(table).is_none() {
+        return;
+    }
+    let tag_path = path.clone().key(&tagged.tag);
+    match crate::origin::lookup(origins, &tag_path) {
+        Some(origin) => {
+            crate::trace::tagged_branch_selected(&tag_path, &origin.label(), value.type_str());
+        }
+        None => crate::trace::tagged_branch_selected(&tag_path, "unknown", value.type_str()),
+    }
+}
+
+fn trace_selected_tagged(
+    table: &Map,
+    tagged: &TaggedShape,
+    path: &ConfigPath,
+    origins: &OriginMap,
+) {
+    emit_tagged_branch_selected(table, tagged, path, origins);
+    let Some(selected) = tagged.selected(table) else {
+        return;
+    };
+    for nf in &selected.schema.fields {
+        if let Some(value) = table.get(&nf.name) {
+            trace_selected_tagged_in_shape(value, &nf.field, &path.clone().key(&nf.name), origins);
+        }
+    }
+}
+
+fn trace_selected_tagged_object(
+    table: &Map,
+    schema: &Schema,
+    path: &ConfigPath,
+    origins: &OriginMap,
+) {
+    for nf in &schema.fields {
+        if let Some(value) = table.get(&nf.name) {
+            trace_selected_tagged_in_shape(value, &nf.field, &path.clone().key(&nf.name), origins);
+        }
+    }
+}
+
+fn trace_selected_tagged_in_shape(
+    value: &Value,
+    shape: &Shape,
+    path: &ConfigPath,
+    origins: &OriginMap,
+) {
+    match shape {
+        Shape::Leaf(_) => {}
+        Shape::Object(nested) => {
+            if let Value::Map(inner) = value {
+                trace_selected_tagged_object(inner, nested, path, origins);
+            }
+        }
+        Shape::Array(array) => {
+            if let Value::Array(items) = value {
+                for (i, item) in items.iter().enumerate() {
+                    trace_selected_tagged_in_shape(
+                        item,
+                        &array.item,
+                        &path.clone().index(i),
+                        origins,
+                    );
+                }
+            }
+        }
+        Shape::Map(map) => {
+            if let Value::Map(entries) = value {
+                for (key, entry) in entries {
+                    trace_selected_tagged_in_shape(
+                        entry,
+                        &map.item,
+                        &path.clone().key(key),
+                        origins,
+                    );
+                }
+            }
+        }
+        Shape::Tagged(tagged) => {
+            if let Value::Map(inner) = value {
+                trace_selected_tagged(inner, tagged, path, origins);
+            }
         }
     }
 }

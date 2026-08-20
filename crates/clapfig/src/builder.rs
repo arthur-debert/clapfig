@@ -76,28 +76,31 @@ enum FileNaming {
 /// [`Clapfig::typed`](crate::Clapfig::typed), whose
 /// [`TypedBuilder`](crate::TypedBuilder) forwards to this
 /// builder.
-/// Document root stored on the builder / resolver.
-enum StoredRoot {
-    Object(Arc<Schema>),
-    Map(Arc<MapShape>),
-    Tagged(Arc<TaggedShape>),
-}
+/// Document root stored on the builder / resolver as a shared [`Arc<Shape>`].
+///
+/// [`Builder::from_shape`] retains the caller's Arc (typed `shape_arc`
+/// caches). Owned constructors wrap a newly allocated Arc.
+struct StoredRoot(Arc<Shape>);
 
 impl StoredRoot {
     fn as_document(&self) -> DocumentRoot<'_> {
-        match self {
-            StoredRoot::Object(schema) => DocumentRoot::Object(schema.as_ref()),
-            StoredRoot::Map(map) => DocumentRoot::Map(map.as_ref()),
-            StoredRoot::Tagged(tagged) => DocumentRoot::Tagged(tagged.as_ref()),
+        match self.0.as_ref() {
+            Shape::Object(schema) => DocumentRoot::Object(schema),
+            Shape::Map(map) => DocumentRoot::Map(map),
+            Shape::Tagged(tagged) => DocumentRoot::Tagged(tagged),
+            Shape::Leaf(_) | Shape::Array(_) => {
+                unreachable!("illegal document roots are rejected by require_document_root")
+            }
         }
     }
 
-    fn as_shape(&self) -> Shape {
-        match self {
-            StoredRoot::Object(schema) => Shape::Object((**schema).clone()),
-            StoredRoot::Map(map) => Shape::Map((**map).clone()),
-            StoredRoot::Tagged(tagged) => Shape::Tagged((**tagged).clone()),
-        }
+    fn as_shape(&self) -> &Shape {
+        self.0.as_ref()
+    }
+
+    #[cfg(test)]
+    fn shares_arc(&self, other: &Arc<Shape>) -> bool {
+        Arc::ptr_eq(&self.0, other)
     }
 }
 
@@ -127,34 +130,28 @@ impl Builder {
         Self::from_arc(Arc::new(schema))
     }
 
-    /// Construct a builder reusing an already-`Arc<Schema>`-cached schema
-    /// (e.g. the per-type cache the `clapfig::Schema` derive maintains).
-    /// Skips the per-builder allocation of the schema tree that
-    /// [`new`](Self::new) performs.
+    /// Construct a builder from an owned object-root schema. Wraps it as
+    /// [`Shape::Object`] in a fresh Arc.
     pub(crate) fn from_arc(schema: Arc<Schema>) -> Self {
-        Self::from_root(StoredRoot::Object(schema))
+        let schema = Arc::try_unwrap(schema).unwrap_or_else(|arc| (*arc).clone());
+        Self::from_shape(Arc::new(Shape::Object(schema)))
     }
 
     pub(crate) fn from_tagged(tagged: TaggedShape) -> Self {
-        Self::from_root(StoredRoot::Tagged(Arc::new(tagged)))
+        Self::from_shape(Arc::new(Shape::Tagged(tagged)))
     }
 
     pub(crate) fn from_map(map: MapShape) -> Self {
-        Self::from_root(StoredRoot::Map(Arc::new(map)))
+        Self::from_shape(Arc::new(Shape::Map(map)))
     }
 
     /// Construct a builder from an already-`Arc<Shape>`-cached document
     /// root (typed HashMap/BTreeMap roots, or an object-root derive cache).
+    /// Retains `shape` so construction is clone-free at the tree — one
+    /// `Arc::clone` at the caller, not a deep clone of the schema.
     pub(crate) fn from_shape(shape: Arc<Shape>) -> Self {
-        match Arc::try_unwrap(shape).unwrap_or_else(|arc| (*arc).clone()) {
-            Shape::Object(schema) => Self::from_arc(Arc::new(schema)),
-            Shape::Map(map) => Self::from_map(map),
-            Shape::Tagged(tagged) => Self::from_tagged(tagged),
-            other => {
-                other.require_document_root();
-                unreachable!("illegal document roots are rejected by require_document_root")
-            }
-        }
+        shape.require_document_root();
+        Self::from_root(StoredRoot(shape))
     }
 
     fn from_root(schema: StoredRoot) -> Self {
@@ -838,7 +835,7 @@ impl Builder {
                         };
                         let template = ops::generate_template(
                             adapter.as_ref(),
-                            &self.schema.as_shape(),
+                            self.schema.as_shape(),
                             self.normalize_keys,
                         )?;
                         if let Some(parent) = path.parent() {
@@ -861,7 +858,7 @@ impl Builder {
                             .expect("effective_registry always registers an adapter");
                         let template = ops::generate_template(
                             preferred,
-                            &self.schema.as_shape(),
+                            self.schema.as_shape(),
                             self.normalize_keys,
                         )?;
                         Ok(ConfigResult::Template(template))
@@ -869,7 +866,7 @@ impl Builder {
                 }
             }
             ConfigAction::Schema { output } => {
-                let value = crate::json_schema::generate_from_shape(&self.schema.as_shape());
+                let value = crate::json_schema::generate_from_shape(self.schema.as_shape());
                 let schema = serde_json::to_string_pretty(&value)
                     .expect("serde_json::Value serialization is infallible");
                 match output {
@@ -891,14 +888,16 @@ impl Builder {
             }
             ConfigAction::Get { key, scope } => match scope {
                 None => {
-                    let shape = self.schema.as_shape();
+                    // Clone the Arc so `load()` can consume `self` while
+                    // `get_from_table` still borrows the shape.
+                    let shape = Arc::clone(&self.schema.0);
                     let normalize_keys = self.normalize_keys;
                     // Merged view: display renders in the preferred
                     // (first-enabled) format's spelling.
                     let registry = self.effective_registry()?;
                     let table = self.load()?;
                     get_from_table(
-                        &shape,
+                        shape.as_ref(),
                         &table,
                         key,
                         normalize_keys,
@@ -911,7 +910,7 @@ impl Builder {
                     let (path, adapter) = self.resolve_scope_persist_path(Some(name))?;
                     get_scope(
                         adapter.as_ref(),
-                        &self.schema.as_shape(),
+                        self.schema.as_shape(),
                         name,
                         &path,
                         key,
@@ -923,7 +922,7 @@ impl Builder {
                 let (path, adapter) = self.resolve_scope_persist_path(scope.as_deref())?;
                 persist::persist_value(
                     adapter.as_ref(),
-                    &self.schema.as_shape(),
+                    self.schema.as_shape(),
                     &path,
                     key,
                     value,
@@ -1458,6 +1457,41 @@ mod tests {
                     .field("pool_size", RtField::integer().default(5i64)),
             )
             .build()
+    }
+
+    #[test]
+    fn from_shape_retains_shared_object_arc() {
+        let cached = Arc::new(Shape::Object(demo_schema()));
+        // Extra clone so `Arc::try_unwrap` cannot succeed — the derive
+        // cache holds one Arc and `shape_arc()` hands out another.
+        let builder = Builder::from_shape(Arc::clone(&cached));
+        assert!(
+            builder.schema.shares_arc(&cached),
+            "from_shape must keep the caller's Arc, not deep-clone the Shape tree"
+        );
+    }
+
+    #[test]
+    fn from_shape_retains_shared_map_and_tagged_arcs() {
+        let map = Arc::new(Shape::Map(
+            Shape::map("blocks", crate::runtime::LeafType::String).build(),
+        ));
+        let map_builder = Builder::from_shape(Arc::clone(&map));
+        assert!(
+            map_builder.schema.shares_arc(&map),
+            "root-map from_shape must keep the caller's Arc"
+        );
+
+        let tagged = Arc::new(Shape::Tagged(
+            Shape::tagged("Block", "kind")
+                .variant("off", Schema::object("Off").build())
+                .build(),
+        ));
+        let tagged_builder = Builder::from_shape(Arc::clone(&tagged));
+        assert!(
+            tagged_builder.schema.shares_arc(&tagged),
+            "tagged from_shape must keep the caller's Arc"
+        );
     }
 
     // --- file + defaults ---

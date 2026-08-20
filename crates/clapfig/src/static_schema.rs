@@ -820,12 +820,11 @@ pub trait Schema {
         Arc::new(Self::shape())
     }
 
-    /// `Arc`-flavored access to the same cached runtime view. Used by the
-    /// macro-driven builder ([`crate::TypedBuilder`]) to avoid
-    /// cloning the schema tree per builder construction — the inner
-    /// [`crate::Builder`] stores an `Arc<Shape>` built from this object
-    /// for named-field roots. Cost: one `Arc::clone` per call (atomic
-    /// increment, no allocation).
+    /// `Arc`-flavored access to the same cached runtime view. Object-root
+    /// derive impls cache this so [`schema`](Self::schema) and this
+    /// method share one tree. Cost: one `Arc::clone` per call (atomic
+    /// increment, no allocation). Typed construction uses
+    /// [`shape_arc`](Self::shape_arc).
     fn schema_arc() -> Arc<RuntimeSchema>;
 
     /// Flat list of every dotted path the schema knows about: leaf

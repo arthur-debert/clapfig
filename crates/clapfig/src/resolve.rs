@@ -339,6 +339,13 @@ pub(crate) fn resolve(
     // Default origins fill in the same walk (ADR-0004).
     schema_walk::fill_defaults_into_root(&mut merged, &mut origins, input.schema);
 
+    // Selection is traced here — before phase 2 — so a valid discriminator
+    // that then fails on a branch-exclusive key still records that a
+    // variant was selected. Missing / mistyped / unknown tags emit nothing.
+    if crate::trace::trace_event_enabled() {
+        schema_walk::trace_selected_tagged_root(&merged, input.schema, &origins);
+    }
+
     if cascade_active {
         let mut exclusive = Vec::new();
         schema_walk::collect_branch_exclusive_root(&merged, input.schema, &mut exclusive);
