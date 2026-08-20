@@ -290,13 +290,19 @@ pub struct Span {
 ///
 /// Two diagnostics caret two different ranges: unknown-key errors the
 /// key token, post-merge value errors the assigned value. A single span
-/// makes one of those carets a lie. `key` is `None` on array elements —
-/// there is no key token in source for `[[servers]]` entries or JSON
-/// array items. The origin retained on the shadow tree keeps the
-/// **value** span; unknown-key lookup uses the **key** span.
+/// makes one of those carets a lie. `key` is `None` on array elements
+/// that exist in source — there is no key token for `[[servers]]`
+/// entries or JSON array items. YAML alias-expanded paths (ADR-0008)
+/// are the exception: a path that exists in [`Value`] only because an
+/// alias expanded carets the `*name` token for both `key` and `value`,
+/// including expanded sequence items. The origin retained on the shadow
+/// tree keeps the **value** span; unknown-key lookup uses the **key**
+/// span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpanEntry {
-    /// Byte range of the key token, if any. `None` on array elements.
+    /// Byte range of the key token, if any. `None` on written array
+    /// elements. YAML alias-expanded paths (ADR-0008) use the `*name`
+    /// token for both sides, including expanded sequence items.
     pub key: Option<Span>,
     /// Byte range of the assigned value.
     pub value: Span,
@@ -305,17 +311,19 @@ pub struct SpanEntry {
 /// The value tree and path → span index produced by one
 /// [`FormatAdapter::parse`] (ADR-0005).
 ///
-/// `spans` covers every path in `value` when an adapter fills it. An
-/// empty map is this workstream's holding state, not a legal degradation
-/// of the finished contract — later slices fill the index. Callers that
-/// only want a [`Value`] (persist, some tests) use [`Parsed::value`].
+/// `spans` covers every path in `value` when an adapter fills it. YAML
+/// fills the index (ADR-0008). An empty map is holding state for adapters
+/// that have not landed their span slice yet, not a legal degradation of
+/// the finished contract. Callers that only want a [`Value`] (persist,
+/// some tests) use [`Parsed::value`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Parsed {
     /// The document as a clapfig [`Value`] tree.
     pub value: Value,
-    /// Path → [`SpanEntry`] index. Empty until a later workstream fills
-    /// spans; a successful parse of the finished contract covers every
-    /// path in [`value`](Self::value).
+    /// Path → [`SpanEntry`] index. YAML fills this (ADR-0008); other
+    /// adapters still return empty until their workstream lands. A
+    /// successful parse of the finished contract covers every path in
+    /// [`value`](Self::value).
     pub spans: BTreeMap<ConfigPath, SpanEntry>,
 }
 
@@ -470,8 +478,9 @@ pub trait FormatAdapter: Send + Sync {
     /// One parse produces both (ADR-0005): JSON strips `//` comment keys
     /// and YAML resolves aliases in this same walk, so a second pass over
     /// the text cannot stay in sync. Callers that only want the tree use
-    /// [`Parsed::value`]. Span maps are empty until later workstreams
-    /// fill them; the finished contract covers every path in `value`.
+    /// [`Parsed::value`]. YAML fills the span index (ADR-0008); TOML and
+    /// JSON still return an empty map until their workstreams land. The
+    /// finished contract covers every path in `value`.
     fn parse(&self, text: &str) -> Result<Parsed, FormatError>;
 
     /// Serialize a [`Value`] tree to this format's source text.
@@ -829,9 +838,9 @@ mod tests {
 
     #[test]
     fn parse_returns_empty_span_index_as_holding_state() {
-        // WS01: adapters keep today's Value and an empty span map. Filling
-        // the index is later slices; an empty map here is holding state,
-        // not the finished contract (ADR-0005).
+        // Empty documents have no child paths, so every adapter's index
+        // is empty here. YAML fills non-empty documents (ADR-0008);
+        // TOML/JSON still return empty on those until their slices land.
         for (adapter, text) in [
             (&toml::TomlAdapter as &dyn FormatAdapter, ""),
             (&yaml::YamlAdapter, ""),

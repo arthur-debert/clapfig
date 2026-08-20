@@ -207,8 +207,10 @@ empty or partial index is not a legal result. Per adapter:
   stays for serialize and edit.
 - **YAML** — `serde_norway` still builds `Value`; the same `parse` fills
   spans with `yamlpath`. A path that exists only because an alias
-  expanded gets the `*name` token's span
+  expanded gets the `*name` token's span for both `key` and `value`,
+  including expanded sequence items
   ([ADR-0008](../adr/0008-yaml-spans-via-yamlpath-inside-parse.md)).
+  Written array elements still have `key: None` (ADR-0006).
 
 Unknown-key validation stays **per-file, pre-merge**. It consults that
 file's span index, not the merged origin tree (an unknown key in a
