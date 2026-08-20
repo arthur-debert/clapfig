@@ -340,8 +340,10 @@ are true; neither is waived. Merge semantics do not change.
    not a field of any variant — are phase 1 only. They are not re-run
    through the cascade, callback, or `Collect` here, even if they
    survived into the merged tree (`Accept`, `Collect`, or a lenient
-   ancestor). A surviving true unknown produces exactly one callback
-   invocation and at most one collected entry.
+   ancestor). A true unknown is processed only in phase 1:
+   cascade-lenient keys invoke no callback; `Accept` invokes it once
+   without collection; `Collect` invokes it once and appends at most
+   one entry; `Reject` invokes it once and fails the load.
 
    For each branch-exclusive key, apply the same strictness cascade,
    callback, and `Collect` path. Locations come from the merged origin
@@ -356,7 +358,8 @@ callback; cascade-strict keys go through `on_unknown_key` (`Reject` /
 `Accept` / `Collect`) the same way a named-field object's unknown keys
 do today. `Collect` entries from either phase append to the same
 `load_with_unknowns` list. A given key is a candidate of at most one
-phase, so it is never collected or callback-invoked twice.
+phase, so it is never collected twice. Cascade-lenient keys never
+reach the callback in either phase.
 
 **Layered discriminator.** File A supplies `kind = "rust"`. File B
 supplies rust-only keys. An env var later sets `kind = "payload"`. Merge
@@ -569,9 +572,11 @@ CI fixture.
   true unknown (`not_a_field_of_any_variant`) on a sparse file layer is
   rejected pre-merge, even with no discriminator on that layer; the
   same for a sparse env layer. A true unknown that survives phase 1
-  (`Accept`, `Collect`, or cascade-lenient) is not a phase-2 candidate:
-  callback and Collect fire exactly once (`Reject`: load fails at phase
-  1 with one invocation). Discriminator from env *changing* the kind
+  (`Accept`, `Collect`, or cascade-lenient) is not a phase-2 candidate.
+  Phase-1 outcomes, asserted separately: cascade-lenient invokes no
+  callback; `Accept` invokes once without collection; `Collect` invokes
+  once and appends one entry; `Reject` fails the load at phase 1 with
+  one invocation. Discriminator from env *changing* the kind
   while the other layer still supplies the old kind's keys: phase 1
   accepts those keys (they belong to some variant); phase 2 reports
   them as unknown against the winning kind, origins on the losing keys
