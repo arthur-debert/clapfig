@@ -15,7 +15,7 @@
 //! accepts `impl Into<Shape>` so object-root callers keep passing a
 //! [`Schema`]. Root Map loads as a homogeneous map of the item shape.
 //! Tagged object-root and nested tagged objects load via the two-phase
-//! walk (SHP01-WS04).
+//! unknown-key walk.
 //!
 //! # Example
 //!

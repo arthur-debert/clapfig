@@ -34,8 +34,9 @@ use crate::value::Value;
 /// with schema-driven datetime coercion for `DateTime` leaves (ADR-0001)
 /// — so a typo in the key name or a value the leaf type cannot accept
 /// fails, naming the expected type, before the file is touched. A key
-/// addressing an `ArrayOf`/`MapOf` section, a root Map entry, or a path
-/// inside one fails with the targeted
+/// addressing a [`Shape::Array`](crate::runtime::Shape::Array) /
+/// [`Shape::Map`](crate::runtime::Shape::Map) of objects, a root Map
+/// entry, or a path inside one fails with the targeted
 /// [`ClapfigError::UnaddressableKey`] instead of a bare key-not-found:
 /// dotted CLI keys cannot say which entry they mean, so the config file
 /// is the surface for editing those sections.
@@ -429,8 +430,11 @@ fn dotted_config_path(key: &str) -> ConfigPath {
     path
 }
 
-/// If the canonical dotted key targets an `ArrayOf`/`MapOf` schema field
-/// or a path inside one, return that section's dotted path and a kind
+/// If the canonical dotted key targets a
+/// [`Shape::Array`](crate::runtime::Shape::Array) /
+/// [`Shape::Map`](crate::runtime::Shape::Map) of objects (or a root map)
+/// or a path inside one,
+/// return that section's dotted path and a kind
 /// label (`"an array"` / `"a map"`) for [`ClapfigError::UnaddressableKey`].
 /// `None` means the key misses the schema some other way (a plain
 /// key-not-found).
@@ -442,7 +446,7 @@ fn unaddressable_container_shape(
         crate::runtime::Shape::Object(schema) => unaddressable_container(schema, canonical),
         crate::runtime::Shape::Map(map) => {
             // Any persist key against a root map is a dynamic entry (or a
-            // path inside one). Same refuse as a named MapOf.
+            // path inside one). Same refuse as a named Map field.
             Some((root_map_section_label(map), "a map"))
         }
         crate::runtime::Shape::Tagged(_)

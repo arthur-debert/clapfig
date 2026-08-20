@@ -18,16 +18,15 @@
 //!   only if it transitively contains a required leaf. An external
 //!   validator therefore accepts exactly the documents clapfig loads.
 //! - **Docs**: schema and field doc lines become `description`.
-//! - **Types**: converted recursively from each leaf's declared
-//!   [`LeafType`] — including leaves without defaults. String →
-//!   `"string"`, integer → `"integer"` (with declared bounds as
-//!   `minimum`/`maximum`), float → `"number"`, bool → `"boolean"`,
-//!   datetime → `"string"` with an `anyOf` covering TOML's four lexical
-//!   forms (range-aware patterns; `format: "date-time"` / `"date"` only
-//!   on the branches those formats actually describe), array → `"array"`
-//!   with a recursive
-//!   `items` schema, map → `"object"` with a recursive
-//!   `additionalProperties` value schema.
+//! - **Types**: converted recursively from each node's [`Shape`](crate::runtime::Shape)
+//!   / [`LeafType`]. String → `"string"`, integer → `"integer"` (with
+//!   declared bounds as `minimum`/`maximum`), float → `"number"`, bool →
+//!   `"boolean"`, datetime → `"string"` with an `anyOf` covering TOML's
+//!   four lexical forms (range-aware patterns; `format: "date-time"` /
+//!   `"date"` only on the branches those formats actually describe).
+//!   [`Shape::Array`] → `"array"` with a recursive `items` schema;
+//!   [`Shape::Map`] → `"object"` with a recursive `additionalProperties`
+//!   value schema.
 //! - **Defaults**: the literal default value (when present) is emitted as
 //!   `default` on the property (datetimes in their lexical string form).
 //!   Unrepresentable values (non-finite floats) omit the whole
@@ -36,8 +35,8 @@
 //!   `type` is added only when every allowed value shares one JSON
 //!   primitive type — a mixed set (`"auto"` and `0`) is constrained by
 //!   `enum` alone, so an external validator still accepts every value
-//!   clapfig does. Applies at any nesting depth (an `Array(Enum)` leaf
-//!   constrains its `items`). If any member cannot be represented the
+//!   clapfig does. Applies at any nesting depth (a [`Shape::Array`] of an
+//!   enum leaf constrains its `items`). If any member cannot be represented the
 //!   `enum` annotation is omitted entirely.
 //! - **Env vars**: when a field maps to an env var, the name is attached as
 //!   the non-standard `x-env` extension.
