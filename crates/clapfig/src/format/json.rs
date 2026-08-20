@@ -1934,6 +1934,38 @@ mod tests {
     }
 
     #[test]
+    fn template_nested_arrays_keep_every_layer() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Item").field("timeout", Field::integer().default(30i64));
+        let schema = RtSchema::object("App")
+            .field(
+                "matrix",
+                Field::array_of_type(Field::array_of_type(item.clone())),
+            )
+            .field(
+                "cube",
+                Field::array_of_type(Field::array_of_type(Field::array_of_type(item))),
+            )
+            .build();
+        let text = JsonAdapter.template(&schema).unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let obj = json.as_object().unwrap();
+        let parse_snippet = |comment: &Json| {
+            let snippet = comment.as_str().expect("single-line comment snippet");
+            serde_json::from_str::<Json>(&format!("{{{snippet}}}"))
+                .unwrap_or_else(|e| panic!("snippet must parse as JSON object: {e}: {snippet}"))
+        };
+        assert_eq!(
+            parse_snippet(&obj["//matrix"]),
+            serde_json::json!({"matrix": [[{"timeout": 30}]]})
+        );
+        assert_eq!(
+            parse_snippet(&obj["//cube"]),
+            serde_json::json!({"cube": [[[{"timeout": 30}]]]})
+        );
+    }
+
+    #[test]
     fn template_parses_clean_through_own_adapter() {
         // gen → parse: every comment key is stripped, every real key is a
         // schema key with its default value.

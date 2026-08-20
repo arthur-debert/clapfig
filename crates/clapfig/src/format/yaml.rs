@@ -1947,6 +1947,46 @@ db:
     }
 
     #[test]
+    fn template_nested_arrays_keep_every_layer() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Item").field("timeout", Field::integer().default(30i64));
+        let schema = RtSchema::object("App")
+            .field(
+                "matrix",
+                Field::array_of_type(Field::array_of_type(item.clone())),
+            )
+            .field(
+                "cube",
+                Field::array_of_type(Field::array_of_type(Field::array_of_type(item))),
+            )
+            .build();
+        let text = YamlAdapter.template(&schema).unwrap();
+        let uncommented: String = text
+            .lines()
+            .map(|line| line.strip_prefix('#').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let map = parse_map(&uncommented);
+        let timeout = Value::Map({
+            let mut m = Map::new();
+            m.insert("timeout".into(), Value::Integer(30));
+            m
+        });
+        assert_eq!(
+            map.get("matrix"),
+            Some(&Value::Array(vec![Value::Array(vec![timeout.clone()])])),
+            "YAML Array<Array<Object>> must keep both sequence layers: {text}"
+        );
+        assert_eq!(
+            map.get("cube"),
+            Some(&Value::Array(vec![Value::Array(vec![Value::Array(vec![
+                timeout
+            ])])])),
+            "YAML Array<Array<Array<Object>>> must keep three sequence layers: {text}"
+        );
+    }
+
+    #[test]
     fn template_escapes_keys_the_parser_would_misread() {
         // Schema names only forbid empty, `.`, `[`, `]` — a template must
         // quote names the parser would otherwise read as comments,

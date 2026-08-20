@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::runtime::{Schema, Shape};
+use crate::runtime::{LeafType, Schema, Shape};
 use crate::value::{Map, Value};
 
 use super::template::{
@@ -447,18 +447,22 @@ impl TemplateRenderer for TomlTemplate {
     ) -> Result<(), FormatError> {
         use std::fmt::Write;
 
+        // Nested anonymous arrays (`Array<Array<…>>`) have no `[[path]]`
+        // spelling — a second header is another entry of the same array,
+        // not a nested array. Emit a commented inline assignment that
+        // keeps every layer. `item` is the array's item, so an Array
+        // here is already a nested array.
+        if matches!(item, Shape::Array(_)) || has_array_in_array(item) {
+            emit_object_doc(out, item);
+            let example = Value::Array(vec![example_shape_value(item)]);
+            let _ = writeln!(out, "#{name} = {}", value_to_toml_edit(&example));
+            return Ok(());
+        }
         let path = section_path(prefix, name);
         emit_object_doc(out, item);
         let _ = writeln!(out, "#[[{path}]]");
         let mut buf = String::new();
-        // Nested anonymous arrays cannot add another `[[path]]` header
-        // (TOML has no nested array-of-tables without a key); peel one
-        // Array layer and keep wrapping Maps.
-        let inner = match item {
-            Shape::Array(array) => array.item.as_ref(),
-            other => other,
-        };
-        emit_toml_item(self, &mut buf, &path, inner)?;
+        emit_toml_item(self, &mut buf, &path, item)?;
         push_commented_block(out, &buf);
         Ok(())
     }
@@ -472,6 +476,13 @@ impl TemplateRenderer for TomlTemplate {
     ) -> Result<(), FormatError> {
         use std::fmt::Write;
 
+        if has_array_in_array(item) {
+            emit_object_doc(out, item);
+            let mut entry = Map::new();
+            entry.insert("<key>".into(), example_shape_value(item));
+            let _ = writeln!(out, "#{name} = {}", value_to_toml_edit(&Value::Map(entry)));
+            return Ok(());
+        }
         let path = section_path(prefix, name);
         emit_object_doc(out, item);
         let entry = format!("{path}.<key>");
@@ -495,9 +506,66 @@ fn emit_object_doc(out: &mut String, item: &Shape) {
     }
 }
 
+/// True when `shape` is an Array or contains an Array nested directly
+/// inside another Array (anonymous nested arrays). Those cannot be
+/// spelled as repeated `[[path]]` headers.
+fn has_array_in_array(shape: &Shape) -> bool {
+    match shape {
+        Shape::Array(array) => {
+            matches!(array.item.as_ref(), Shape::Array(_)) || has_array_in_array(&array.item)
+        }
+        Shape::Map(map) => has_array_in_array(&map.item),
+        Shape::Leaf(_) | Shape::Object(_) | Shape::Tagged(_) => false,
+    }
+}
+
+/// One-entry example value for a shape, used when a template must keep
+/// nested array layers in inline TOML. Defaults win; otherwise a
+/// placeholder (leaf) or a one-entry nested example (container).
+fn example_shape_value(shape: &Shape) -> Value {
+    match shape {
+        Shape::Leaf(leaf) => leaf
+            .default
+            .clone()
+            .unwrap_or_else(|| leaf_placeholder(&leaf.ty)),
+        Shape::Object(schema) => {
+            let mut map = Map::new();
+            for nf in &schema.fields {
+                map.insert(nf.name.clone(), example_shape_value(&nf.field));
+            }
+            Value::Map(map)
+        }
+        Shape::Array(array) => array
+            .default
+            .clone()
+            .unwrap_or_else(|| Value::Array(vec![example_shape_value(&array.item)])),
+        Shape::Map(map) => map.default.clone().unwrap_or_else(|| {
+            let mut entry = Map::new();
+            entry.insert("<key>".into(), example_shape_value(&map.item));
+            Value::Map(entry)
+        }),
+        Shape::Tagged(_) => tagged_template_stub(),
+    }
+}
+
+fn leaf_placeholder(ty: &LeafType) -> Value {
+    match ty {
+        LeafType::String | LeafType::Enum { .. } | LeafType::Value => Value::String(String::new()),
+        LeafType::Integer { .. } => Value::Integer(0),
+        LeafType::Float => Value::Float(0.0),
+        LeafType::Bool => Value::Boolean(false),
+        LeafType::DateTime => Value::Datetime(
+            "1970-01-01T00:00:00Z"
+                .parse()
+                .expect("epoch datetime placeholder is valid"),
+        ),
+    }
+}
+
 /// Render nested item content under `path`. The caller already emitted
 /// the field's own `[[path]]` / `[path.<key>]` header. Nested Maps add
-/// `[path.<key>]`; nested Arrays add `[[path]]`.
+/// `[path.<key>]`; a keyed Array (map of arrays of objects) adds
+/// `[[path]]`. Nested anonymous arrays are inlined at the field, not here.
 fn emit_toml_item(
     renderer: &mut TomlTemplate,
     out: &mut String,
@@ -510,8 +578,24 @@ fn emit_toml_item(
         Shape::Object(child) => walk_level(renderer, child, &path.to_string(), out),
         Shape::Map(map) => {
             let entry = format!("{path}.<key>");
-            let _ = writeln!(out, "[{entry}]");
-            emit_toml_item(renderer, out, &entry, &map.item)
+            match map.item.as_ref() {
+                Shape::Array(array) if !has_array_in_array(&array.item) => {
+                    let _ = writeln!(out, "[[{entry}]]");
+                    emit_toml_item(renderer, out, &entry, &array.item)
+                }
+                Shape::Array(_) => {
+                    let _ = writeln!(
+                        out,
+                        "<key> = {}",
+                        value_to_toml_edit(&example_shape_value(&map.item))
+                    );
+                    Ok(())
+                }
+                other => {
+                    let _ = writeln!(out, "[{entry}]");
+                    emit_toml_item(renderer, out, &entry, other)
+                }
+            }
         }
         Shape::Array(array) => {
             let _ = writeln!(out, "[[{path}]]");
@@ -653,6 +737,84 @@ pool_size = 5
         assert!(
             text.contains("#[[batches.<key>]]"),
             "map-of-array emits array-of-tables under the map key: {text}"
+        );
+    }
+
+    fn uncommented_toml_assignments(template: &str) -> String {
+        template
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix('#')
+                    .map(str::trim_start)
+                    .filter(|rest| rest.contains('=') && !rest.starts_with('['))
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn timeout_item() -> crate::runtime::Schema {
+        use crate::runtime::{Field, Schema as RtSchema};
+        RtSchema::object("Item")
+            .field("timeout", Field::integer().default(30i64))
+            .build()
+    }
+
+    #[test]
+    fn template_nested_arrays_keep_every_layer_inline() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = timeout_item();
+        let schema = RtSchema::object("App")
+            .field(
+                "matrix",
+                Field::array_of_type(Field::array_of_type(item.clone())),
+            )
+            .field(
+                "cube",
+                Field::array_of_type(Field::array_of_type(Field::array_of_type(item.clone()))),
+            )
+            .field(
+                "batches",
+                Field::map_of(Field::array_of_type(Field::array_of_type(item))),
+            )
+            .build();
+        let text = TomlAdapter.template(&schema).unwrap();
+        assert!(
+            !text.contains("#[[matrix]]"),
+            "must not flatten Array<Array<Object>> to one [[header]]: {text}"
+        );
+        assert!(
+            !text.contains("#[[cube]]"),
+            "must not flatten Array<Array<Array<Object>>> to one [[header]]: {text}"
+        );
+        let parsed = TomlAdapter
+            .parse(&uncommented_toml_assignments(&text))
+            .unwrap()
+            .value;
+        let map = parsed.as_map().unwrap();
+        let timeout = Value::Map({
+            let mut m = Map::new();
+            m.insert("timeout".into(), Value::Integer(30));
+            m
+        });
+        assert_eq!(
+            &map["matrix"],
+            &Value::Array(vec![Value::Array(vec![timeout.clone()])]),
+            "uncommented Array<Array<Object>> example must keep both array layers: {text}"
+        );
+        assert_eq!(
+            &map["cube"],
+            &Value::Array(vec![Value::Array(vec![Value::Array(vec![
+                timeout.clone()
+            ])])]),
+            "uncommented Array<Array<Array<Object>>> example must keep three array layers: {text}"
+        );
+        let batches = map["batches"].as_map().unwrap();
+        assert_eq!(
+            batches.get("<key>").or_else(|| batches.values().next()),
+            Some(&Value::Array(vec![Value::Array(vec![timeout])])),
+            "uncommented Map<Array<Array<Object>>> example must keep both array layers: {text}"
         );
     }
 
