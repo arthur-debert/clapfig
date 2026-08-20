@@ -2,8 +2,8 @@
 //!
 //! All errors are designed to be shown directly to end users. Each variant
 //! includes enough context to diagnose the problem without reaching for a
-//! debugger: file paths (and, for TOML sources, line numbers) for unknown
-//! keys, the list of
+//! debugger: file paths and, when the span index locates the key, line
+//! numbers (TOML, YAML, and JSON) for unknown keys, the list of
 //! available scopes when a scope name is wrong, and references to the
 //! builder method that needs to be called when a prerequisite is missing.
 //!
@@ -77,9 +77,8 @@ pub struct UnknownKeyInfo {
     /// URL query-parameter key that supplied this unknown key, when it
     /// came from the URL layer.
     pub url_key: Option<String>,
-    /// Which input type produced the key. `None` until later provenance
-    /// slices fill origin facts; env-derived keys already name
-    /// [`env_var`](Self::env_var).
+    /// Which input type produced the key. `None` when unset; env-derived
+    /// keys already name [`env_var`](Self::env_var).
     pub input_type: Option<InputType>,
 }
 

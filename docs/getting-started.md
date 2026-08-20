@@ -253,7 +253,7 @@ myapp config schema           # print a JSON Schema for the struct
 
 Strict mode is **on by default**. If a config file contains a key that doesn't
 match any field in your struct, loading fails with the file path, key name, and
-— for TOML sources — the line number:
+the line number when the span index locates the key:
 
 ```text
 Unknown key 'typo_key' in /home/user/.config/myapp/myapp.toml (line 5)

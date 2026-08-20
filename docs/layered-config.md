@@ -125,10 +125,10 @@ wins.
 ### One meaning across formats
 
 A config file means the same thing whatever its format: identical schema
-validation and strict-mode accept/reject decisions. (One current
-limitation: unknown-key line numbers and source snippets are TOML-only —
-YAML/JSON strict errors name the key and file but carry no source line.) Values follow the TOML
-baseline; notably, **datetimes in YAML and JSON are written as strings**
+validation and strict-mode accept/reject decisions. Unknown-key and
+`InvalidValue` errors locate the token from byte spans in TOML, YAML, and
+JSON. Values follow the TOML baseline; notably, **datetimes in YAML
+and JSON are written as strings**
 using TOML's four datetime spellings (offset date-time, local date-time,
 local date, local time). Parsing never guesses at types — a string becomes a
 datetime only when the schema declares the field as one (so YAML's implicit
