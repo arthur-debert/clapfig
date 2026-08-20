@@ -65,6 +65,11 @@ use syn::{
 ///   leaf (or `Map(Enum)` / `Array(Enum)` in the map/array positions
 ///   above). Variant names are the allowed values; `rename` /
 ///   `rename_all` apply to those spellings.
+/// - Internally tagged enum (`#[serde(tag = "...")]`): emits
+///   `Shape::Tagged`. Unit variants are the empty object; named-field
+///   struct variants are that object. The tag is reserved (not a field
+///   of any variant). Discriminators follow the same `rename` /
+///   `rename_all` rules as unit-only enums. A legal document root.
 ///
 /// Field types named `Datetime` / `Value` are matched *by name* (a proc
 /// macro cannot resolve paths), so the macro also emits a compile-time
@@ -78,8 +83,9 @@ use syn::{
 /// - `i128` / `u128` (TOML's integer width is signed 64-bit).
 /// - Generic types and `where` clauses (`static SchemaStatic` cannot
 ///   reference type parameters).
-/// - Tuple structs, unit structs, tuple/struct enum variants, and
-///   non-unit enums.
+/// - Tuple structs, unit structs, tuple/newtype enum variants, and
+///   struct-variant enums that are not internally tagged
+///   (`#[serde(tag = "...")]`).
 /// - `Option<Option<T>>`.
 /// - Non-`String` map keys; `HashMap`/`BTreeMap` of `Option<T>`, of
 ///   another map, or of `Vec<NestedStruct>`.
@@ -93,7 +99,7 @@ use syn::{
 ///   clapfig's own types.
 /// - Unknown `#[clapfig(...)]` metas (fields, structs, enum variants).
 /// - `#[clapfig(name)]` / `#[clapfig(strict)]` on unit-only enums
-///   (flattened away).
+///   (flattened away). Internally tagged enums accept both.
 /// - Kind-mismatched `default` / `allowed` literals; empty `allowed`;
 ///   `value` + `allowed` on the same field; `allowed` on `Vec` /
 ///   nested / map-of-nested fields; defaults on map-typed fields and
@@ -212,7 +218,8 @@ use syn::{
 ///
 /// Both are rejected on unit-only enums: the enum flattens to a
 /// value-level `LeafType::Enum` at every use site, which discards them.
-/// On enum *variants* the only supported clapfig attribute is
+/// Internally tagged enums keep `name` / `strict` (they are a real schema
+/// node). On enum *variants* the only supported clapfig attribute is
 /// `rename = "..."`; anything else is a derive error (same strictness as
 /// fields and types).
 ///
@@ -221,23 +228,25 @@ use syn::{
 /// Any `#[serde(...)]` attribute the derived schema does not honor is a
 /// **derive-time error** naming the attribute and the divergence it would
 /// cause — never silently ignored. Honored: `rename` (fields/variants,
-/// directional included), `rename_all` (structs and unit-only enums,
-/// directional included — see *Struct attributes*), and
-/// `deserialize_with`/`with` (the typed deserialize runs through serde,
-/// so custom deserializers apply to every source). `deserialize_with` is
-/// honored for *shape-preserving* normalization: the schema keeps
-/// advertising the field's inferred shape and validates the merged map
-/// against it *before* serde runs, so a deserializer expecting a different
-/// wire shape gets its inputs rejected by schema validation with a loud
-/// type error — a load failure, never a silently mis-typed value. Pair a
-/// shape-changing deserializer with `#[clapfig(value)]` so the schema
-/// declares a free-form leaf and steps aside. Serialize-only
-/// attributes (`skip_serializing`, `serialize_with`, …) and derive
-/// plumbing (`bound`, `borrow`, `crate`, `expecting`) are accepted — they
-/// cannot make the schema disagree with serde's deserialize. Everything
-/// else (`default`, `flatten`, `alias`, `skip`, `skip_deserializing`,
-/// `tag`/`untagged`/`content`, `deny_unknown_fields`, `transparent`,
-/// `from`/`try_from`, …) is rejected.
+/// directional included), `rename_all` (structs, unit-only enums, and
+/// internally tagged enums, directional included — see *Struct
+/// attributes*), `#[serde(tag = "...")]` on enums (internally tagged
+/// unions), and `deserialize_with`/`with` (the typed deserialize runs
+/// through serde, so custom deserializers apply to every source).
+/// `deserialize_with` is honored for *shape-preserving* normalization:
+/// the schema keeps advertising the field's inferred shape and validates
+/// the merged map against it *before* serde runs, so a deserializer
+/// expecting a different wire shape gets its inputs rejected by schema
+/// validation with a loud type error — a load failure, never a silently
+/// mis-typed value. Pair a shape-changing deserializer with
+/// `#[clapfig(value)]` so the schema declares a free-form leaf and steps
+/// aside. Serialize-only attributes (`skip_serializing`, `serialize_with`,
+/// …) and derive plumbing (`bound`, `borrow`, `crate`, `expecting`) are
+/// accepted — they cannot make the schema disagree with serde's
+/// deserialize. Everything else (`default`, `flatten`, `alias`, `skip`,
+/// `skip_deserializing`, `untagged`/`content` (adjacent tagging),
+/// `deny_unknown_fields`, `transparent`, `from`/`try_from`, …) is
+/// rejected. There is no clapfig-only `#[clapfig(tag)]`.
 ///
 /// `rename_all` (clapfig or serde spelling, including serde's directional
 /// `rename_all(deserialize = "...")` form) rewrites field names on structs
@@ -286,7 +295,10 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
     // name (`Datetime` / `Value`); emitted alongside the schema statics.
     let mut claim_asserts: Vec<TokenStream2> = Vec::new();
 
-    let mut is_named_struct = false;
+    let mut is_document_root = false;
+    let mut extra_statics: Vec<TokenStream2> = Vec::new();
+    let mut tagged_tag_body = quote! { "" };
+    let mut tagged_variants_body = quote! { &[] };
     let (fields_body, enum_variants_body) = match &input.data {
         Data::Struct(s) => match &s.fields {
             Fields::Named(named) => {
@@ -343,7 +355,7 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
                     claim_asserts.extend(expanded.claim_asserts);
                     field_entries.push(expanded.entry);
                 }
-                is_named_struct = true;
+                is_document_root = true;
                 (quote! { &[ #(#field_entries),* ] }, quote! { &[] })
             }
             other => {
@@ -354,37 +366,70 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         },
         Data::Enum(e) => {
-            // A unit-only enum flattens to a value-level `LeafType::Enum`
-            // at every field that uses it — the flatten reads only the
-            // variant list (and doc), so `name` / `strict` would be
-            // accepted and then silently discarded. Reject instead.
-            if struct_attrs.name.is_some() {
-                return Err(syn::Error::new(
-                    input.ident.span(),
-                    "#[clapfig(name = \"...\")] has no effect on a unit-only enum — the \
-                     enum flattens to a value-level `LeafType::Enum` at each use site and \
-                     the schema name is discarded there. Remove the attribute.",
-                ));
+            if serde_has_meta(&input.attrs, "untagged") {
+                // Reject at the `untagged` token (UnitEnum does not honor it).
+                check_serde_attrs(&input.attrs, SerdeCtx::UnitEnum)?;
             }
-            if struct_attrs.strict.is_some() {
-                return Err(syn::Error::new(
-                    input.ident.span(),
-                    "#[clapfig(strict = ...)] has no effect on a unit-only enum — \
-                     strictness governs nested-section schemas, and the enum flattens to \
-                     a leaf whose flag is discarded. Remove the attribute (set strictness \
-                     on the struct that owns the field instead).",
-                ));
+            if serde_has_meta(&input.attrs, "content") {
+                // Adjacent tagging: `tag` is honored, `content` is not.
+                check_serde_attrs(&input.attrs, SerdeCtx::TaggedEnum)?;
             }
-            check_serde_attrs(&input.attrs, SerdeCtx::UnitEnum)?;
-            let variants =
-                expand_enum_variants(&input.attrs, &struct_attrs, e, input.ident.span())?;
-            (quote! { &[] }, quote! { &[ #(#variants),* ] })
+            if serde_has_meta(&input.attrs, "tag") {
+                let Some(tag) = find_serde_string_meta(&input.attrs, "tag") else {
+                    return Err(syn::Error::new(
+                        input.ident.span(),
+                        "#[serde(tag)] requires a field name string, e.g. #[serde(tag = \"kind\")]",
+                    ));
+                };
+                validate_schema_field_name(&tag, "#[serde(tag)]", input.ident.span())?;
+                check_serde_attrs(&input.attrs, SerdeCtx::TaggedEnum)?;
+                let expanded = expand_tagged_enum(
+                    type_name,
+                    &input.attrs,
+                    &struct_attrs,
+                    e,
+                    &tag,
+                    input.ident.span(),
+                )?;
+                extra_statics = expanded.extra_statics;
+                claim_asserts.extend(expanded.claim_asserts);
+                tagged_tag_body = quote! { #tag };
+                tagged_variants_body = expanded.variants_tokens;
+                is_document_root = true;
+                (quote! { &[] }, quote! { &[] })
+            } else {
+                // A unit-only enum flattens to a value-level `LeafType::Enum`
+                // at every field that uses it — the flatten reads only the
+                // variant list (and doc), so `name` / `strict` would be
+                // accepted and then silently discarded. Reject instead.
+                if struct_attrs.name.is_some() {
+                    return Err(syn::Error::new(
+                        input.ident.span(),
+                        "#[clapfig(name = \"...\")] has no effect on a unit-only enum — the \
+                         enum flattens to a value-level `LeafType::Enum` at each use site and \
+                         the schema name is discarded there. Remove the attribute.",
+                    ));
+                }
+                if struct_attrs.strict.is_some() {
+                    return Err(syn::Error::new(
+                        input.ident.span(),
+                        "#[clapfig(strict = ...)] has no effect on a unit-only enum — \
+                         strictness governs nested-section schemas, and the enum flattens to \
+                         a leaf whose flag is discarded. Remove the attribute (set strictness \
+                         on the struct that owns the field instead).",
+                    ));
+                }
+                check_serde_attrs(&input.attrs, SerdeCtx::UnitEnum)?;
+                let variants =
+                    expand_enum_variants(&input.attrs, &struct_attrs, e, input.ident.span())?;
+                (quote! { &[] }, quote! { &[ #(#variants),* ] })
+            }
         }
         other => {
             return Err(syn::Error::new(
                 input.ident.span(),
                 format!(
-                    "clapfig::Schema can only be derived for structs and unit-only enums (not {:?})",
+                    "clapfig::Schema can only be derived for structs, unit-only enums, and internally tagged enums (not {:?})",
                     discriminant(other)
                 ),
             ));
@@ -400,7 +445,7 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
     let static_ident = quote::format_ident!("__CLAPFIG_SCHEMA_{}", type_name);
     let cache_ident = quote::format_ident!("__CLAPFIG_RUNTIME_{}", type_name);
     let shape_cache_ident = quote::format_ident!("__CLAPFIG_SHAPE_{}", type_name);
-    let document_root_impl = if is_named_struct {
+    let document_root_impl = if is_document_root {
         quote! { impl ::clapfig::DocumentRoot for #type_name {} }
     } else {
         quote! {}
@@ -408,6 +453,7 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let output = quote! {
         #(#claim_asserts)*
+        #(#extra_statics)*
 
         #[allow(non_upper_case_globals)]
         static #static_ident: ::clapfig::static_schema::SchemaStatic =
@@ -417,6 +463,8 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
                 strict: #strict_expr,
                 fields: #fields_body,
                 enum_variants: #enum_variants_body,
+                tagged_tag: #tagged_tag_body,
+                tagged_variants: #tagged_variants_body,
             };
 
         #[allow(non_upper_case_globals)]
@@ -534,6 +582,148 @@ fn expand_enum_variants(
         out.push(quote! { #name });
     }
     Ok(out)
+}
+
+struct TaggedEnumExpansion {
+    extra_statics: Vec<TokenStream2>,
+    variants_tokens: TokenStream2,
+    claim_asserts: Vec<TokenStream2>,
+}
+
+/// Internally tagged `#[serde(tag = "...")]` enum: each unit variant is
+/// the empty object; each named-field struct variant is that object.
+/// Discriminators follow the same rename rules as unit-only enums.
+fn expand_tagged_enum(
+    type_name: &syn::Ident,
+    type_attrs: &[Attribute],
+    struct_attrs: &StructAttrs,
+    data: &DataEnum,
+    tag: &str,
+    ident_span: proc_macro2::Span,
+) -> syn::Result<TaggedEnumExpansion> {
+    if data.variants.is_empty() {
+        return Err(syn::Error::new(
+            data.variants.span(),
+            "clapfig::Schema requires at least one variant on an enum (an \
+             empty enum is uninhabited and cannot be deserialized)",
+        ));
+    }
+    let serde_rename_all = find_serde_string_meta(type_attrs, "rename_all");
+    let rename_all = resolve_rename_all_rule(
+        struct_attrs.rename_all.as_ref(),
+        serde_rename_all,
+        ident_span,
+        "variant names",
+    )?;
+    if let Some(rule) = &rename_all
+        && !is_supported_rename_all_rule(rule)
+    {
+        return Err(syn::Error::new(
+            ident_span,
+            format!(
+                "unsupported rename_all rule {rule:?}; supported: \
+                 lowercase, UPPERCASE, PascalCase, camelCase, snake_case, \
+                 SCREAMING_SNAKE_CASE, kebab-case, SCREAMING-KEBAB-CASE"
+            ),
+        ));
+    }
+
+    let mut extra_statics = Vec::new();
+    let mut variant_entries = Vec::new();
+    let mut claim_asserts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for variant in &data.variants {
+        check_serde_attrs(&variant.attrs, SerdeCtx::Variant)?;
+        let discriminator = variant_schema_name(variant, rename_all.as_deref())?;
+        validate_schema_field_name(&discriminator, "tagged discriminator", variant.ident.span())?;
+        if !seen.insert(discriminator.clone()) {
+            return Err(syn::Error::new(
+                variant.ident.span(),
+                format!(
+                    "duplicate tagged discriminator {discriminator:?} after rename — \
+                     two variants would produce the same schema value"
+                ),
+            ));
+        }
+
+        let (fields_tokens, variant_claims) = match &variant.fields {
+            Fields::Unit => (quote! { &[] }, Vec::new()),
+            Fields::Named(named) => {
+                let mut field_entries = Vec::with_capacity(named.named.len());
+                let mut field_names = std::collections::HashSet::new();
+                let mut claims = Vec::new();
+                for f in &named.named {
+                    let expanded = expand_field(f, None)?;
+                    if expanded.name == tag {
+                        return Err(syn::Error::new(
+                            f.ident.span(),
+                            format!(
+                                "tagged variant field {:?} clashes with #[serde(tag = {tag:?})] — \
+                                 the tag is reserved on the object and is not a field of the \
+                                 variant. Rename the field, or pick a different tag.",
+                                expanded.name
+                            ),
+                        ));
+                    }
+                    if !field_names.insert(expanded.name.clone()) {
+                        return Err(syn::Error::new(
+                            f.ident.span(),
+                            format!(
+                                "duplicate schema field name {:?} — two fields (after \
+                                 `rename`/`rename_all`) would collide in the schema, \
+                                 making lookups and unknown-key validation \
+                                 order-dependent. Rename one of them.",
+                                expanded.name
+                            ),
+                        ));
+                    }
+                    claims.extend(expanded.claim_asserts);
+                    field_entries.push(expanded.entry);
+                }
+                (quote! { &[ #(#field_entries),* ] }, claims)
+            }
+            Fields::Unnamed(_) => {
+                return Err(syn::Error::new(
+                    variant.fields.span(),
+                    "internally tagged clapfig::Schema enums only support unit variants \
+                     (empty object) and named-field struct variants. Tuple and newtype \
+                     variants have no internally tagged object shape — use \
+                     `#[clapfig(value)]` on the field that holds the union instead.",
+                ));
+            }
+        };
+        claim_asserts.extend(variant_claims);
+
+        let variant_static_ident =
+            quote::format_ident!("__CLAPFIG_SCHEMA_{}_{}", type_name, variant.ident);
+        let variant_name = variant.ident.unraw().to_string();
+        let variant_doc = collect_doc_lines(&variant.attrs);
+        let variant_doc_expr = doc_slice(&variant_doc);
+        extra_statics.push(quote! {
+            #[allow(non_upper_case_globals)]
+            static #variant_static_ident: ::clapfig::static_schema::SchemaStatic =
+                ::clapfig::static_schema::SchemaStatic {
+                    name: #variant_name,
+                    doc: #variant_doc_expr,
+                    strict: None,
+                    fields: #fields_tokens,
+                    enum_variants: &[],
+                    tagged_tag: "",
+                    tagged_variants: &[],
+                };
+        });
+        variant_entries.push(quote! {
+            ::clapfig::static_schema::TaggedVariantStatic {
+                discriminator: #discriminator,
+                schema: &#variant_static_ident,
+            }
+        });
+    }
+    Ok(TaggedEnumExpansion {
+        extra_statics,
+        variants_tokens: quote! { &[ #(#variant_entries),* ] },
+        claim_asserts,
+    })
 }
 
 /// Resolve a single variant's schema-facing name: per-variant `rename`
@@ -824,6 +1014,23 @@ fn resolve_rename_all_rule(
 /// tracks what serde's deserialize expects, and the serialize spelling is
 /// irrelevant to config loading. A serialize-only directional meta leaves
 /// the deserialize side on the Rust spelling, so it is treated as absent.
+fn serde_has_meta(attrs: &[Attribute], key: &str) -> bool {
+    for attr in attrs {
+        if !attr.path().is_ident("serde") {
+            continue;
+        }
+        let Ok(metas) = attr.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            continue;
+        };
+        if metas.iter().any(|meta| meta.path().is_ident(key)) {
+            return true;
+        }
+    }
+    false
+}
+
 fn find_serde_string_meta(attrs: &[Attribute], key: &str) -> Option<String> {
     for attr in attrs {
         if !attr.path().is_ident("serde") {
@@ -875,6 +1082,7 @@ fn find_serde_string_meta(attrs: &[Attribute], key: &str) -> Option<String> {
 enum SerdeCtx {
     Struct,
     UnitEnum,
+    TaggedEnum,
     Field,
     Variant,
 }
@@ -883,7 +1091,7 @@ impl SerdeCtx {
     fn noun(self) -> &'static str {
         match self {
             SerdeCtx::Struct => "struct",
-            SerdeCtx::UnitEnum => "enum",
+            SerdeCtx::UnitEnum | SerdeCtx::TaggedEnum => "enum",
             SerdeCtx::Field => "field",
             SerdeCtx::Variant => "variant",
         }
@@ -939,6 +1147,13 @@ fn serde_key_allowed(key: &str, ctx: SerdeCtx) -> bool {
             // are rewritten in both the schema and serde).
             "rename" | "rename_all" | "into" | "bound" | "crate" | "expecting"
         ),
+        SerdeCtx::TaggedEnum => matches!(
+            key,
+            // Internally tagged: `tag` is the contract (same policy as
+            // `rename` / `rename_all`). `content` / `untagged` stay
+            // rejected by the caller before this allowlist is used.
+            "tag" | "rename" | "rename_all" | "into" | "bound" | "crate" | "expecting"
+        ),
     }
 }
 
@@ -973,10 +1188,22 @@ fn serde_key_rejection(key: &str) -> &'static str {
              would reject keys a non-strict schema accepts. Use \
              `#[clapfig(strict = true)]` instead"
         }
-        "tag" | "content" | "untagged" => {
-            "it changes the value shape serde deserializes, and the schema has no \
-             representation for tagged/untagged unions — use `#[clapfig(value)]` on \
-             the field that holds the union type instead"
+        "tag" => {
+            "internally tagged unions are only honored on enums via \
+             `#[serde(tag = \"...\")]`; on this item it would change the value \
+             shape serde deserializes — use `#[clapfig(value)]` on the field \
+             that holds the union type instead"
+        }
+        "content" => {
+            "adjacent tagging (`tag` + `content`) is not supported — only \
+             internally tagged enums (`#[serde(tag = \"...\")]` without \
+             `content`) are. Use `#[clapfig(value)]` on the field that holds \
+             the union type instead"
+        }
+        "untagged" => {
+            "untagged unions have no schema representation; internally tagged \
+             `#[serde(tag = \"...\")]` is the supported form. Use \
+             `#[clapfig(value)]` on the field that holds the union type instead"
         }
         "transparent" => {
             "the schema keeps the struct's nested shape while serde deserializes \

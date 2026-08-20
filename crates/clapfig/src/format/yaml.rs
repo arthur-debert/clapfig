@@ -49,7 +49,7 @@ use crate::value::{Map, Value};
 
 use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
-    tagged_template_stub, walk_level, walk_root,
+    tagged_variant_example_schema, walk_level, walk_root,
 };
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
@@ -983,6 +983,9 @@ impl TemplateRenderer for YamlTemplate {
         name: &str,
         item: &Shape,
     ) -> Result<(), FormatError> {
+        if let Shape::Tagged(tagged) = item {
+            return emit_tagged_yaml_sequence(self, out, depth, name, tagged);
+        }
         let indent = "  ".repeat(*depth);
         emit_object_doc(out, &indent, item);
         let mut buf = String::new();
@@ -1001,6 +1004,9 @@ impl TemplateRenderer for YamlTemplate {
         name: &str,
         item: &Shape,
     ) -> Result<(), FormatError> {
+        if let Shape::Tagged(tagged) = item {
+            return emit_tagged_yaml_map(self, out, depth, Some(name), tagged);
+        }
         let indent = "  ".repeat(*depth);
         emit_object_doc(out, &indent, item);
         let mut buf = String::new();
@@ -1018,6 +1024,9 @@ impl TemplateRenderer for YamlTemplate {
         item: &Shape,
         _doc: &[String],
     ) -> Result<(), FormatError> {
+        if let Shape::Tagged(tagged) = item {
+            return emit_tagged_yaml_map(self, out, depth, None, tagged);
+        }
         let indent = "  ".repeat(*depth);
         // Value-shaped items are assignments, not mappings: a leaf or
         // array/map of leaves has no `<key>:` + nested-block spelling,
@@ -1042,6 +1051,81 @@ impl TemplateRenderer for YamlTemplate {
         push_commented_block(out, &buf);
         Ok(())
     }
+
+    fn tagged(
+        &mut self,
+        out: &mut String,
+        depth: &usize,
+        name: Option<&str>,
+        tagged: &crate::runtime::TaggedShape,
+    ) -> Result<(), FormatError> {
+        let indent = "  ".repeat(*depth);
+        for (i, variant) in tagged.variants.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let example = tagged_variant_example_schema(tagged, variant);
+            let mut buf = String::new();
+            if let Some(name) = name {
+                let _ = writeln!(buf, "{indent}{}:", inline_scalar(name));
+                walk_level(self, &example, &(depth + 1), &mut buf)?;
+            } else {
+                walk_level(self, &example, depth, &mut buf)?;
+            }
+            push_commented_block(out, &buf);
+        }
+        Ok(())
+    }
+}
+
+fn emit_tagged_yaml_sequence(
+    renderer: &mut YamlTemplate,
+    out: &mut String,
+    depth: &usize,
+    name: &str,
+    tagged: &crate::runtime::TaggedShape,
+) -> Result<(), FormatError> {
+    let indent = "  ".repeat(*depth);
+    for (i, variant) in tagged.variants.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let example = tagged_variant_example_schema(tagged, variant);
+        let mut buf = String::new();
+        let _ = writeln!(buf, "{indent}{}:", inline_scalar(name));
+        let mut item_buf = String::new();
+        walk_level(renderer, &example, &(depth + 2), &mut item_buf)?;
+        buf.push_str(&with_sequence_dash(&item_buf, depth + 1));
+        push_commented_block(out, &buf);
+    }
+    Ok(())
+}
+
+fn emit_tagged_yaml_map(
+    renderer: &mut YamlTemplate,
+    out: &mut String,
+    depth: &usize,
+    name: Option<&str>,
+    tagged: &crate::runtime::TaggedShape,
+) -> Result<(), FormatError> {
+    let indent = "  ".repeat(*depth);
+    for (i, variant) in tagged.variants.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let example = tagged_variant_example_schema(tagged, variant);
+        let mut buf = String::new();
+        if let Some(name) = name {
+            let _ = writeln!(buf, "{indent}{}:", inline_scalar(name));
+            let _ = writeln!(buf, "{indent}  <key>:");
+            walk_level(renderer, &example, &(depth + 2), &mut buf)?;
+        } else {
+            let _ = writeln!(buf, "{indent}<key>:");
+            walk_level(renderer, &example, &(depth + 1), &mut buf)?;
+        }
+        push_commented_block(out, &buf);
+    }
+    Ok(())
 }
 
 fn emit_object_doc(out: &mut String, indent: &str, item: &Shape) {
@@ -1054,7 +1138,7 @@ fn emit_object_doc(out: &mut String, indent: &str, item: &Shape) {
 
 /// Render one example item at `depth`. Nested Maps emit a `<key>:`
 /// wrapper; nested Arrays emit a sequence dash; objects walk the child
-/// schema. Tagged items are a loud WS05 stub.
+/// schema. Tagged items emit one complete example per variant.
 fn emit_yaml_item(
     renderer: &mut YamlTemplate,
     out: &mut String,
@@ -1074,7 +1158,16 @@ fn emit_yaml_item(
             out.push_str(&with_sequence_dash(&item_buf, *depth));
             Ok(())
         }
-        Shape::Tagged(_) => tagged_template_stub(),
+        Shape::Tagged(tagged) => {
+            for (i, variant) in tagged.variants.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                let example = tagged_variant_example_schema(tagged, variant);
+                walk_level(renderer, &example, depth, out)?;
+            }
+            Ok(())
+        }
         Shape::Leaf(_) => unreachable!("value-field containers are emitted as leaves"),
     }
 }
@@ -2090,6 +2183,65 @@ db:
             nested_map.contains("<key>:"),
             "nested map item adds an inner placeholder key: {nested_map}"
         );
+    }
+
+    fn nested_tagged() -> crate::runtime::TaggedShape {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let inner = crate::runtime::Shape::tagged("Inner", "kind")
+            .variant(
+                "alpha",
+                RtSchema::object("Alpha")
+                    .field("n", Field::integer())
+                    .build(),
+            )
+            .variant(
+                "beta",
+                RtSchema::object("Beta").field("s", Field::string()).build(),
+            )
+            .build();
+        crate::runtime::Shape::tagged("Outer", "mode")
+            .variant(
+                "wrap",
+                RtSchema::object("Wrap")
+                    .field("child", crate::runtime::Shape::from(inner))
+                    .build(),
+            )
+            .build()
+    }
+
+    fn uncomment_lines(text: &str) -> String {
+        text.lines()
+            .map(|line| line.strip_prefix('#').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn template_nested_tagged_example_is_a_complete_object() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let tagged = nested_tagged();
+        let text = YamlAdapter
+            .template(&Shape::Tagged(tagged.clone()))
+            .unwrap();
+        assert!(
+            !text.contains("##"),
+            "nested tagged must not be double-commented: {text}"
+        );
+        let uncommented = uncomment_lines(&text);
+        let map = parse_map(&uncommented);
+        let child = map["child"].as_map().expect("child object");
+        assert_eq!(child["kind"], Value::String("alpha".into()));
+        finalize_root(
+            map,
+            &OriginMap::new(),
+            DocumentRoot::Tagged(&tagged),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap();
     }
 
     #[test]

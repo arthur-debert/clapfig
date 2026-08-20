@@ -526,8 +526,9 @@ pub enum Shape {
     /// Homogeneous array. Item is any shape. Not a legal document root.
     Array(ArrayShape),
     /// Internally tagged union of objects, selected by a discriminator
-    /// field. A legal document root; the two-phase tagged walk is
-    /// SHP01-WS04.
+    /// field. A legal document root. JSON Schema is `oneOf` with a
+    /// per-branch tag `const`; `config gen` emits one commented example
+    /// per variant.
     Tagged(TaggedShape),
 }
 

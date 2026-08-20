@@ -26,8 +26,9 @@ use crate::types::{ConfigAction, Layer, SearchMode, SearchPath};
 use crate::value::{Map, Value, from_value};
 
 /// Typed-config builder driven by a [`DocumentRoot`] (a named-field
-/// `#[derive(clapfig::Schema)]` struct, or `BTreeMap`/`HashMap<String, T>`
-/// where `T: Schema`).
+/// `#[derive(clapfig::Schema)]` struct, an internally tagged
+/// `#[serde(tag = "...")]` enum deriving `Schema`, or
+/// `BTreeMap`/`HashMap<String, T>` where `T: Schema`).
 ///
 /// Same surface as [`Builder`](crate::Builder) — `app_name`,
 /// `search_paths`, `env_prefix`, `cli_override`, `post_validate`, `load`,

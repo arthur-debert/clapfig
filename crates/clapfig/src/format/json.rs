@@ -60,7 +60,8 @@ use crate::runtime::{Schema, Shape};
 use crate::value::{Map, Value};
 
 use super::template::{
-    TemplateRenderer, doc_lines, leaf_annotations, tagged_template_stub, walk_level, walk_root,
+    TemplateRenderer, doc_lines, leaf_annotations, tagged_variant_example_schema, walk_level,
+    walk_root,
 };
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
@@ -959,16 +960,23 @@ impl TemplateRenderer for JsonTemplate {
     fn array_of(
         &mut self,
         out: &mut Self::Out,
-        _ctx: &(),
+        ctx: &(),
         name: &str,
         item: &Shape,
     ) -> Result<(), FormatError> {
         // Entry count is the user's call, so no real key is emitted (an
         // absent array-of resolves to the empty list); the comment carries
-        // a one-entry example.
+        // a one-entry example (one per tagged variant).
         let mut lines = doc_lines(item.field_doc());
-        let example = Json::Array(vec![example_value(item, name)?]);
-        lines.push(assignment_snippet(name, compact(&example)));
+        if let Shape::Tagged(tagged) = item {
+            for variant in &tagged.variants {
+                let example = Json::Array(vec![tagged_variant_json(self, ctx, tagged, variant)?]);
+                lines.push(assignment_snippet(name, compact(&example)));
+            }
+        } else {
+            let example = Json::Array(vec![example_value(item, name)?]);
+            lines.push(assignment_snippet(name, compact(&example)));
+        }
         out.insert(comment_key(name), comment_value(lines));
         Ok(())
     }
@@ -976,17 +984,28 @@ impl TemplateRenderer for JsonTemplate {
     fn map_of(
         &mut self,
         out: &mut Self::Out,
-        _ctx: &(),
+        ctx: &(),
         name: &str,
         item: &Shape,
     ) -> Result<(), FormatError> {
         // Entry keys are user-supplied, so no real key is emitted (an
         // absent map-of resolves to the empty map); the comment carries a
-        // placeholder-keyed example.
+        // placeholder-keyed example (one per tagged variant).
         let mut lines = doc_lines(item.field_doc());
-        let mut example = JsonMap::new();
-        example.insert("<key>".to_string(), example_value(item, name)?);
-        lines.push(assignment_snippet(name, compact(&Json::Object(example))));
+        if let Shape::Tagged(tagged) = item {
+            for variant in &tagged.variants {
+                let mut example = JsonMap::new();
+                example.insert(
+                    "<key>".to_string(),
+                    tagged_variant_json(self, ctx, tagged, variant)?,
+                );
+                lines.push(assignment_snippet(name, compact(&Json::Object(example))));
+            }
+        } else {
+            let mut example = JsonMap::new();
+            example.insert("<key>".to_string(), example_value(item, name)?);
+            lines.push(assignment_snippet(name, compact(&Json::Object(example))));
+        }
         out.insert(comment_key(name), comment_value(lines));
         Ok(())
     }
@@ -994,7 +1013,7 @@ impl TemplateRenderer for JsonTemplate {
     fn root_map(
         &mut self,
         out: &mut Self::Out,
-        _ctx: &(),
+        ctx: &(),
         item: &Shape,
         doc: &[String],
     ) -> Result<(), FormatError> {
@@ -1004,13 +1023,59 @@ impl TemplateRenderer for JsonTemplate {
         // would advertise a map level the schema does not accept.
         let mut lines = doc_lines(doc);
         lines.extend(doc_lines(item.field_doc()));
-        lines.push(assignment_snippet(
-            "<key>",
-            compact(&example_value(item, "<key>")?),
-        ));
+        if let Shape::Tagged(tagged) = item {
+            for variant in &tagged.variants {
+                lines.push(assignment_snippet(
+                    "<key>",
+                    compact(&tagged_variant_json(self, ctx, tagged, variant)?),
+                ));
+            }
+        } else {
+            lines.push(assignment_snippet(
+                "<key>",
+                compact(&example_value(item, "<key>")?),
+            ));
+        }
         out.insert(COMMENT_PREFIX.into(), comment_value(lines));
         Ok(())
     }
+
+    fn tagged(
+        &mut self,
+        out: &mut Self::Out,
+        ctx: &(),
+        name: Option<&str>,
+        tagged: &crate::runtime::TaggedShape,
+    ) -> Result<(), FormatError> {
+        let mut lines = doc_lines(&tagged.doc);
+        for variant in &tagged.variants {
+            let example = compact(&tagged_variant_json(self, ctx, tagged, variant)?);
+            match name {
+                Some(name) => lines.push(assignment_snippet(name, example)),
+                None => lines.push(example),
+            }
+        }
+        let key = match name {
+            Some(name) => comment_key(name),
+            None => COMMENT_PREFIX.to_string(),
+        };
+        if !lines.is_empty() {
+            out.insert(key, comment_value(lines));
+        }
+        Ok(())
+    }
+}
+
+fn tagged_variant_json(
+    renderer: &mut JsonTemplate,
+    ctx: &(),
+    tagged: &crate::runtime::TaggedShape,
+    variant: &crate::runtime::TaggedVariant,
+) -> Result<Json, FormatError> {
+    let example = tagged_variant_example_schema(tagged, variant);
+    let mut obj = JsonMap::new();
+    walk_level(renderer, &example, ctx, &mut obj)?;
+    Ok(Json::Object(obj))
 }
 
 /// Example object for an array-of / map-of entry, shown inside a comment:
@@ -1037,7 +1102,8 @@ fn example_object(
 
 /// One example JSON value for a shape: a declared default when present,
 /// otherwise a placeholder (leaf) or a one-entry nested example
-/// (object / array / map). Tagged shapes are a loud WS05 stub.
+/// (object / array / map). Tagged shapes use the first variant's complete
+/// object (callers that need every variant emit them as separate comments).
 fn example_value(shape: &Shape, context_key: &str) -> Result<Json, FormatError> {
     match shape {
         Shape::Leaf(leaf) => match &leaf.default {
@@ -1064,7 +1130,13 @@ fn example_value(shape: &Shape, context_key: &str) -> Result<Json, FormatError> 
             entry.insert("<key>".to_string(), example_value(&map.item, context_key)?);
             Ok(Json::Object(entry))
         }
-        Shape::Tagged(_) => tagged_template_stub(),
+        Shape::Tagged(tagged) => {
+            let Some(variant) = tagged.variants.first() else {
+                return Ok(Json::Object(JsonMap::new()));
+            };
+            let example = tagged_variant_example_schema(tagged, variant);
+            Ok(Json::Object(example_object(&example, context_key)?))
+        }
     }
 }
 
@@ -2063,6 +2135,126 @@ mod tests {
         let leaf_parsed: Json = serde_json::from_str(&format!("{{{leaf_snippet}}}"))
             .unwrap_or_else(|e| panic!("leaf snippet must parse: {e}: {leaf_snippet}"));
         assert_eq!(leaf_parsed["<key>"], "");
+    }
+
+    fn tagged_block() -> crate::runtime::TaggedShape {
+        use crate::runtime::{Field, Schema as RtSchema};
+        crate::runtime::Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                RtSchema::object("Rust")
+                    .field("mount", Field::string())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                RtSchema::object("Payload")
+                    .field("mount", Field::string())
+                    .field("artifact", Field::string())
+                    .build(),
+            )
+            .build()
+    }
+
+    fn nested_tagged() -> crate::runtime::TaggedShape {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let inner = crate::runtime::Shape::tagged("Inner", "kind")
+            .variant(
+                "alpha",
+                RtSchema::object("Alpha")
+                    .field("n", Field::integer())
+                    .build(),
+            )
+            .variant(
+                "beta",
+                RtSchema::object("Beta").field("s", Field::string()).build(),
+            )
+            .build();
+        crate::runtime::Shape::tagged("Outer", "mode")
+            .variant(
+                "wrap",
+                RtSchema::object("Wrap")
+                    .field("child", crate::runtime::Shape::from(inner))
+                    .build(),
+            )
+            .build()
+    }
+
+    fn comment_lines(comment: &Json) -> Vec<&str> {
+        match comment {
+            Json::String(s) => vec![s.as_str()],
+            Json::Array(items) => items.iter().filter_map(Json::as_str).collect(),
+            other => panic!("comment payload must be a string or array: {other}"),
+        }
+    }
+
+    #[test]
+    fn template_tagged_json_snippets_are_copyable_assignments() {
+        use crate::runtime::Schema as RtSchema;
+        let schema = RtSchema::object("App")
+            .field("block", Shape::from(tagged_block()))
+            .build();
+        let text = JsonAdapter.template(&Shape::Object(schema)).unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let lines = comment_lines(&json["//block"]);
+        assert_eq!(lines.len(), 2, "{text}");
+        for line in &lines {
+            assert!(
+                line.starts_with("\"block\":"),
+                "field snippet must be a JSON assignment, got {line}"
+            );
+            let parsed: Json = serde_json::from_str(&format!("{{{line}}}"))
+                .unwrap_or_else(|e| panic!("snippet must parse as a JSON object: {e}: {line}"));
+            assert!(parsed["block"].get("kind").is_some(), "{parsed}");
+        }
+    }
+
+    #[test]
+    fn template_tagged_root_json_snippets_are_complete_objects() {
+        let tagged = tagged_block();
+        let text = JsonAdapter
+            .template(&Shape::Tagged(tagged.clone()))
+            .unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let lines = comment_lines(&json["//"]);
+        assert_eq!(lines.len(), 2, "{text}");
+        for line in &lines {
+            let parsed: Json = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("root snippet must be a JSON object: {e}: {line}"));
+            assert!(parsed.get("kind").is_some(), "{parsed}");
+        }
+    }
+
+    #[test]
+    fn template_nested_tagged_example_is_a_complete_object() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let tagged = nested_tagged();
+        let text = JsonAdapter
+            .template(&Shape::Tagged(tagged.clone()))
+            .unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let lines = comment_lines(&json["//"]);
+        let snippet = lines
+            .iter()
+            .find(|l| l.contains("\"wrap\""))
+            .unwrap_or_else(|| panic!("wrap example missing: {text}"));
+        let map = match JsonAdapter.parse(snippet).unwrap().value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let child = map["child"].as_map().expect("child object");
+        assert_eq!(child["kind"], Value::String("alpha".into()));
+        finalize_root(
+            map,
+            &OriginMap::new(),
+            DocumentRoot::Tagged(&tagged),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap();
     }
 
     #[test]

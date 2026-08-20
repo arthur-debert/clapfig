@@ -41,12 +41,17 @@
 //!   `enum` annotation is omitted entirely.
 //! - **Env vars**: when a field maps to an env var, the name is attached as
 //!   the non-standard `x-env` extension.
+//! - **Tagged unions**: an internally tagged shape is JSON Schema `oneOf`.
+//!   Each branch is that variant's object schema plus the tag as a required
+//!   property whose schema is `{ "type": "string", "const": "<discriminator>" }`.
+//!   OpenAPI's `discriminator` keyword is not used.
 //! - **JSON comment keys**: every object allowlists the `^//` key pattern
 //!   (`patternProperties`) alongside `additionalProperties: false`. This is
 //!   for third-party validators only — editors validating a documented JSON
 //!   template against this schema directly. Clapfig's own validation never
 //!   sees the keys: the JSON adapter strips the reserved `//` namespace at
-//!   parse time (ADR-0002).
+//!   parse time (ADR-0002). Tagged `oneOf` branches are closed objects and
+//!   carry the same allowlist.
 //!
 //! # Example
 //!
@@ -59,7 +64,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::runtime::{Leaf, LeafType, NamedField, Schema, Shape};
+use crate::runtime::{Leaf, LeafType, NamedField, Schema, Shape, TaggedShape, TaggedVariant};
 use crate::value::Value as ConfigValue;
 
 /// JSON Schema dialect emitted in the root `$schema` field.
@@ -135,14 +140,14 @@ pub fn generate_schema(schema: &Schema) -> Value {
 ///
 /// A root [`Shape::Map`] is `type: object` with `additionalProperties` of
 /// the item schema at the document root (no synthetic parent property).
-/// Object roots match [`generate_schema`].
+/// A root [`Shape::Tagged`] is `oneOf` of variant objects, each with the
+/// tag as a required `{ "const": "<discriminator>" }` property. Object
+/// roots match [`generate_schema`].
 pub fn generate_from_shape(shape: &Shape) -> Value {
     let mut root = match shape {
         Shape::Object(schema) => schema_to_object(schema),
         Shape::Map(map) => map_root_to_object(map),
-        Shape::Tagged(_) => panic!(
-            "clapfig: tagged JSON Schema is SHP01-WS05; do not export a tagged shape this slice"
-        ),
+        Shape::Tagged(tagged) => tagged_to_schema(tagged),
         Shape::Leaf(_) | Shape::Array(_) => panic!(
             "clapfig: a Leaf or Array is not a legal document root (legal roots: Object, Map, Tagged)"
         ),
@@ -260,9 +265,11 @@ fn field_to_property(field: &NamedField) -> (String, Value, bool) {
             let required = !leaf.optional && leaf.default.is_none();
             (field.name.clone(), Value::Object(prop), required)
         }
-        Shape::Tagged(_) => panic!(
-            "clapfig: tagged JSON Schema is SHP01-WS05; object-root schemas in this slice have no tagged fields"
-        ),
+        Shape::Tagged(tagged) => {
+            // Absent tagged object → empty table → MissingRequired on the
+            // tag, so the property is required on the parent.
+            (field.name.clone(), tagged_to_schema(tagged), true)
+        }
     }
 }
 
@@ -287,10 +294,60 @@ fn shape_to_schema(shape: &Shape) -> Option<Value> {
             }
             Some(Value::Object(obj))
         }
-        Shape::Tagged(_) => panic!(
-            "clapfig: tagged JSON Schema is SHP01-WS05; object-root schemas in this slice have no tagged fields"
-        ),
+        Shape::Tagged(tagged) => Some(tagged_to_schema(tagged)),
     }
+}
+
+/// JSON Schema for an internally tagged union: `oneOf` of variant objects,
+/// each with the tag as a required `{ "const": "<discriminator>" }`
+/// property. No OpenAPI `discriminator`.
+fn tagged_to_schema(tagged: &TaggedShape) -> Value {
+    let mut obj = Map::new();
+    if !tagged.name.is_empty() {
+        obj.insert("title".into(), Value::String(tagged.name.clone()));
+    }
+    if !tagged.doc.is_empty() {
+        obj.insert("description".into(), Value::String(join_doc(&tagged.doc)));
+    }
+    let branches = tagged
+        .variants
+        .iter()
+        .map(|variant| tagged_branch_schema(tagged, variant))
+        .collect();
+    obj.insert("oneOf".into(), Value::Array(branches));
+    Value::Object(obj)
+}
+
+/// One `oneOf` branch: the variant object plus the tag field as a
+/// required string `const`.
+fn tagged_branch_schema(tagged: &TaggedShape, variant: &TaggedVariant) -> Value {
+    let mut object = schema_to_object(&variant.schema);
+    let Value::Object(map) = &mut object else {
+        return object;
+    };
+    let tag_schema = json!({ "type": "string", "const": variant.discriminator });
+    if let Some(Value::Object(props)) = map.get_mut("properties") {
+        let mut ordered = Map::new();
+        ordered.insert(tagged.tag.clone(), tag_schema);
+        for (key, value) in props.clone() {
+            ordered.insert(key, value);
+        }
+        *props = ordered;
+    }
+    match map.get_mut("required") {
+        Some(Value::Array(req)) => {
+            if !req
+                .iter()
+                .any(|value| value.as_str() == Some(tagged.tag.as_str()))
+            {
+                req.insert(0, Value::String(tagged.tag.clone()));
+            }
+        }
+        _ => {
+            map.insert("required".into(), json!([tagged.tag]));
+        }
+    }
+    object
 }
 
 fn populate_container_attrs(
@@ -319,7 +376,10 @@ fn schema_requires_presence(schema: &Schema) -> bool {
     schema.fields.iter().any(|nf| match &nf.field {
         Shape::Leaf(leaf) => !leaf.optional && leaf.default.is_none(),
         Shape::Object(nested) => schema_requires_presence(nested),
-        Shape::Array(_) | Shape::Map(_) | Shape::Tagged(_) => false,
+        Shape::Array(_) | Shape::Map(_) => false,
+        // Absent tagged object materializes as the empty table, then
+        // MissingRequired on the tag — the parent must require this field.
+        Shape::Tagged(_) => true,
     })
 }
 
@@ -978,20 +1038,105 @@ mod tests {
         assert_eq!(entries["enum"], json!(["auto", 0]));
     }
 
+    fn tagged_block() -> crate::runtime::TaggedShape {
+        use crate::runtime::Schema as RtSchema;
+        Shape::tagged("Block", "kind")
+            .doc("A block instance.")
+            .variant(
+                "rust",
+                RtSchema::object("Rust")
+                    .field("mount", crate::runtime::Field::string())
+                    .field("crate_path", crate::runtime::Field::string().optional())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                RtSchema::object("Payload")
+                    .field("mount", crate::runtime::Field::string())
+                    .field("artifact", crate::runtime::Field::string())
+                    .build(),
+            )
+            .variant("off", RtSchema::object("Off").build())
+            .build()
+    }
+
     #[test]
-    #[should_panic(expected = "tagged JSON Schema is SHP01-WS05")]
-    fn tagged_item_shape_fails_loudly() {
-        use crate::runtime::{Field, Schema as RtSchema, Shape};
-        let _ = generate_schema(
+    fn tagged_root_is_oneof_with_per_branch_tag_const() {
+        let s = generate_from_shape(&Shape::Tagged(tagged_block()));
+        assert_eq!(s["$schema"], SCHEMA_DIALECT);
+        assert_eq!(s["title"], "Block");
+        assert!(s["description"].as_str().unwrap().contains("block"), "{s}");
+        assert!(
+            s.get("discriminator").is_none(),
+            "OpenAPI discriminator is not JSON Schema: {s}"
+        );
+        assert!(
+            s.get("type").is_none(),
+            "tagged root is oneOf, not type=object: {s}"
+        );
+        let one_of = s["oneOf"].as_array().expect("oneOf");
+        assert_eq!(one_of.len(), 3);
+        let rust = &one_of[0];
+        assert_eq!(rust["type"], "object");
+        assert_eq!(rust["properties"]["kind"]["const"], "rust");
+        assert_eq!(rust["properties"]["kind"]["type"], "string");
+        assert_eq!(rust["properties"]["mount"]["type"], "string");
+        assert!(rust["properties"].get("artifact").is_none(), "{rust}");
+        let required: Vec<&str> = rust["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(required.contains(&"kind"), "{required:?}");
+        assert!(required.contains(&"mount"), "{required:?}");
+        assert!(!required.contains(&"crate_path"), "{required:?}");
+        assert_eq!(rust["additionalProperties"], false);
+        assert_eq!(rust["patternProperties"]["^//"], json!({}));
+        assert_eq!(one_of[1]["properties"]["kind"]["const"], "payload");
+        assert_eq!(one_of[2]["properties"]["kind"]["const"], "off");
+        assert_eq!(one_of[2]["required"], json!(["kind"]));
+    }
+
+    #[test]
+    fn nested_tagged_field_is_oneof_and_required() {
+        use crate::runtime::Schema as RtSchema;
+        let s = generate_schema(
             &RtSchema::object("App")
-                .field(
-                    "blocks",
-                    Field::array_of_type(
-                        Shape::tagged("Block", "kind").variant("rust", RtSchema::object("Rust")),
-                    ),
-                )
+                .field("block", Shape::from(tagged_block()))
                 .build(),
         );
+        assert_eq!(s["patternProperties"]["^//"], json!({}));
+        assert_eq!(s["additionalProperties"], false);
+        let required: Vec<&str> = s["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(required, ["block"]);
+        let block = &s["properties"]["block"];
+        assert!(block.get("discriminator").is_none(), "{block}");
+        assert_eq!(block["oneOf"].as_array().unwrap().len(), 3);
+        assert_eq!(block["oneOf"][0]["properties"]["kind"]["const"], "rust");
+    }
+
+    #[test]
+    fn map_of_tagged_composes_additional_properties_oneof() {
+        use crate::runtime::Field;
+        use crate::runtime::Schema as RtSchema;
+        let s = generate_schema(
+            &RtSchema::object("App")
+                .field("blocks", Field::map_of(Shape::from(tagged_block())))
+                .build(),
+        );
+        let blocks = &s["properties"]["blocks"];
+        assert_eq!(blocks["type"], "object");
+        assert_eq!(blocks["patternProperties"]["^//"], json!({}));
+        let entry = &blocks["additionalProperties"];
+        assert!(entry.get("discriminator").is_none(), "{entry}");
+        assert_eq!(entry["oneOf"][0]["properties"]["kind"]["const"], "rust");
+        assert_eq!(entry["oneOf"][0]["patternProperties"]["^//"], json!({}));
     }
 
     #[test]

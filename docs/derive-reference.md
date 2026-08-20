@@ -334,17 +334,21 @@ error** naming the attribute and the divergence it would cause. There is
 no silent ignore and no compatibility path.
 
 **Honored:** `rename` (fields/variants, directional included),
-`rename_all` (structs and unit-only enums, directional included),
-`deserialize_with` / `with` for shape-preserving normalization.
+`rename_all` (structs, unit-only enums, and internally tagged enums,
+directional included), `#[serde(tag = "...")]` on enums (internally
+tagged unions of objects), `deserialize_with` / `with` for
+shape-preserving normalization. There is no clapfig-only
+`#[clapfig(tag)]`.
 
 **Accepted and inert** for config loading: serialize-only attributes
 (`skip_serializing`, `serialize_with`, …) and derive plumbing (`bound`,
 `borrow`, `crate`, `expecting`).
 
 **Rejected:** `default`, `flatten`, `alias`, `skip`, `skip_deserializing`,
-`tag` / `untagged` / `content`, `deny_unknown_fields`, `transparent`,
-`from` / `try_from`, and anything else the schema would disagree with.
-Supporting any of those is future work, not a missing flag.
+`untagged` / `content` (adjacent tagging), `deny_unknown_fields`,
+`transparent`, `from` / `try_from`, and anything else the schema would
+disagree with. Supporting any of those is future work, not a missing
+flag.
 
 A shape-changing deserializer must be paired with `#[clapfig(value)]` so
 the schema declares a free-form leaf. Without `value`, schema validation
@@ -357,7 +361,8 @@ runs first and rejects the unexpected wire shape with a type error.
 width's bounds), `f32`/`f64`, `clapfig::value::Datetime`,
 `clapfig::value::Value`, `Vec<T>` (scalar or Schema-deriving element),
 `HashMap<String, V>` / `BTreeMap<String, V>`, nested structs that also
-derive `Schema`, unit-only enums.
+derive `Schema`, unit-only enums, internally tagged enums
+(`#[serde(tag = "...")]`).
 
 **Supported `Option` wrappers:** `Option<T>` where `T` is a scalar,
 `Value`, or unit-only enum; `Option<Vec<T>>` of a scalar or unit-only

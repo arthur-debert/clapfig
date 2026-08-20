@@ -19,7 +19,7 @@
 
 use std::fmt::Write;
 
-use crate::runtime::{LeafType, Schema, Shape};
+use crate::runtime::{Field, LeafType, Schema, Shape, TaggedShape, TaggedVariant};
 use crate::value::Value;
 
 use super::FormatError;
@@ -114,6 +114,20 @@ pub(crate) trait TemplateRenderer: Sized {
         item: &Shape,
         doc: &[String],
     ) -> Result<(), FormatError>;
+
+    /// Emit one commented example per tagged variant.
+    ///
+    /// `name` is the field name in field position, or `None` at a tagged
+    /// document root. Each example is a complete object for that
+    /// discriminator (tag plus that variant's fields). No uncommented
+    /// mixed-variant object is emitted.
+    fn tagged(
+        &mut self,
+        out: &mut Self::Out,
+        ctx: &Self::Ctx,
+        name: Option<&str>,
+        tagged: &TaggedShape,
+    ) -> Result<(), FormatError>;
 }
 
 /// Drive one schema level through `renderer`: the level's doc hook, then
@@ -155,7 +169,10 @@ pub(crate) fn walk_level<R: TemplateRenderer>(
                 renderer.check_field_name(&nf.name)?;
                 renderer.map_of(out, ctx, &nf.name, &map.item)?;
             }
-            Shape::Tagged(_) => tagged_template_stub(),
+            Shape::Tagged(tagged) => {
+                renderer.check_field_name(&nf.name)?;
+                renderer.tagged(out, ctx, Some(&nf.name), tagged)?;
+            }
             Shape::Leaf(_) => unreachable!("leaves are value fields"),
         }
     }
@@ -165,8 +182,8 @@ pub(crate) fn walk_level<R: TemplateRenderer>(
 /// Drive a document-root [`Shape`] through `renderer`.
 ///
 /// Object roots use [`walk_level`]. Map roots emit a commented example
-/// entry with no parent table. Tagged is SHP01-WS05. Leaf and Array are
-/// illegal document roots.
+/// entry with no parent table. Tagged roots emit one commented example
+/// per variant. Leaf and Array are illegal document roots.
 pub(crate) fn walk_root<R: TemplateRenderer>(
     renderer: &mut R,
     shape: &Shape,
@@ -176,9 +193,7 @@ pub(crate) fn walk_root<R: TemplateRenderer>(
     match shape {
         Shape::Object(schema) => walk_level(renderer, schema, ctx, out),
         Shape::Map(map) => renderer.root_map(out, ctx, &map.item, &map.doc),
-        Shape::Tagged(_) => {
-            tagged_template_stub();
-        }
+        Shape::Tagged(tagged) => renderer.tagged(out, ctx, None, tagged),
         Shape::Leaf(_) | Shape::Array(_) => panic!(
             "clapfig: a Leaf or Array is not a legal document root (legal roots: Object, Map, Tagged)"
         ),
@@ -231,12 +246,100 @@ fn emit_value_field<R: TemplateRenderer>(
     renderer.leaf(out, ctx, name, ValueView::from_shape(shape))
 }
 
-/// Tagged template emission is SHP01-WS05. Walkers in this slice fail
-/// loudly rather than emit a lying example.
-pub(crate) fn tagged_template_stub() -> ! {
-    panic!(
-        "clapfig: tagged templates are SHP01-WS05; object-root schemas in this slice have no tagged fields"
+/// Build a walkable object schema for one tagged variant: the tag field
+/// (defaulted to the discriminator) plus the variant's fields with
+/// placeholder defaults so a single `walk_level` pass emits uncommented
+/// assignments that the caller then comments as a block.
+///
+/// Nested tagged fields are materialized as the first child variant's
+/// complete object so the enclosing example is valid when uncommented.
+pub(crate) fn tagged_variant_example_schema(
+    tagged: &TaggedShape,
+    variant: &TaggedVariant,
+) -> Schema {
+    let mut builder = Schema::object(variant.schema.name.clone());
+    for line in &variant.schema.doc {
+        builder = builder.doc(line.clone());
+    }
+    builder = builder.field(
+        tagged.tag.clone(),
+        Field::string().default(variant.discriminator.clone()),
     );
+    for nf in &variant.schema.fields {
+        builder = builder.field(nf.name.clone(), with_example_defaults(&nf.field));
+    }
+    builder.build()
+}
+
+fn with_example_defaults(shape: &Shape) -> Shape {
+    match shape {
+        Shape::Leaf(leaf) => {
+            let mut leaf = leaf.clone();
+            if leaf.default.is_none() {
+                leaf.default = Some(example_leaf_value(&leaf.ty));
+            }
+            Shape::Leaf(leaf)
+        }
+        Shape::Object(schema) => {
+            let mut builder = Schema::object(schema.name.clone());
+            for line in &schema.doc {
+                builder = builder.doc(line.clone());
+            }
+            if let Some(strict) = schema.strict {
+                builder = builder.strict(strict);
+            }
+            for nf in &schema.fields {
+                builder = builder.field(nf.name.clone(), with_example_defaults(&nf.field));
+            }
+            Shape::Object(builder.build())
+        }
+        Shape::Array(array) => {
+            let mut array = array.clone();
+            array.item = Box::new(with_example_defaults(&array.item));
+            Shape::Array(array)
+        }
+        Shape::Map(map) => {
+            let mut map = map.clone();
+            map.item = Box::new(with_example_defaults(&map.item));
+            Shape::Map(map)
+        }
+        Shape::Tagged(tagged) => tagged
+            .variants
+            .first()
+            .map(|variant| Shape::Object(tagged_variant_example_schema(tagged, variant)))
+            .unwrap_or_else(|| Shape::Tagged(tagged.clone())),
+    }
+}
+
+fn example_leaf_value(ty: &LeafType) -> Value {
+    match ty {
+        LeafType::String | LeafType::Value => Value::String(String::new()),
+        LeafType::Enum { values } => values
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Value::String(String::new())),
+        LeafType::Integer { min, max } => Value::Integer(example_integer(*min, *max)),
+        LeafType::Float => Value::Float(0.0),
+        LeafType::Bool => Value::Boolean(false),
+        LeafType::DateTime => Value::Datetime(
+            "1970-01-01T00:00:00Z"
+                .parse()
+                .expect("epoch datetime placeholder is valid"),
+        ),
+    }
+}
+
+/// Placeholder integer that satisfies declared bounds: zero when it is
+/// in range, otherwise the lower bound of a positive-only range or the
+/// upper bound of a negative-only range.
+fn example_integer(min: Option<i64>, max: Option<i64>) -> i64 {
+    if min.is_none_or(|lo| 0 >= lo) && max.is_none_or(|hi| 0 <= hi) {
+        0
+    } else if let Some(lo) = min.filter(|lo| *lo > 0) {
+        lo
+    } else {
+        max.or(min).unwrap_or(0)
+    }
 }
 
 /// Doc lines ready for a comment payload: trailing whitespace trimmed,
@@ -430,6 +533,68 @@ mod tests {
         let map = Shape::from(Field::map_of(LeafType::Float));
         let lines = leaf_annotations(view(&map), "TOML", &mut |_| unreachable!()).unwrap();
         assert_eq!(lines, ["Values: float"]);
+    }
+
+    #[test]
+    fn example_leaf_value_integer_respects_bounds() {
+        assert_eq!(
+            example_leaf_value(&LeafType::Integer {
+                min: Some(5),
+                max: Some(10)
+            }),
+            Value::Integer(5)
+        );
+        assert_eq!(
+            example_leaf_value(&LeafType::Integer {
+                min: Some(-10),
+                max: Some(-1)
+            }),
+            Value::Integer(-1)
+        );
+        assert_eq!(
+            example_leaf_value(&LeafType::Integer {
+                min: Some(-5),
+                max: Some(5)
+            }),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn tagged_variant_example_materializes_nested_tagged_as_first_variant() {
+        let inner = Shape::tagged("Inner", "kind")
+            .variant(
+                "alpha",
+                Schema::object("Alpha").field("n", Field::integer()).build(),
+            )
+            .variant(
+                "beta",
+                Schema::object("Beta").field("s", Field::string()).build(),
+            )
+            .build();
+        let outer = Shape::tagged("Outer", "mode")
+            .variant(
+                "wrap",
+                Schema::object("Wrap")
+                    .field("child", Shape::from(inner))
+                    .build(),
+            )
+            .build();
+        let example = tagged_variant_example_schema(&outer, &outer.variants[0]);
+        match &example
+            .fields
+            .iter()
+            .find(|f| f.name == "child")
+            .expect("wrap has child")
+            .field
+        {
+            Shape::Object(child) => {
+                assert!(child.fields.iter().any(|f| f.name == "kind"));
+                assert!(child.fields.iter().any(|f| f.name == "n"));
+                assert!(!child.fields.iter().any(|f| f.name == "s"));
+            }
+            other => panic!("nested tagged must materialize as an object, got {other:?}"),
+        }
     }
 
     #[test]

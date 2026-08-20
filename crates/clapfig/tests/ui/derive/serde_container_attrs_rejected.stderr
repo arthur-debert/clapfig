@@ -10,14 +10,14 @@ error: #[serde(default)] on a struct deriving clapfig::Schema is not supported: 
 13 | #[serde(default)]
    |         ^^^^^^^
 
-error: #[serde(untagged)] on a enum deriving clapfig::Schema is not supported: it changes the value shape serde deserializes, and the schema has no representation for tagged/untagged unions — use `#[clapfig(value)]` on the field that holds the union type instead. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+error: #[serde(untagged)] on a enum deriving clapfig::Schema is not supported: untagged unions have no schema representation; internally tagged `#[serde(tag = "...")]` is the supported form. Use `#[clapfig(value)]` on the field that holds the union type instead. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
   --> tests/ui/derive/serde_container_attrs_rejected.rs:19:9
    |
 19 | #[serde(untagged)]
    |         ^^^^^^^^
 
-error: #[serde(tag)] on a enum deriving clapfig::Schema is not supported: it changes the value shape serde deserializes, and the schema has no representation for tagged/untagged unions — use `#[clapfig(value)]` on the field that holds the union type instead. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
-  --> tests/ui/derive/serde_container_attrs_rejected.rs:26:9
+error: #[serde(content)] on a enum deriving clapfig::Schema is not supported: adjacent tagging (`tag` + `content`) is not supported — only internally tagged enums (`#[serde(tag = "...")]` without `content`) are. Use `#[clapfig(value)]` on the field that holds the union type instead. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+  --> tests/ui/derive/serde_container_attrs_rejected.rs:26:23
    |
-26 | #[serde(tag = "kind")]
-   |         ^^^
+26 | #[serde(tag = "kind", content = "body")]
+   |                       ^^^^^^^

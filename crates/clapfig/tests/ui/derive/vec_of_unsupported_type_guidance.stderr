@@ -6,7 +6,7 @@ error[E0277]: `PathBuf` is not a field type `#[derive(clapfig::Schema)]` support
    |
    = help: the trait `clapfig::Schema` is not implemented for `PathBuf`
    = note: supported scalars: String, bool, integers (i8–i64, u8–u64, usize, isize), f32/f64, clapfig::value::Datetime, clapfig::value::Value; wrappers: Option<T>, Vec<T> (scalar or Schema-deriving element), HashMap/BTreeMap<String, V>
-   = note: other types (PathBuf, Duration, char, newtypes, type aliases, third-party maps, …) have no TOML-faithful schema shape: either add `#[derive(clapfig::Schema)]` to the type (structs with named fields and unit-only enums only), or mark the field `#[clapfig(value)]` and take over the deserialize side yourself
+   = note: other types (PathBuf, Duration, char, newtypes, type aliases, third-party maps, …) have no TOML-faithful schema shape: either add `#[derive(clapfig::Schema)]` to the type (structs with named fields, unit-only enums, or internally tagged `#[serde(tag = "...")]` enums), or mark the field `#[clapfig(value)]` and take over the deserialize side yourself
 help: the following other types implement trait `clapfig::Schema`
   --> tests/ui/derive/vec_of_unsupported_type_guidance.rs:8:10
    |

@@ -42,6 +42,12 @@ use crate::value::Value;
 /// non-empty list becomes a `Shape::Leaf` with `LeafType::Enum` (for
 /// `MapOf`, `Shape::Map` of that leaf; for `ArrayOf`, `Shape::Array` of
 /// that leaf), while an empty list keeps the nested-object shape.
+///
+/// Internally tagged enums (`#[serde(tag = "...")]`) keep `fields` and
+/// `enum_variants` empty and populate [`tagged_tag`](Self::tagged_tag) /
+/// [`tagged_variants`](Self::tagged_variants). Nested / map-of / array-of
+/// conversion then emits [`Shape::Tagged`](crate::runtime::Shape::Tagged)
+/// rather than flattening to a leaf.
 #[derive(Debug)]
 pub struct SchemaStatic {
     pub name: &'static str,
@@ -49,15 +55,22 @@ pub struct SchemaStatic {
     pub strict: Option<bool>,
     pub fields: &'static [NamedFieldStatic],
     /// For unit-only enum types: variant names (post-rename). For struct
-    /// schemas this slice is empty.
+    /// schemas and tagged enums this slice is empty.
     pub enum_variants: &'static [&'static str],
+    /// Discriminator field name for an internally tagged enum. Empty when
+    /// this schema is not tagged.
+    pub tagged_tag: &'static str,
+    /// Tagged variants (discriminator → object schema). Empty when this
+    /// schema is not tagged.
+    pub tagged_variants: &'static [TaggedVariantStatic],
 }
 
 /// `const`-friendly mirror of [`runtime::Shape`](crate::runtime::Shape).
 ///
-/// Five constructors matching the runtime node. Derive will emit const
-/// trees of this type for root Map / Tagged in later slices; today's
-/// object-root derive still emits [`SchemaStatic`].
+/// Five constructors matching the runtime node. Object-root and tagged
+/// derive emit [`SchemaStatic`] (tagged metadata lives on that struct);
+/// a root Map is a typed `BTreeMap`/`HashMap` and does not emit a
+/// `ShapeStatic` const.
 ///
 /// Tagged variants are objects ([`SchemaStatic`]), not an arbitrary
 /// [`ShapeStatic`]. `to_runtime` enforces the same construction
@@ -266,8 +279,16 @@ impl SchemaStatic {
     /// struct. The macro emits an empty `fields` slice for enums and
     /// populates `enum_variants` instead; the converter consults this
     /// when flattening a `FieldStatic::Nested(...)` into the runtime form.
+    /// Internally tagged enums are [`is_tagged`](Self::is_tagged), not this.
     pub fn is_enum(&self) -> bool {
         !self.enum_variants.is_empty()
+    }
+
+    /// `true` when this schema is an internally tagged union
+    /// (`#[serde(tag = "...")]`). Nested / map-of / array-of conversion
+    /// emits [`Shape::Tagged`](crate::runtime::Shape::Tagged).
+    pub fn is_tagged(&self) -> bool {
+        !self.tagged_tag.is_empty()
     }
 }
 
@@ -330,6 +351,13 @@ impl ShapeStatic {
             } => RuntimeShape::Tagged(tagged_static_to_runtime(name, doc, *strict, tag, variants)),
         }
     }
+}
+
+fn tagged_static_with_doc(s: &SchemaStatic, doc: Vec<String>) -> RuntimeTaggedShape {
+    let mut tagged =
+        tagged_static_to_runtime(s.name, s.doc, s.strict, s.tagged_tag, s.tagged_variants);
+    tagged.doc = doc;
+    tagged
 }
 
 fn tagged_static_to_runtime(
@@ -447,6 +475,9 @@ impl FieldStatic {
                     env: None,
                 })
             }
+            FieldStatic::Nested { schema: s, doc } if s.is_tagged() => {
+                RuntimeShape::Tagged(tagged_static_with_doc(s, effective_doc(doc, s.doc)))
+            }
             FieldStatic::Nested { schema: s, doc } => {
                 let mut runtime = s.to_runtime();
                 runtime.doc = effective_doc(doc, s.doc);
@@ -469,6 +500,16 @@ impl FieldStatic {
                         optional: false,
                         env: None,
                     }),
+                    None,
+                    false,
+                    None,
+                ))
+            }
+            FieldStatic::ArrayOf { schema: s, doc } if s.is_tagged() => {
+                let doc = effective_doc(doc, s.doc);
+                RuntimeShape::Array(array_shape_from_item(
+                    doc.clone(),
+                    RuntimeShape::Tagged(tagged_static_with_doc(s, doc)),
                     None,
                     false,
                     None,
@@ -508,6 +549,16 @@ impl FieldStatic {
                         optional: false,
                         env: None,
                     }),
+                    None,
+                    false,
+                    None,
+                ))
+            }
+            FieldStatic::MapOf { schema: s, doc } if s.is_tagged() => {
+                let doc = effective_doc(doc, s.doc);
+                RuntimeShape::Map(map_shape_from_item(
+                    doc.clone(),
+                    RuntimeShape::Tagged(tagged_static_with_doc(s, doc)),
                     None,
                     false,
                     None,
@@ -776,7 +827,8 @@ impl ValueStatic {
             or Schema-deriving element), HashMap/BTreeMap<String, V>",
     note = "other types (PathBuf, Duration, char, newtypes, type aliases, third-party maps, …) \
             have no TOML-faithful schema shape: either add `#[derive(clapfig::Schema)]` to the \
-            type (structs with named fields and unit-only enums only), or mark the field \
+            type (structs with named fields, unit-only enums, or internally tagged \
+            `#[serde(tag = \"...\")]` enums), or mark the field \
             `#[clapfig(value)]` and take over the deserialize side yourself"
 )]
 pub trait Schema {
@@ -799,13 +851,23 @@ pub trait Schema {
     /// Unit-only enums become [`Shape::Leaf`](crate::runtime::Shape::Leaf)
     /// with [`LeafType::Enum`](crate::runtime::LeafType::Enum), preserving
     /// the closed post-rename variant set from [`STATIC`](Self::STATIC).
-    /// Named-field structs wrap [`schema`](Self::schema) as
+    /// Internally tagged enums become
+    /// [`Shape::Tagged`](crate::runtime::Shape::Tagged). Named-field
+    /// structs wrap [`schema`](Self::schema) as
     /// [`Shape::Object`](crate::runtime::Shape::Object). Root-map typed
     /// loads (`HashMap`/`BTreeMap`) override this as
     /// [`Shape::Map`](crate::runtime::Shape::Map). Walkers take
     /// [`Shape`](crate::runtime::Shape).
     fn shape() -> crate::runtime::Shape {
-        if Self::STATIC.is_enum() {
+        if Self::STATIC.is_tagged() {
+            crate::runtime::Shape::Tagged(tagged_static_to_runtime(
+                Self::STATIC.name,
+                Self::STATIC.doc,
+                Self::STATIC.strict,
+                Self::STATIC.tagged_tag,
+                Self::STATIC.tagged_variants,
+            ))
+        } else if Self::STATIC.is_enum() {
             crate::runtime::Shape::Leaf(unit_enum_leaf(Self::STATIC))
         } else {
             crate::runtime::Shape::Object(Self::schema().clone())
@@ -840,12 +902,19 @@ pub trait Schema {
     /// (`"plugins"`); individual array entries are not addressable as
     /// distinct paths at this layer so no `plugins[N]` form is emitted.
     /// Unit-enum leaves contribute only their own path (the variant set
-    /// is metadata on the leaf, not a separate sub-path).
+    /// is metadata on the leaf, not a separate sub-path). Internally
+    /// tagged unions contribute the tag key, then the union of every
+    /// variant's field paths: a name shared by two variants is listed
+    /// once, but descendants of that name still come from every variant.
     ///
     /// The default impl walks `Self::STATIC`. Override is rarely needed.
     fn field_paths() -> Vec<String> {
         let mut out = Vec::new();
-        collect_field_paths(Self::STATIC, "", &mut out);
+        if Self::STATIC.is_tagged() {
+            collect_tagged_field_paths(Self::STATIC, "", &mut out);
+        } else {
+            collect_field_paths(Self::STATIC, "", &mut out);
+        }
         out
     }
 }
@@ -853,14 +922,16 @@ pub trait Schema {
 /// Marker: `{Self}` is a legal clapfig **document root**.
 ///
 /// [`Clapfig::typed`](crate::Clapfig::typed) is generic over this, not
-/// over [`Schema`] alone: a named-field struct deriving `Schema`, or
+/// over [`Schema`] alone: a named-field struct deriving `Schema`, an
+/// internally tagged `#[serde(tag = "...")]` enum deriving `Schema`, or
 /// `BTreeMap<String, T>` / `HashMap<String, T>` where `T: Schema`. Leaf
 /// and Array (scalars, `Vec<T>`, a unit-only enum as the document type)
 /// are not legal document roots — they remain valid nested shapes.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a legal clapfig document root",
     label = "illegal document root",
-    note = "legal roots: a named-field struct deriving Schema, or BTreeMap<String, T> / \
+    note = "legal roots: a named-field struct deriving Schema, an internally tagged \
+            #[serde(tag = \"...\")] enum deriving Schema, or BTreeMap<String, T> / \
             HashMap<String, T> where T: Schema",
     note = "Leaf and Array (scalars, Vec<T>, unit-only enums as the document type) are not \
             legal document roots"
@@ -997,10 +1068,42 @@ pub fn collect_field_paths(schema: &SchemaStatic, prefix: &str, out: &mut Vec<St
             }
             FieldStatic::Nested { schema: child, .. }
             | FieldStatic::ArrayOf { schema: child, .. }
+            | FieldStatic::MapOf { schema: child, .. }
+                if child.is_tagged() =>
+            {
+                out.push(dotted.clone());
+                collect_tagged_field_paths(child, &dotted, out);
+            }
+            FieldStatic::Nested { schema: child, .. }
+            | FieldStatic::ArrayOf { schema: child, .. }
             | FieldStatic::MapOf { schema: child, .. } => {
                 out.push(dotted.clone());
                 collect_field_paths(child, &dotted, out);
             }
+        }
+    }
+}
+
+/// Depth-first inventory of a tagged schema: the tag key, then the union
+/// of variant field paths (shared names once). Every variant's field
+/// subtree is walked; uniqueness is per emitted path so a name shared
+/// by two variants still contributes each variant's distinct descendants.
+fn collect_tagged_field_paths(schema: &SchemaStatic, prefix: &str, out: &mut Vec<String>) {
+    let tag_path = if prefix.is_empty() {
+        schema.tagged_tag.to_string()
+    } else {
+        format!("{prefix}.{}", schema.tagged_tag)
+    };
+    out.push(tag_path.clone());
+    let mut collected = Vec::new();
+    for variant in schema.tagged_variants {
+        collect_field_paths(variant.schema, prefix, &mut collected);
+    }
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(tag_path);
+    for path in collected {
+        if seen.insert(path.clone()) {
+            out.push(path);
         }
     }
 }
@@ -1065,6 +1168,8 @@ mod tests {
             }),
         }],
         enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
     };
 
     #[test]
@@ -1155,6 +1260,8 @@ mod tests {
             }),
         }],
         enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
     };
 
     static NESTED_OUTER: SchemaStatic = SchemaStatic {
@@ -1169,6 +1276,8 @@ mod tests {
             },
         }],
         enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
     };
 
     static ENUM_PDF_PAGE: SchemaStatic = SchemaStatic {
@@ -1177,6 +1286,8 @@ mod tests {
         strict: None,
         fields: &[],
         enum_variants: &["a4", "letter"],
+        tagged_tag: "",
+        tagged_variants: &[],
     };
 
     static ENUM_CONTAINER: SchemaStatic = SchemaStatic {
@@ -1191,6 +1302,8 @@ mod tests {
             },
         }],
         enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
     };
 
     #[test]
@@ -1228,6 +1341,8 @@ mod tests {
             },
         }],
         enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
     };
 
     #[test]
@@ -1271,6 +1386,8 @@ mod tests {
             },
         }],
         enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
     };
 
     #[test]
@@ -1314,6 +1431,8 @@ mod tests {
             },
         }],
         enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
     };
 
     #[test]
@@ -1363,6 +1482,8 @@ mod tests {
                 }),
             }],
             enum_variants: &[],
+            tagged_tag: "",
+            tagged_variants: &[],
         };
         let _ = BAD_OPTIONAL_ARRAY.to_runtime();
     }
@@ -1379,6 +1500,8 @@ mod tests {
             },
         }],
         enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
     };
 
     #[test]
@@ -1413,6 +1536,8 @@ mod tests {
                 }),
             }],
             enum_variants: &[],
+            tagged_tag: "",
+            tagged_variants: &[],
         };
         let _ = BAD_DEFAULT.to_runtime();
     }
@@ -1471,6 +1596,8 @@ mod tests {
         strict: None,
         fields: &[],
         enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
     };
 
     static TAGGED_BLOCK: ShapeStatic = ShapeStatic::Tagged {
@@ -1519,6 +1646,91 @@ mod tests {
                 assert!(t.variants[1].schema.fields.is_empty());
             }
             other => panic!("expected Tagged, got {other:?}"),
+        }
+    }
+
+    static TAGGED_ITEM_SCHEMA: SchemaStatic = SchemaStatic {
+        name: "Block",
+        doc: &["A block type."],
+        strict: None,
+        fields: &[],
+        enum_variants: &[],
+        tagged_tag: "kind",
+        tagged_variants: &[
+            TaggedVariantStatic {
+                discriminator: "rust",
+                schema: &NESTED_INNER,
+            },
+            TaggedVariantStatic {
+                discriminator: "off",
+                schema: &OFF_OBJECT,
+            },
+        ],
+    };
+
+    static ARRAY_OF_TAGGED_CONTAINER: SchemaStatic = SchemaStatic {
+        name: "App",
+        doc: EMPTY_DOC,
+        strict: None,
+        fields: &[NamedFieldStatic {
+            name: "blocks",
+            field: FieldStatic::ArrayOf {
+                schema: &TAGGED_ITEM_SCHEMA,
+                doc: &["Installed blocks."],
+            },
+        }],
+        enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
+    };
+
+    static MAP_OF_TAGGED_CONTAINER: SchemaStatic = SchemaStatic {
+        name: "Sites",
+        doc: EMPTY_DOC,
+        strict: None,
+        fields: &[NamedFieldStatic {
+            name: "blocks",
+            field: FieldStatic::MapOf {
+                schema: &TAGGED_ITEM_SCHEMA,
+                doc: &["Named blocks."],
+            },
+        }],
+        enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
+    };
+
+    #[test]
+    fn array_of_tagged_field_site_doc_overrides_item_and_wrapper() {
+        let s = ARRAY_OF_TAGGED_CONTAINER.to_runtime();
+        match &s.fields[0].field {
+            RuntimeShape::Array(array) => {
+                assert_eq!(array.doc, vec!["Installed blocks.".to_string()]);
+                match array.item.as_ref() {
+                    RuntimeShape::Tagged(tagged) => {
+                        assert_eq!(tagged.doc, vec!["Installed blocks.".to_string()]);
+                    }
+                    other => panic!("expected Tagged item, got {other:?}"),
+                }
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_of_tagged_field_site_doc_overrides_item_and_wrapper() {
+        let s = MAP_OF_TAGGED_CONTAINER.to_runtime();
+        match &s.fields[0].field {
+            RuntimeShape::Map(map) => {
+                assert_eq!(map.doc, vec!["Named blocks.".to_string()]);
+                match map.item.as_ref() {
+                    RuntimeShape::Tagged(tagged) => {
+                        assert_eq!(tagged.doc, vec!["Named blocks.".to_string()]);
+                    }
+                    other => panic!("expected Tagged item, got {other:?}"),
+                }
+            }
+            other => panic!("expected Map, got {other:?}"),
         }
     }
 
@@ -1612,6 +1824,8 @@ mod tests {
             }),
         }],
         enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
     };
 
     static TAG_FIELD_CLASH: ShapeStatic = ShapeStatic::Tagged {
