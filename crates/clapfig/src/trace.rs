@@ -25,31 +25,46 @@ pub(crate) fn discovery_probe(path: &Path, outcome: &ProbeOutcome) {
 }
 
 /// Per-stage summary of the discovery record attached to this resolve.
+///
+/// Per-probe `trace` events fire only when TRACE is enabled; the DEBUG
+/// summary (and its counts) only when DEBUG is enabled. Healthy loads
+/// with `clapfig=info` or no subscriber skip the walk (ADR-0009).
 pub(crate) fn discovery_complete(record: &DiscoveryRecord) {
+    let trace = trace_event_enabled();
+    let debug = debug_event_enabled();
+    if !trace && !debug {
+        return;
+    }
     let mut loaded = 0usize;
     let mut missing = 0usize;
     let mut error = 0usize;
     let mut not_probed = 0usize;
     for probe in &record.files {
-        discovery_probe(&probe.path, &probe.outcome);
-        match probe.outcome {
-            ProbeOutcome::Loaded => loaded += 1,
-            ProbeOutcome::Missing => missing += 1,
-            ProbeOutcome::Error { .. } => error += 1,
-            ProbeOutcome::NotProbed => not_probed += 1,
+        if trace {
+            discovery_probe(&probe.path, &probe.outcome);
+        }
+        if debug {
+            match probe.outcome {
+                ProbeOutcome::Loaded => loaded += 1,
+                ProbeOutcome::Missing => missing += 1,
+                ProbeOutcome::Error { .. } => error += 1,
+                ProbeOutcome::NotProbed => not_probed += 1,
+            }
         }
     }
-    tracing::debug!(
-        target: TARGET,
-        loaded,
-        missing,
-        error,
-        not_probed,
-        env = record.env,
-        url = record.url,
-        overrides = record.overrides,
-        "discovery complete"
-    );
+    if debug {
+        tracing::debug!(
+            target: TARGET,
+            loaded,
+            missing,
+            error,
+            not_probed,
+            env = record.env,
+            url = record.url,
+            overrides = record.overrides,
+            "discovery complete"
+        );
+    }
 }
 
 /// A file parsed into a value tree (contents never recorded).
@@ -89,6 +104,11 @@ pub(crate) fn cli_layer_constructed(keys: usize) {
 /// events when this is false, so unused tracing stays free (ADR-0009).
 pub(crate) fn trace_event_enabled() -> bool {
     tracing::event_enabled!(target: TARGET, tracing::Level::TRACE)
+}
+
+/// True when a clapfig `debug` event would be recorded.
+pub(crate) fn debug_event_enabled() -> bool {
+    tracing::event_enabled!(target: TARGET, tracing::Level::DEBUG)
 }
 
 /// Overlay replaced an existing value. Both origins and both value

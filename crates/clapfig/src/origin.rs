@@ -350,33 +350,29 @@ fn walk_file_value(
 /// value at that path (ADR-0004 winner-only). Env source aggregation
 /// stays on unknown-key errors.
 pub(crate) fn origin_map_from_env(table: &Map, winners: &EnvWinners) -> OriginMap {
-    walk_env_map(table, "", winners)
+    walk_env_map(table, ConfigPath::new(), winners)
 }
 
-fn walk_env_map(table: &Map, prefix: &str, winners: &EnvWinners) -> OriginMap {
+fn walk_env_map(table: &Map, parent: ConfigPath, winners: &EnvWinners) -> OriginMap {
     table
         .iter()
         .map(|(key, value)| {
-            let dotted = if prefix.is_empty() {
-                key.clone()
-            } else {
-                format!("{prefix}.{key}")
-            };
-            (key.clone(), walk_env_value(value, &dotted, winners))
+            let path = parent.clone().key(key);
+            (key.clone(), walk_env_value(value, path, winners))
         })
         .collect()
 }
 
-fn walk_env_value(value: &Value, dotted: &str, winners: &EnvWinners) -> OriginNode {
+fn walk_env_value(value: &Value, path: ConfigPath, winners: &EnvWinners) -> OriginNode {
     let origin = Origin::env(
         winners
-            .get(dotted)
+            .get(&path)
             .cloned()
             .map(|name| vec![name])
             .unwrap_or_default(),
     );
     match value {
-        Value::Map(m) => OriginNode::map(origin, walk_env_map(m, dotted, winners)),
+        Value::Map(m) => OriginNode::map(origin, walk_env_map(m, path, winners)),
         Value::Array(items) => OriginNode::array(
             origin.clone(),
             items
@@ -571,5 +567,39 @@ mod tests {
         );
         let origins = origin_map_from_env(&table, &winners);
         assert_eq!(env_origin_vars(&origins, "host"), ["APP__HOST"]);
+    }
+
+    #[test]
+    fn env_origin_map_distinguishes_dotted_map_of_entry_from_nested_path() {
+        let (table, _, winners) = crate::env::env_to_table_with_sources(
+            "APP",
+            [
+                ("APP__PLUGINS__A.CONFIG__X".into(), "dotted".into()),
+                ("APP__PLUGINS__A__CONFIG__X".into(), "nested".into()),
+            ],
+        );
+        let origins = origin_map_from_env(&table, &winners);
+        assert_eq!(
+            lookup(
+                &origins,
+                &ConfigPath::new().key("plugins").key("a.config").key("x")
+            )
+            .map(|o| o.env_vars.clone())
+            .unwrap_or_default(),
+            ["APP__PLUGINS__A.CONFIG__X"]
+        );
+        assert_eq!(
+            lookup(
+                &origins,
+                &ConfigPath::new()
+                    .key("plugins")
+                    .key("a")
+                    .key("config")
+                    .key("x")
+            )
+            .map(|o| o.env_vars.clone())
+            .unwrap_or_default(),
+            ["APP__PLUGINS__A__CONFIG__X"]
+        );
     }
 }

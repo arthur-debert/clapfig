@@ -5,8 +5,8 @@
 //! and segments lowercased to match Rust field names. Values are parsed heuristically
 //! (bool > integer > float > string). Takes an iterator for testability.
 //!
-//! Each inserted dotted path also records the original environment
-//! variable name that produced it. Case-sensitive platforms accept
+//! Each inserted path also records the original environment variable
+//! name that produced it. Case-sensitive platforms accept
 //! `MYAPP__rogue_key` as well as `MYAPP__ROGUE_KEY`; both collapse to
 //! the same table path, but unknown-key errors must name the variable
 //! the user actually has to unset — reconstructing an uppercased
@@ -15,28 +15,32 @@
 //! insert order) and every source name is retained so the error can
 //! list them all.
 //!
+//! Paths are [`ConfigPath`] identities, not flattened dotted strings:
+//! `APP__PLUGINS__A.CONFIG__X` (`plugins."a.config".x`) and
+//! `APP__PLUGINS__A__CONFIG__X` (`plugins.a.config.x`) coexist.
 //! Provenance is a separate last-writer map ([`EnvWinners`]): when a
 //! value wins, only that variable is the origin. Unknown-key aggregation
 //! on [`EnvSources`] must not leak losing writers into `InvalidValue`.
 
 use std::collections::BTreeMap;
 
+use crate::format::ConfigPath;
 use crate::value::{Map, Value};
 
-/// Dotted table path → the original environment variable name(s) that
-/// produced it, in first-seen order. Several names can collapse onto
-/// one path (`MYAPP__HOST` and `MYAPP__host` both become `host`); the
-/// table last-wins, and this map keeps every spelling so unknown-key
+/// Structured table path → the original environment variable name(s)
+/// that produced it, in first-seen order. Several names can collapse
+/// onto one path (`MYAPP__HOST` and `MYAPP__host` both become `host`);
+/// the table last-wins, and this map keeps every spelling so unknown-key
 /// reporting can name each variable to unset.
-pub(crate) type EnvSources = BTreeMap<String, Vec<String>>;
+pub(crate) type EnvSources = BTreeMap<ConfigPath, Vec<String>>;
 
-/// Dotted table path → the original environment variable that produced
-/// the **winning** node at that path.
+/// Structured table path → the original environment variable that
+/// produced the **winning** node at that path.
 ///
 /// Last-writer, same as the value table: a later var that replaces a
 /// subtree drops the losing descendants. Unknown-key reporting stays on
 /// [`EnvSources`].
-pub(crate) type EnvWinners = BTreeMap<String, String>;
+pub(crate) type EnvWinners = BTreeMap<ConfigPath, String>;
 
 /// Build a config value [`Map`] from environment variables matching `{PREFIX}__*`.
 ///
@@ -57,8 +61,8 @@ pub(crate) type EnvWinners = BTreeMap<String, String>;
 ///
 /// Takes an iterator so tests can pass synthetic data instead of
 /// `std::env::vars()`. Also returns the original variable names for
-/// each dotted path ([`EnvSources`], every spelling for unknown-key
-/// errors) and the last-writer map ([`EnvWinners`], provenance).
+/// each path ([`EnvSources`], every spelling for unknown-key errors)
+/// and the last-writer map ([`EnvWinners`], provenance).
 pub(crate) fn env_to_table_with_sources(
     prefix: &str,
     vars: impl IntoIterator<Item = (String, String)>,
@@ -83,7 +87,7 @@ pub(crate) fn env_to_table_with_sources(
             &mut winners,
             &segments,
             parse_env_value(&value),
-            &mut String::new(),
+            ConfigPath::new(),
             &key,
         );
     }
@@ -96,10 +100,10 @@ pub(crate) fn env_to_table_with_sources(
 /// Unknown-key traversal stops at the first unknown schema ancestor, so
 /// `MYAPP__DATABASE__ROGUE` is stored under `database.rogue` while
 /// validation reports `database`. An exact-path lookup would miss it;
-/// this walks descendants (`path` or `path.`) and deduplicates names
-/// in first-seen (path-sorted, then recorded) order so the error can
-/// still name every variable to unset.
-pub(crate) fn env_source_names(sources: &EnvSources, path: &str) -> Option<String> {
+/// this walks descendants (segment prefix, not a dotted-string prefix)
+/// and deduplicates names in first-seen (path-sorted, then recorded)
+/// order so the error can still name every variable to unset.
+pub(crate) fn env_source_names(sources: &EnvSources, path: &ConfigPath) -> Option<String> {
     let names = env_source_vars(sources, path);
     if names.is_empty() {
         None
@@ -110,11 +114,10 @@ pub(crate) fn env_source_names(sources: &EnvSources, path: &str) -> Option<Strin
 
 /// Original variable names that produced `path` or any descendant, in
 /// first-seen order. Empty when nothing under `path` was set.
-pub(crate) fn env_source_vars(sources: &EnvSources, path: &str) -> Vec<String> {
-    let prefix = format!("{path}.");
+pub(crate) fn env_source_vars(sources: &EnvSources, path: &ConfigPath) -> Vec<String> {
     let mut names = Vec::new();
     for (key, vars) in sources {
-        if key == path || key.starts_with(&prefix) {
+        if key == path || is_descendant(key, path) {
             for name in vars {
                 if !names.iter().any(|existing| existing == name) {
                     names.push(name.clone());
@@ -131,23 +134,19 @@ fn insert_nested(
     winners: &mut EnvWinners,
     segments: &[&str],
     value: Value,
-    dotted: &mut String,
+    path: ConfigPath,
     original: &str,
 ) {
     debug_assert!(!segments.is_empty());
 
     let key = segments[0].to_lowercase();
-    let restore = dotted.len();
-    if !dotted.is_empty() {
-        dotted.push('.');
-    }
-    dotted.push_str(&key);
+    let child = path.key(key.clone());
 
     if segments.len() == 1 {
         table.insert(key, value);
-        prune_descendant_winners(winners, dotted);
-        winners.insert(dotted.clone(), original.to_string());
-        let entry = sources.entry(dotted.clone()).or_default();
+        prune_descendant_winners(winners, &child);
+        winners.insert(child.clone(), original.to_string());
+        let entry = sources.entry(child).or_default();
         if !entry.iter().any(|name| name == original) {
             entry.push(original.to_string());
         }
@@ -158,10 +157,10 @@ fn insert_nested(
         // non-map, replace it — the more specific nested key wins.
         if !matches!(sub, Value::Map(_)) {
             *sub = Value::Map(Map::new());
-            prune_descendant_winners(winners, dotted);
-            winners.insert(dotted.clone(), original.to_string());
+            prune_descendant_winners(winners, &child);
+            winners.insert(child.clone(), original.to_string());
         } else if !existed_as_map {
-            winners.insert(dotted.clone(), original.to_string());
+            winners.insert(child.clone(), original.to_string());
         }
         if let Value::Map(sub_map) = sub {
             insert_nested(
@@ -170,18 +169,25 @@ fn insert_nested(
                 winners,
                 &segments[1..],
                 value,
-                dotted,
+                child,
                 original,
             );
         }
     }
-    dotted.truncate(restore);
 }
 
-/// Drop last-writer names under `dotted` when that node is replaced.
-fn prune_descendant_winners(winners: &mut EnvWinners, dotted: &str) {
-    let prefix = format!("{dotted}.");
-    winners.retain(|key, _| !key.starts_with(&prefix));
+/// Drop last-writer names under `path` when that node is replaced.
+fn prune_descendant_winners(winners: &mut EnvWinners, path: &ConfigPath) {
+    winners.retain(|key, _| !is_descendant(key, path));
+}
+
+/// `true` when `key` is a proper descendant of `path` (strictly longer,
+/// matching segment prefix). Distinct from dotted-string prefix matches:
+/// `plugins."a.config".x` is not under `plugins.a`.
+fn is_descendant(key: &ConfigPath, path: &ConfigPath) -> bool {
+    let segs = key.segments();
+    let prefix = path.segments();
+    segs.len() > prefix.len() && segs.starts_with(prefix)
 }
 
 /// Parse a string value into a typed config value.
@@ -221,8 +227,12 @@ mod tests {
         env_to_table_with_sources(prefix, vars).0
     }
 
-    fn env_winner<'a>(winners: &'a EnvWinners, path: &str) -> Option<&'a str> {
-        winners.get(path).map(String::as_str)
+    fn env_winner(winners: &EnvWinners, path: ConfigPath) -> Option<&str> {
+        winners.get(&path).map(String::as_str)
+    }
+
+    fn path(keys: &[&str]) -> ConfigPath {
+        keys.iter().fold(ConfigPath::new(), |p, k| p.key(*k))
     }
 
     #[test]
@@ -357,13 +367,13 @@ mod tests {
         );
         assert_eq!(table["rogue_key"].as_integer().unwrap(), 1);
         assert_eq!(
-            sources.get("rogue_key"),
+            sources.get(&path(&["rogue_key"])),
             Some(&vec!["MYAPP__rogue_key".to_string()])
         );
         let db = table["database"].as_map().unwrap();
         assert_eq!(db["rogue"].as_str().unwrap(), "x");
         assert_eq!(
-            sources.get("database.rogue"),
+            sources.get(&path(&["database", "rogue"])),
             Some(&vec!["MYAPP__Database__Rogue".to_string()])
         );
     }
@@ -376,16 +386,19 @@ mod tests {
         let (_, sources, _) =
             env_to_table_with_sources("MYAPP", vars(&[("MYAPP__DATABASE__ROGUE", "1")]));
         assert_eq!(
-            env_source_names(&sources, "database.rogue").as_deref(),
+            env_source_names(&sources, &path(&["database", "rogue"])).as_deref(),
             Some("MYAPP__DATABASE__ROGUE")
         );
         assert_eq!(
-            env_source_names(&sources, "database").as_deref(),
+            env_source_names(&sources, &path(&["database"])).as_deref(),
             Some("MYAPP__DATABASE__ROGUE")
         );
         // A sibling prefix must not steal the name.
-        assert_eq!(env_source_names(&sources, "data"), None);
-        assert_eq!(env_source_names(&sources, "database_backup"), None);
+        assert_eq!(env_source_names(&sources, &path(&["data"])), None);
+        assert_eq!(
+            env_source_names(&sources, &path(&["database_backup"])),
+            None
+        );
     }
 
     #[test]
@@ -399,10 +412,10 @@ mod tests {
         );
         assert_eq!(table["host"].as_str().unwrap(), "second");
         assert_eq!(
-            sources.get("host"),
+            sources.get(&path(&["host"])),
             Some(&vec!["MYAPP__host".to_string(), "MYAPP__HOST".to_string()])
         );
-        assert_eq!(env_winner(&winners, "host"), Some("MYAPP__HOST"));
+        assert_eq!(env_winner(&winners, path(&["host"])), Some("MYAPP__HOST"));
     }
 
     #[test]
@@ -411,10 +424,13 @@ mod tests {
             "APP",
             vars(&[("APP__DATABASE__URL", "x"), ("APP__DATABASE", "oops")]),
         );
-        assert_eq!(env_winner(&winners, "database"), Some("APP__DATABASE"));
-        assert_eq!(env_winner(&winners, "database.url"), None);
+        assert_eq!(
+            env_winner(&winners, path(&["database"])),
+            Some("APP__DATABASE")
+        );
+        assert_eq!(env_winner(&winners, path(&["database", "url"])), None);
         assert!(
-            env_source_names(&sources, "database")
+            env_source_names(&sources, &path(&["database"]))
                 .as_deref()
                 .is_some_and(|s| s.contains("APP__DATABASE__URL")),
             "unknown-key aggregation still lists the losing nested var"
@@ -427,10 +443,72 @@ mod tests {
             "APP",
             vars(&[("APP__DATABASE", "oops"), ("APP__DATABASE__URL", "x")]),
         );
-        assert_eq!(env_winner(&winners, "database"), Some("APP__DATABASE__URL"));
         assert_eq!(
-            env_winner(&winners, "database.url"),
+            env_winner(&winners, path(&["database"])),
             Some("APP__DATABASE__URL")
+        );
+        assert_eq!(
+            env_winner(&winners, path(&["database", "url"])),
+            Some("APP__DATABASE__URL")
+        );
+    }
+
+    #[test]
+    fn dotted_map_of_entry_and_nested_path_keep_distinct_winners() {
+        // `__` nests; a literal `.` is part of a segment. These two
+        // flatten to the same unquoted dotted string (`plugins.a.config.x`)
+        // but are distinct ConfigPaths — a MapOf entry `"a.config"` vs
+        // genuinely nested `a` → `config`.
+        let (table, _, winners) = env_to_table_with_sources(
+            "APP",
+            vars(&[
+                ("APP__PLUGINS__A.CONFIG__X", "dotted"),
+                ("APP__PLUGINS__A__CONFIG__X", "nested"),
+            ]),
+        );
+        let plugins = table["plugins"].as_map().unwrap();
+        assert_eq!(
+            plugins["a.config"].as_map().unwrap()["x"].as_str(),
+            Some("dotted")
+        );
+        assert_eq!(
+            plugins["a"].as_map().unwrap()["config"].as_map().unwrap()["x"].as_str(),
+            Some("nested")
+        );
+        assert_eq!(
+            env_winner(&winners, path(&["plugins", "a.config", "x"])),
+            Some("APP__PLUGINS__A.CONFIG__X")
+        );
+        assert_eq!(
+            env_winner(&winners, path(&["plugins", "a", "config", "x"])),
+            Some("APP__PLUGINS__A__CONFIG__X")
+        );
+    }
+
+    #[test]
+    fn prune_does_not_drop_a_dotted_key_that_shares_a_string_prefix() {
+        // Inserting a flat `plugins.a` must not drop `plugins."a.config".x`
+        // just because the unquoted displays share a `plugins.a.` prefix.
+        let (table, _, winners) = env_to_table_with_sources(
+            "APP",
+            vars(&[
+                ("APP__PLUGINS__A.CONFIG__X", "dotted"),
+                ("APP__PLUGINS__A", "flat"),
+            ]),
+        );
+        let plugins = table["plugins"].as_map().unwrap();
+        assert_eq!(plugins["a"].as_str(), Some("flat"));
+        assert_eq!(
+            plugins["a.config"].as_map().unwrap()["x"].as_str(),
+            Some("dotted")
+        );
+        assert_eq!(
+            env_winner(&winners, path(&["plugins", "a"])),
+            Some("APP__PLUGINS__A")
+        );
+        assert_eq!(
+            env_winner(&winners, path(&["plugins", "a.config", "x"])),
+            Some("APP__PLUGINS__A.CONFIG__X")
         );
     }
 }

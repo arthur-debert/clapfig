@@ -360,9 +360,10 @@ impl Builder {
     /// `[Files, Env, Url, Cli]` — the common-sense precedence where schema
     /// defaults are lowest and explicit overrides are highest.
     ///
-    /// Omit a layer to exclude it from merging entirely. Duplicate layers
-    /// are applied in the order given (the second occurrence overrides the
-    /// first).
+    /// Omit a layer to exclude it from merging entirely — omitting
+    /// [`Layer::Env`] also skips capturing `std::env::vars()`. Duplicate
+    /// layers are applied in the order given (the second occurrence
+    /// overrides the first).
     pub fn layer_order(mut self, order: Vec<Layer>) -> Self {
         self.layer_order = Some(order);
         self
@@ -563,7 +564,14 @@ impl Builder {
         let registry = self.effective_registry()?;
         let search_paths = self.effective_search_paths();
         let env_prefix = self.effective_env_prefix()?;
-        let env_vars = if env_prefix.is_some() {
+        let layer_order = self.layer_order;
+        let order = layer_order
+            .clone()
+            .unwrap_or_else(resolve::default_layer_order);
+        // Omitting Env excludes `std::env::vars()` entirely — that iterator
+        // panics on a non-Unicode variable, so an app that drops the env
+        // layer must not crash because of one.
+        let env_vars = if env_prefix.is_some() && order.contains(&Layer::Env) {
             std::env::vars().collect()
         } else {
             Vec::new()
@@ -594,7 +602,7 @@ impl Builder {
             #[cfg(feature = "url")]
             url_overrides: self.url_overrides,
             cli_overrides: self.cli_overrides,
-            layer_order: self.layer_order,
+            layer_order,
             post_validate: self.post_validate.map(Arc::new),
             file_cache: Mutex::new(std::collections::HashMap::new()),
         })
@@ -2973,6 +2981,32 @@ mod tests {
             .unwrap();
 
         // Files listed after Cli, so the file wins.
+        assert_eq!(table.get("port"), Some(&Value::Integer(3000)));
+    }
+
+    #[test]
+    fn omitted_env_layer_does_not_consult_environment() {
+        // Omitting Layer::Env must skip `std::env::vars()` (and merge): a
+        // matching variable must not win, even though env is otherwise
+        // enabled via the prefix. Synthetic ResolveInput coverage lives
+        // in resolve.rs; this locks the builder capture path.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "port = 3000\n").unwrap();
+        const PREFIX: &str = "CLAPFIG_PRV01_OMIT_ENV";
+        const VAR: &str = "CLAPFIG_PRV01_OMIT_ENV__PORT";
+        unsafe { std::env::set_var(VAR, "9999") };
+
+        let table = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .env_prefix(PREFIX)
+            .layer_order(vec![Layer::Files])
+            .load();
+
+        unsafe { std::env::remove_var(VAR) };
+
+        let table = table.expect("omitted env layer still loads files");
         assert_eq!(table.get("port"), Some(&Value::Integer(3000)));
     }
 

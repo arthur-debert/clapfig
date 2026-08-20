@@ -38,8 +38,8 @@ pub(crate) struct ValidateContext<'a> {
 ///
 /// A `File` source carries the raw text (for renderer snippets), the
 /// file path, and that file's span index (key span for the caret). An
-/// `Env` source carries the original variable name(s) for each dotted
-/// path so each violation can name the exact variable to unset
+/// `Env` source carries the original variable name(s) for each
+/// structured path so each violation can name the exact variable to unset
 /// (`MYAPP__rogue_key`, not a reconstructed `MYAPP__ROGUE_KEY`) instead
 /// of wearing config-file clothing.
 pub(crate) enum UnknownKeySource<'a> {
@@ -164,9 +164,12 @@ pub(crate) fn filter_through_cascade(
                     .unwrap_or(0);
                 (Some(*path), line, None, key_span)
             }
-            UnknownKeySource::Env { sources } => {
-                (None, 0, crate::env::env_source_names(sources, &key), None)
-            }
+            UnknownKeySource::Env { sources } => (
+                None,
+                0,
+                crate::env::env_source_names(sources, &config_path),
+                None,
+            ),
         };
         let value_ref = lookup_value(table, &config_path);
 
@@ -348,7 +351,7 @@ mod tests {
         table.insert("database".into(), crate::value::Value::Map(db));
         let mut sources = crate::env::EnvSources::new();
         sources.insert(
-            "database.rogue".into(),
+            ConfigPath::new().key("database").key("rogue"),
             vec!["MYAPP__DATABASE__ROGUE".into()],
         );
         let err = validate_unknown(

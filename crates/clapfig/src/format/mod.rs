@@ -362,8 +362,10 @@ pub struct Parsed {
 
 impl Parsed {
     /// A value tree with an empty span index — dummy adapters, persist
-    /// callers, and tests that only need the tree.
-    pub(crate) fn from_value(value: Value) -> Self {
+    /// callers, and tests that only need the tree. External
+    /// [`FormatAdapter`] implementations that do not fill spans use this
+    /// constructor rather than assembling the public fields by hand.
+    pub fn from_value(value: Value) -> Self {
         Self {
             value,
             spans: BTreeMap::new(),

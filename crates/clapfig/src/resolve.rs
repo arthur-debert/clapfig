@@ -362,6 +362,16 @@ mod tests {
         })
     }
 
+    fn yaml_registry() -> &'static FormatRegistry {
+        use std::sync::OnceLock;
+        static REGISTRY: OnceLock<FormatRegistry> = OnceLock::new();
+        REGISTRY.get_or_init(|| {
+            let mut r = FormatRegistry::new();
+            r.register(Box::new(crate::format::YamlAdapter));
+            r
+        })
+    }
+
     fn empty_input(schema: &Schema) -> ResolveInput<'_> {
         ResolveInput {
             schema,
@@ -1267,6 +1277,43 @@ mod tests {
             source[span.start..span.end].chars().count(),
             "caret should cover the value span, got: {out}"
         );
+    }
+
+    fn assert_yaml_root_invalid(source: &str, expected_slice: &str) {
+        let spec = test_spec();
+        let input = ResolveInput {
+            registry: yaml_registry(),
+            files: vec![("app.yaml".into(), source.into())],
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "app.yaml", crate::types::InputType::File);
+        assert_eq!(
+            facts.file.as_deref(),
+            Some(std::path::Path::new("app.yaml"))
+        );
+        let span = facts.span.expect("root value span");
+        assert_eq!(&source[span.start..span.end], expected_slice);
+        let msg = err.to_string();
+        assert!(msg.contains("app.yaml:1"), "{msg}");
+        let out = crate::render::render_plain(&err);
+        let caret = out.lines().find(|l| l.contains('^')).expect("{out}");
+        let caret_run = caret.chars().filter(|&c| c == '^').count();
+        assert_eq!(
+            caret_run,
+            expected_slice.chars().count(),
+            "caret should cover the root value span, got: {out}"
+        );
+    }
+
+    #[test]
+    fn invalid_value_yaml_root_scalar_names_line_and_caret() {
+        assert_yaml_root_invalid("42\n", "42");
+    }
+
+    #[test]
+    fn invalid_value_yaml_root_array_names_line_and_caret() {
+        assert_yaml_root_invalid("[1, 2]\n", "[1, 2]");
     }
 
     #[test]

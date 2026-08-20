@@ -7,6 +7,6 @@
 
 **Migration (hard cut, per project policy):**
 
-- `adapter.parse(text)` is now `Result<Parsed, FormatError>`. Use `parsed.value` (or `adapter.parse(text)?.value`) wherever you previously used the `Value`.
+- `adapter.parse(text)` is now `Result<Parsed, FormatError>`. Use `parsed.value` (or `adapter.parse(text)?.value`) wherever you previously used the `Value`. Dummy/test adapters that do not fill spans construct `Parsed::from_value(value)` (public).
 - Struct-update / match arms that name `InvalidValue { key, reason }`, `MissingRequired { key }`, `UnknownKeyInfo { ... }`, `UnknownKeyContext { ... }`, or `CollectedUnknown { ... }` must include the new fields or `..`. `ClapfigError` remains `#[non_exhaustive]`.
 - Do not match `Operation::SpanIndex` or call `span_index`; those entry points no longer exist.

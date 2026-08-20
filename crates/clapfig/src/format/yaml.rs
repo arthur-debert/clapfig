@@ -285,9 +285,10 @@ fn inline_norway(value: &serde_norway::Value) -> String {
 }
 
 /// Fill a path → [`SpanEntry`] index for every node in `value` (ADR-0005,
-/// ADR-0008). The root itself is not an entry — it has no key token and
-/// unknown-key / value diagnostics never look it up — so an empty map
-/// (including blank and comments-only documents) yields an empty index.
+/// ADR-0008), including the document root (`key: None`, exact value
+/// span) so a non-map root (`42`, `[1, 2]`) locates `InvalidValue`.
+/// Blank and comments-only documents skip this walk and yield an empty
+/// index — there is no source value to locate.
 ///
 /// `yamlpath` is queried per written path. It can follow aliases; this
 /// walk does not. When a node's exact span sits outside its pretty span
@@ -320,9 +321,7 @@ fn fill_spans(
     inherited_alias: Option<Span>,
     spans: &mut BTreeMap<ConfigPath, SpanEntry>,
 ) {
-    let child_alias = if path.is_empty() {
-        None
-    } else if let Some(alias) = inherited_alias {
+    let child_alias = if let Some(alias) = inherited_alias {
         // ADR-0008 exception to ADR-0006: expanded nested paths caret
         // the `*name` token for both sides, including Index paths that
         // exist only because an alias expanded into a sequence.
@@ -365,19 +364,17 @@ fn fill_fallback(
     fallback: Span,
     spans: &mut BTreeMap<ConfigPath, SpanEntry>,
 ) {
-    if !path.is_empty() {
-        let key = match path.last() {
-            Some(PathSegment::Key(_)) => Some(fallback),
-            _ => None,
-        };
-        spans.insert(
-            ConfigPath::from(path.clone()),
-            SpanEntry {
-                key,
-                value: fallback,
-            },
-        );
-    }
+    let key = match path.last() {
+        Some(PathSegment::Key(_)) => Some(fallback),
+        _ => None,
+    };
+    spans.insert(
+        ConfigPath::from(path.clone()),
+        SpanEntry {
+            key,
+            value: fallback,
+        },
+    );
     match value {
         Value::Map(map) => {
             for (key, child) in map {
@@ -1354,9 +1351,7 @@ mod tests {
 
     fn assert_covers_tree(value: &Value, spans: &BTreeMap<ConfigPath, SpanEntry>) {
         fn walk(value: &Value, path: ConfigPath, spans: &BTreeMap<ConfigPath, SpanEntry>) {
-            if !path.segments().is_empty() {
-                assert!(spans.contains_key(&path), "span index missing path {path}");
-            }
+            assert!(spans.contains_key(&path), "span index missing path {path}");
             match value {
                 Value::Map(map) => {
                     for (key, child) in map {
@@ -1375,8 +1370,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_document_span_index_is_empty() {
-        // An empty map has no child paths; the root is not an index entry.
+    fn blank_document_span_index_is_empty() {
+        // No source value to locate — same as JSON's empty-file path.
         assert!(YamlAdapter.parse("").unwrap().spans.is_empty());
         assert!(
             YamlAdapter
@@ -1385,7 +1380,45 @@ mod tests {
                 .spans
                 .is_empty()
         );
-        assert!(YamlAdapter.parse("{}\n").unwrap().spans.is_empty());
+    }
+
+    #[test]
+    fn empty_mapping_records_root_span() {
+        let source = "{}\n";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        let root = parsed
+            .spans
+            .get(&ConfigPath::new())
+            .expect("root mapping is an index entry");
+        assert!(root.key.is_none(), "root has no key token");
+        assert_eq!(snippet(source, root.value).trim(), "{}");
+    }
+
+    #[test]
+    fn span_index_covers_root_scalar() {
+        let source = "42\n";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        assert_eq!(parsed.value, Value::Integer(42));
+        let root = parsed
+            .spans
+            .get(&ConfigPath::new())
+            .expect("root scalar is an index entry");
+        assert!(root.key.is_none(), "root has no key token");
+        assert_eq!(snippet(source, root.value).trim(), "42");
+    }
+
+    #[test]
+    fn span_index_covers_root_sequence() {
+        let source = "[1, 2]\n";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        assert!(matches!(parsed.value, Value::Array(_)));
+        assert_covers_tree(&parsed.value, &parsed.spans);
+        let root = parsed
+            .spans
+            .get(&ConfigPath::new())
+            .expect("root sequence is an index entry");
+        assert!(root.key.is_none(), "root has no key token");
+        assert_eq!(snippet(source, root.value).trim(), "[1, 2]");
     }
 
     #[test]

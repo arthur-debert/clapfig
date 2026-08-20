@@ -77,8 +77,8 @@ already decided are lenient never reach it. It receives an
 parsed value as `Option<&clapfig::value::Value>` (`None` in the rare case lookup
 can't resolve — out-of-bounds array index, path through a non-table
 intermediate), the source file, and the 1-indexed line number (`Some`
-when the file's span index locates the key; `None` for non-file
-sources and missing lookup), and
+when the file's span index locates the key; `None` when the origin
+is not a file, or when lookup cannot resolve the key), and
 returns `Accept` (drop silently) or `Reject` (the default — error as
 today).
 

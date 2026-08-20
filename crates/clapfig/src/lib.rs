@@ -452,8 +452,8 @@
 //! value as `Option<&value::Value>` (`None` in the rare case lookup can't
 //! resolve — out-of-bounds array index, path through a non-map
 //! intermediate), the source file, and the 1-indexed line number
-//! (`Some` when the file's span index locates the key; `None` for
-//! non-file sources and missing lookup).
+//! (`Some` when the file's span index locates the key; `None` when
+//! the origin is not a file, or when lookup cannot resolve the key).
 //!
 //! # Runtime-defined schemas
 //!
