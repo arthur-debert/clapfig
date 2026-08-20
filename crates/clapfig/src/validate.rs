@@ -22,16 +22,15 @@ use crate::value::{Map, Value};
 ///
 /// Bundles the cascade overrides, the builder-level default ([Knob 1]),
 /// and the optional [`on_unknown_key`](crate::Builder::on_unknown_key)
-/// callback. The `normalize_keys` flag records that the table (and its
-/// span index) have already been rewritten kebab → snake; line/caret
-/// come from the key span, which still points at the original spelling.
+/// callback. When kebab-case normalization is on, the caller rewrites
+/// the table and span-index paths before this walk; line/caret come
+/// from the key span, which still points at the original spelling.
 ///
 /// [Knob 1]: crate::Builder::strict
 pub(crate) struct ValidateContext<'a> {
     pub overrides: &'a StrictnessOverrides,
     pub default_strict: bool,
     pub callback: Option<&'a UnknownKeyHook>,
-    pub normalize_keys: bool,
 }
 
 /// Where the table under validation came from — decides how an
@@ -142,10 +141,11 @@ pub(crate) fn filter_through_cascade(
 
         // File identity and the key span live on the file source;
         // env-derived keys instead carry the variable name so errors
-        // name the thing to unset. YAML/JSON still ship an empty span
-        // index (holding state), so they omit the line rather than
-        // inventing a heuristic.
-        let _ = ctx.normalize_keys;
+        // name the thing to unset. Missing span-index lookup omits the
+        // line rather than inventing a heuristic. Normalization, when
+        // enabled, already rewrote the table and span-index paths
+        // before this walk; the key span still points at the original
+        // spelling.
         let (file, line, env_var, span) = match origin {
             UnknownKeySource::File {
                 path,
@@ -323,6 +323,7 @@ mod tests {
         content: &str,
         path: &Path,
         ctx: &ValidateContext<'_>,
+        normalize_keys: bool,
     ) -> Result<Vec<CollectedUnknown>, ClapfigError> {
         let parsed = crate::format::TomlAdapter
             .parse(content)
@@ -332,7 +333,7 @@ mod tests {
             _ => unreachable!("TOML documents are maps at the root"),
         };
         let mut spans = parsed.spans;
-        if ctx.normalize_keys {
+        if normalize_keys {
             crate::normalize::normalize_table_and_spans(&mut table, &mut spans)
                 .expect("test fixtures must not contain collisions");
         }
@@ -351,14 +352,13 @@ mod tests {
     /// Default validate context: strict on, no overrides, no callback.
     /// Mirrors the pre-Phase-3 default and is the right baseline for every
     /// existing test in this module.
-    fn test_ctx(normalize_keys: bool) -> ValidateContext<'static> {
+    fn test_ctx() -> ValidateContext<'static> {
         static EMPTY: OnceLock<StrictnessOverrides> = OnceLock::new();
         let overrides = EMPTY.get_or_init(StrictnessOverrides::new);
         ValidateContext {
             overrides,
             default_strict: true,
             callback: None,
-            normalize_keys,
         }
     }
 
@@ -381,7 +381,7 @@ mod tests {
             &table,
             &crate::fixtures::test::test_schema(),
             &UnknownKeySource::Env { sources: &sources },
-            &test_ctx(false),
+            &test_ctx(),
         )
         .unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
@@ -405,7 +405,7 @@ mod tests {
             &table,
             &crate::fixtures::test::test_schema(),
             &UnknownKeySource::Env { sources: &sources },
-            &test_ctx(false),
+            &test_ctx(),
         )
         .unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
@@ -427,7 +427,7 @@ mod tests {
             &table,
             &crate::fixtures::test::test_schema(),
             &UnknownKeySource::Env { sources: &sources },
-            &test_ctx(false),
+            &test_ctx(),
         )
         .unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
@@ -459,7 +459,7 @@ mod tests {
             &table,
             &schema_without_database(),
             &UnknownKeySource::Env { sources: &sources },
-            &test_ctx(false),
+            &test_ctx(),
         )
         .unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
@@ -484,7 +484,7 @@ mod tests {
             &table,
             &schema_without_database(),
             &UnknownKeySource::Env { sources: &sources },
-            &test_ctx(false),
+            &test_ctx(),
         )
         .unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
@@ -511,7 +511,7 @@ mod tests {
             &table,
             &schema_without_database(),
             &UnknownKeySource::Env { sources: &sources },
-            &test_ctx(false),
+            &test_ctx(),
         )
         .unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
@@ -537,10 +537,9 @@ mod tests {
             UnknownKeyDecision::Collect
         });
         let ctx = ValidateContext {
-            overrides: test_ctx(false).overrides,
+            overrides: test_ctx().overrides,
             default_strict: true,
             callback: Some(&hook),
-            normalize_keys: false,
         };
         let collected = validate_unknown(
             &table,
@@ -568,14 +567,14 @@ debug = true
 url = "postgres://localhost"
 pool_size = 10
 "#;
-        let result = validate(content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(), false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn unknown_top_level_key() {
         let content = "host = \"localhost\"\ntypo_key = 42\n";
-        let result = validate(content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(), false);
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
@@ -587,7 +586,7 @@ pool_size = 10
     #[test]
     fn unknown_nested_key() {
         let content = "[database]\nurl = \"pg://\"\ntypo = \"bad\"\n";
-        let result = validate(content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(), false);
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
@@ -598,7 +597,7 @@ pool_size = 10
     #[test]
     fn multiple_unknown_keys() {
         let content = "typo1 = 1\ntypo2 = 2\n";
-        let result = validate(content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(), false);
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 2);
@@ -607,7 +606,7 @@ pool_size = 10
     #[test]
     fn line_number_accuracy() {
         let content = "host = \"x\"\nport = 8080\ndebug = false\n\n# comment\nbad_key = 1\n";
-        let result = validate(content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(), false);
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys[0].line, 6);
@@ -615,21 +614,21 @@ pool_size = 10
 
     #[test]
     fn empty_content_ok() {
-        let result = validate("", &path(), &test_ctx(false));
+        let result = validate("", &path(), &test_ctx(), false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn known_optional_field_ok() {
         let content = "[database]\nurl = \"pg://\"\n";
-        let result = validate(content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(), false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn sparse_config_ok() {
         let content = "port = 3000\n";
-        let result = validate(content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(), false);
         assert!(result.is_ok());
     }
 
@@ -637,7 +636,7 @@ pool_size = 10
     fn error_includes_file_path() {
         let content = "typo = 1\n";
         let p = PathBuf::from("/home/user/.config/myapp/config.toml");
-        let err = validate(content, &p, &test_ctx(false)).unwrap_err();
+        let err = validate(content, &p, &test_ctx(), false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("config.toml") || msg.contains("Unknown keys"));
     }
@@ -645,7 +644,7 @@ pool_size = 10
     #[test]
     fn line_number_finds_correct_section_for_duplicate_leaf() {
         let content = "host = \"x\"\nport = 8080\n[database]\ntypo = \"bad\"\n";
-        let result = validate(content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(), false);
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys[0].key, "database.typo");
@@ -655,7 +654,7 @@ pool_size = 10
     #[test]
     fn line_number_top_level_not_confused_by_nested_same_name() {
         let content = "typo = 99\n[database]\npool_size = 5\n";
-        let result = validate(content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(), false);
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys[0].key, "typo");
@@ -672,7 +671,7 @@ pool_size = 10
         // through nested database.pool-size — see the next test for the real
         // pool_size case.
         let content = "host = \"x\"\n";
-        let result = validate(content, &path(), &test_ctx(true));
+        let result = validate(content, &path(), &test_ctx(), true);
         assert!(result.is_ok());
     }
 
@@ -681,7 +680,7 @@ pool_size = 10
         // `pool-size` in source → `pool_size` after normalize_table → matches
         // the `pool_size` field on TestDbConfig.
         let content = "[database]\npool-size = 25\n";
-        let result = validate(content, &path(), &test_ctx(true));
+        let result = validate(content, &path(), &test_ctx(), true);
         assert!(result.is_ok(), "kebab key should be accepted: {result:?}");
     }
 
@@ -691,7 +690,7 @@ pool_size = 10
         // in snake form. The line-number lookup must still locate the kebab
         // line in the original source.
         let content = "host = \"x\"\n[database]\npool-zize = 99\n";
-        let result = validate(content, &path(), &test_ctx(true));
+        let result = validate(content, &path(), &test_ctx(), true);
         let err = result.unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys.len(), 1);
@@ -709,7 +708,7 @@ pool_size = 10
         // path is rewritten with the table; the key span still points at
         // `my-section` in the header.
         let content = "[my-section]\nfoo = 1\n";
-        let err = validate(content, &path(), &test_ctx(true)).unwrap_err();
+        let err = validate(content, &path(), &test_ctx(), true).unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         // Top-level `my_section` is the unknown key here.
         let hit = keys.iter().find(|k| k.key == "my_section").unwrap();
@@ -721,7 +720,7 @@ pool_size = 10
         // Sanity check: with normalization disabled, `pool-size` still fails
         // strict validation the way it always has.
         let content = "[database]\npool-size = 25\n";
-        let result = validate(content, &path(), &test_ctx(false));
+        let result = validate(content, &path(), &test_ctx(), false);
         assert!(result.is_err());
     }
 
@@ -748,7 +747,7 @@ pool_size = 10
                 source: content,
                 spans: &parsed.spans,
             },
-            &test_ctx(false),
+            &test_ctx(),
         )
         .unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
@@ -765,7 +764,7 @@ pool_size = 10
     #[test]
     fn unknown_key_in_inline_table_has_line_and_key_span() {
         let content = "host = \"x\"\ndatabase = { url = \"pg://\", typo = 1 }\n";
-        let err = validate(content, &path(), &test_ctx(false)).unwrap_err();
+        let err = validate(content, &path(), &test_ctx(), false).unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys[0].key, "database.typo");
         assert_eq!(keys[0].line, 2);
@@ -796,7 +795,7 @@ pool_size = 10
                 source: quoted,
                 spans: &parsed.spans,
             },
-            &test_ctx(false),
+            &test_ctx(),
         )
         .unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
@@ -818,7 +817,7 @@ pool_size = 10
                 source: nested,
                 spans: &parsed.spans,
             },
-            &test_ctx(false),
+            &test_ctx(),
         )
         .unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
@@ -844,7 +843,7 @@ pool_size = 10
                 source: yaml,
                 spans: &parsed.spans,
             },
-            &test_ctx(false),
+            &test_ctx(),
         )
         .unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
@@ -866,7 +865,7 @@ pool_size = 10
                 source: json,
                 spans: &parsed.spans,
             },
-            &test_ctx(false),
+            &test_ctx(),
         )
         .unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
@@ -878,7 +877,7 @@ pool_size = 10
     #[test]
     fn normalize_keys_snippet_carets_the_original_quoted_spelling() {
         let content = "\"my-key\" = 1\n";
-        let err = validate(content, &path(), &test_ctx(true)).unwrap_err();
+        let err = validate(content, &path(), &test_ctx(), true).unwrap_err();
         let keys = err.unknown_keys().expect("expected UnknownKeys");
         assert_eq!(keys[0].key, "my_key");
         let span = keys[0].span.expect("key span");
@@ -890,5 +889,18 @@ pool_size = 10
             caret.contains("^^^^^^^^"),
             "caret should cover the quoted original spelling, got: {out}"
         );
+    }
+
+    #[test]
+    fn unicode_quoted_key_caret_is_character_width() {
+        let content = "\"🔑\" = 1\n";
+        let err = validate(content, &path(), &test_ctx(), false).unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&content[span.start..span.end], "\"🔑\"");
+        let out = crate::render::render_plain(&err);
+        let caret = out.lines().find(|l| l.contains('^')).expect("{out}");
+        let caret_run = caret.chars().filter(|&c| c == '^').count();
+        assert_eq!(caret_run, 3, "caret should be character-width, got: {out}");
     }
 }

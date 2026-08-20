@@ -83,9 +83,8 @@ fn render_unknown_keys_plain(infos: &[crate::error::UnknownKeyInfo]) -> String {
             continue;
         }
         let snippet = unknown_key_snippet(info);
-        // Line 0 means "could not be located" (empty span index, e.g.
-        // YAML/JSON holding state) — render the path alone, never a
-        // bogus `:0`.
+        // Line 0 means "could not be located" (no span-index entry) —
+        // render the path alone, never a bogus `:0`.
         if snippet.line > 0 {
             let _ = write!(
                 out,
@@ -140,9 +139,9 @@ fn render_parse_error_plain(
             let gutter = format!("\n{:>4} | ", line);
             out.push_str(&gutter);
             out.push_str(line_text);
-            let pad = " ".repeat("     | ".len() + col.saturating_sub(1));
-            let len = (span.end - span.start).max(1);
-            let carets = "^".repeat(len.min(line_text.len().saturating_sub(col - 1).max(1)));
+            let col0 = col.saturating_sub(1);
+            let pad = " ".repeat("     | ".len() + col0);
+            let carets = "^".repeat(caret_len_chars(src, span, line_text, col0));
             let _ = write!(out, "\n{pad}{carets}");
         }
     }
@@ -153,12 +152,29 @@ fn render_parse_error_plain(
 
 struct UnknownKeySnippet<'a> {
     line: usize,
+    /// Source line, 0-based character column, and caret length in characters.
     body: Option<(&'a str, usize, usize)>,
 }
 
-/// Line/column and caret length from the key span when present; otherwise
-/// the stored 1-indexed line and a leaf-text find (synthetic tests that
-/// only set `line`). YAML/JSON empty indexes yield line 0 and no body.
+/// Caret width in characters for a byte `span` on `line_text`.
+///
+/// `col0` is a 0-based **character** column (from
+/// [`byte_offset_to_line_col`](crate::format::byte_offset_to_line_col)).
+/// Pad and caret repeats are characters, so the span's byte length must
+/// not be used as a width — a quoted `"🔑"` key is 6 bytes and 3 columns.
+fn caret_len_chars(src: &str, span: crate::format::Span, line_text: &str, col0: usize) -> usize {
+    let max_len = line_text.chars().count().saturating_sub(col0).max(1);
+    src.get(span.start..span.end)
+        .map(|s| s.chars().count())
+        .unwrap_or(1)
+        .max(1)
+        .min(max_len)
+}
+
+/// Line, character column, and caret length from the key span when
+/// present; otherwise the stored 1-indexed line and a leaf-text find
+/// (synthetic tests that only set `line`). A missing span-index entry
+/// yields line 0 and no body.
 fn unknown_key_snippet(info: &crate::error::UnknownKeyInfo) -> UnknownKeySnippet<'_> {
     let Some(src) = info.source.as_deref() else {
         return UnknownKeySnippet {
@@ -170,22 +186,23 @@ fn unknown_key_snippet(info: &crate::error::UnknownKeyInfo) -> UnknownKeySnippet
         let (line, col) = crate::format::byte_offset_to_line_col(src, span.start);
         let col0 = col.saturating_sub(1);
         let line_text = src.lines().nth(line.saturating_sub(1)).unwrap_or("");
-        let max_len = line_text.len().saturating_sub(col0).max(1);
-        let caret_len = (span.end.saturating_sub(span.start)).max(1).min(max_len);
         return UnknownKeySnippet {
             line,
-            body: Some((line_text, col0, caret_len)),
+            body: Some((line_text, col0, caret_len_chars(src, span, line_text, col0))),
         };
     }
     if info.line > 0
         && let Some(line_text) = src.lines().nth(info.line - 1)
     {
-        let caret_col = line_text
+        let byte_col = line_text
             .find(info.leaf())
             .unwrap_or_else(|| line_text.len() - line_text.trim_start().len());
+        let col0 = line_text[..byte_col].chars().count();
+        let remaining = line_text.chars().count().saturating_sub(col0).max(1);
+        let caret_len = info.leaf().chars().count().max(1).min(remaining);
         return UnknownKeySnippet {
             line: info.line,
-            body: Some((line_text, caret_col, info.leaf().len().max(1))),
+            body: Some((line_text, col0, caret_len)),
         };
     }
     UnknownKeySnippet {
@@ -452,8 +469,62 @@ mod tests {
     }
 
     #[test]
+    fn plain_span_carets_unicode_key_in_character_width() {
+        use crate::format::Span;
+        // `"🔑"` is 6 UTF-8 bytes and 3 characters. Mixing those units
+        // used to draw six carets under a three-column token.
+        let source: Arc<str> = Arc::from("\"🔑\" = 1\n");
+        let infos = vec![UnknownKeyInfo {
+            key: "🔑".into(),
+            path: "/p.toml".into(),
+            line: 1,
+            source: Some(source),
+            env_var: None,
+            span: Some(Span { start: 0, end: 6 }),
+            url_key: None,
+            input_type: None,
+        }];
+        let out = render_plain(&ClapfigError::UnknownKeys(infos));
+        assert!(out.contains("\"🔑\" = 1"), "{out}");
+        let caret = out.lines().find(|l| l.contains('^')).expect("{out}");
+        let caret_run = caret.chars().filter(|&c| c == '^').count();
+        assert_eq!(caret_run, 3, "caret should be character-width, got: {out}");
+    }
+
+    #[test]
+    fn plain_fallback_carets_use_character_column() {
+        // No span: leaf-find must convert the byte offset of `typo`
+        // (after a 4-byte emoji) into a character column, and caret the
+        // leaf in characters.
+        let source: Arc<str> = Arc::from("🔑 typo = 1\n");
+        let infos = vec![UnknownKeyInfo {
+            key: "typo".into(),
+            path: "/p.toml".into(),
+            line: 1,
+            source: Some(source),
+            env_var: None,
+            span: None,
+            url_key: None,
+            input_type: None,
+        }];
+        let out = render_plain(&ClapfigError::UnknownKeys(infos));
+        let caret = out.lines().find(|l| l.contains('^')).expect("{out}");
+        let prefix = caret.split('^').next().expect("caret prefix");
+        assert_eq!(
+            prefix.chars().count(),
+            "     | ".len() + 2,
+            "caret should sit under 'typo' (2 columns of prefix), got: {out}"
+        );
+        assert_eq!(
+            caret.chars().filter(|&c| c == '^').count(),
+            4,
+            "caret should cover 'typo', got: {out}"
+        );
+    }
+
+    #[test]
     fn plain_line_zero_renders_path_without_line() {
-        // YAML/JSON sources have no line heuristic — never render `:0`.
+        // Line 0 means "could not be located" — never render `:0`.
         let infos = vec![UnknownKeyInfo {
             key: "typo".into(),
             path: "/p.yaml".into(),

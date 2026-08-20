@@ -295,11 +295,12 @@ impl Span {
     }
 }
 
-/// 1-indexed line and column of a byte offset in `src`.
+/// 1-indexed line and character column of a byte offset in `src`.
 ///
-/// Line and column are derived from byte spans at render time (provenance
-/// spec); validation stores the span and uses this to fill the public
-/// 1-indexed `line` field.
+/// Column counts Unicode scalar values, not bytes — renderers pad and
+/// draw carets in characters. Line and column are derived from byte
+/// spans at render time (provenance spec); validation stores the span
+/// and uses this to fill the public 1-indexed `line` field.
 pub(crate) fn byte_offset_to_line_col(src: &str, offset: usize) -> (usize, usize) {
     let mut line = 1;
     let mut col = 1;

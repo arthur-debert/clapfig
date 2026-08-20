@@ -127,7 +127,6 @@ pub(crate) fn resolve(
         overrides: &input.strict_overrides,
         default_strict: input.strict_default,
         callback: input.unknown_key_hook.as_ref(),
-        normalize_keys: input.normalize_keys,
     };
 
     // Skip validation entirely when no path through the cascade can ever

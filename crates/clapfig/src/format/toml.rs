@@ -170,16 +170,15 @@ fn table_like_to_map(
     path: &ConfigPath,
     spans: &mut BTreeMap<ConfigPath, SpanEntry>,
 ) -> Map {
-    let keys: Vec<String> = table.iter().map(|(k, _)| k.to_string()).collect();
     let mut map = Map::new();
-    for k in keys {
-        let Some((key, item)) = table.get_key_value(&k) else {
-            continue;
+    for (k, item) in table.iter() {
+        let Some(key) = table.key(k) else {
+            unreachable!("iter() key must exist in the table");
         };
-        let child = path.clone().key(k.clone());
+        let child = path.clone().key(k);
         let key_span = key.span().map(Span::from_range);
         let value = item_to_value(item, &child, key_span, spans);
-        map.insert(k, value);
+        map.insert(k.to_string(), value);
     }
     map
 }
