@@ -1,12 +1,18 @@
-//! Runtime-defined schemas: owned `Schema` / `Field` / `LeafType` types and a
-//! fluent builder, for callers without a compile-time
+//! Runtime-defined schemas: owned [`Shape`] / [`Schema`] / [`Field`] /
+//! [`LeafType`] types and a fluent builder, for callers without a compile-time
 //! `#[derive(clapfig::Schema)]` struct.
 //!
-//! This is the crate's one schema model: every consumer — strict-mode
-//! validation, doc lookup, valid-key enumeration, JSON Schema
-//! generation, template generation, persistence validation — walks
-//! `&Schema` directly, whether it was built here or emitted by
-//! `#[derive(clapfig::Schema)]`.
+//! [`Shape`] is the schema node (ADR-0010, `docs/spec/shape-algebra.md`):
+//! leaf, named-field object, homogeneous map, homogeneous array, or
+//! internally tagged union. [`Schema`] is the named-field **object**
+//! constructor (`Schema::object`), not the node, and is not renamed to
+//! `Object`. [`clapfig::Schema`](crate::Schema) is the derive trait.
+//!
+//! Walkers still take `&Schema` today; SHP01-WS02 switches them to
+//! [`Shape`]. Until then, [`Clapfig::builder`](crate::Clapfig::builder)
+//! accepts `impl Into<Shape>` so object-root callers keep passing a
+//! [`Schema`]. Root Map and Tagged shapes construct; loading them is a
+//! loud stub, not a silent object walk.
 //!
 //! # Example
 //!
@@ -35,12 +41,14 @@
 
 use crate::value::Value;
 
-/// Owned, runtime-defined schema for a config node.
+/// Named-field object — the [`Shape::Object`] constructor, not the schema
+/// node (ADR-0010).
 ///
 /// Constructed via [`Schema::object`] and the fluent builder, or directly
-/// as a plain data struct. The clapfig resolve pipeline borrows from
-/// this internally — callers normally only need to build it and hand it
-/// to [`Clapfig::builder`](crate::Clapfig::builder).
+/// as a plain data struct. The clapfig resolve pipeline still walks
+/// `&Schema` today (SHP01-WS02 switches walkers to [`Shape`]). Object-root
+/// callers hand this to [`Clapfig::builder`](crate::Clapfig::builder),
+/// which takes `impl Into<Shape>`.
 #[derive(Debug, Clone)]
 pub struct Schema {
     pub name: String,
@@ -449,6 +457,365 @@ impl FieldBuilder {
     }
 }
 
+/// A schema node: leaf, named-field object, homogeneous map, homogeneous
+/// array, or internally tagged union.
+///
+/// This is the node walkers will take (SHP01-WS02). [`Schema`] remains the
+/// named-field object — the [`Shape::Object`] constructor — not this enum
+/// and not renamed to `Object` (ADR-0010). An object's field value is a
+/// [`Shape`]; [`Field`] is not a second node in this contract (the public
+/// collapse of `Field` / `LeafType::Map` / `LeafType::Array` is SHP01-WS02).
+///
+/// Legal document roots are [`Object`](Shape::Object), [`Map`](Shape::Map),
+/// and [`Tagged`](Shape::Tagged). [`Leaf`](Shape::Leaf) and
+/// [`Array`](Shape::Array) are valid nested shapes; using them as a
+/// document root is rejected at construction.
+///
+/// ```
+/// use clapfig::runtime::{Field, Schema, Shape};
+///
+/// let item = Schema::object("Block")
+///     .field("mount", Field::string())
+///     .build();
+/// let root = Shape::from(Shape::map("blocks", item).build());
+/// assert!(root.is_legal_document_root());
+/// ```
+#[derive(Debug, Clone)]
+pub enum Shape {
+    /// A scalar / closed-enum / `Value`-escape-hatch leaf. Not a legal
+    /// document root.
+    Leaf(Leaf),
+    /// Today's named-field object ([`Schema::object`]). A legal document
+    /// root.
+    Object(Schema),
+    /// Homogeneous unordered string-keyed map. Item is any shape. A legal
+    /// document root; load of a root map is SHP01-WS03.
+    Map(MapShape),
+    /// Homogeneous array. Item is any shape. Not a legal document root.
+    Array(ArrayShape),
+    /// Internally tagged union of objects, selected by a discriminator
+    /// field. A legal document root; tagged walk is SHP01-WS04.
+    Tagged(TaggedShape),
+}
+
+impl Shape {
+    /// A leaf node from a [`LeafType`]. Not a legal document root.
+    pub fn leaf(ty: LeafType) -> Self {
+        Self::Leaf(Leaf {
+            doc: Vec::new(),
+            ty,
+            default: None,
+            optional: false,
+            env: None,
+        })
+    }
+
+    /// Wrap a named-field object. A legal document root.
+    pub fn object(schema: Schema) -> Self {
+        Self::Object(schema)
+    }
+
+    /// Start a homogeneous map. A legal document root.
+    ///
+    /// `name` is the node name (the derive will emit the type name here).
+    /// `item` is any shape — a map of objects and a map of leaves are the
+    /// same constructor.
+    pub fn map(name: impl Into<String>, item: impl Into<Shape>) -> MapShapeBuilder {
+        MapShapeBuilder {
+            map: MapShape {
+                name: name.into(),
+                doc: Vec::new(),
+                strict: None,
+                item: Box::new(item.into()),
+            },
+        }
+    }
+
+    /// Start a homogeneous array. Not a legal document root.
+    pub fn array(name: impl Into<String>, item: impl Into<Shape>) -> ArrayShapeBuilder {
+        ArrayShapeBuilder {
+            array: ArrayShape {
+                name: name.into(),
+                doc: Vec::new(),
+                strict: None,
+                item: Box::new(item.into()),
+            },
+        }
+    }
+
+    /// Start an internally tagged union. A legal document root.
+    ///
+    /// `name` is the node name (the enum type name). `tag` is the
+    /// discriminator field (`serde(tag = ...)`), reserved on every variant
+    /// object and not itself a field of the variant. Panics if `tag` is
+    /// empty. Call [`TaggedShapeBuilder::variant`] at least once before
+    /// [`build`](TaggedShapeBuilder::build).
+    pub fn tagged(name: impl Into<String>, tag: impl Into<String>) -> TaggedShapeBuilder {
+        let tag = tag.into();
+        assert!(
+            !tag.is_empty(),
+            "clapfig: tagged discriminator field name must not be empty"
+        );
+        TaggedShapeBuilder {
+            name: name.into(),
+            doc: Vec::new(),
+            strict: None,
+            tag,
+            variants: Vec::new(),
+        }
+    }
+
+    /// Constructor name for error messages (`"Leaf"`, `"Object"`, …).
+    pub fn constructor_name(&self) -> &'static str {
+        match self {
+            Shape::Leaf(_) => "Leaf",
+            Shape::Object(_) => "Object",
+            Shape::Map(_) => "Map",
+            Shape::Array(_) => "Array",
+            Shape::Tagged(_) => "Tagged",
+        }
+    }
+
+    /// Object, Map, and Tagged are legal document roots; Leaf and Array
+    /// are not.
+    pub fn is_legal_document_root(&self) -> bool {
+        matches!(self, Shape::Object(_) | Shape::Map(_) | Shape::Tagged(_))
+    }
+
+    /// Panic unless this shape is a legal document root.
+    ///
+    /// Leaf and Array are valid nested shapes; they are not documents.
+    pub fn require_document_root(&self) {
+        match self {
+            Shape::Object(_) | Shape::Map(_) | Shape::Tagged(_) => {}
+            Shape::Leaf(_) => panic!(
+                "clapfig: a Leaf is not a legal document root (legal roots: Object, Map, Tagged)"
+            ),
+            Shape::Array(_) => panic!(
+                "clapfig: an Array is not a legal document root (legal roots: Object, Map, Tagged)"
+            ),
+        }
+    }
+}
+
+impl From<Schema> for Shape {
+    fn from(schema: Schema) -> Self {
+        Shape::Object(schema)
+    }
+}
+
+impl From<SchemaBuilder> for Shape {
+    fn from(builder: SchemaBuilder) -> Self {
+        Shape::Object(builder.build())
+    }
+}
+
+impl From<Leaf> for Shape {
+    fn from(leaf: Leaf) -> Self {
+        Shape::Leaf(leaf)
+    }
+}
+
+impl From<FieldBuilder> for Shape {
+    fn from(builder: FieldBuilder) -> Self {
+        Shape::Leaf(builder.build())
+    }
+}
+
+impl From<MapShape> for Shape {
+    fn from(map: MapShape) -> Self {
+        Shape::Map(map)
+    }
+}
+
+impl From<ArrayShape> for Shape {
+    fn from(array: ArrayShape) -> Self {
+        Shape::Array(array)
+    }
+}
+
+impl From<TaggedShape> for Shape {
+    fn from(tagged: TaggedShape) -> Self {
+        Shape::Tagged(tagged)
+    }
+}
+
+/// Homogeneous unordered map: string keys, item is any [`Shape`].
+///
+/// Node header (`name` / `doc` / `strict`) parallels [`Schema`]. A legal
+/// document root; walkers consume this in SHP01-WS02 / WS03.
+#[derive(Debug, Clone)]
+pub struct MapShape {
+    pub name: String,
+    pub doc: Vec<String>,
+    pub strict: Option<bool>,
+    pub item: Box<Shape>,
+}
+
+/// Fluent builder for [`MapShape`].
+#[derive(Debug, Clone)]
+pub struct MapShapeBuilder {
+    map: MapShape,
+}
+
+impl MapShapeBuilder {
+    /// Append a doc-comment line.
+    pub fn doc(mut self, line: impl Into<String>) -> Self {
+        self.map.doc.push(line.into());
+        self
+    }
+
+    /// Set the node-level `strict` override.
+    pub fn strict(mut self, value: bool) -> Self {
+        self.map.strict = Some(value);
+        self
+    }
+
+    /// Finalize into a [`MapShape`].
+    pub fn build(self) -> MapShape {
+        self.map
+    }
+}
+
+/// Homogeneous array: item is any [`Shape`].
+///
+/// Not a legal document root. Node header parallels [`Schema`].
+#[derive(Debug, Clone)]
+pub struct ArrayShape {
+    pub name: String,
+    pub doc: Vec<String>,
+    pub strict: Option<bool>,
+    pub item: Box<Shape>,
+}
+
+/// Fluent builder for [`ArrayShape`].
+#[derive(Debug, Clone)]
+pub struct ArrayShapeBuilder {
+    array: ArrayShape,
+}
+
+impl ArrayShapeBuilder {
+    /// Append a doc-comment line.
+    pub fn doc(mut self, line: impl Into<String>) -> Self {
+        self.array.doc.push(line.into());
+        self
+    }
+
+    /// Set the node-level `strict` override.
+    pub fn strict(mut self, value: bool) -> Self {
+        self.array.strict = Some(value);
+        self
+    }
+
+    /// Finalize into an [`ArrayShape`].
+    pub fn build(self) -> ArrayShape {
+        self.array
+    }
+}
+
+/// Internally tagged union of objects.
+///
+/// The tag is declared here (serde `tag = "..."`) and is **not** a field
+/// of any variant object. Each variant is a [`Schema`] (an object). A
+/// unit variant is the empty object. Variants that are Map, Array, Leaf,
+/// or Tagged are rejected at construction.
+///
+/// A legal document root; tagged walk is SHP01-WS04.
+#[derive(Debug, Clone)]
+pub struct TaggedShape {
+    pub name: String,
+    pub doc: Vec<String>,
+    pub strict: Option<bool>,
+    /// Discriminator field name. Required, closed, never an unknown key.
+    pub tag: String,
+    /// Closed discriminator set. At least one variant; names unique and
+    /// non-empty.
+    pub variants: Vec<TaggedVariant>,
+}
+
+/// One variant of a [`TaggedShape`]: post-rename discriminator → object.
+#[derive(Debug, Clone)]
+pub struct TaggedVariant {
+    pub discriminator: String,
+    pub schema: Schema,
+}
+
+/// Fluent builder for [`TaggedShape`].
+#[derive(Debug, Clone)]
+pub struct TaggedShapeBuilder {
+    name: String,
+    doc: Vec<String>,
+    strict: Option<bool>,
+    tag: String,
+    variants: Vec<TaggedVariant>,
+}
+
+impl TaggedShapeBuilder {
+    /// Append a doc-comment line.
+    pub fn doc(mut self, line: impl Into<String>) -> Self {
+        self.doc.push(line.into());
+        self
+    }
+
+    /// Set the node-level `strict` override.
+    pub fn strict(mut self, value: bool) -> Self {
+        self.strict = Some(value);
+        self
+    }
+
+    /// Add a variant. `shape` must be [`Shape::Object`]; other constructors
+    /// panic. `discriminator` is the post-rename name: non-empty and unique
+    /// within this union.
+    pub fn variant(mut self, discriminator: impl Into<String>, shape: impl Into<Shape>) -> Self {
+        let discriminator = discriminator.into();
+        assert!(
+            !discriminator.is_empty(),
+            "clapfig: tagged discriminator must not be empty"
+        );
+        assert!(
+            !self
+                .variants
+                .iter()
+                .any(|v| v.discriminator == discriminator),
+            "clapfig: duplicate tagged discriminator {discriminator:?} on {:?}",
+            self.name
+        );
+        let shape = shape.into();
+        let schema = match shape {
+            Shape::Object(schema) => schema,
+            other => panic!(
+                "clapfig: tagged variant {discriminator:?} must be an object, got {}",
+                other.constructor_name()
+            ),
+        };
+        self.variants.push(TaggedVariant {
+            discriminator,
+            schema,
+        });
+        self
+    }
+
+    /// Finalize into a [`TaggedShape`].
+    ///
+    /// Panics if no variant was added. Empty tag names are rejected by
+    /// [`Shape::tagged`]; empty / duplicate discriminators and non-object
+    /// variants are rejected by [`variant`](Self::variant).
+    pub fn build(self) -> TaggedShape {
+        assert!(
+            !self.variants.is_empty(),
+            "clapfig: tagged union {:?} must have at least one variant",
+            self.name
+        );
+        TaggedShape {
+            name: self.name,
+            doc: self.doc,
+            strict: self.strict,
+            tag: self.tag,
+            variants: self.variants,
+        }
+    }
+}
+
 /// Reject field names that would confuse every downstream consumer
 /// (resolve, persist, cascade lookup) the moment they're constructed.
 ///
@@ -756,5 +1123,232 @@ mod tests {
         t.insert("b".into(), Value::String("oops".into()));
         let err = map.check(&Value::Map(t)).unwrap_err();
         assert!(err.contains("map[b]"));
+    }
+
+    fn object(name: &str) -> Schema {
+        Schema::object(name).field("x", Field::string()).build()
+    }
+
+    #[test]
+    fn shape_object_from_schema_is_a_legal_document_root() {
+        let shape = Shape::from(object("App"));
+        assert!(matches!(shape, Shape::Object(_)));
+        assert!(shape.is_legal_document_root());
+        shape.require_document_root();
+        let _ = crate::Clapfig::builder(object("App"));
+    }
+
+    #[test]
+    fn root_may_be_a_map() {
+        let root = Shape::from(
+            Shape::map("blocks", object("Block"))
+                .doc("named instances")
+                .build(),
+        );
+        match &root {
+            Shape::Map(map) => {
+                assert_eq!(map.name, "blocks");
+                assert_eq!(map.doc, vec!["named instances".to_string()]);
+                assert!(matches!(map.item.as_ref(), Shape::Object(_)));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+        assert!(root.is_legal_document_root());
+        root.require_document_root();
+    }
+
+    #[test]
+    fn root_may_be_tagged() {
+        let root = Shape::from(
+            Shape::tagged("Block", "kind")
+                .doc("internally tagged block")
+                .variant("rust", object("Rust"))
+                .variant("payload", object("Payload"))
+                .build(),
+        );
+        match &root {
+            Shape::Tagged(tagged) => {
+                assert_eq!(tagged.name, "Block");
+                assert_eq!(tagged.tag, "kind");
+                assert_eq!(tagged.variants.len(), 2);
+                assert_eq!(tagged.variants[0].discriminator, "rust");
+                assert_eq!(tagged.variants[0].schema.name, "Rust");
+                assert_eq!(tagged.variants[1].discriminator, "payload");
+            }
+            other => panic!("expected Tagged, got {other:?}"),
+        }
+        assert!(root.is_legal_document_root());
+        root.require_document_root();
+    }
+
+    #[test]
+    fn tagged_has_closed_unique_non_empty_discriminator_set() {
+        let tagged = Shape::tagged("Block", "kind")
+            .variant("rust", object("Rust"))
+            .variant("payload", object("Payload"))
+            .build();
+        let names: Vec<&str> = tagged
+            .variants
+            .iter()
+            .map(|v| v.discriminator.as_str())
+            .collect();
+        assert_eq!(names, ["rust", "payload"]);
+        assert!(!names.iter().any(|n| n.is_empty()));
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len());
+    }
+
+    #[test]
+    fn tagged_variants_are_objects() {
+        let tagged = Shape::tagged("Block", "kind")
+            .variant("off", Schema::object("Off").build())
+            .variant("rust", object("Rust"))
+            .build();
+        // A unit variant is the empty object (tag-only on the wire).
+        assert!(tagged.variants[0].schema.fields.is_empty());
+        assert_eq!(tagged.variants[1].schema.fields.len(), 1);
+        for variant in &tagged.variants {
+            // Stored payload is Schema — the Object constructor — not an
+            // arbitrary Shape.
+            let _object: &Schema = &variant.schema;
+        }
+    }
+
+    #[test]
+    fn leaf_and_array_construct_as_nested_shapes() {
+        let leaf = Shape::leaf(LeafType::String);
+        assert!(matches!(leaf, Shape::Leaf(_)));
+        assert!(!leaf.is_legal_document_root());
+
+        let array = Shape::from(Shape::array("flags", Field::string()).build());
+        assert!(matches!(array, Shape::Array(_)));
+        assert!(!array.is_legal_document_root());
+
+        // Nested: a map of arrays of leaves is a constructible tree.
+        let nested = Shape::from(Shape::map("groups", array).build());
+        assert!(nested.is_legal_document_root());
+    }
+
+    #[test]
+    fn map_of_tagged_objects_constructs() {
+        let tagged = Shape::from(
+            Shape::tagged("Block", "kind")
+                .variant("rust", object("Rust"))
+                .build(),
+        );
+        let root = Shape::from(Shape::map("block", tagged).build());
+        match root {
+            Shape::Map(map) => match map.item.as_ref() {
+                Shape::Tagged(t) => assert_eq!(t.tag, "kind"),
+                other => panic!("expected Tagged item, got {other:?}"),
+            },
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "a Leaf is not a legal document root")]
+    fn leaf_is_not_a_legal_document_root() {
+        Shape::leaf(LeafType::String).require_document_root();
+    }
+
+    #[test]
+    #[should_panic(expected = "an Array is not a legal document root")]
+    fn array_is_not_a_legal_document_root() {
+        Shape::from(Shape::array("xs", Field::integer()).build()).require_document_root();
+    }
+
+    #[test]
+    #[should_panic(expected = "a Leaf is not a legal document root")]
+    fn clapfig_builder_rejects_leaf_document_root() {
+        let _ = crate::Clapfig::builder(Shape::leaf(LeafType::String));
+    }
+
+    #[test]
+    #[should_panic(expected = "an Array is not a legal document root")]
+    fn clapfig_builder_rejects_array_document_root() {
+        let _ = crate::Clapfig::builder(Shape::array("xs", Field::string()).build());
+    }
+
+    #[test]
+    #[should_panic(expected = "root Map and Tagged")]
+    fn clapfig_builder_does_not_silently_load_root_map() {
+        let _ = crate::Clapfig::builder(Shape::map("blocks", object("Block")).build());
+    }
+
+    #[test]
+    #[should_panic(expected = "root Map and Tagged")]
+    fn clapfig_builder_does_not_silently_load_root_tagged() {
+        let _ = crate::Clapfig::builder(
+            Shape::tagged("Block", "kind")
+                .variant("rust", object("Rust"))
+                .build(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must have at least one variant")]
+    fn tagged_rejects_empty_union() {
+        let _ = Shape::tagged("Block", "kind").build();
+    }
+
+    #[test]
+    #[should_panic(expected = "discriminator field name must not be empty")]
+    fn tagged_rejects_empty_tag_name() {
+        let _ = Shape::tagged("Block", "");
+    }
+
+    #[test]
+    #[should_panic(expected = "discriminator must not be empty")]
+    fn tagged_rejects_empty_discriminator() {
+        let _ = Shape::tagged("Block", "kind")
+            .variant("", object("Rust"))
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate tagged discriminator")]
+    fn tagged_rejects_duplicate_discriminators() {
+        let _ = Shape::tagged("Block", "kind")
+            .variant("rust", object("Rust"))
+            .variant("rust", object("AlsoRust"))
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "must be an object, got Leaf")]
+    fn tagged_rejects_non_object_leaf_variant() {
+        let _ = Shape::tagged("Block", "kind")
+            .variant("rust", Shape::leaf(LeafType::String))
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "must be an object, got Map")]
+    fn tagged_rejects_non_object_map_variant() {
+        let _ = Shape::tagged("Block", "kind")
+            .variant("rust", Shape::map("inner", object("Inner")).build())
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "must be an object, got Array")]
+    fn tagged_rejects_non_object_array_variant() {
+        let _ = Shape::tagged("Block", "kind")
+            .variant("rust", Shape::array("xs", Field::string()).build())
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "must be an object, got Tagged")]
+    fn tagged_rejects_nested_tagged_variant() {
+        let inner = Shape::tagged("Inner", "k")
+            .variant("a", object("A"))
+            .build();
+        let _ = Shape::tagged("Block", "kind")
+            .variant("rust", inner)
+            .build();
     }
 }
