@@ -108,6 +108,14 @@ pub fn set_in_document(
         Some(c) => Some(adapter.parse(c).map_err(ClapfigError::from)?),
         None => None,
     };
+    // `persist_table_get` uses `resolve_table_key`, whose contract is
+    // that the whole document has already been collision-checked. Do
+    // that here — before tagged branch selection — so two equivalent
+    // discriminator spellings fail as `NormalizedKeyCollision` rather
+    // than one spelling silently selecting a variant.
+    if normalize_keys && let Some(Value::Map(map)) = parsed.as_ref().map(|p| &p.value) {
+        check_collisions(map).map_err(|c| c.into_error(Path::new("")))?;
+    }
     let existing = parsed.as_ref().map(|p| &p.value);
 
     let disc_shape;
@@ -690,6 +698,9 @@ fn persist_target_tagged<'a>(
 /// same rule [`resolve_document_path`] uses — so a kebab-case tagged
 /// document still selects the variant for `block_kind` stored as
 /// `block-kind`.
+///
+/// Callers must already have run [`check_collisions`] on the document
+/// (see [`set_in_document`]); this only chooses the concrete spelling.
 fn persist_table_get<'a>(
     table: &'a crate::value::Map,
     schema_key: &str,
@@ -2322,5 +2333,46 @@ mod tests {
         .unwrap();
         assert!(result.contains("artifact = \"123\""), "{result}");
         assert!(result.contains("block-kind = \"payload\""), "{result}");
+    }
+
+    #[test]
+    fn colliding_discriminator_spellings_fail_as_normalized_key_collision() {
+        // Both spellings, different variants: collision must win over
+        // picking one discriminator and then UnaddressableKey / a typed
+        // write against the wrong branch.
+        let result = set_in_document(
+            &TomlAdapter,
+            &kebab_tagged_block(),
+            Some("block-kind = \"payload\"\nblock_kind = \"rust\"\nmount = \".\"\n"),
+            "artifact",
+            "123",
+            true,
+        );
+        assert_collision(
+            result,
+            "",
+            "block_kind",
+            &["block-kind", "block_kind"],
+            "root tagged discriminator collision",
+        );
+    }
+
+    #[test]
+    fn colliding_nested_discriminator_spellings_fail_as_normalized_key_collision() {
+        let result = set_in_document(
+            &TomlAdapter,
+            &nested_kebab_tagged_app(),
+            Some("[site-block]\nblock-kind = \"payload\"\nblock_kind = \"rust\"\nmount = \".\"\n"),
+            "site-block.artifact",
+            "123",
+            true,
+        );
+        assert_collision(
+            result,
+            "site_block",
+            "block_kind",
+            &["block-kind", "block_kind"],
+            "nested tagged discriminator collision",
+        );
     }
 }
