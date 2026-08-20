@@ -865,10 +865,10 @@ impl Clapfig {
     /// document roots are Object, Map, and Tagged; Leaf and Array are
     /// valid nested shapes and panic when used as the document root.
     ///
-    /// Resolve still walks today's object schema (SHP01-WS02 switches the
-    /// pipeline). A root Map or Tagged therefore `todo!()` here — it must
-    /// not load as if it were an object. Object-root `load()` is
-    /// unchanged.
+    /// Walkers take [`Shape`](crate::runtime::Shape). A root Map or Tagged
+    /// therefore `todo!()` here — it must not load as if it were an
+    /// object (root-map load is SHP01-WS03; tagged walk is SHP01-WS04).
+    /// Object-root `load()` is unchanged.
     ///
     /// Returns a [`Builder`] with the same surface as
     /// [`Self::typed`] — `app_name`, `search_paths`, `env_prefix`,
@@ -896,9 +896,9 @@ impl Clapfig {
             crate::runtime::Shape::Object(schema) => Builder::new(schema),
             crate::runtime::Shape::Map(_) | crate::runtime::Shape::Tagged(_) => {
                 todo!(
-                    "clapfig: root Map and Tagged shapes are constructible (SHP01-WS01) \
-                     but the resolve pipeline still walks today's object schema \
-                     (SHP01-WS02); root-map load is SHP01-WS03 and tagged walk is SHP01-WS04"
+                    "clapfig: root Map and Tagged shapes are constructible \
+                     but must not load as an object; root-map load is SHP01-WS03 \
+                     and tagged walk is SHP01-WS04"
                 )
             }
             crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => {

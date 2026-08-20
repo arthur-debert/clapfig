@@ -15,11 +15,11 @@
 //!   `properties`.
 //! - **Required**: `required` mirrors what the runtime actually rejects
 //!   when absent — a leaf is required only if it is non-optional AND has
-//!   no default AND is neither map-typed nor array-typed (defaults are
-//!   synthesized during finalization; an absent map/array materializes as
-//!   the empty one), and a nested section is required only if it
-//!   transitively contains such a leaf. An external validator therefore
-//!   accepts exactly the documents clapfig loads.
+//!   no default. [`Shape::Array`] / [`Shape::Map`] are never required
+//!   (defaults are synthesized during finalization; an absent array/map
+//!   materializes as the empty one), and a nested section is required
+//!   only if it transitively contains a required leaf. An external
+//!   validator therefore accepts exactly the documents clapfig loads.
 //! - **Docs**: schema and field doc lines become `description`.
 //! - **Types**: converted recursively from each leaf's declared
 //!   [`LeafType`] — including leaves without defaults. String →
@@ -62,7 +62,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::runtime::{Field, Leaf, LeafType, NamedField, Schema};
+use crate::runtime::{Leaf, LeafType, NamedField, Schema, Shape};
 use crate::value::Value as ConfigValue;
 
 /// JSON Schema dialect emitted in the root `$schema` field.
@@ -170,69 +170,108 @@ fn schema_to_object(schema: &Schema) -> Value {
 
 /// Convert a [`NamedField`] into a `(name, schema, required)` triple.
 ///
-/// `required` mirrors the runtime's absence rules: `true` for a leaf that
-/// is non-optional AND defaultless AND neither map-typed nor array-typed
-/// (an absent non-optional map/array leaf materializes as the empty
-/// map/array, like structural `MapOf`/`ArrayOf` nodes), and for a nested
-/// struct that transitively contains such a leaf ([`schema_requires_presence`]).
+/// `required` mirrors the runtime's absence rules: `true` for a
+/// [`Shape::Leaf`] that is non-optional AND defaultless, and for a nested
+/// object that transitively contains such a leaf
+/// ([`schema_requires_presence`]). [`Shape::Array`] and [`Shape::Map`]
+/// are never required — an absent non-optional array/map materializes as
+/// the empty array/map.
 fn field_to_property(field: &NamedField) -> (String, Value, bool) {
     match &field.field {
-        Field::Nested(nested) => {
+        Shape::Object(nested) => {
             let schema = schema_to_object(nested);
             (field.name.clone(), schema, schema_requires_presence(nested))
         }
-        Field::ArrayOf(item) => {
-            // JSON Schema for a TOML `[[name]]` array of items: `type: array`
-            // with `items: <item schema>`. Each runtime array entry is itself
-            // typed against `item`, so the per-item schema is the natural
-            // place to declare structure.
+        Shape::Array(array) => {
+            // JSON Schema for an array field: `type: array` with
+            // `items: <item schema>`. Object items are TOML `[[name]]`;
+            // leaf items are homogeneous arrays of leaves.
             //
-            // Not marked required: finalization treats an absent
-            // array-of as the empty list (no entries), so a JSON Schema
-            // requiring the property would reject configs clapfig accepts.
+            // Not marked required: finalization treats an absent array
+            // as the empty list, so a JSON Schema requiring the property
+            // would reject configs clapfig accepts.
             let mut prop = Map::new();
-            if !item.doc.is_empty() {
-                prop.insert("description".into(), Value::String(join_doc(&item.doc)));
+            if !array.doc.is_empty() {
+                prop.insert("description".into(), Value::String(join_doc(&array.doc)));
             }
             prop.insert("type".into(), Value::String("array".into()));
-            prop.insert("items".into(), schema_to_object(item));
+            if let Some(items) = shape_to_schema(&array.item) {
+                prop.insert("items".into(), items);
+            }
+            populate_container_attrs(&mut prop, array.default.as_ref(), array.env.as_deref());
             (field.name.clone(), Value::Object(prop), false)
         }
-        Field::MapOf(item) => {
-            // TOML `[name.<key>]` with arbitrary entry keys. JSON Schema
-            // models this as `type: object` with `additionalProperties:
-            // <entry schema>` — entry keys are user-supplied so there are
-            // no fixed properties, but each value must satisfy the item
-            // schema.
-            //
-            // Not marked required: finalization treats an
-            // absent map-of as the empty map (no entries).
+        Shape::Map(map) => {
+            // TOML `[name.<key>]` / homogeneous map: `type: object` with
+            // `additionalProperties: <entry schema>`.
             let mut prop = Map::new();
-            if !item.doc.is_empty() {
-                prop.insert("description".into(), Value::String(join_doc(&item.doc)));
+            if !map.doc.is_empty() {
+                prop.insert("description".into(), Value::String(join_doc(&map.doc)));
             }
             prop.insert("type".into(), Value::String("object".into()));
-            // Comment keys inside a map-of instance are comments, not
+            // Comment keys inside a map instance are comments, not
             // entries — allowlist them so they escape the entry schema.
             prop.insert("patternProperties".into(), comment_key_allowlist());
-            prop.insert("additionalProperties".into(), schema_to_object(item));
+            if let Some(entry) = shape_to_schema(&map.item) {
+                prop.insert("additionalProperties".into(), entry);
+            }
+            populate_container_attrs(&mut prop, map.default.as_ref(), map.env.as_deref());
             (field.name.clone(), Value::Object(prop), false)
         }
-        Field::Leaf(leaf) => {
+        Shape::Leaf(leaf) => {
             let mut prop = Map::new();
             if !leaf.doc.is_empty() {
                 prop.insert("description".into(), Value::String(join_doc(&leaf.doc)));
             }
             populate_leaf(&mut prop, leaf);
-            // Required only when the runtime rejects the absence:
-            // non-optional AND defaultless AND neither map- nor
-            // array-typed — an absent non-optional map/array leaf
-            // materializes as the empty map/array.
-            let required = !leaf.optional
-                && leaf.default.is_none()
-                && !matches!(leaf.ty, LeafType::Map(_) | LeafType::Array(_));
+            let required = !leaf.optional && leaf.default.is_none();
             (field.name.clone(), Value::Object(prop), required)
         }
+        Shape::Tagged(_) => panic!(
+            "clapfig: tagged JSON Schema is SHP01-WS05; object-root schemas in this slice have no tagged fields"
+        ),
+    }
+}
+
+fn shape_to_schema(shape: &Shape) -> Option<Value> {
+    match shape {
+        Shape::Object(schema) => Some(schema_to_object(schema)),
+        Shape::Leaf(leaf) => leaf_type_to_schema(&leaf.ty).map(Value::Object),
+        Shape::Array(array) => {
+            let mut obj = Map::new();
+            obj.insert("type".into(), Value::String("array".into()));
+            if let Some(items) = shape_to_schema(&array.item) {
+                obj.insert("items".into(), items);
+            }
+            Some(Value::Object(obj))
+        }
+        Shape::Map(map) => {
+            let mut obj = Map::new();
+            obj.insert("type".into(), Value::String("object".into()));
+            obj.insert("patternProperties".into(), comment_key_allowlist());
+            if let Some(entry) = shape_to_schema(&map.item) {
+                obj.insert("additionalProperties".into(), entry);
+            }
+            Some(Value::Object(obj))
+        }
+        Shape::Tagged(_) => panic!(
+            "clapfig: tagged JSON Schema is SHP01-WS05; object-root schemas in this slice have no tagged fields"
+        ),
+    }
+}
+
+fn populate_container_attrs(
+    prop: &mut Map<String, Value>,
+    default: Option<&crate::value::Value>,
+    env: Option<&str>,
+) {
+    if let Some(default) = default
+        && let Some(default_value) = value_to_json(default)
+    {
+        prop.insert("default".into(), default_value);
+    }
+    if let Some(env_name) = env {
+        prop.insert("x-env".into(), Value::String(env_name.to_string()));
     }
 }
 
@@ -241,19 +280,13 @@ fn field_to_property(field: &NamedField) -> (String, Value, bool) {
 /// default. Finalization synthesizes defaults into absent sections, so a
 /// section whose required leaves all carry defaults is satisfiable when
 /// absent — exporting it `required` would make external validators reject
-/// configs clapfig loads fine. `ArrayOf`/`MapOf` subtrees never require
-/// presence (absent means the empty list/map), and neither do map- or
-/// array-typed leaves (an absent non-optional map/array leaf materializes
-/// as the empty map/array).
+/// configs clapfig loads fine. [`Shape::Array`] / [`Shape::Map`] subtrees
+/// never require presence (absent means the empty list/map).
 fn schema_requires_presence(schema: &Schema) -> bool {
     schema.fields.iter().any(|nf| match &nf.field {
-        Field::Leaf(leaf) => {
-            !leaf.optional
-                && leaf.default.is_none()
-                && !matches!(leaf.ty, LeafType::Map(_) | LeafType::Array(_))
-        }
-        Field::Nested(nested) => schema_requires_presence(nested),
-        Field::ArrayOf(_) | Field::MapOf(_) => false,
+        Shape::Leaf(leaf) => !leaf.optional && leaf.default.is_none(),
+        Shape::Object(nested) => schema_requires_presence(nested),
+        Shape::Array(_) | Shape::Map(_) | Shape::Tagged(_) => false,
     })
 }
 
@@ -316,21 +349,6 @@ fn leaf_type_to_schema(ty: &LeafType) -> Option<Map<String, Value>> {
         }
         LeafType::DateTime => {
             obj.extend(datetime_type_schema());
-        }
-        LeafType::Array(elem) => {
-            obj.insert("type".into(), Value::String("array".into()));
-            if let Some(items) = leaf_type_to_schema(elem) {
-                obj.insert("items".into(), Value::Object(items));
-            }
-        }
-        LeafType::Map(elem) => {
-            obj.insert("type".into(), Value::String("object".into()));
-            if let Some(entry) = leaf_type_to_schema(elem) {
-                // Comment keys inside a map instance are comments, not
-                // entries — allowlist them so they escape the value schema.
-                obj.insert("patternProperties".into(), comment_key_allowlist());
-                obj.insert("additionalProperties".into(), Value::Object(entry));
-            }
         }
         LeafType::Enum { values } => {
             if let Some(name) = homogeneous_json_type(values) {
@@ -742,11 +760,7 @@ mod tests {
             &RtSchema::object("App")
                 .field(
                     "matrix",
-                    Field::array_of_type(LeafType::Array(Box::new(LeafType::Integer {
-                        min: None,
-                        max: None,
-                    })))
-                    .optional(),
+                    Field::array_of_type(Field::array_of_type(Field::integer())).optional(),
                 )
                 .field(
                     "modes",
@@ -929,6 +943,22 @@ mod tests {
         let entries = props["labels"]["additionalProperties"].as_object().unwrap();
         assert!(!entries.contains_key("type"), "{entries:?}");
         assert_eq!(entries["enum"], json!(["auto", 0]));
+    }
+
+    #[test]
+    #[should_panic(expected = "tagged JSON Schema is SHP01-WS05")]
+    fn tagged_item_shape_fails_loudly() {
+        use crate::runtime::{Field, Schema as RtSchema, Shape};
+        let _ = generate_schema(
+            &RtSchema::object("App")
+                .field(
+                    "blocks",
+                    Field::array_of_type(
+                        Shape::tagged("Block", "kind").variant("rust", RtSchema::object("Rust")),
+                    ),
+                )
+                .build(),
+        );
     }
 
     #[test]

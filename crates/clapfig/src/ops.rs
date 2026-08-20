@@ -140,17 +140,21 @@ fn kebab_renamed(schema: &crate::runtime::Schema) -> crate::runtime::Schema {
 }
 
 fn kebab_rename_fields(schema: &mut crate::runtime::Schema) {
-    use crate::runtime::Field;
     for nf in &mut schema.fields {
         if nf.name.contains('_') {
             nf.name = crate::normalize::kebab_key(&nf.name);
         }
-        match &mut nf.field {
-            Field::Nested(child) | Field::ArrayOf(child) | Field::MapOf(child) => {
-                kebab_rename_fields(child);
-            }
-            Field::Leaf(_) => {}
-        }
+        kebab_rename_shape(&mut nf.field);
+    }
+}
+
+fn kebab_rename_shape(shape: &mut crate::runtime::Shape) {
+    use crate::runtime::Shape;
+    match shape {
+        Shape::Object(child) => kebab_rename_fields(child),
+        Shape::Array(array) => kebab_rename_shape(&mut array.item),
+        Shape::Map(map) => kebab_rename_shape(&mut map.item),
+        Shape::Leaf(_) | Shape::Tagged(_) => {}
     }
 }
 

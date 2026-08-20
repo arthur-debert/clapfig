@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::origin::{Origin, OriginMap, OriginNode};
-use crate::runtime::{Field, Schema};
+use crate::runtime::Schema;
 use crate::value::{Map, Value};
 
 /// Convert dotted-key overrides into a nested config value [`Map`].
@@ -92,35 +92,41 @@ fn collect_keys(schema: &Schema, prefix: &str, keys: &mut HashSet<String>) {
             format!("{prefix}.{}", field.name)
         };
         match &field.field {
-            Field::Leaf(_) => {
+            crate::runtime::Shape::Leaf(_) => {
                 keys.insert(dotted);
             }
-            Field::Nested(nested) => {
+            crate::runtime::Shape::Object(nested) => {
                 collect_keys(nested, &dotted, keys);
             }
-            Field::ArrayOf(_) => {
-                // Skip ArrayOf subtrees. Dotted-key consumers (cli_overrides,
-                // url_query, persist set/unset) build nested tables, not
-                // arrays-of-tables, so listing `plugins.name` as valid would
-                // let `config set plugins.name foo` write `[plugins]
-                // name = "foo"` — which then fails runtime validation with
-                // "expected array, got map". The right surface for setting
-                // entries inside an array of tables would be an indexed
-                // dotted syntax (`plugins[0].name`) that none of the current
-                // consumers parses. Until then, ArrayOf keys are not
-                // addressable by dotted path.
+            crate::runtime::Shape::Array(array) if array.item.is_value_field() => {
+                // Homogeneous array of leaves is addressable as one key
+                // (`tags = ["a", "b"]`), like the old LeafType::Array.
+                keys.insert(dotted);
             }
-            Field::MapOf(_) => {
-                // Skip MapOf subtrees for the same reason ArrayOf is
-                // skipped: dotted-key consumers can't tell whether
+            crate::runtime::Shape::Map(map) if map.item.is_value_field() => {
+                keys.insert(dotted);
+            }
+            crate::runtime::Shape::Array(_) => {
+                // Skip array-of-objects subtrees. Dotted-key consumers
+                // (cli_overrides, url_query, persist set/unset) build
+                // nested tables, not arrays-of-tables, so listing
+                // `plugins.name` as valid would let `config set
+                // plugins.name foo` write `[plugins] name = "foo"` —
+                // which then fails runtime validation with "expected
+                // array, got map". The right surface for setting
+                // entries inside an array of tables would be an indexed
+                // dotted syntax (`plugins[0].name`) that none of the
+                // current consumers parses. Until then, those keys are
+                // not addressable by dotted path.
+            }
+            crate::runtime::Shape::Map(_) => {
+                // Skip map-of-objects subtrees for the same reason:
+                // dotted-key consumers can't tell whether
                 // `plugins.audit` means "set the `audit` entry" (a real
                 // user-supplied key) or "set the `audit` leaf inside a
-                // known schema field." The entries' inner keys aren't
-                // declared in the schema, so listing them up-front isn't
-                // possible — callers writing to map entries need a
-                // different surface (top-level `[plugins.audit]` in a
-                // config file, not a dotted CLI override).
+                // known schema field."
             }
+            crate::runtime::Shape::Tagged(_) => {}
         }
     }
 }

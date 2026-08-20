@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use crate::error::ClapfigError;
 use crate::format::Span;
-use crate::runtime::{Field, Schema};
+use crate::runtime::Schema;
 use crate::types::InputType;
 use crate::value::Value;
 
@@ -311,12 +311,33 @@ fn walk_schema_strict(schema: &Schema, prefix: &str, out: &mut StrictnessOverrid
         } else {
             format!("{prefix}.{}", field.name)
         };
-        match &field.field {
-            Field::Leaf(_) => {
-                // Leaves don't carry a `strict` override.
+        walk_shape_strict(&field.field, &dotted, out);
+    }
+}
+
+fn walk_shape_strict(shape: &crate::runtime::Shape, dotted: &str, out: &mut StrictnessOverrides) {
+    use crate::runtime::Shape;
+    match shape {
+        Shape::Leaf(_) => {}
+        Shape::Object(nested) => walk_schema_strict(nested, dotted, out),
+        Shape::Array(array) => {
+            if let Some(value) = array.strict {
+                out.insert(dotted.to_string(), value);
             }
-            Field::Nested(nested) | Field::ArrayOf(nested) | Field::MapOf(nested) => {
-                walk_schema_strict(nested, &dotted, out);
+            walk_shape_strict(&array.item, dotted, out);
+        }
+        Shape::Map(map) => {
+            if let Some(value) = map.strict {
+                out.insert(dotted.to_string(), value);
+            }
+            walk_shape_strict(&map.item, dotted, out);
+        }
+        Shape::Tagged(tagged) => {
+            if let Some(value) = tagged.strict {
+                out.insert(dotted.to_string(), value);
+            }
+            for variant in &tagged.variants {
+                walk_schema_strict(&variant.schema, dotted, out);
             }
         }
     }
@@ -387,19 +408,40 @@ pub(crate) fn resolve_path_kind(schema: &Schema, dotted: &str) -> PathKind {
             return PathKind::Unknown;
         };
         match &field.field {
-            Field::Leaf(_) => {
+            crate::runtime::Shape::Leaf(_) => {
                 return if segments.peek().is_some() {
                     PathKind::Unknown
                 } else {
                     PathKind::Leaf
                 };
             }
-            Field::Nested(nested) | Field::ArrayOf(nested) | Field::MapOf(nested) => {
+            shape if shape.is_value_field() => {
+                return if segments.peek().is_some() {
+                    PathKind::Unknown
+                } else {
+                    PathKind::Leaf
+                };
+            }
+            crate::runtime::Shape::Object(nested) => {
                 if segments.peek().is_none() {
                     return PathKind::Section;
                 }
                 current = nested;
             }
+            crate::runtime::Shape::Array(_) | crate::runtime::Shape::Map(_) => {
+                if segments.peek().is_none() {
+                    return PathKind::Section;
+                }
+                match field.field.peel_containers() {
+                    crate::runtime::Shape::Object(nested) => current = nested,
+                    crate::runtime::Shape::Tagged(_) => return PathKind::Unknown,
+                    crate::runtime::Shape::Leaf(_) => return PathKind::Unknown,
+                    crate::runtime::Shape::Array(_) | crate::runtime::Shape::Map(_) => {
+                        unreachable!("peel_containers strips Array/Map")
+                    }
+                }
+            }
+            crate::runtime::Shape::Tagged(_) => return PathKind::Unknown,
         }
     }
     PathKind::Section
@@ -562,6 +604,59 @@ mod tests {
         assert_eq!(strip_brackets("a[10].b[2].c"), "a.b.c");
         assert_eq!(strip_brackets("a.b.c"), "a.b.c");
         assert_eq!(strip_brackets(""), "");
+    }
+
+    #[test]
+    fn from_schema_records_array_and_map_node_strict() {
+        use crate::runtime::{Field, Schema as RtSchema, Shape};
+        let plugin = RtSchema::object("Plugin").field("name", Field::string().optional());
+        let schema = RtSchema::object("App")
+            .field(
+                "plugins",
+                Shape::array("plugins", plugin.clone()).strict(false),
+            )
+            .field("servers", Shape::map("servers", plugin).strict(false))
+            .build();
+        let overrides = StrictnessOverrides::from_schema(&schema);
+        assert!(
+            !overrides.effective_strict("plugins[0].rogue", "rogue", true),
+            "array-node strict(false) must govern unknown keys in nested items"
+        );
+        assert!(
+            !overrides.effective_strict("servers.core.rogue", "rogue", true),
+            "map-node strict(false) must govern unknown keys in nested items"
+        );
+    }
+
+    #[test]
+    fn resolve_path_kind_walks_through_nested_containers() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .field(
+                "containers",
+                Field::array_of_type(Field::array_of_type(RtSchema::object("Item").nested(
+                    "policy",
+                    RtSchema::object("Policy").field("name", Field::string().optional()),
+                ))),
+            )
+            .field(
+                "groups",
+                Field::map_of(Field::array_of_type(
+                    RtSchema::object("Item").field("timeout", Field::integer().optional()),
+                )),
+            )
+            .build();
+        assert_eq!(resolve_path_kind(&schema, "containers"), PathKind::Section);
+        assert_eq!(
+            resolve_path_kind(&schema, "containers.policy"),
+            PathKind::Section
+        );
+        assert_eq!(
+            resolve_path_kind(&schema, "containers.policy.name"),
+            PathKind::Leaf
+        );
+        assert_eq!(resolve_path_kind(&schema, "groups"), PathKind::Section);
+        assert_eq!(resolve_path_kind(&schema, "groups.timeout"), PathKind::Leaf);
     }
 
     #[test]

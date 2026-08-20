@@ -15,7 +15,7 @@
 //! metadata lookups DWIM-friendly so callers don't have to remember which
 //! shape the user typed.
 
-use crate::runtime::{Field, Schema};
+use crate::runtime::{Schema, Shape};
 
 /// Look up the doc-comment lines for a config key in a [`Schema`].
 ///
@@ -56,18 +56,17 @@ fn walk_segments(schema: &Schema, segments: &[&str]) -> Option<Vec<String>> {
     for field in &schema.fields {
         if segment_matches(&field.name, head) {
             if segments.len() == 1 {
-                return Some(match &field.field {
-                    Field::Leaf(leaf) => leaf.doc.clone(),
-                    Field::Nested(s) | Field::ArrayOf(s) | Field::MapOf(s) => s.doc.clone(),
-                });
+                return Some(field.field.field_doc().to_vec());
             }
-            return match &field.field {
-                Field::Nested(nested) | Field::ArrayOf(nested) | Field::MapOf(nested) => {
-                    walk_segments(nested, &segments[1..])
+            return match field.field.peel_containers() {
+                Shape::Object(nested) => walk_segments(nested, &segments[1..]),
+                // Hit a leaf (or tagged node) with segments still
+                // pending — anonymous Array/Map wrappers do not
+                // consume a path segment, but a named node does.
+                Shape::Leaf(_) | Shape::Tagged(_) => None,
+                Shape::Array(_) | Shape::Map(_) => {
+                    unreachable!("peel_containers strips Array/Map")
                 }
-                // Hit a leaf with segments still pending — the rest of the
-                // path can't resolve.
-                Field::Leaf(_) => None,
             };
         }
     }
@@ -251,6 +250,36 @@ mod tests {
     fn snake_spelling_finds_snake_field() {
         let doc = doc_for_key("database.pool_size").expect("snake spelling resolves");
         assert!(doc.iter().any(|line| line.contains("Connection pool size")));
+    }
+
+    #[test]
+    fn doc_for_walks_through_nested_containers() {
+        let schema = Schema::object("App")
+            .field(
+                "groups",
+                Field::array_of_type(Field::array_of_type(Schema::object("Item").field(
+                    "timeout",
+                    Field::integer().doc("Deadline in ms.").default(1i64),
+                ))),
+            )
+            .field(
+                "servers",
+                Field::map_of(Field::array_of_type(Schema::object("Server").field(
+                    "host",
+                    Field::string().doc("Listen address.").default("localhost"),
+                ))),
+            )
+            .build();
+        let timeout = doc_for(&schema, "groups.timeout").expect("timeout exists under arrays");
+        assert!(
+            timeout.iter().any(|line| line.contains("Deadline in ms")),
+            "{timeout:?}"
+        );
+        let host = doc_for(&schema, "servers.host").expect("host exists under map then array");
+        assert!(
+            host.iter().any(|line| line.contains("Listen address")),
+            "{host:?}"
+        );
     }
 
     #[test]

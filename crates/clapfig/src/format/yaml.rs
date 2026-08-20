@@ -44,12 +44,12 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use crate::runtime::{Field, Leaf, Schema};
+use crate::runtime::{Schema, Shape};
 use crate::value::{Map, Value};
 
 use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
-    walk_level,
+    tagged_template_stub, walk_level,
 };
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
@@ -898,10 +898,11 @@ fn unset_in_source(source: &str, keys: &[&str]) -> Result<String, FormatError> {
 /// itself be commented, or the generated document would carry a null.
 fn has_active_content(schema: &Schema) -> bool {
     schema.fields.iter().any(|nf| match &nf.field {
-        Field::Leaf(leaf) => leaf.default.is_some(),
-        Field::Nested(child) => has_active_content(child),
-        // Array-of and map-of sections render as fully commented examples.
-        Field::ArrayOf(_) | Field::MapOf(_) => false,
+        crate::runtime::Shape::Leaf(leaf) => leaf.default.is_some(),
+        crate::runtime::Shape::Object(child) => has_active_content(child),
+        crate::runtime::Shape::Array(array) => array.default.is_some(),
+        crate::runtime::Shape::Map(map) => map.default.is_some(),
+        crate::runtime::Shape::Tagged(_) => false,
     })
 }
 
@@ -925,13 +926,13 @@ impl TemplateRenderer for YamlTemplate {
         out: &mut String,
         depth: &usize,
         name: &str,
-        leaf: &Leaf,
+        field: super::template::ValueView<'_>,
     ) -> Result<(), FormatError> {
         let indent = "  ".repeat(*depth);
-        for line in leaf_annotations(leaf, "YAML", &mut |v| Ok(format_inline_yaml(v)))? {
+        for line in leaf_annotations(field, "YAML", &mut |v| Ok(format_inline_yaml(v)))? {
             push_comment_line(out, &indent, &line);
         }
-        match &leaf.default {
+        match field.default {
             Some(value) => {
                 let _ = writeln!(
                     out,
@@ -941,7 +942,7 @@ impl TemplateRenderer for YamlTemplate {
                 );
             }
             None => {
-                let hint = placeholder(&leaf.ty, "''", "1970-01-01T00:00:00Z");
+                let hint = placeholder(field.shape, "''", "1970-01-01T00:00:00Z");
                 let _ = writeln!(out, "{indent}#{}: {hint}", inline_scalar(name));
             }
         }
@@ -979,17 +980,15 @@ impl TemplateRenderer for YamlTemplate {
         out: &mut String,
         depth: &usize,
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError> {
         let indent = "  ".repeat(*depth);
-        for line in &child.doc {
-            push_comment_line(out, &indent, line);
-        }
+        emit_object_doc(out, &indent, item);
         let mut buf = String::new();
         let _ = writeln!(buf, "{indent}{}:", inline_scalar(name));
-        let mut item = String::new();
-        walk_level(self, child, &(depth + 2), &mut item)?;
-        buf.push_str(&with_sequence_dash(&item, depth + 1));
+        let mut item_buf = String::new();
+        emit_yaml_item(self, &mut item_buf, &(depth + 2), item)?;
+        buf.push_str(&with_sequence_dash(&item_buf, depth + 1));
         push_commented_block(out, &buf);
         Ok(())
     }
@@ -999,18 +998,51 @@ impl TemplateRenderer for YamlTemplate {
         out: &mut String,
         depth: &usize,
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError> {
         let indent = "  ".repeat(*depth);
-        for line in &child.doc {
-            push_comment_line(out, &indent, line);
-        }
+        emit_object_doc(out, &indent, item);
         let mut buf = String::new();
         let _ = writeln!(buf, "{indent}{}:", inline_scalar(name));
         let _ = writeln!(buf, "{indent}  <key>:");
-        walk_level(self, child, &(depth + 2), &mut buf)?;
+        emit_yaml_item(self, &mut buf, &(depth + 2), item)?;
         push_commented_block(out, &buf);
         Ok(())
+    }
+}
+
+fn emit_object_doc(out: &mut String, indent: &str, item: &Shape) {
+    if let Shape::Object(child) = item {
+        for line in &child.doc {
+            push_comment_line(out, indent, line);
+        }
+    }
+}
+
+/// Render one example item at `depth`. Nested Maps emit a `<key>:`
+/// wrapper; nested Arrays emit a sequence dash; objects walk the child
+/// schema. Tagged items are a loud WS05 stub.
+fn emit_yaml_item(
+    renderer: &mut YamlTemplate,
+    out: &mut String,
+    depth: &usize,
+    item: &Shape,
+) -> Result<(), FormatError> {
+    match item {
+        Shape::Object(child) => walk_level(renderer, child, depth, out),
+        Shape::Map(map) => {
+            let indent = "  ".repeat(*depth);
+            let _ = writeln!(out, "{indent}<key>:");
+            emit_yaml_item(renderer, out, &(depth + 1), &map.item)
+        }
+        Shape::Array(array) => {
+            let mut item_buf = String::new();
+            emit_yaml_item(renderer, &mut item_buf, &(depth + 1), &array.item)?;
+            out.push_str(&with_sequence_dash(&item_buf, *depth));
+            Ok(())
+        }
+        Shape::Tagged(_) => tagged_template_stub(),
+        Shape::Leaf(_) => unreachable!("value-field containers are emitted as leaves"),
     }
 }
 
@@ -1887,6 +1919,71 @@ db:
         // The commented examples must not leak into the parsed document.
         let map = parse_map(&text);
         assert_eq!(map.keys().collect::<Vec<_>>(), ["port"]);
+    }
+
+    #[test]
+    fn template_recurses_through_nested_containers() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Item").field("timeout", Field::integer().default(30i64));
+        let schema = RtSchema::object("App")
+            .field("groups", Field::array_of_type(Field::map_of(item.clone())))
+            .field("batches", Field::map_of(Field::array_of_type(item)))
+            .build();
+        let text = YamlAdapter.template(&schema).unwrap();
+        assert!(text.contains("#groups:"), "text: {text}");
+        assert!(
+            text.contains("#  - <key>:"),
+            "array-of-map wraps a sequence item around the map key: {text}"
+        );
+        assert!(
+            text.contains("timeout: 30"),
+            "nested object defaults stay in the commented example: {text}"
+        );
+        assert!(text.contains("#batches:"), "text: {text}");
+        assert!(
+            text.contains("#  <key>:"),
+            "map-of-array keeps the placeholder key: {text}"
+        );
+    }
+
+    #[test]
+    fn template_nested_arrays_keep_every_layer() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Item").field("timeout", Field::integer().default(30i64));
+        let schema = RtSchema::object("App")
+            .field(
+                "matrix",
+                Field::array_of_type(Field::array_of_type(item.clone())),
+            )
+            .field(
+                "cube",
+                Field::array_of_type(Field::array_of_type(Field::array_of_type(item))),
+            )
+            .build();
+        let text = YamlAdapter.template(&schema).unwrap();
+        let uncommented: String = text
+            .lines()
+            .map(|line| line.strip_prefix('#').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let map = parse_map(&uncommented);
+        let timeout = Value::Map({
+            let mut m = Map::new();
+            m.insert("timeout".into(), Value::Integer(30));
+            m
+        });
+        assert_eq!(
+            map.get("matrix"),
+            Some(&Value::Array(vec![Value::Array(vec![timeout.clone()])])),
+            "YAML Array<Array<Object>> must keep both sequence layers: {text}"
+        );
+        assert_eq!(
+            map.get("cube"),
+            Some(&Value::Array(vec![Value::Array(vec![Value::Array(vec![
+                timeout
+            ])])])),
+            "YAML Array<Array<Array<Object>>> must keep three sequence layers: {text}"
+        );
     }
 
     #[test]
