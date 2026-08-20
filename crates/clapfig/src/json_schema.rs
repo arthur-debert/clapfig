@@ -1,9 +1,10 @@
 //! JSON Schema generation from a config schema.
 //!
-//! Entry point is [`generate_schema`] (object root) or
-//! [`generate_from_shape`] (any document-root [`Shape`](crate::runtime::Shape)).
-//! A root map is `type: object` plus `additionalProperties` of the item
-//! at the document root. Useful for auto-generating UI editors, external
+//! Entry point is [`generate_schema`]: it takes `impl Into<Shape>`
+//! (a runtime [`Schema`], a [`Shape`](crate::runtime::Shape), or a
+//! derive type's [`Schema::shape`](crate::Schema::shape)). A root map
+//! is `type: object` plus `additionalProperties` of the item at the
+//! document root. Useful for auto-generating UI editors, external
 //! validation tools, or IDE integrations.
 //!
 //! # What is in the schema
@@ -57,7 +58,7 @@
 //! ```ignore
 //! use clapfig::json_schema;
 //!
-//! let value = json_schema::generate_schema(MyConfig::schema());
+//! let value = json_schema::generate_schema(MyConfig::shape());
 //! println!("{}", serde_json::to_string_pretty(&value).unwrap());
 //! ```
 
@@ -123,32 +124,25 @@ fn comment_key_allowlist() -> Value {
     json!({ COMMENT_KEY_PATTERN: {} })
 }
 
-/// Generate a JSON Schema document from an **object-root** config schema.
+/// Generate a JSON Schema document from a document-root [`Shape`].
 ///
-/// Object-root only: pass the schema handed to
-/// [`Clapfig::builder`](crate::Clapfig::builder), or a derive-emitted
-/// schema via `C::schema()`. Root [`Shape::Map`] / [`Shape::Tagged`]
-/// documents use [`generate_from_shape`].
+/// Accepts `impl Into<Shape>`. Object-root callers pass a [`Schema`]
+/// (`From<Schema> for Shape`). Derive callers pass `C::shape()` —
+/// [`Schema::schema`](crate::Schema::schema) is the named-field object
+/// constructor and panics on tagged unions and unit-only enums. A root
+/// [`Shape::Map`] is `type: object` with
+/// `additionalProperties` of the item at the document root (no synthetic
+/// parent property). A root [`Shape::Tagged`] is `oneOf` of variant
+/// objects, each with the tag as a required
+/// `{ "const": "<discriminator>" }` property. OpenAPI's `discriminator`
+/// keyword is not used. [`Shape::Leaf`] / [`Shape::Array`] panic: they
+/// are not legal document roots.
 ///
 /// Returns a `serde_json::Value` — the caller serializes it to a string,
 /// writes it to a file, or embeds it wherever needed.
-pub fn generate_schema(schema: &Schema) -> Value {
-    let mut root = schema_to_object(schema);
-    if let Value::Object(map) = &mut root {
-        map.insert("$schema".into(), Value::String(SCHEMA_DIALECT.into()));
-    }
-    root
-}
-
-/// Generate a JSON Schema document from a document-root [`Shape`].
-///
-/// A root [`Shape::Map`] is `type: object` with `additionalProperties` of
-/// the item schema at the document root (no synthetic parent property).
-/// A root [`Shape::Tagged`] is `oneOf` of variant objects, each with the
-/// tag as a required `{ "const": "<discriminator>" }` property. Object
-/// roots match [`generate_schema`].
-pub fn generate_from_shape(shape: &Shape) -> Value {
-    let mut root = match shape {
+pub fn generate_schema(shape: impl Into<Shape>) -> Value {
+    let shape = shape.into();
+    let mut root = match &shape {
         Shape::Object(schema) => schema_to_object(schema),
         Shape::Map(map) => map_root_to_object(map),
         Shape::Tagged(tagged) => tagged_to_schema(tagged),
@@ -569,7 +563,7 @@ mod tests {
     use crate::fixtures::test::test_schema;
 
     fn schema() -> Value {
-        generate_schema(&test_schema())
+        generate_schema(test_schema())
     }
 
     #[test]
@@ -610,7 +604,7 @@ mod tests {
     fn unrepresentable_collection_omits_the_whole_annotation() {
         use crate::runtime::{Field, LeafType, Schema as RtSchema};
         let s = generate_schema(
-            &RtSchema::object("App")
+            RtSchema::object("App")
                 .field(
                     "samples",
                     Field::array_of_type(LeafType::Float)
@@ -727,7 +721,7 @@ mod tests {
     fn required_lists_defaultless_leaves_and_sections_containing_them() {
         use crate::runtime::{Field, LeafType, Schema as RtSchema};
         let s = generate_schema(
-            &RtSchema::object("App")
+            RtSchema::object("App")
                 .field("name", Field::string()) // required, no default
                 .field("host", Field::string().default("localhost"))
                 .field("tags", Field::array_of_type(LeafType::String))
@@ -810,7 +804,7 @@ mod tests {
     fn map_of_object_allowlists_comment_keys_beside_entry_schema() {
         use crate::runtime::{Field, Schema as RtSchema};
         let s = generate_schema(
-            &RtSchema::object("App")
+            RtSchema::object("App")
                 .map_of(
                     "servers",
                     RtSchema::object("Server").field("host", Field::string().default("x")),
@@ -825,7 +819,7 @@ mod tests {
 
     #[test]
     fn enum_leaf_emits_enum_array_and_primitive_type() {
-        let s = generate_schema(&crate::fixtures::test::enum_schema());
+        let s = generate_schema(crate::fixtures::test::enum_schema());
         let mode = &s["properties"]["mode"];
         assert_eq!(mode["type"], "string");
         let allowed: Vec<&str> = mode["enum"]
@@ -854,7 +848,7 @@ mod tests {
     fn container_leaf_types_convert_recursively() {
         use crate::runtime::{Field, LeafType, Schema as RtSchema};
         let s = generate_schema(
-            &RtSchema::object("App")
+            RtSchema::object("App")
                 .field(
                     "matrix",
                     Field::array_of_type(Field::array_of_type(Field::integer())).optional(),
@@ -896,7 +890,7 @@ mod tests {
     fn integer_bounds_emit_minimum_and_maximum() {
         use crate::runtime::{Field, Schema as RtSchema};
         let s = generate_schema(
-            &RtSchema::object("App")
+            RtSchema::object("App")
                 .field("retries", Field::integer_in(Some(0), Some(255)).optional())
                 .field("count", Field::integer().optional())
                 .build(),
@@ -918,7 +912,7 @@ mod tests {
             ConfigValue::Datetime(s.parse().unwrap())
         }
         let s = generate_schema(
-            &RtSchema::object("App")
+            RtSchema::object("App")
                 .field(
                     "offset",
                     Field::datetime().default(dt("1979-05-27T07:32:00Z")),
@@ -1013,7 +1007,7 @@ mod tests {
         use crate::runtime::{Field, LeafType, Schema as RtSchema};
         let mixed = vec!["auto".into(), 0i64.into()];
         let s = generate_schema(
-            &RtSchema::object("App")
+            RtSchema::object("App")
                 .field("choice", Field::enum_of(mixed.clone()).optional())
                 .field(
                     "modes",
@@ -1066,13 +1060,21 @@ mod tests {
 
     #[test]
     fn tagged_root_is_oneof_with_per_branch_tag_const() {
-        let s = generate_from_shape(&Shape::Tagged(tagged_block()));
+        let s = generate_schema(Shape::Tagged(tagged_block()));
         assert_eq!(s["$schema"], SCHEMA_DIALECT);
         assert_eq!(s["title"], "Block");
         assert!(s["description"].as_str().unwrap().contains("block"), "{s}");
         assert!(
             s.get("discriminator").is_none(),
             "OpenAPI discriminator is not JSON Schema: {s}"
+        );
+        assert!(
+            s.get("oneOf").is_some(),
+            "tagged document root must be oneOf through the public path: {s}"
+        );
+        assert!(
+            s.get("additionalProperties").is_none(),
+            "tagged root must not be an empty additionalProperties:false object: {s}"
         );
         assert!(
             s.get("type").is_none(),
@@ -1106,7 +1108,7 @@ mod tests {
     fn nested_tagged_field_is_oneof_and_required() {
         use crate::runtime::Schema as RtSchema;
         let s = generate_schema(
-            &RtSchema::object("App")
+            RtSchema::object("App")
                 .field("block", Shape::from(tagged_block()))
                 .build(),
         );
@@ -1130,7 +1132,7 @@ mod tests {
         use crate::runtime::Field;
         use crate::runtime::Schema as RtSchema;
         let s = generate_schema(
-            &RtSchema::object("App")
+            RtSchema::object("App")
                 .field("blocks", Field::map_of(Shape::from(tagged_block())))
                 .build(),
         );

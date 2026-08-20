@@ -186,7 +186,7 @@ fn collect_required(schema: &serde_json::Value, prefix: &str, out: &mut Vec<Stri
 
 #[test]
 fn exported_required_matches_what_the_runtime_rejects_when_absent() {
-    let schema = clapfig::json_schema::generate_schema(RoundTripCfg::schema());
+    let schema = clapfig::json_schema::generate_schema(RoundTripCfg::shape());
 
     // The exported schema requires exactly the defaultless leaves and
     // the sections transitively containing them.
@@ -238,7 +238,7 @@ fn exported_schema_carries_integer_bounds_and_datetime_format() {
         #[clapfig(default = "1979-05-27T07:32:00Z")]
         starts_at: clapfig::value::Datetime,
     }
-    let schema = clapfig::json_schema::generate_schema(MetaCfg::schema());
+    let schema = clapfig::json_schema::generate_schema(MetaCfg::shape());
     let props = &schema["properties"];
     assert_eq!(props["retries"]["type"], "integer");
     assert_eq!(props["retries"]["minimum"], 0);

@@ -6,8 +6,8 @@
 //! builder-built schema but unfit for a `const SCHEMA: ... = ...` form, so
 //! the macro emits a parallel tree whose every field is `&'static`. At
 //! first call, [`Schema::schema`] caches a converted
-//! `runtime::Schema` in a per-type `OnceLock`; all existing schema
-//! consumers walk the cached runtime view.
+//! `runtime::Schema` in a per-type `OnceLock` for named-field objects
+//! (tagged unions and unit-only enums panic — use [`Schema::shape`]).
 //!
 //! [`SchemaStatic`] is the named-field object constructor (ADR-0010).
 //! Derive emits [`SchemaStatic`] trees (named-field objects, unit-only
@@ -32,8 +32,11 @@ use crate::value::Value;
 /// `const`-friendly mirror of [`runtime::Schema`](crate::runtime::Schema).
 ///
 /// The macro emits one of these per struct (and one per nested struct).
-/// Convert to the runtime form via [`SchemaStatic::to_runtime`] or read
-/// the cached runtime view via [`Schema::schema`].
+/// Convert a named-field object to the runtime form via
+/// [`SchemaStatic::to_runtime`] or read the cached object view via
+/// [`Schema::schema`]. Tagged unions and unit-only enums are not
+/// objects: [`to_runtime`](Self::to_runtime) / [`Schema::schema`] panic;
+/// use [`Schema::shape`].
 ///
 /// Unit-only enums also derive [`Schema`] (so a field of that type can
 /// compose via the same `<T as Schema>::STATIC` reference the macro uses
@@ -225,7 +228,22 @@ pub enum ValueStatic {
 }
 
 impl SchemaStatic {
+    /// Convert a **named-field object** to the runtime form.
+    ///
+    /// Panics if `self` is a unit-only enum or an internally tagged union:
+    /// those kinds are not objects. [`Schema::schema`] is this conversion
+    /// cached; use [`Schema::shape`] for the honest node.
     pub fn to_runtime(&self) -> RuntimeSchema {
+        assert!(
+            !self.is_tagged(),
+            "clapfig: `{}` is a tagged union; `Schema::schema()` is the named-field object constructor. Use `Schema::shape()`",
+            self.name
+        );
+        assert!(
+            !self.is_enum(),
+            "clapfig: `{}` is a unit-only enum; `Schema::schema()` is the named-field object constructor. Use `Schema::shape()`",
+            self.name
+        );
         RuntimeSchema {
             name: self.name.to_string(),
             doc: self.doc.iter().map(|s| (*s).to_string()).collect(),
@@ -711,16 +729,16 @@ impl ValueStatic {
 /// The macro emits a [`STATIC`](Schema::STATIC) associated const carrying
 /// the const-form schema tree, plus a [`schema`](Schema::schema) accessor
 /// that lazily converts and caches a runtime
-/// [`Schema`](crate::runtime::Schema). The associated const lets nested
-/// struct references (e.g. `<DbConfig as Schema>::STATIC`) appear inside
-/// the parent's `static SchemaStatic = ...` initializer — fn-form trait
-/// methods cannot, since trait fns are not callable in const contexts on
+/// [`Schema`](crate::runtime::Schema) for **named-field objects**. The
+/// associated const lets nested struct references (e.g.
+/// `<DbConfig as Schema>::STATIC`) appear inside the parent's
+/// `static SchemaStatic = ...` initializer — fn-form trait methods
+/// cannot, since trait fns are not callable in const contexts on
 /// stable Rust.
 ///
-/// Every existing schema consumer (JSON-Schema emission, template
-/// generation, persistence validation, strictness cascade, etc.) walks
-/// the cached runtime view, so static and runtime entry points produce
-/// byte-identical behavior.
+/// Walkers take [`runtime::Shape`](crate::runtime::Shape).
+/// [`schema`](Schema::schema) is the object constructor's cached view;
+/// tagged unions and unit-only enums use [`shape`](Schema::shape).
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a field type `#[derive(clapfig::Schema)]` supports",
     label = "no schema shape for this type",
@@ -743,9 +761,14 @@ pub trait Schema {
         Self::STATIC
     }
 
-    /// Cached runtime view. The macro emits this method explicitly with a
-    /// per-impl `OnceLock`; the helper [`cached_runtime_schema`] keeps the
-    /// generated body small.
+    /// Cached runtime **object** view. The macro emits this method
+    /// explicitly with a per-impl `OnceLock`; the helper
+    /// [`cached_runtime_schema`] keeps the generated body small.
+    ///
+    /// Named-field structs only. Internally tagged enums and unit-only
+    /// enums panic: converting them to [`RuntimeSchema`] would drop the
+    /// tag / variant set and yield an empty object. Use
+    /// [`shape`](Self::shape) for the honest node.
     fn schema() -> &'static RuntimeSchema;
 
     /// This type as a [`runtime::Shape`](crate::runtime::Shape) node.
@@ -784,11 +807,12 @@ pub trait Schema {
         Arc::new(Self::shape())
     }
 
-    /// `Arc`-flavored access to the same cached runtime view. Object-root
-    /// derive impls cache this so [`schema`](Self::schema) and this
-    /// method share one tree. Cost: one `Arc::clone` per call (atomic
-    /// increment, no allocation). Typed construction uses
-    /// [`shape_arc`](Self::shape_arc).
+    /// `Arc`-flavored access to the same cached runtime **object** view.
+    /// Object-root derive impls cache this so [`schema`](Self::schema)
+    /// and this method share one tree. Panics for tagged unions and
+    /// unit-only enums; see [`schema`](Self::schema). Cost: one
+    /// `Arc::clone` per call (atomic increment, no allocation). Typed
+    /// construction uses [`shape_arc`](Self::shape_arc).
     fn schema_arc() -> Arc<RuntimeSchema>;
 
     /// Flat list of every dotted path the schema knows about: leaf
@@ -1016,7 +1040,8 @@ fn collect_tagged_field_paths(schema: &SchemaStatic, prefix: &str, out: &mut Vec
 /// can hand out cheap reference-counted clones without re-running
 /// `to_runtime()`. [`Schema::schema`] returns a `&'static Schema` by
 /// dereferencing through the `Arc` — the deref is sound because the
-/// `OnceLock` itself is `'static`.
+/// `OnceLock` itself is `'static`. Panics when `static_schema` is a
+/// tagged union or unit-only enum ([`SchemaStatic::to_runtime`]).
 pub fn cached_runtime_schema(
     cell: &'static OnceLock<Arc<RuntimeSchema>>,
     static_schema: &'static SchemaStatic,
@@ -1568,5 +1593,17 @@ mod tests {
             }
             other => panic!("expected Map, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "is a tagged union")]
+    fn schema_static_to_runtime_rejects_tagged() {
+        let _ = TAGGED_ITEM_SCHEMA.to_runtime();
+    }
+
+    #[test]
+    #[should_panic(expected = "is a unit-only enum")]
+    fn schema_static_to_runtime_rejects_unit_enum() {
+        let _ = ENUM_PDF_PAGE.to_runtime();
     }
 }

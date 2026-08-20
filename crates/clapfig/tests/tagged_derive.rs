@@ -150,10 +150,18 @@ fn map_of_tagged_loads() {
 
 #[test]
 fn tagged_json_schema_is_oneof_with_const_no_openapi_discriminator() {
-    let s = clapfig::json_schema::generate_from_shape(&Block::shape());
+    let s = clapfig::json_schema::generate_schema(Block::shape());
     assert!(
         s.get("discriminator").is_none(),
         "OpenAPI discriminator is not JSON Schema: {s}"
+    );
+    assert!(
+        s.get("oneOf").is_some(),
+        "tagged document root must be oneOf through the public path: {s}"
+    );
+    assert!(
+        s.get("additionalProperties").is_none(),
+        "tagged root must not be an empty additionalProperties:false object: {s}"
     );
     let one_of = s["oneOf"].as_array().expect("oneOf");
     assert_eq!(one_of.len(), 3);
@@ -169,14 +177,14 @@ fn tagged_json_schema_is_oneof_with_const_no_openapi_discriminator() {
 
 #[test]
 fn nested_and_map_of_tagged_json_schema_compose() {
-    let nested = clapfig::json_schema::generate_schema(App::schema());
+    let nested = clapfig::json_schema::generate_schema(App::shape());
     assert_eq!(nested["patternProperties"]["^//"], serde_json::json!({}));
     assert_eq!(nested["additionalProperties"], false);
     let block = &nested["properties"]["block"];
     assert!(block.get("discriminator").is_none(), "{block}");
     assert_eq!(block["oneOf"][0]["properties"]["kind"]["const"], "rust");
 
-    let mapped = clapfig::json_schema::generate_schema(Sites::schema());
+    let mapped = clapfig::json_schema::generate_schema(Sites::shape());
     let entry = &mapped["properties"]["blocks"]["additionalProperties"];
     assert!(entry.get("discriminator").is_none(), "{entry}");
     assert_eq!(entry["oneOf"][0]["properties"]["kind"]["const"], "rust");
@@ -380,6 +388,12 @@ fn tagged_discriminators_may_contain_path_characters() {
             mount: "/old".into(),
         }
     );
+}
+
+#[test]
+#[should_panic(expected = "is a tagged union")]
+fn tagged_schema_accessor_fails_loudly() {
+    let _ = Block::schema();
 }
 
 #[test]

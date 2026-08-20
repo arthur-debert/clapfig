@@ -173,8 +173,8 @@ fn json_schema_export_is_format_independent() {
     // The JSON Schema derives from the runtime schema, not from any config
     // file — the YAML slice's guarantee is that adopting YAML changes
     // nothing about the exported schema.
-    let from_toml_context = clapfig::json_schema::generate_schema(&shared_schema());
-    let from_yaml_context = clapfig::json_schema::generate_schema(&shared_schema());
+    let from_toml_context = clapfig::json_schema::generate_schema(shared_schema());
+    let from_yaml_context = clapfig::json_schema::generate_schema(shared_schema());
     assert_eq!(from_toml_context, from_yaml_context);
     assert_eq!(from_toml_context["type"], serde_json::json!("object"));
     assert!(from_toml_context["properties"]["database"]["properties"]["pool_size"].is_object());
