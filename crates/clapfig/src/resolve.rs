@@ -40,7 +40,8 @@ use crate::value::{Map, Value};
 /// All pre-loaded data needed to resolve a config. No I/O happens here.
 pub(crate) struct ResolveInput<'a> {
     /// The document-root shape every layer is validated and finalized against.
-    pub shape: Shape,
+    /// An [`Arc`] so each `resolve_at` clones the handle, not the tree.
+    pub shape: Arc<Shape>,
     /// Enabled format adapters — the routing seam every file parse goes
     /// through. Per-file adapter selection is by extension; extensionless
     /// files (rc-style names) fall back to the preferred
@@ -375,7 +376,7 @@ mod tests {
 
     fn empty_input(schema: &Schema) -> ResolveInput<'_> {
         ResolveInput {
-            shape: Shape::Object(schema.clone()),
+            shape: Arc::new(Shape::Object(schema.clone())),
             registry: toml_only_registry(),
             files: vec![],
             discovery: DiscoveryRecord::empty(),

@@ -503,9 +503,36 @@ impl TemplateRenderer for TomlTemplate {
         out: &mut String,
         _prefix: &String,
         item: &Shape,
+        _doc: &[String],
     ) -> Result<(), FormatError> {
         use std::fmt::Write;
 
+        // Value-shaped items are assignments, not tables: a leaf or
+        // array/map of leaves has no `[<key>]` spelling, and routing
+        // them through `emit_toml_item` hits its leaf `unreachable!`.
+        if item.is_value_field() {
+            let field = super::template::ValueView::from_shape(item);
+            for line in leaf_annotations(field, "TOML", &mut |v| Ok(format_inline_toml(v)))? {
+                push_comment_line(out, "", &line);
+            }
+            let example = match field.default {
+                Some(value) => format_inline_toml(value),
+                None => placeholder(field.shape, "\"\"", "1970-01-01T00:00:00Z").to_string(),
+            };
+            let _ = writeln!(out, "#<key> = {example}");
+            return Ok(());
+        }
+        // Nested anonymous arrays have no `[[<key>]]` spelling — the
+        // same inline fallback field-position `map_of` uses.
+        if has_array_in_array(item) {
+            emit_object_doc(out, item);
+            let _ = writeln!(
+                out,
+                "#<key> = {}",
+                value_to_toml_edit(&example_shape_value(item))
+            );
+            return Ok(());
+        }
         emit_object_doc(out, item);
         let entry = "<key>";
         let (header, inner) = match item {
@@ -846,6 +873,67 @@ pool_size = 5
             batches.get("<key>").or_else(|| batches.values().next()),
             Some(&Value::Array(vec![Value::Array(vec![timeout])])),
             "uncommented Map<Array<Array<Object>>> example must keep both array layers: {text}"
+        );
+    }
+
+    #[test]
+    fn template_root_map_covers_leaf_array_and_nested_map_items() {
+        use crate::runtime::{Field, LeafType, Schema as RtSchema};
+        let object = RtSchema::object("Site")
+            .field("host", Field::string().default("localhost"))
+            .field("port", Field::integer().default(8080i64));
+
+        let leaf = TomlAdapter
+            .template(&Shape::from(Shape::map("values", Field::string())))
+            .unwrap();
+        assert!(
+            leaf.contains("#<key> = \"\""),
+            "root map of leaves is a commented assignment, not a table: {leaf}"
+        );
+        assert!(
+            !leaf.contains("[<key>]") && !leaf.contains("[[<key>]]"),
+            "value-shaped root map must not emit a table header: {leaf}"
+        );
+
+        let array_of_leaves = TomlAdapter
+            .template(&Shape::from(Shape::map(
+                "values",
+                Field::array_of_type(LeafType::String),
+            )))
+            .unwrap();
+        assert!(
+            array_of_leaves.contains("#<key> = []"),
+            "root map of scalar arrays is a commented assignment: {array_of_leaves}"
+        );
+
+        let array_of_objects = TomlAdapter
+            .template(&Shape::from(Shape::map(
+                "sites",
+                Shape::array("sites", object.clone()),
+            )))
+            .unwrap();
+        assert!(
+            array_of_objects.contains("#[[<key>]]"),
+            "root map of object arrays keeps array-of-tables: {array_of_objects}"
+        );
+        assert!(
+            array_of_objects.contains("#host = \"localhost\""),
+            "object-array item defaults stay in the example: {array_of_objects}"
+        );
+
+        let nested_map = TomlAdapter
+            .template(&Shape::from(Shape::map(
+                "groups",
+                Shape::map("inner", object),
+            )))
+            .unwrap();
+        assert!(
+            nested_map.contains("#[<key>]"),
+            "root map of maps keeps a table header: {nested_map}"
+        );
+        assert!(
+            nested_map.contains("#[<key>.<key>]"),
+            "nested map item adds an inner table header: {nested_map}"
         );
     }
 

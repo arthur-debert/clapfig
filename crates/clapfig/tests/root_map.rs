@@ -262,3 +262,161 @@ fn config_set_of_dynamic_entry_key_refuses() {
         other => panic!("expected UnaddressableKey, got {other:?}"),
     }
 }
+
+fn nested_strict_root(db_strict: bool) -> Shape {
+    let item = Schema::object("Site")
+        .field("host", Field::string().default("localhost"))
+        .nested(
+            "db",
+            Schema::object("Db")
+                .strict(db_strict)
+                .field("url", Field::string().optional()),
+        );
+    Shape::from(Shape::map("sites", item))
+}
+
+#[test]
+fn template_root_map_of_leaves_is_commented_assignment() {
+    let result = Clapfig::builder(Shape::from(Shape::map("values", Field::string())))
+        .app_name("demo")
+        .no_env()
+        .handle(&ConfigAction::Gen { output: None })
+        .unwrap();
+    match result {
+        ConfigResult::Template(text) => {
+            assert!(
+                text.contains("#<key> = \"\""),
+                "value-shaped root map must be a commented assignment:\n{text}"
+            );
+            assert!(
+                !text.contains("[<key>]") && !text.contains("[[<key>]]"),
+                "must not emit a table header for a leaf item:\n{text}"
+            );
+        }
+        other => panic!("expected Template, got {other:?}"),
+    }
+}
+
+#[test]
+fn root_map_nested_strict_false_accepts_unknown_under_every_file_entry() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("demo.toml"),
+        "[core.db]\nurl = \"a\"\nrogue = 1\n\n[site.db]\nurl = \"b\"\nrogue = 2\n",
+    )
+    .unwrap();
+    let table = Clapfig::builder(nested_strict_root(false))
+        .app_name("demo")
+        .file_name("demo.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .strict(true)
+        .load()
+        .unwrap();
+    assert_eq!(table["core"]["db"]["url"].as_str().unwrap(), "a");
+    assert_eq!(table["site"]["db"]["url"].as_str().unwrap(), "b");
+}
+
+#[test]
+fn root_map_nested_strict_false_still_rejects_unknown_at_entry_top_level() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("demo.toml"),
+        "[core]\nhost = \"a\"\nextra = 1\n",
+    )
+    .unwrap();
+    let err = Clapfig::builder(nested_strict_root(false))
+        .app_name("demo")
+        .file_name("demo.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .strict(true)
+        .load()
+        .unwrap_err();
+    let keys = err.unknown_keys().expect("expected UnknownKeys");
+    assert_eq!(keys[0].key, "core.extra");
+}
+
+#[test]
+fn root_map_nested_strict_true_rejects_unknown_under_every_file_entry() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("demo.toml"),
+        "[core.db]\nurl = \"a\"\nrogue = 1\n\n[site.db]\nurl = \"b\"\nrogue = 2\n",
+    )
+    .unwrap();
+    let err = Clapfig::builder(nested_strict_root(true))
+        .app_name("demo")
+        .file_name("demo.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .strict(false)
+        .load()
+        .unwrap_err();
+    let keys = err.unknown_keys().expect("expected UnknownKeys");
+    let names: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
+    assert!(
+        names.contains(&"core.db.rogue") && names.contains(&"site.db.rogue"),
+        "both entries must reject under db.strict(true): {names:?}"
+    );
+}
+
+#[test]
+fn root_map_nested_strict_false_accepts_unknown_under_every_env_entry() {
+    const PREFIX: &str = "CLAPFIG_SHP01_WS03_ROOT_MAP_STRICT_OK";
+    let core_db = format!("{PREFIX}__CORE__DB__ROGUE");
+    let site_db = format!("{PREFIX}__SITE__DB__ROGUE");
+    unsafe {
+        std::env::set_var(&core_db, "1");
+        std::env::set_var(&site_db, "1");
+    }
+
+    let dir = TempDir::new().unwrap();
+    let table = Clapfig::builder(nested_strict_root(false))
+        .app_name("demo")
+        .file_name("demo.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .env_prefix(PREFIX)
+        .strict(true)
+        .load();
+
+    unsafe {
+        std::env::remove_var(&core_db);
+        std::env::remove_var(&site_db);
+    }
+
+    table.expect("db.strict(false) must drop env unknowns under every map entry");
+}
+
+#[test]
+fn root_map_nested_strict_true_rejects_unknown_under_every_env_entry() {
+    const PREFIX: &str = "CLAPFIG_SHP01_WS03_ROOT_MAP_STRICT_NO";
+    let core_db = format!("{PREFIX}__CORE__DB__ROGUE");
+    let site_db = format!("{PREFIX}__SITE__DB__ROGUE");
+    unsafe {
+        std::env::set_var(&core_db, "1");
+        std::env::set_var(&site_db, "1");
+    }
+
+    let dir = TempDir::new().unwrap();
+    let result = Clapfig::builder(nested_strict_root(true))
+        .app_name("demo")
+        .file_name("demo.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .env_prefix(PREFIX)
+        .strict(false)
+        .load();
+
+    unsafe {
+        std::env::remove_var(&core_db);
+        std::env::remove_var(&site_db);
+    }
+
+    let err = result.expect_err("db.strict(true) must reject env unknowns");
+    let keys = err.unknown_keys().expect("expected UnknownKeys");
+    let names: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
+    assert!(
+        names.contains(&"core.db.rogue") && names.contains(&"site.db.rogue"),
+        "both env entries must reject under db.strict(true): {names:?}"
+    );
+}

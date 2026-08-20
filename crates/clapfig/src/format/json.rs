@@ -996,11 +996,18 @@ impl TemplateRenderer for JsonTemplate {
         out: &mut Self::Out,
         _ctx: &(),
         item: &Shape,
+        doc: &[String],
     ) -> Result<(), FormatError> {
-        let mut lines = doc_lines(item.field_doc());
-        let mut example = JsonMap::new();
-        example.insert("<key>".to_string(), example_value(item, "<key>")?);
-        lines.push(assignment_snippet("<key>", compact(&Json::Object(example))));
+        // Root-map docs live on the MapShape (`doc`); item docs are the
+        // entry example's own prose. The assignment value is the item
+        // example directly — wrapping it in a second `<key>` object
+        // would advertise a map level the schema does not accept.
+        let mut lines = doc_lines(doc);
+        lines.extend(doc_lines(item.field_doc()));
+        lines.push(assignment_snippet(
+            "<key>",
+            compact(&example_value(item, "<key>")?),
+        ));
         out.insert(COMMENT_PREFIX.into(), comment_value(lines));
         Ok(())
     }
@@ -1992,6 +1999,70 @@ mod tests {
             parse_snippet(&obj["//cube"]),
             serde_json::json!({"cube": [[[{"timeout": 30}]]]})
         );
+    }
+
+    #[test]
+    fn template_root_map_snippet_is_one_entry_not_an_extra_key_level() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Site")
+            .doc("One named site.")
+            .field("host", Field::string().default("localhost"))
+            .field("port", Field::integer().default(8080i64));
+        let shape = Shape::from(Shape::map("sites", item).doc("Named sites by key."));
+        let text = JsonAdapter.template(&shape).unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let comment = json
+            .as_object()
+            .unwrap()
+            .get("//")
+            .expect("root-map example rides the object comment");
+        let lines: Vec<&str> = match comment {
+            Json::String(s) => vec![s.as_str()],
+            Json::Array(items) => items.iter().filter_map(Json::as_str).collect(),
+            other => panic!("comment payload must be a string or array: {other}"),
+        };
+        assert!(
+            lines.iter().any(|l| l.contains("Named sites by key.")),
+            "root MapShape docs must appear in the JSON template: {text}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("One named site.")),
+            "item object docs must still appear: {text}"
+        );
+        let snippet = lines
+            .iter()
+            .find(|l| l.contains("\"<key>\""))
+            .expect("assignment snippet");
+        let parsed: Json = serde_json::from_str(&format!("{{{snippet}}}")).unwrap_or_else(|e| {
+            panic!("root-map snippet must parse as a JSON object: {e}: {snippet}")
+        });
+        let entry = parsed
+            .get("<key>")
+            .unwrap_or_else(|| panic!("snippet assigns <key>: {parsed}"));
+        assert!(
+            entry.get("<key>").is_none(),
+            "must not wrap the item in a second <key> object: {parsed}"
+        );
+        assert_eq!(entry["host"], "localhost");
+        assert_eq!(entry["port"], 8080);
+
+        let leaf = JsonAdapter
+            .template(&Shape::from(Shape::map("values", Field::string())))
+            .unwrap();
+        let leaf_json: Json = serde_json::from_str(&leaf).unwrap();
+        let leaf_comment = &leaf_json["//"];
+        let leaf_lines: Vec<&str> = match leaf_comment {
+            Json::String(s) => vec![s.as_str()],
+            Json::Array(items) => items.iter().filter_map(Json::as_str).collect(),
+            other => panic!("leaf comment payload must be a string or array: {other}"),
+        };
+        let leaf_snippet = leaf_lines
+            .iter()
+            .find(|l| l.contains("\"<key>\""))
+            .expect("leaf assignment snippet");
+        let leaf_parsed: Json = serde_json::from_str(&format!("{{{leaf_snippet}}}"))
+            .unwrap_or_else(|e| panic!("leaf snippet must parse: {e}: {leaf_snippet}"));
+        assert_eq!(leaf_parsed["<key>"], "");
     }
 
     #[test]

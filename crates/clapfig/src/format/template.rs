@@ -101,12 +101,18 @@ pub(crate) trait TemplateRenderer: Sized {
     ) -> Result<(), FormatError>;
 
     /// Emit a **document-root** map as a commented example entry, with no
-    /// invented parent table. `item` is the entry shape.
+    /// invented parent table. `item` is the entry shape — value-shaped
+    /// items (leaf, array/map of leaves) render as a commented assignment;
+    /// object and nested-container items keep their format's table /
+    /// mapping syntax. `doc` is the root [`MapShape`](crate::runtime::MapShape)'s
+    /// own prose (JSON parks it on the `"//"` comment with the example;
+    /// TOML/YAML already emit it in `template` before the walk).
     fn root_map(
         &mut self,
         out: &mut Self::Out,
         ctx: &Self::Ctx,
         item: &Shape,
+        doc: &[String],
     ) -> Result<(), FormatError>;
 }
 
@@ -169,7 +175,7 @@ pub(crate) fn walk_root<R: TemplateRenderer>(
 ) -> Result<(), FormatError> {
     match shape {
         Shape::Object(schema) => walk_level(renderer, schema, ctx, out),
-        Shape::Map(map) => renderer.root_map(out, ctx, &map.item),
+        Shape::Map(map) => renderer.root_map(out, ctx, &map.item, &map.doc),
         Shape::Tagged(_) => {
             tagged_template_stub();
         }
@@ -190,7 +196,7 @@ pub(crate) struct ValueView<'a> {
 }
 
 impl<'a> ValueView<'a> {
-    fn from_shape(shape: &'a Shape) -> Self {
+    pub(crate) fn from_shape(shape: &'a Shape) -> Self {
         match shape {
             Shape::Leaf(leaf) => Self {
                 doc: &leaf.doc,

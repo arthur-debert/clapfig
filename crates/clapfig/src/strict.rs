@@ -220,12 +220,18 @@ pub(crate) fn dotted_extension_callback(
 #[derive(Debug, Default, Clone)]
 pub(crate) struct StrictnessOverrides {
     entries: HashMap<String, bool>,
+    /// When the document root is a homogeneous Map, item-schema `strict`
+    /// annotations are stored root-relative (`db`), while runtime paths
+    /// include the dynamic entry key (`core.db.rogue`). Cascade lookup
+    /// then also probes the path with that first segment stripped.
+    skip_root_entry: bool,
 }
 
 impl StrictnessOverrides {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            skip_root_entry: false,
         }
     }
 
@@ -257,6 +263,7 @@ impl StrictnessOverrides {
             crate::runtime::Shape::Object(schema) => Self::from_schema(schema),
             crate::runtime::Shape::Map(map) => {
                 let mut out = Self::new();
+                out.skip_root_entry = true;
                 if let Some(value) = map.strict {
                     out.insert(String::new(), value);
                 }
@@ -289,6 +296,10 @@ impl StrictnessOverrides {
     ///   probes both the physical form (`plugins[0]`) and the
     ///   bracket-stripped schema form (`plugins`) at each step, so an
     ///   override set on the item schema applies to any entry.
+    /// - **Root-map paths** (`core.db.rogue`): item-schema overrides are
+    ///   stored without the dynamic entry key (`db`). When the document
+    ///   root is a Map, the cascade also probes the path after stripping
+    ///   that first segment, so `db.strict(false)` governs every entry.
     ///
     /// The cascade walks from the leaf's section path upward, returning
     /// the first explicit override found. With no override on any
@@ -300,25 +311,44 @@ impl StrictnessOverrides {
         // which we now skip when the cursor has no brackets to strip.
         let mut cursor: &str = section_path_of(path, leaf);
         loop {
-            if let Some(v) = self.entries.get(cursor) {
-                return *v;
-            }
-            // Also probe the bracket-stripped form so an override set on a
-            // runtime ArrayOf schema (e.g. `plugins.audit`) is consulted
-            // when the unknown key sits inside an array entry
-            // (`plugins[0].audit.rogue`). Allocation-free fast path when
-            // there are no brackets in the cursor.
-            if cursor.contains('[') {
-                let schema_form = strip_brackets(cursor);
-                if let Some(v) = self.entries.get(&schema_form) {
-                    return *v;
-                }
+            if let Some(v) = self.probe(cursor) {
+                return v;
             }
             if cursor.is_empty() {
                 return default;
             }
             cursor = parent_path(cursor);
         }
+    }
+
+    /// Direct match, then the array-index and root-map schema forms of
+    /// `cursor` when those probes apply.
+    fn probe(&self, cursor: &str) -> Option<bool> {
+        if let Some(v) = self.entries.get(cursor) {
+            return Some(*v);
+        }
+        // Also probe the bracket-stripped form so an override set on a
+        // runtime ArrayOf schema (e.g. `plugins.audit`) is consulted
+        // when the unknown key sits inside an array entry
+        // (`plugins[0].audit.rogue`). Allocation-free fast path when
+        // there are no brackets in the cursor.
+        if cursor.contains('[') {
+            let schema_form = strip_brackets(cursor);
+            if let Some(v) = self.entries.get(&schema_form) {
+                return Some(*v);
+            }
+            if self.skip_root_entry
+                && let Some(v) = self.entries.get(strip_first_segment(&schema_form))
+            {
+                return Some(*v);
+            }
+        }
+        if self.skip_root_entry
+            && let Some(v) = self.entries.get(strip_first_segment(cursor))
+        {
+            return Some(*v);
+        }
+        None
     }
 }
 
@@ -363,6 +393,17 @@ fn walk_shape_strict(shape: &crate::runtime::Shape, dotted: &str, out: &mut Stri
                 walk_schema_strict(&variant.schema, dotted, out);
             }
         }
+    }
+}
+
+/// Drop the first dotted path segment: `core.db` → `db`, `core[0].db` →
+/// `db` (the `[0]` stays in the first segment, the remainder starts after
+/// the first `.`), `core` → `""`. Used so a root-map item override stored
+/// at `db` matches the runtime path `core.db.rogue`.
+fn strip_first_segment(path: &str) -> &str {
+    match path.find('.') {
+        Some(i) => &path[i + 1..],
+        None => "",
     }
 }
 
@@ -677,6 +718,57 @@ mod tests {
         let mut overrides = StrictnessOverrides::new();
         overrides.insert("plugins.audit", false);
         assert!(!overrides.effective_strict("plugins[0].audit.rogue", "rogue", true,));
+    }
+
+    #[test]
+    fn strip_first_segment_drops_the_dynamic_root_entry() {
+        assert_eq!(strip_first_segment("core.db"), "db");
+        assert_eq!(strip_first_segment("core[0].db"), "db");
+        assert_eq!(strip_first_segment("core"), "");
+        assert_eq!(strip_first_segment(""), "");
+    }
+
+    #[test]
+    fn from_shape_root_map_item_strict_matches_every_entry() {
+        use crate::runtime::{Field, Schema as RtSchema, Shape};
+        let item = RtSchema::object("Site")
+            .field("host", Field::string().optional())
+            .nested(
+                "db",
+                RtSchema::object("Db")
+                    .strict(false)
+                    .field("url", Field::string().optional()),
+            )
+            .nested(
+                "audit",
+                RtSchema::object("Audit")
+                    .strict(true)
+                    .field("level", Field::string().optional()),
+            );
+        let shape = Shape::from(Shape::map("sites", item));
+        let overrides = StrictnessOverrides::from_shape(&shape);
+        // Nested `db.strict(false)` is stored as `db`; runtime paths are
+        // `core.db.rogue` / `site.db.rogue` — the root-entry skip must
+        // make both match, not only a path that never occurs.
+        assert!(
+            !overrides.effective_strict("core.db.rogue", "rogue", true),
+            "item db.strict(false) must govern unknown keys under every entry"
+        );
+        assert!(
+            !overrides.effective_strict("site.db.rogue", "rogue", true),
+            "item db.strict(false) must govern a second map entry"
+        );
+        assert!(
+            overrides.effective_strict("core.audit.rogue", "rogue", false),
+            "item audit.strict(true) must re-tighten under every entry"
+        );
+        assert!(
+            overrides.effective_strict("site.audit.rogue", "rogue", false),
+            "item audit.strict(true) must re-tighten a second map entry"
+        );
+        // Unknown at the item top-level still uses the builder default
+        // (no item-root strict here).
+        assert!(overrides.effective_strict("core.rogue", "rogue", true));
     }
 
     #[test]

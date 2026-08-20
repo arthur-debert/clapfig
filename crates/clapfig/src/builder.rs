@@ -1002,7 +1002,7 @@ impl Resolver {
         };
 
         let input = ResolveInput {
-            shape: (*self.shape).clone(),
+            shape: Arc::clone(&self.shape),
             registry: &self.registry,
             files: loaded.files,
             discovery,
