@@ -76,24 +76,28 @@ pub(crate) trait TemplateRenderer: Sized {
         child: &Schema,
     ) -> Result<(), FormatError>;
 
-    /// Emit an array-of-objects field as a fully commented one-entry
-    /// example — clapfig can't know how many entries the user wants.
+    /// Emit an array field whose item is not a value shape, as a fully
+    /// commented one-entry example — clapfig can't know how many entries
+    /// the user wants. `item` may be an object or a nested container;
+    /// renderers recurse through Array/Map items, preserving container
+    /// syntax at every level.
     fn array_of(
         &mut self,
         out: &mut Self::Out,
         ctx: &Self::Ctx,
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError>;
 
-    /// Emit a map-of-objects field as a fully commented example keyed by a
-    /// `<key>` placeholder — entry keys are user-supplied.
+    /// Emit a map field whose item is not a value shape, as a fully
+    /// commented example keyed by a `<key>` placeholder — entry keys are
+    /// user-supplied. `item` may be an object or a nested container.
     fn map_of(
         &mut self,
         out: &mut Self::Out,
         ctx: &Self::Ctx,
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError>;
 }
 
@@ -128,23 +132,15 @@ pub(crate) fn walk_level<R: TemplateRenderer>(
                 renderer.check_field_name(&nf.name)?;
                 renderer.nested(out, ctx, &nf.name, child)?;
             }
-            Shape::Array(array) => match array.item.as_ref() {
-                Shape::Object(child) => {
-                    renderer.check_field_name(&nf.name)?;
-                    renderer.array_of(out, ctx, &nf.name, child)?;
-                }
-                _ => unreachable!("value-field arrays are emitted above"),
-            },
-            Shape::Map(map) => match map.item.as_ref() {
-                Shape::Object(child) => {
-                    renderer.check_field_name(&nf.name)?;
-                    renderer.map_of(out, ctx, &nf.name, child)?;
-                }
-                _ => unreachable!("value-field maps are emitted above"),
-            },
-            Shape::Tagged(_) => panic!(
-                "clapfig: tagged templates are SHP01-WS05; object-root schemas in this slice have no tagged fields"
-            ),
+            Shape::Array(array) => {
+                renderer.check_field_name(&nf.name)?;
+                renderer.array_of(out, ctx, &nf.name, &array.item)?;
+            }
+            Shape::Map(map) => {
+                renderer.check_field_name(&nf.name)?;
+                renderer.map_of(out, ctx, &nf.name, &map.item)?;
+            }
+            Shape::Tagged(_) => tagged_template_stub(),
             Shape::Leaf(_) => unreachable!("leaves are value fields"),
         }
     }
@@ -195,6 +191,14 @@ fn emit_value_field<R: TemplateRenderer>(
     shape: &Shape,
 ) -> Result<(), FormatError> {
     renderer.leaf(out, ctx, name, ValueView::from_shape(shape))
+}
+
+/// Tagged template emission is SHP01-WS05. Walkers in this slice fail
+/// loudly rather than emit a lying example.
+pub(crate) fn tagged_template_stub() -> ! {
+    panic!(
+        "clapfig: tagged templates are SHP01-WS05; object-root schemas in this slice have no tagged fields"
+    );
 }
 
 /// Doc lines ready for a comment payload: trailing whitespace trimmed,

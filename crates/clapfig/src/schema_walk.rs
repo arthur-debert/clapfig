@@ -249,6 +249,8 @@ fn fill_defaults_for_field(
             // An absent non-optional array without a declared default
             // materializes as the empty array. Optional arrays
             // (`Option<Vec<..>>`) stay absent and deserialize to `None`.
+            // After inserting a declared default, walk the inserted
+            // value so nested object defaults still fill.
             if !table.contains_key(name) {
                 if let Some(default) = &array.default {
                     insert_default(
@@ -260,14 +262,12 @@ fn fill_defaults_for_field(
                         schema_key,
                         filled,
                     );
-                    return;
-                }
-                if array.optional {
+                } else if array.optional {
                     return;
                 }
             }
             let created = !table.contains_key(name);
-            let entry = table
+            table
                 .entry(name.to_string())
                 .or_insert_with(|| Value::Array(Vec::new()));
             if created {
@@ -276,21 +276,15 @@ fn fill_defaults_for_field(
                     .or_insert_with(|| OriginNode::array(Origin::default(schema_key), Vec::new()));
                 trace_default_filled(child.as_ref(), "array", filled);
             }
-            if let Value::Array(items) = entry {
-                let child_origins = child_array_origins(origins, name, schema_key);
-                for (i, item) in items.iter_mut().enumerate() {
-                    let indexed = format!("{schema_key}[{i}]");
-                    let indexed_path = child.as_ref().map(|p| p.clone().index(i));
-                    fill_defaults_against_shape(
-                        item,
-                        child_origins,
-                        i,
-                        &array.item,
-                        &indexed,
-                        indexed_path,
-                        filled,
+            if let Some(entry) = table.get_mut(name) {
+                if !origins.contains_key(name) {
+                    origins.insert(
+                        name.to_string(),
+                        OriginNode::from_value(entry, Origin::default(schema_key)),
                     );
                 }
+                let node = origins.get_mut(name).expect("just ensured origin node");
+                fill_defaults_in_value(entry, node, shape, schema_key, child, filled);
             }
         }
         Shape::Map(map) => {
@@ -310,14 +304,12 @@ fn fill_defaults_for_field(
                         schema_key,
                         filled,
                     );
-                    return;
-                }
-                if map.optional {
+                } else if map.optional {
                     return;
                 }
             }
             let created = !table.contains_key(name);
-            let entry = table
+            table
                 .entry(name.to_string())
                 .or_insert_with(|| Value::Map(Map::new()));
             if created {
@@ -326,16 +318,90 @@ fn fill_defaults_for_field(
                 });
                 trace_default_filled(child.as_ref(), "map", filled);
             }
-            if let Value::Map(entries) = entry {
-                let child_origins = child_map_origins(origins, name, schema_key);
-                for (entry_key, entry_value) in entries.iter_mut() {
-                    let entry_path = format!("{schema_key}.{entry_key}");
-                    let entry_origins =
-                        child_map_entry_origins(child_origins, entry_key, &entry_path);
-                    let entry_cfg = child.as_ref().map(|p| p.clone().key(entry_key));
-                    fill_defaults_for_value(
+            if let Some(entry) = table.get_mut(name) {
+                if !origins.contains_key(name) {
+                    origins.insert(
+                        name.to_string(),
+                        OriginNode::from_value(entry, Origin::default(schema_key)),
+                    );
+                }
+                let node = origins.get_mut(name).expect("just ensured origin node");
+                fill_defaults_in_value(entry, node, shape, schema_key, child, filled);
+            }
+        }
+        Shape::Tagged(_) => {
+            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+        }
+    }
+}
+
+/// Recursively fill defaults in an existing `value` against `shape`.
+/// Object fields use [`fill_defaults_at`]; Array and Map walk existing
+/// entries (never synthesizing missing items) so nested objects under
+/// multiple container layers still receive their declared defaults.
+fn fill_defaults_in_value(
+    value: &mut Value,
+    origin: &mut OriginNode,
+    shape: &Shape,
+    schema_key: &str,
+    path: Option<ConfigPath>,
+    filled: &mut usize,
+) {
+    match shape {
+        Shape::Leaf(_) => {}
+        Shape::Object(nested) => {
+            if let Value::Map(t) = value {
+                fill_defaults_at(
+                    t,
+                    origin.map_children_mut(),
+                    nested,
+                    schema_key,
+                    path,
+                    filled,
+                );
+            }
+        }
+        Shape::Array(array) => {
+            if let Value::Array(items) = value {
+                let children = origin.array_children_mut();
+                for i in 0..items.len() {
+                    let indexed = format!("{schema_key}[{i}]");
+                    let indexed_path = path.as_ref().map(|p| p.clone().index(i));
+                    while children.len() <= i {
+                        children.push(OriginNode::from_value(&items[i], Origin::default(&indexed)));
+                    }
+                    fill_defaults_in_value(
+                        &mut items[i],
+                        &mut children[i],
+                        &array.item,
+                        &indexed,
+                        indexed_path,
+                        filled,
+                    );
+                }
+            }
+        }
+        Shape::Map(map) => {
+            if let Value::Map(entries) = value {
+                let children = origin.map_children_mut();
+                let keys: Vec<String> = entries.keys().cloned().collect();
+                for key in keys {
+                    let entry_path = format!("{schema_key}.{key}");
+                    let entry_cfg = path.as_ref().map(|p| p.clone().key(&key));
+                    if !children.contains_key(&key) {
+                        children.insert(
+                            key.clone(),
+                            OriginNode::from_value(
+                                entries.get(&key).expect("key came from entries"),
+                                Origin::default(&entry_path),
+                            ),
+                        );
+                    }
+                    let entry_value = entries.get_mut(&key).expect("key came from entries");
+                    let node = children.get_mut(&key).expect("just ensured origin node");
+                    fill_defaults_in_value(
                         entry_value,
-                        entry_origins,
+                        node,
                         &map.item,
                         &entry_path,
                         entry_cfg,
@@ -344,53 +410,6 @@ fn fill_defaults_for_field(
                 }
             }
         }
-        Shape::Tagged(_) => {
-            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
-        }
-    }
-}
-
-fn fill_defaults_against_shape(
-    item: &mut Value,
-    child_origins: &mut Vec<OriginNode>,
-    i: usize,
-    shape: &Shape,
-    indexed: &str,
-    indexed_path: Option<ConfigPath>,
-    filled: &mut usize,
-) {
-    match shape {
-        Shape::Object(item_schema) => {
-            if let Value::Map(t) = item {
-                while child_origins.len() <= i {
-                    child_origins.push(OriginNode::map(Origin::default(indexed), OriginMap::new()));
-                }
-                let entry_origins = child_origins[i].map_children_mut();
-                fill_defaults_at(t, entry_origins, item_schema, indexed, indexed_path, filled);
-            }
-        }
-        Shape::Leaf(_) | Shape::Array(_) | Shape::Map(_) => {}
-        Shape::Tagged(_) => {
-            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
-        }
-    }
-}
-
-fn fill_defaults_for_value(
-    value: &mut Value,
-    origins: &mut OriginMap,
-    shape: &Shape,
-    schema_key: &str,
-    path: Option<ConfigPath>,
-    filled: &mut usize,
-) {
-    match shape {
-        Shape::Object(nested) => {
-            if let Value::Map(t) = value {
-                fill_defaults_at(t, origins, nested, schema_key, path, filled);
-            }
-        }
-        Shape::Leaf(_) | Shape::Array(_) | Shape::Map(_) => {}
         Shape::Tagged(_) => {
             todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
         }
@@ -428,28 +447,6 @@ fn child_map_origins<'a>(
 ) -> &'a mut OriginMap {
     let node = origins
         .entry(name.to_string())
-        .or_insert_with(|| OriginNode::map(Origin::default(schema_key), OriginMap::new()));
-    node.map_children_mut()
-}
-
-fn child_array_origins<'a>(
-    origins: &'a mut OriginMap,
-    name: &str,
-    schema_key: &str,
-) -> &'a mut Vec<OriginNode> {
-    let node = origins
-        .entry(name.to_string())
-        .or_insert_with(|| OriginNode::array(Origin::default(schema_key), Vec::new()));
-    node.array_children_mut()
-}
-
-fn child_map_entry_origins<'a>(
-    origins: &'a mut OriginMap,
-    entry_key: &str,
-    schema_key: &str,
-) -> &'a mut OriginMap {
-    let node = origins
-        .entry(entry_key.to_string())
         .or_insert_with(|| OriginNode::map(Origin::default(schema_key), OriginMap::new()));
     node.map_children_mut()
 }
@@ -909,6 +906,86 @@ mod tests {
         let mut table = parse("");
         fill(&mut table, &schema);
         assert!(!table.contains_key("tags"));
+    }
+
+    fn plugin_with_timeout() -> Schema {
+        Schema::object("Plugin")
+            .field("timeout", RtField::integer().default(30i64))
+            .build()
+    }
+
+    #[test]
+    fn fill_defaults_recurses_through_array_of_map_of_object() {
+        let schema = Schema::object("App")
+            .field(
+                "groups",
+                RtField::array_of_type(RtField::map_of(plugin_with_timeout())),
+            )
+            .build();
+        let mut core = Map::new();
+        core.insert("core".into(), Value::Map(Map::new()));
+        let mut table = Map::new();
+        table.insert("groups".into(), Value::Array(vec![Value::Map(core)]));
+        fill(&mut table, &schema);
+        let groups = table.get("groups").and_then(Value::as_array).unwrap();
+        let core = groups[0]
+            .as_map()
+            .unwrap()
+            .get("core")
+            .unwrap()
+            .as_map()
+            .unwrap();
+        assert_eq!(core.get("timeout"), Some(&Value::Integer(30)));
+    }
+
+    #[test]
+    fn fill_defaults_recurses_through_map_of_array_of_object() {
+        let schema = Schema::object("App")
+            .field(
+                "groups",
+                RtField::map_of(RtField::array_of_type(plugin_with_timeout())),
+            )
+            .build();
+        let mut groups = Map::new();
+        groups.insert("core".into(), Value::Array(vec![Value::Map(Map::new())]));
+        let mut table = Map::new();
+        table.insert("groups".into(), Value::Map(groups));
+        fill(&mut table, &schema);
+        let core = table
+            .get("groups")
+            .and_then(Value::as_map)
+            .unwrap()
+            .get("core")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(
+            core[0].as_map().unwrap().get("timeout"),
+            Some(&Value::Integer(30))
+        );
+    }
+
+    #[test]
+    fn fill_defaults_walks_inserted_container_default_into_nested_objects() {
+        let mut default_entry = Map::new();
+        default_entry.insert("core".into(), Value::Map(Map::new()));
+        let schema = Schema::object("App")
+            .field(
+                "groups",
+                RtField::array_of_type(RtField::map_of(plugin_with_timeout()))
+                    .default(Value::Array(vec![Value::Map(default_entry)])),
+            )
+            .build();
+        let mut table = Map::new();
+        fill(&mut table, &schema);
+        let groups = table.get("groups").and_then(Value::as_array).unwrap();
+        let core = groups[0]
+            .as_map()
+            .unwrap()
+            .get("core")
+            .unwrap()
+            .as_map()
+            .unwrap();
+        assert_eq!(core.get("timeout"), Some(&Value::Integer(30)));
     }
 
     // --- finalize: required-field check ---

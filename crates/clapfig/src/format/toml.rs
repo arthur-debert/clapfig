@@ -15,12 +15,12 @@
 
 use std::collections::BTreeMap;
 
-use crate::runtime::Schema;
+use crate::runtime::{Schema, Shape};
 use crate::value::{Map, Value};
 
 use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
-    walk_level,
+    tagged_template_stub, walk_level,
 };
 use super::{ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, Span, SpanEntry};
 
@@ -443,17 +443,22 @@ impl TemplateRenderer for TomlTemplate {
         out: &mut String,
         prefix: &String,
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError> {
         use std::fmt::Write;
 
         let path = section_path(prefix, name);
-        for line in &child.doc {
-            push_comment_line(out, "", line);
-        }
+        emit_object_doc(out, item);
         let _ = writeln!(out, "#[[{path}]]");
         let mut buf = String::new();
-        walk_level(self, child, &path, &mut buf)?;
+        // Nested anonymous arrays cannot add another `[[path]]` header
+        // (TOML has no nested array-of-tables without a key); peel one
+        // Array layer and keep wrapping Maps.
+        let inner = match item {
+            Shape::Array(array) => array.item.as_ref(),
+            other => other,
+        };
+        emit_toml_item(self, &mut buf, &path, inner)?;
         push_commented_block(out, &buf);
         Ok(())
     }
@@ -463,19 +468,57 @@ impl TemplateRenderer for TomlTemplate {
         out: &mut String,
         prefix: &String,
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError> {
         use std::fmt::Write;
 
         let path = section_path(prefix, name);
+        emit_object_doc(out, item);
+        let entry = format!("{path}.<key>");
+        let (header, inner) = match item {
+            Shape::Array(array) => (format!("#[[{entry}]]"), array.item.as_ref()),
+            other => (format!("#[{entry}]"), other),
+        };
+        let _ = writeln!(out, "{header}");
+        let mut buf = String::new();
+        emit_toml_item(self, &mut buf, &entry, inner)?;
+        push_commented_block(out, &buf);
+        Ok(())
+    }
+}
+
+fn emit_object_doc(out: &mut String, item: &Shape) {
+    if let Shape::Object(child) = item {
         for line in &child.doc {
             push_comment_line(out, "", line);
         }
-        let _ = writeln!(out, "#[{path}.<key>]");
-        let mut buf = String::new();
-        walk_level(self, child, &format!("{path}.<key>"), &mut buf)?;
-        push_commented_block(out, &buf);
-        Ok(())
+    }
+}
+
+/// Render nested item content under `path`. The caller already emitted
+/// the field's own `[[path]]` / `[path.<key>]` header. Nested Maps add
+/// `[path.<key>]`; nested Arrays add `[[path]]`.
+fn emit_toml_item(
+    renderer: &mut TomlTemplate,
+    out: &mut String,
+    path: &str,
+    item: &Shape,
+) -> Result<(), FormatError> {
+    use std::fmt::Write;
+
+    match item {
+        Shape::Object(child) => walk_level(renderer, child, &path.to_string(), out),
+        Shape::Map(map) => {
+            let entry = format!("{path}.<key>");
+            let _ = writeln!(out, "[{entry}]");
+            emit_toml_item(renderer, out, &entry, &map.item)
+        }
+        Shape::Array(array) => {
+            let _ = writeln!(out, "[[{path}]]");
+            emit_toml_item(renderer, out, path, &array.item)
+        }
+        Shape::Tagged(_) => tagged_template_stub(),
+        Shape::Leaf(_) => unreachable!("value-field containers are emitted as leaves"),
     }
 }
 
@@ -584,6 +627,33 @@ pool_size = 5
 
 "#;
         assert_eq!(TomlAdapter.template(&schema).unwrap(), golden);
+    }
+
+    #[test]
+    fn template_recurses_through_nested_containers() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Item").field("timeout", Field::integer().default(30i64));
+        let schema = RtSchema::object("App")
+            .field("groups", Field::array_of_type(Field::map_of(item.clone())))
+            .field("batches", Field::map_of(Field::array_of_type(item)))
+            .build();
+        let text = TomlAdapter.template(&schema).unwrap();
+        assert!(
+            text.contains("#[[groups]]"),
+            "array-of-map emits array-of-tables header: {text}"
+        );
+        assert!(
+            text.contains("#[groups.<key>]"),
+            "array-of-map emits nested map header: {text}"
+        );
+        assert!(
+            text.contains("#timeout = 30"),
+            "nested object defaults stay in the commented example: {text}"
+        );
+        assert!(
+            text.contains("#[[batches.<key>]]"),
+            "map-of-array emits array-of-tables under the map key: {text}"
+        );
     }
 
     #[test]

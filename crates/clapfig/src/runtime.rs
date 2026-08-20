@@ -657,6 +657,22 @@ impl Shape {
         }
     }
 
+    /// Follow Array/Map items until a named node (Object, Leaf, or Tagged).
+    ///
+    /// Anonymous container nodes do not contribute dotted path segments, so
+    /// lookups such as `strict_at` and `doc_for` walk through them without
+    /// consuming another key.
+    pub(crate) fn peel_containers(&self) -> &Shape {
+        let mut current = self;
+        loop {
+            match current {
+                Shape::Array(array) => current = array.item.as_ref(),
+                Shape::Map(map) => current = map.item.as_ref(),
+                Shape::Leaf(_) | Shape::Object(_) | Shape::Tagged(_) => return current,
+            }
+        }
+    }
+
     /// Type-check `value` against this shape. Object / tagged payloads
     /// are checked field-by-field by the walker; this only asserts the
     /// container kind. Homogeneous arrays and maps recurse into items.

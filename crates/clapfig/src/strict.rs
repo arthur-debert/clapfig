@@ -320,8 +320,18 @@ fn walk_shape_strict(shape: &crate::runtime::Shape, dotted: &str, out: &mut Stri
     match shape {
         Shape::Leaf(_) => {}
         Shape::Object(nested) => walk_schema_strict(nested, dotted, out),
-        Shape::Array(array) => walk_shape_strict(&array.item, dotted, out),
-        Shape::Map(map) => walk_shape_strict(&map.item, dotted, out),
+        Shape::Array(array) => {
+            if let Some(value) = array.strict {
+                out.insert(dotted.to_string(), value);
+            }
+            walk_shape_strict(&array.item, dotted, out);
+        }
+        Shape::Map(map) => {
+            if let Some(value) = map.strict {
+                out.insert(dotted.to_string(), value);
+            }
+            walk_shape_strict(&map.item, dotted, out);
+        }
         Shape::Tagged(tagged) => {
             if let Some(value) = tagged.strict {
                 out.insert(dotted.to_string(), value);
@@ -418,22 +428,17 @@ pub(crate) fn resolve_path_kind(schema: &Schema, dotted: &str) -> PathKind {
                 }
                 current = nested;
             }
-            crate::runtime::Shape::Array(array) => {
+            crate::runtime::Shape::Array(_) | crate::runtime::Shape::Map(_) => {
                 if segments.peek().is_none() {
                     return PathKind::Section;
                 }
-                match array.item.as_ref() {
+                match field.field.peel_containers() {
                     crate::runtime::Shape::Object(nested) => current = nested,
-                    _ => return PathKind::Unknown,
-                }
-            }
-            crate::runtime::Shape::Map(map) => {
-                if segments.peek().is_none() {
-                    return PathKind::Section;
-                }
-                match map.item.as_ref() {
-                    crate::runtime::Shape::Object(nested) => current = nested,
-                    _ => return PathKind::Unknown,
+                    crate::runtime::Shape::Tagged(_) => return PathKind::Unknown,
+                    crate::runtime::Shape::Leaf(_) => return PathKind::Unknown,
+                    crate::runtime::Shape::Array(_) | crate::runtime::Shape::Map(_) => {
+                        unreachable!("peel_containers strips Array/Map")
+                    }
                 }
             }
             crate::runtime::Shape::Tagged(_) => return PathKind::Unknown,
@@ -599,6 +604,59 @@ mod tests {
         assert_eq!(strip_brackets("a[10].b[2].c"), "a.b.c");
         assert_eq!(strip_brackets("a.b.c"), "a.b.c");
         assert_eq!(strip_brackets(""), "");
+    }
+
+    #[test]
+    fn from_schema_records_array_and_map_node_strict() {
+        use crate::runtime::{Field, Schema as RtSchema, Shape};
+        let plugin = RtSchema::object("Plugin").field("name", Field::string().optional());
+        let schema = RtSchema::object("App")
+            .field(
+                "plugins",
+                Shape::array("plugins", plugin.clone()).strict(false),
+            )
+            .field("servers", Shape::map("servers", plugin).strict(false))
+            .build();
+        let overrides = StrictnessOverrides::from_schema(&schema);
+        assert!(
+            !overrides.effective_strict("plugins[0].rogue", "rogue", true),
+            "array-node strict(false) must govern unknown keys in nested items"
+        );
+        assert!(
+            !overrides.effective_strict("servers.core.rogue", "rogue", true),
+            "map-node strict(false) must govern unknown keys in nested items"
+        );
+    }
+
+    #[test]
+    fn resolve_path_kind_walks_through_nested_containers() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .field(
+                "containers",
+                Field::array_of_type(Field::array_of_type(RtSchema::object("Item").nested(
+                    "policy",
+                    RtSchema::object("Policy").field("name", Field::string().optional()),
+                ))),
+            )
+            .field(
+                "groups",
+                Field::map_of(Field::array_of_type(
+                    RtSchema::object("Item").field("timeout", Field::integer().optional()),
+                )),
+            )
+            .build();
+        assert_eq!(resolve_path_kind(&schema, "containers"), PathKind::Section);
+        assert_eq!(
+            resolve_path_kind(&schema, "containers.policy"),
+            PathKind::Section
+        );
+        assert_eq!(
+            resolve_path_kind(&schema, "containers.policy.name"),
+            PathKind::Leaf
+        );
+        assert_eq!(resolve_path_kind(&schema, "groups"), PathKind::Section);
+        assert_eq!(resolve_path_kind(&schema, "groups.timeout"), PathKind::Leaf);
     }
 
     #[test]

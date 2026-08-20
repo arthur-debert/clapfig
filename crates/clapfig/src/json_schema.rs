@@ -15,11 +15,11 @@
 //!   `properties`.
 //! - **Required**: `required` mirrors what the runtime actually rejects
 //!   when absent — a leaf is required only if it is non-optional AND has
-//!   no default AND is neither map-typed nor array-typed (defaults are
-//!   synthesized during finalization; an absent map/array materializes as
-//!   the empty one), and a nested section is required only if it
-//!   transitively contains such a leaf. An external validator therefore
-//!   accepts exactly the documents clapfig loads.
+//!   no default. [`Shape::Array`] / [`Shape::Map`] are never required
+//!   (defaults are synthesized during finalization; an absent array/map
+//!   materializes as the empty one), and a nested section is required
+//!   only if it transitively contains a required leaf. An external
+//!   validator therefore accepts exactly the documents clapfig loads.
 //! - **Docs**: schema and field doc lines become `description`.
 //! - **Types**: converted recursively from each leaf's declared
 //!   [`LeafType`] — including leaves without defaults. String →
@@ -170,11 +170,12 @@ fn schema_to_object(schema: &Schema) -> Value {
 
 /// Convert a [`NamedField`] into a `(name, schema, required)` triple.
 ///
-/// `required` mirrors the runtime's absence rules: `true` for a leaf that
-/// is non-optional AND defaultless AND neither map-typed nor array-typed
-/// (an absent non-optional map/array leaf materializes as the empty
-/// map/array, like structural `MapOf`/`ArrayOf` nodes), and for a nested
-/// struct that transitively contains such a leaf ([`schema_requires_presence`]).
+/// `required` mirrors the runtime's absence rules: `true` for a
+/// [`Shape::Leaf`] that is non-optional AND defaultless, and for a nested
+/// object that transitively contains such a leaf
+/// ([`schema_requires_presence`]). [`Shape::Array`] and [`Shape::Map`]
+/// are never required — an absent non-optional array/map materializes as
+/// the empty array/map.
 fn field_to_property(field: &NamedField) -> (String, Value, bool) {
     match &field.field {
         Shape::Object(nested) => {
@@ -183,8 +184,8 @@ fn field_to_property(field: &NamedField) -> (String, Value, bool) {
         }
         Shape::Array(array) => {
             // JSON Schema for an array field: `type: array` with
-            // `items: <item schema>`. Object items are the old ArrayOf
-            // (TOML `[[name]]`); leaf items are the old LeafType::Array.
+            // `items: <item schema>`. Object items are TOML `[[name]]`;
+            // leaf items are homogeneous arrays of leaves.
             //
             // Not marked required: finalization treats an absent array
             // as the empty list, so a JSON Schema requiring the property
@@ -253,7 +254,9 @@ fn shape_to_schema(shape: &Shape) -> Option<Value> {
             }
             Some(Value::Object(obj))
         }
-        Shape::Tagged(_) => None,
+        Shape::Tagged(_) => panic!(
+            "clapfig: tagged JSON Schema is SHP01-WS05; object-root schemas in this slice have no tagged fields"
+        ),
     }
 }
 
@@ -277,10 +280,8 @@ fn populate_container_attrs(
 /// default. Finalization synthesizes defaults into absent sections, so a
 /// section whose required leaves all carry defaults is satisfiable when
 /// absent — exporting it `required` would make external validators reject
-/// configs clapfig loads fine. `ArrayOf`/`MapOf` subtrees never require
-/// presence (absent means the empty list/map), and neither do map- or
-/// array-typed leaves (an absent non-optional map/array leaf materializes
-/// as the empty map/array).
+/// configs clapfig loads fine. [`Shape::Array`] / [`Shape::Map`] subtrees
+/// never require presence (absent means the empty list/map).
 fn schema_requires_presence(schema: &Schema) -> bool {
     schema.fields.iter().any(|nf| match &nf.field {
         Shape::Leaf(leaf) => !leaf.optional && leaf.default.is_none(),
@@ -942,6 +943,22 @@ mod tests {
         let entries = props["labels"]["additionalProperties"].as_object().unwrap();
         assert!(!entries.contains_key("type"), "{entries:?}");
         assert_eq!(entries["enum"], json!(["auto", 0]));
+    }
+
+    #[test]
+    #[should_panic(expected = "tagged JSON Schema is SHP01-WS05")]
+    fn tagged_item_shape_fails_loudly() {
+        use crate::runtime::{Field, Schema as RtSchema, Shape};
+        let _ = generate_schema(
+            &RtSchema::object("App")
+                .field(
+                    "blocks",
+                    Field::array_of_type(
+                        Shape::tagged("Block", "kind").variant("rust", RtSchema::object("Rust")),
+                    ),
+                )
+                .build(),
+        );
     }
 
     #[test]

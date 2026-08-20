@@ -56,10 +56,12 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map as JsonMap, Value as Json};
 
-use crate::runtime::Schema;
+use crate::runtime::{Schema, Shape};
 use crate::value::{Map, Value};
 
-use super::template::{TemplateRenderer, doc_lines, leaf_annotations, walk_level};
+use super::template::{
+    TemplateRenderer, doc_lines, leaf_annotations, tagged_template_stub, walk_level,
+};
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
     SpanEntry, walk_label,
@@ -959,13 +961,13 @@ impl TemplateRenderer for JsonTemplate {
         out: &mut Self::Out,
         _ctx: &(),
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError> {
         // Entry count is the user's call, so no real key is emitted (an
         // absent array-of resolves to the empty list); the comment carries
         // a one-entry example.
-        let mut lines = doc_lines(&child.doc);
-        let example = Json::Array(vec![Json::Object(example_object(child, name)?)]);
+        let mut lines = doc_lines(item.field_doc());
+        let example = Json::Array(vec![example_value(item, name)?]);
         lines.push(assignment_snippet(name, compact(&example)));
         out.insert(comment_key(name), comment_value(lines));
         Ok(())
@@ -976,17 +978,14 @@ impl TemplateRenderer for JsonTemplate {
         out: &mut Self::Out,
         _ctx: &(),
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError> {
         // Entry keys are user-supplied, so no real key is emitted (an
         // absent map-of resolves to the empty map); the comment carries a
         // placeholder-keyed example.
-        let mut lines = doc_lines(&child.doc);
+        let mut lines = doc_lines(item.field_doc());
         let mut example = JsonMap::new();
-        example.insert(
-            "<key>".to_string(),
-            Json::Object(example_object(child, name)?),
-        );
+        example.insert("<key>".to_string(), example_value(item, name)?);
         lines.push(assignment_snippet(name, compact(&Json::Object(example))));
         out.insert(comment_key(name), comment_value(lines));
         Ok(())
@@ -1010,45 +1009,42 @@ fn example_object(
                 message: reserved_key_message(&format!("'{}'", nf.name)),
             });
         }
-        let value = match &nf.field {
-            crate::runtime::Shape::Leaf(leaf) => match &leaf.default {
-                Some(default) => {
-                    let mut path = vec![PathSegment::Key(context_key.to_string())];
-                    value_to_json(default, &mut path)?
-                }
-                None => placeholder_value(&nf.field),
-            },
-            crate::runtime::Shape::Object(child) => {
-                Json::Object(example_object(child, context_key)?)
-            }
-            crate::runtime::Shape::Array(array) => match array.item.as_ref() {
-                crate::runtime::Shape::Object(child) => {
-                    Json::Array(vec![Json::Object(example_object(child, context_key)?)])
-                }
-                item => Json::Array(vec![placeholder_value(item)]),
-            },
-            crate::runtime::Shape::Map(map) => match map.item.as_ref() {
-                crate::runtime::Shape::Object(child) => {
-                    let mut entry = JsonMap::new();
-                    entry.insert(
-                        "<key>".to_string(),
-                        Json::Object(example_object(child, context_key)?),
-                    );
-                    Json::Object(entry)
-                }
-                item => {
-                    let mut entry = JsonMap::new();
-                    entry.insert("<key>".to_string(), placeholder_value(item));
-                    Json::Object(entry)
-                }
-            },
-            crate::runtime::Shape::Tagged(_) => {
-                panic!("clapfig: tagged templates are SHP01-WS05")
-            }
-        };
-        obj.insert(nf.name.clone(), value);
+        obj.insert(nf.name.clone(), example_value(&nf.field, context_key)?);
     }
     Ok(obj)
+}
+
+/// One example JSON value for a shape: a declared default when present,
+/// otherwise a placeholder (leaf) or a one-entry nested example
+/// (object / array / map). Tagged shapes are a loud WS05 stub.
+fn example_value(shape: &Shape, context_key: &str) -> Result<Json, FormatError> {
+    match shape {
+        Shape::Leaf(leaf) => match &leaf.default {
+            Some(default) => {
+                let mut path = vec![PathSegment::Key(context_key.to_string())];
+                value_to_json(default, &mut path)
+            }
+            None => Ok(placeholder_value(shape)),
+        },
+        Shape::Object(child) => Ok(Json::Object(example_object(child, context_key)?)),
+        Shape::Array(array) => {
+            if let Some(default) = &array.default {
+                let mut path = vec![PathSegment::Key(context_key.to_string())];
+                return value_to_json(default, &mut path);
+            }
+            Ok(Json::Array(vec![example_value(&array.item, context_key)?]))
+        }
+        Shape::Map(map) => {
+            if let Some(default) = &map.default {
+                let mut path = vec![PathSegment::Key(context_key.to_string())];
+                return value_to_json(default, &mut path);
+            }
+            let mut entry = JsonMap::new();
+            entry.insert("<key>".to_string(), example_value(&map.item, context_key)?);
+            Ok(Json::Object(entry))
+        }
+        Shape::Tagged(_) => tagged_template_stub(),
+    }
 }
 
 /// The comment key documenting `field_name` (`"//port"`).
@@ -1886,6 +1882,55 @@ mod tests {
             obj["//servers"],
             r#""servers": {"<key>":{"host":"localhost"}}"#
         );
+    }
+
+    #[test]
+    fn template_uses_nested_container_defaults_in_examples() {
+        use crate::runtime::{Field, LeafType, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .array_of(
+                "plugins",
+                RtSchema::object("Plugin").field(
+                    "tags",
+                    Field::array_of_type(LeafType::String)
+                        .default(Value::Array(vec![Value::String("builtin".into())])),
+                ),
+            )
+            .map_of(
+                "servers",
+                RtSchema::object("Server").field(
+                    "labels",
+                    Field::map_of(LeafType::String).default({
+                        let mut m = Map::new();
+                        m.insert("role".into(), Value::String("web".into()));
+                        Value::Map(m)
+                    }),
+                ),
+            )
+            .build();
+        let text = JsonAdapter.template(&schema).unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj["//plugins"], r#""plugins": [{"tags":["builtin"]}]"#);
+        assert_eq!(
+            obj["//servers"],
+            r#""servers": {"<key>":{"labels":{"role":"web"}}}"#
+        );
+    }
+
+    #[test]
+    fn template_recurses_through_nested_containers() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Item").field("timeout", Field::integer().default(30i64));
+        let schema = RtSchema::object("App")
+            .field("groups", Field::array_of_type(Field::map_of(item.clone())))
+            .field("batches", Field::map_of(Field::array_of_type(item)))
+            .build();
+        let text = JsonAdapter.template(&schema).unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj["//groups"], r#""groups": [{"<key>":{"timeout":30}}]"#);
+        assert_eq!(obj["//batches"], r#""batches": {"<key>":[{"timeout":30}]}"#);
     }
 
     #[test]

@@ -44,12 +44,12 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use crate::runtime::Schema;
+use crate::runtime::{Schema, Shape};
 use crate::value::{Map, Value};
 
 use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
-    walk_level,
+    tagged_template_stub, walk_level,
 };
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
@@ -980,17 +980,15 @@ impl TemplateRenderer for YamlTemplate {
         out: &mut String,
         depth: &usize,
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError> {
         let indent = "  ".repeat(*depth);
-        for line in &child.doc {
-            push_comment_line(out, &indent, line);
-        }
+        emit_object_doc(out, &indent, item);
         let mut buf = String::new();
         let _ = writeln!(buf, "{indent}{}:", inline_scalar(name));
-        let mut item = String::new();
-        walk_level(self, child, &(depth + 2), &mut item)?;
-        buf.push_str(&with_sequence_dash(&item, depth + 1));
+        let mut item_buf = String::new();
+        emit_yaml_item(self, &mut item_buf, &(depth + 2), item)?;
+        buf.push_str(&with_sequence_dash(&item_buf, depth + 1));
         push_commented_block(out, &buf);
         Ok(())
     }
@@ -1000,18 +998,51 @@ impl TemplateRenderer for YamlTemplate {
         out: &mut String,
         depth: &usize,
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError> {
         let indent = "  ".repeat(*depth);
-        for line in &child.doc {
-            push_comment_line(out, &indent, line);
-        }
+        emit_object_doc(out, &indent, item);
         let mut buf = String::new();
         let _ = writeln!(buf, "{indent}{}:", inline_scalar(name));
         let _ = writeln!(buf, "{indent}  <key>:");
-        walk_level(self, child, &(depth + 2), &mut buf)?;
+        emit_yaml_item(self, &mut buf, &(depth + 2), item)?;
         push_commented_block(out, &buf);
         Ok(())
+    }
+}
+
+fn emit_object_doc(out: &mut String, indent: &str, item: &Shape) {
+    if let Shape::Object(child) = item {
+        for line in &child.doc {
+            push_comment_line(out, indent, line);
+        }
+    }
+}
+
+/// Render one example item at `depth`. Nested Maps emit a `<key>:`
+/// wrapper; nested Arrays emit a sequence dash; objects walk the child
+/// schema. Tagged items are a loud WS05 stub.
+fn emit_yaml_item(
+    renderer: &mut YamlTemplate,
+    out: &mut String,
+    depth: &usize,
+    item: &Shape,
+) -> Result<(), FormatError> {
+    match item {
+        Shape::Object(child) => walk_level(renderer, child, depth, out),
+        Shape::Map(map) => {
+            let indent = "  ".repeat(*depth);
+            let _ = writeln!(out, "{indent}<key>:");
+            emit_yaml_item(renderer, out, &(depth + 1), &map.item)
+        }
+        Shape::Array(array) => {
+            let mut item_buf = String::new();
+            emit_yaml_item(renderer, &mut item_buf, &(depth + 1), &array.item)?;
+            out.push_str(&with_sequence_dash(&item_buf, *depth));
+            Ok(())
+        }
+        Shape::Tagged(_) => tagged_template_stub(),
+        Shape::Leaf(_) => unreachable!("value-field containers are emitted as leaves"),
     }
 }
 
@@ -1888,6 +1919,31 @@ db:
         // The commented examples must not leak into the parsed document.
         let map = parse_map(&text);
         assert_eq!(map.keys().collect::<Vec<_>>(), ["port"]);
+    }
+
+    #[test]
+    fn template_recurses_through_nested_containers() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Item").field("timeout", Field::integer().default(30i64));
+        let schema = RtSchema::object("App")
+            .field("groups", Field::array_of_type(Field::map_of(item.clone())))
+            .field("batches", Field::map_of(Field::array_of_type(item)))
+            .build();
+        let text = YamlAdapter.template(&schema).unwrap();
+        assert!(text.contains("#groups:"), "text: {text}");
+        assert!(
+            text.contains("#  - <key>:"),
+            "array-of-map wraps a sequence item around the map key: {text}"
+        );
+        assert!(
+            text.contains("timeout: 30"),
+            "nested object defaults stay in the commented example: {text}"
+        );
+        assert!(text.contains("#batches:"), "text: {text}");
+        assert!(
+            text.contains("#  <key>:"),
+            "map-of-array keeps the placeholder key: {text}"
+        );
     }
 
     #[test]

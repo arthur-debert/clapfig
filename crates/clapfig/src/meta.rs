@@ -58,19 +58,15 @@ fn walk_segments(schema: &Schema, segments: &[&str]) -> Option<Vec<String>> {
             if segments.len() == 1 {
                 return Some(field.field.field_doc().to_vec());
             }
-            return match &field.field {
+            return match field.field.peel_containers() {
                 Shape::Object(nested) => walk_segments(nested, &segments[1..]),
-                Shape::Array(array) => match array.item.as_ref() {
-                    Shape::Object(nested) => walk_segments(nested, &segments[1..]),
-                    _ => None,
-                },
-                Shape::Map(map) => match map.item.as_ref() {
-                    Shape::Object(nested) => walk_segments(nested, &segments[1..]),
-                    _ => None,
-                },
-                // Hit a leaf (or value-container) with segments still
-                // pending — the rest of the path can't resolve.
+                // Hit a leaf (or tagged node) with segments still
+                // pending — anonymous Array/Map wrappers do not
+                // consume a path segment, but a named node does.
                 Shape::Leaf(_) | Shape::Tagged(_) => None,
+                Shape::Array(_) | Shape::Map(_) => {
+                    unreachable!("peel_containers strips Array/Map")
+                }
             };
         }
     }
@@ -254,6 +250,36 @@ mod tests {
     fn snake_spelling_finds_snake_field() {
         let doc = doc_for_key("database.pool_size").expect("snake spelling resolves");
         assert!(doc.iter().any(|line| line.contains("Connection pool size")));
+    }
+
+    #[test]
+    fn doc_for_walks_through_nested_containers() {
+        let schema = Schema::object("App")
+            .field(
+                "groups",
+                Field::array_of_type(Field::array_of_type(Schema::object("Item").field(
+                    "timeout",
+                    Field::integer().doc("Deadline in ms.").default(1i64),
+                ))),
+            )
+            .field(
+                "servers",
+                Field::map_of(Field::array_of_type(Schema::object("Server").field(
+                    "host",
+                    Field::string().doc("Listen address.").default("localhost"),
+                ))),
+            )
+            .build();
+        let timeout = doc_for(&schema, "groups.timeout").expect("timeout exists under arrays");
+        assert!(
+            timeout.iter().any(|line| line.contains("Deadline in ms")),
+            "{timeout:?}"
+        );
+        let host = doc_for(&schema, "servers.host").expect("host exists under map then array");
+        assert!(
+            host.iter().any(|line| line.contains("Listen address")),
+            "{host:?}"
+        );
     }
 
     #[test]
