@@ -1184,16 +1184,18 @@ fn get_scope(
             path: file_path.to_path_buf(),
             source: Box::new(e),
             source_text: Some(Arc::from(content.as_str())),
-        })? {
+        })?
+        .value
+    {
         Value::Map(map) => map,
         other => {
-            return Err(ClapfigError::InvalidValue {
-                key: file_path.display().to_string(),
-                reason: format!(
+            return Err(ClapfigError::invalid_value(
+                file_path.display().to_string(),
+                format!(
                     "config documents must be maps at the root, got {}",
                     other.type_str()
                 ),
-            });
+            ));
         }
     };
 
@@ -1429,7 +1431,7 @@ mod tests {
             .load();
 
         match result {
-            Err(ClapfigError::InvalidValue { key, reason }) => {
+            Err(ClapfigError::InvalidValue { key, reason, .. }) => {
                 assert_eq!(key, "level");
                 assert!(reason.contains("not in allowed set"));
             }
@@ -1474,7 +1476,7 @@ mod tests {
             .load();
 
         match result {
-            Err(ClapfigError::MissingRequired { key }) => assert_eq!(key, "name"),
+            Err(ClapfigError::MissingRequired { key, .. }) => assert_eq!(key, "name"),
             other => panic!("expected MissingRequired(name), got {other:?}"),
         }
     }
@@ -1791,7 +1793,7 @@ mod tests {
             .no_env()
             .load();
         match result.unwrap_err() {
-            ClapfigError::MissingRequired { key } => {
+            ClapfigError::MissingRequired { key, .. } => {
                 assert_eq!(key, "plugins.audit.severity");
             }
             other => panic!("expected MissingRequired, got {other:?}"),
@@ -1881,7 +1883,7 @@ mod tests {
             .no_env()
             .load();
         match result.unwrap_err() {
-            ClapfigError::InvalidValue { key, reason } => {
+            ClapfigError::InvalidValue { key, reason, .. } => {
                 assert_eq!(key, "plugins");
                 assert!(reason.contains("expected map"));
             }
@@ -2566,7 +2568,7 @@ mod tests {
         let file = dir.path().join("demo.toml");
         let db_map = || {
             let content = fs::read_to_string(&file).unwrap();
-            let tree = TomlAdapter.parse(&content).unwrap();
+            let tree = TomlAdapter.parse(&content).unwrap().value;
             tree.as_map().unwrap()["db"].as_map().unwrap().clone()
         };
 

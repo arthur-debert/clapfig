@@ -15,24 +15,19 @@
 use crate::runtime::{Leaf, Schema};
 use crate::value::{Map, Value};
 
-use std::collections::BTreeMap;
-
 use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
     walk_level,
 };
-use super::{
-    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
-    UnsupportedByFormat,
-};
+use super::{FileEdit, FormatAdapter, FormatError, Operation, Parsed, Span};
 
 /// The TOML format behind the adapter contract.
 ///
 /// TOML is the baseline format: per ADR-0002's capability matrix it
 /// declares every implemented operation with no known refusals, including
-/// lossless comment-preserving edits. The one gap is
-/// [`span_index`](TomlAdapter::span_index) — undeclared and refused typed
-/// until the provenance epic builds the index.
+/// lossless comment-preserving edits. Span indexing rides on
+/// [`parse`](TomlAdapter::parse) (ADR-0005); this workstream returns an
+/// empty index as holding state.
 pub struct TomlAdapter;
 
 impl FormatAdapter for TomlAdapter {
@@ -45,8 +40,6 @@ impl FormatAdapter for TomlAdapter {
     }
 
     fn capabilities(&self) -> &'static [Operation] {
-        // The provenance epic adds Operation::SpanIndex when it
-        // implements span_index.
         &[
             Operation::Parse,
             Operation::Template,
@@ -58,7 +51,7 @@ impl FormatAdapter for TomlAdapter {
         ]
     }
 
-    fn parse(&self, text: &str) -> Result<Value, FormatError> {
+    fn parse(&self, text: &str) -> Result<Parsed, FormatError> {
         let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
             // `message()` is the bare description; some parser errors
             // express themselves through the span alone, so fall back to
@@ -76,7 +69,7 @@ impl FormatAdapter for TomlAdapter {
                 }),
             }
         })?;
-        Ok(toml_to_value(toml::Value::Table(table)))
+        Ok(Parsed::from_value(toml_to_value(toml::Value::Table(table))))
     }
 
     fn serialize(&self, value: &Value) -> Result<String, FormatError> {
@@ -123,24 +116,15 @@ impl FormatAdapter for TomlAdapter {
         match edit {
             FileEdit::Set { path, value, .. } => {
                 check_datetime_offsets(value)?;
-                let keys = key_segments(path);
+                let keys = key_segments(path)?;
                 super::edit::write_at_path(doc.as_item_mut(), &keys, value_to_toml_edit(value))?;
             }
             FileEdit::Unset { path } => {
-                let keys = key_segments(path);
+                let keys = key_segments(path)?;
                 super::edit::unset_at_path(doc.as_item_mut(), &keys);
             }
         }
         Ok(doc.to_string())
-    }
-
-    fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
-        // Provenance epic: build the path → span index from parser spans.
-        Err(UnsupportedByFormat {
-            format: self.name(),
-            operation: Operation::SpanIndex,
-        }
-        .into())
     }
 }
 
@@ -213,12 +197,10 @@ fn value_to_toml(value: &Value) -> toml::Value {
 }
 
 /// The key segments of a [`ConfigPath`](super::ConfigPath), for the edit
-/// walkers below.
-fn key_segments(path: &super::ConfigPath) -> Vec<&str> {
-    path.segments()
-        .iter()
-        .map(|PathSegment::Key(k)| k.as_str())
-        .collect()
+/// walkers below. Index segments refuse rather than silently retargeting
+/// the edit.
+fn key_segments(path: &super::ConfigPath) -> Result<Vec<&str>, FormatError> {
+    super::edit::map_key_segments(path, "toml")
 }
 
 /// The TOML document tree behind the shared edit walkers
@@ -477,7 +459,8 @@ pool_size = 5
     fn parse_scalars_and_containers() {
         let value = TomlAdapter
             .parse("s = \"x\"\ni = 3\nf = 1.5\nb = true\n[t]\nn = 1\narr = [1, 2]\n")
-            .unwrap();
+            .unwrap()
+            .value;
         let map = value.as_map().unwrap();
         assert_eq!(map["s"], Value::String("x".into()));
         assert_eq!(map["i"], Value::Integer(3));
@@ -493,7 +476,10 @@ pool_size = 5
 
     #[test]
     fn parse_datetime_lands_in_owned_variant() {
-        let value = TomlAdapter.parse("dt = 1979-05-27T07:32:00Z\n").unwrap();
+        let value = TomlAdapter
+            .parse("dt = 1979-05-27T07:32:00Z\n")
+            .unwrap()
+            .value;
         let dt = value.as_map().unwrap()["dt"].as_datetime().unwrap();
         assert_eq!(dt.to_string(), "1979-05-27T07:32:00Z");
     }
@@ -646,9 +632,9 @@ pool_size = 5
     #[test]
     fn serialize_round_trips_parse() {
         let source = "b = true\ni = 3\ns = \"x\"\n\n[t]\nn = 1\n";
-        let value = TomlAdapter.parse(source).unwrap();
+        let value = TomlAdapter.parse(source).unwrap().value;
         let text = TomlAdapter.serialize(&value).unwrap();
-        let reparsed = TomlAdapter.parse(&text).unwrap();
+        let reparsed = TomlAdapter.parse(&text).unwrap().value;
         assert_eq!(value, reparsed);
     }
 
@@ -691,7 +677,7 @@ pool_size = 5
                 },
             )
             .unwrap();
-        let reparsed = TomlAdapter.parse(&out).unwrap();
+        let reparsed = TomlAdapter.parse(&out).unwrap().value;
         assert_eq!(
             reparsed.as_map().unwrap()["database"].as_map().unwrap()["url"],
             Value::String("pg://x".into())
@@ -714,6 +700,28 @@ pool_size = 5
             .unwrap_err();
         match err {
             FormatError::Edit { message, .. } => assert!(message.contains("path conflict")),
+            other => panic!("expected Edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_indexed_path_is_typed_error() {
+        let path = ConfigPath::new().key("plugins").index(0).key("host");
+        let value = Value::from("x");
+        let err = TomlAdapter
+            .edit(
+                "port = 1\n",
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap_err();
+        match err {
+            FormatError::Edit { message, .. } => {
+                assert!(message.contains("[0]"), "{message}");
+            }
             other => panic!("expected Edit, got {other:?}"),
         }
     }

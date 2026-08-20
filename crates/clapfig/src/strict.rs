@@ -34,7 +34,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::ClapfigError;
+use crate::format::Span;
 use crate::runtime::{Field, Schema};
+use crate::types::InputType;
 use crate::value::Value;
 
 /// Context handed to an [`on_unknown_key`](crate::Builder::on_unknown_key)
@@ -85,8 +87,25 @@ pub struct UnknownKeyContext<'a> {
     /// the `find_key_line` heuristic could not locate it. The heuristic
     /// only recognizes TOML `key = value` / `[section]` syntax, so this is
     /// always `None` for YAML/JSON and non-file sources, and `None` in
-    /// rare TOML cases (quoted keys, inline tables).
+    /// rare TOML cases (quoted keys, inline tables). Later provenance
+    /// slices replace this with [`span`](Self::span).
     pub line: Option<usize>,
+
+    /// Byte span of the **key** token (ADR-0006). `None` until a format
+    /// adapter fills the span index, and `None` for non-file origins.
+    pub span: Option<Span>,
+
+    /// Environment variable that supplied this key, when it came from
+    /// the env layer.
+    pub env_var: Option<&'a str>,
+
+    /// URL query-parameter key that supplied this key, when it came from
+    /// the URL layer.
+    pub url_key: Option<&'a str>,
+
+    /// Which input type produced the key. `None` until later provenance
+    /// slices fill origin facts.
+    pub input_type: Option<InputType>,
 }
 
 /// Decision returned by an [`on_unknown_key`](crate::Builder::on_unknown_key)
@@ -132,6 +151,18 @@ pub struct CollectedUnknown {
     /// 1-indexed line number in `file`, if the `find_key_line` heuristic
     /// located the key. TOML-only — see [`UnknownKeyContext::line`].
     pub line: Option<usize>,
+    /// Byte span of the **key** token (ADR-0006). `None` until a format
+    /// adapter fills the span index.
+    pub span: Option<Span>,
+    /// Environment variable that supplied this key, when it came from
+    /// the env layer.
+    pub env_var: Option<String>,
+    /// URL query-parameter key that supplied this key, when it came from
+    /// the URL layer.
+    pub url_key: Option<String>,
+    /// Which input type produced the key. `None` until later provenance
+    /// slices fill origin facts.
+    pub input_type: Option<InputType>,
 }
 
 /// Internal type-alias for the boxed callback. `Send + Sync` is required so
@@ -543,5 +574,45 @@ mod tests {
         assert!(!overrides.has_any_strict());
         overrides.insert("b", true);
         assert!(overrides.has_any_strict());
+    }
+
+    #[test]
+    fn unknown_key_context_origin_facts_construct() {
+        let value = Value::Integer(1);
+        let ctx = UnknownKeyContext {
+            path: "plugins[3].host",
+            leaf: "host",
+            value: Some(&value),
+            file: Some(Path::new("/tmp/app.toml")),
+            line: Some(4),
+            span: Some(Span { start: 10, end: 14 }),
+            env_var: None,
+            url_key: None,
+            input_type: Some(InputType::File),
+        };
+        assert_eq!(ctx.path, "plugins[3].host");
+        assert_eq!(ctx.span, Some(Span { start: 10, end: 14 }));
+        assert_eq!(ctx.input_type, Some(InputType::File));
+        assert!(ctx.env_var.is_none());
+        assert!(ctx.url_key.is_none());
+    }
+
+    #[test]
+    fn collected_unknown_mirrors_context_origin_facts() {
+        let collected = CollectedUnknown {
+            path: "rogue".into(),
+            leaf: "rogue".into(),
+            value: Some(Value::Boolean(true)),
+            file: None,
+            line: None,
+            span: None,
+            env_var: Some("MYAPP__ROGUE".into()),
+            url_key: None,
+            input_type: Some(InputType::Env),
+        };
+        assert_eq!(collected.env_var.as_deref(), Some("MYAPP__ROGUE"));
+        assert_eq!(collected.input_type, Some(InputType::Env));
+        assert!(collected.span.is_none());
+        assert!(collected.url_key.is_none());
     }
 }

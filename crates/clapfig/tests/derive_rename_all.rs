@@ -467,7 +467,7 @@ fn clapfig_only_rule_on_typed_struct_converts_schema_but_not_deserialize() {
         .no_env()
         .load();
     match result {
-        Err(ClapfigError::InvalidValue { key, reason }) => {
+        Err(ClapfigError::InvalidValue { key, reason, .. }) => {
             assert_eq!(key, "<merged>");
             assert!(
                 reason.contains("connect_timeout"),

@@ -13,7 +13,7 @@
 //! `serde_json::Value`) implements the seam and keeps only its
 //! format-specific node operations.
 
-use super::FormatError;
+use super::{ConfigPath, FormatError, PathSegment};
 
 /// One format's editable document tree, as the shared walkers see it:
 /// nested string-keyed containers with format-specific leaf values.
@@ -44,6 +44,28 @@ pub(crate) trait EditDoc {
     /// Remove `key`; `false` when nothing was removed (key missing, or
     /// `self` not a container).
     fn remove_key(&mut self, key: &str) -> bool;
+}
+
+/// Map-key segments of a file-edit path.
+///
+/// File edits address nested maps via dotted persist paths. Index
+/// segments belong on the span/origin trees; dropping them would
+/// retarget `foo[0].bar` as `foo.bar`. Refuse with a typed edit error
+/// instead.
+pub(crate) fn map_key_segments<'a>(
+    path: &'a ConfigPath,
+    format: &'static str,
+) -> Result<Vec<&'a str>, FormatError> {
+    path.segments()
+        .iter()
+        .map(|seg| match seg {
+            PathSegment::Key(k) => Ok(k.as_str()),
+            PathSegment::Index(n) => Err(FormatError::Edit {
+                format,
+                message: format!("file edits address map keys; {path} contains array index [{n}]"),
+            }),
+        })
+        .collect()
 }
 
 /// A typed path-conflict edit error for `D`'s format.
@@ -145,6 +167,32 @@ mod tests {
                     message,
                     "path conflict: existing file has a non-map value at 'a' (setting 'a.b')"
                 );
+            }
+            other => panic!("expected Edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_key_segments_keeps_map_keys() {
+        let path = crate::format::ConfigPath::new().key("database").key("url");
+        assert_eq!(
+            map_key_segments(&path, "json").unwrap(),
+            ["database", "url"]
+        );
+    }
+
+    #[test]
+    fn map_key_segments_refuses_index() {
+        let path = crate::format::ConfigPath::new()
+            .key("plugins")
+            .index(0)
+            .key("host");
+        let err = map_key_segments(&path, "toml").unwrap_err();
+        match err {
+            FormatError::Edit { format, message } => {
+                assert_eq!(format, "toml");
+                assert!(message.contains("[0]"), "{message}");
+                assert!(message.contains("plugins[0].host"), "{message}");
             }
             other => panic!("expected Edit, got {other:?}"),
         }

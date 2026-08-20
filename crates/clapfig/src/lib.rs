@@ -778,6 +778,7 @@ mod flatten;
 pub(crate) mod merge;
 mod normalize;
 mod ops;
+mod origin;
 mod overrides;
 mod persist;
 mod resolve;
@@ -796,12 +797,14 @@ pub use builder::{Builder, Resolver};
 pub use clapfig_derive::Schema;
 #[cfg(feature = "clap")]
 pub use cli::{ConfigArgs, ConfigCommand, ConfigSubcommand};
-pub use error::{ClapfigError, UnknownKeyInfo};
+pub use error::{
+    ClapfigError, DiscoveryRecord, FileProbe, OriginFacts, ProbeOutcome, UnknownKeyInfo,
+};
 pub use ops::ConfigResult;
 pub use static_schema::Schema;
 pub use strict::{CollectedUnknown, UnknownKeyContext, UnknownKeyDecision};
 pub use typed_builder::{TypedBuilder, TypedResolver};
-pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};
+pub use types::{Boundary, ConfigAction, InputType, Layer, SearchMode, SearchPath};
 
 /// Entry point for building a clapfig configuration.
 ///

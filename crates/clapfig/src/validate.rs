@@ -165,6 +165,10 @@ pub(crate) fn filter_through_cascade(
                 value: value_ref,
                 file,
                 line: if line > 0 { Some(line) } else { None },
+                span: None,
+                env_var: env_var.as_deref(),
+                url_key: None,
+                input_type: None,
             };
             match callback(&context) {
                 UnknownKeyDecision::Accept => continue,
@@ -175,6 +179,10 @@ pub(crate) fn filter_through_cascade(
                         value: value_ref.cloned(),
                         file: file.map(Path::to_path_buf),
                         line: if line > 0 { Some(line) } else { None },
+                        span: None,
+                        env_var: env_var.clone(),
+                        url_key: None,
+                        input_type: None,
                     });
                     continue;
                 }
@@ -190,6 +198,9 @@ pub(crate) fn filter_through_cascade(
             line,
             source: source_arc.clone(),
             env_var,
+            span: None,
+            url_key: None,
+            input_type: None,
         });
     }
     if rejected.is_empty() {
@@ -561,6 +572,41 @@ mod tests {
             keys[0].env_var.as_deref(),
             Some("MYAPP__DATABASE, MYAPP__DATABASE__ROGUE")
         );
+    }
+
+    #[test]
+    fn env_origin_passes_variable_name_to_callback_and_collect() {
+        // `env_var` is already computed for UnknownKeyInfo; the callback
+        // context and collected-unknown list must see the same name.
+        let (table, sources) = crate::env::env_to_table_with_sources(
+            "MYAPP",
+            [("MYAPP__rogue_key".into(), "1".into())],
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<Option<String>>));
+        let seen_cb = std::sync::Arc::clone(&seen);
+        let hook: UnknownKeyHook = Arc::new(move |ctx| {
+            *seen_cb.lock().unwrap() = Some(ctx.env_var.map(str::to_owned));
+            UnknownKeyDecision::Collect
+        });
+        let ctx = ValidateContext {
+            overrides: test_ctx(false).overrides,
+            default_strict: true,
+            callback: Some(&hook),
+            normalize_keys: false,
+        };
+        let collected = validate_unknown(
+            &table,
+            &crate::fixtures::test::test_schema(),
+            &UnknownKeySource::Env { sources: &sources },
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(Some("MYAPP__rogue_key".into()))
+        );
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].env_var.as_deref(), Some("MYAPP__rogue_key"));
     }
 
     #[test]

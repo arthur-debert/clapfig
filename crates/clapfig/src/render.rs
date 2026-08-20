@@ -328,6 +328,9 @@ mod tests {
             line: 2,
             source: Some(source),
             env_var: None,
+            span: None,
+            url_key: None,
+            input_type: None,
         }]
     }
 
@@ -359,6 +362,9 @@ mod tests {
                 line: 1,
                 source: Some(Arc::clone(&source)),
                 env_var: None,
+                span: None,
+                url_key: None,
+                input_type: None,
             },
             UnknownKeyInfo {
                 key: "typo2".into(),
@@ -366,6 +372,9 @@ mod tests {
                 line: 2,
                 source: Some(source),
                 env_var: None,
+                span: None,
+                url_key: None,
+                input_type: None,
             },
         ];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
@@ -380,6 +389,9 @@ mod tests {
             line: 0,
             source: None,
             env_var: None,
+            span: None,
+            url_key: None,
+            input_type: None,
         }];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
         assert!(out.contains("x"));
@@ -395,6 +407,9 @@ mod tests {
             line: 0,
             source: Some(Arc::from("typo: 1\n")),
             env_var: None,
+            span: None,
+            url_key: None,
+            input_type: None,
         }];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
         assert!(out.contains("--> /p.yaml\n"), "{out}");
@@ -409,6 +424,9 @@ mod tests {
             line: 0,
             source: None,
             env_var: Some("MYAPP__ROGUE_KEY".into()),
+            span: None,
+            url_key: None,
+            input_type: None,
         }];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
         assert!(out.contains("unknown key in environment"), "{out}");
@@ -466,6 +484,9 @@ mod tests {
             line: 2,
             source: Some(source),
             env_var: None,
+            span: None,
+            url_key: None,
+            input_type: None,
         }];
         let out = render_rich(&ClapfigError::UnknownKeys(infos));
         assert!(out.contains("typo_key"), "missing key: {out}");

@@ -99,19 +99,13 @@ pub fn set_in_document(
     }
 
     let leaf_ty = lookup_leaf_type(schema, &canonical);
-    let mut value =
-        parse_raw_value(raw_value, leaf_ty).map_err(|reason| ClapfigError::InvalidValue {
-            key: key.into(),
-            reason,
-        })?;
+    let mut value = parse_raw_value(raw_value, leaf_ty)
+        .map_err(|reason| ClapfigError::invalid_value(key, reason))?;
     if let Some(leaf_ty) = leaf_ty {
         crate::schema_walk::coerce_value(&mut value, leaf_ty);
         leaf_ty
             .check(&value)
-            .map_err(|reason| ClapfigError::InvalidValue {
-                key: key.into(),
-                reason,
-            })?;
+            .map_err(|reason| ClapfigError::invalid_value(key, reason))?;
     }
 
     let (base, target, path) = match content {
@@ -121,7 +115,7 @@ pub fn set_in_document(
             // own first step, so parse failures (including a format that
             // cannot parse at all) surface as-is. The same parsed tree
             // resolves the concrete key spellings the edit targets.
-            let tree = adapter.parse(c).map_err(ClapfigError::from)?;
+            let tree = adapter.parse(c).map_err(ClapfigError::from)?.value;
             let (segments, exists) = resolve_document_path(&tree, &canonical, normalize_keys)
                 .map_err(|c| c.into_error(Path::new("")))?;
             let target = if exists {
@@ -281,7 +275,7 @@ pub fn unset_in_document(
     normalize_keys: bool,
 ) -> Result<String, ClapfigError> {
     let path = if normalize_keys {
-        let tree = adapter.parse(content).map_err(ClapfigError::from)?;
+        let tree = adapter.parse(content).map_err(ClapfigError::from)?.value;
         let (segments, _) = resolve_document_path(&tree, &normalize_key(key), true)
             .map_err(|c| c.into_error(Path::new("")))?;
         config_path(&segments)
@@ -534,7 +528,10 @@ fn parse_inline_container(raw: &str, ty: &crate::runtime::LeafType) -> Result<Va
     match crate::format::TomlAdapter.parse(&doc) {
         // Require exactly the probe key back: a raw string smuggling
         // extra TOML (newlines, additional keys) is not one value.
-        Ok(Value::Map(mut map)) if map.len() == 1 => map.remove("v").ok_or_else(refuse),
+        Ok(parsed) => match parsed.value {
+            Value::Map(mut map) if map.len() == 1 => map.remove("v").ok_or_else(refuse),
+            _ => Err(refuse()),
+        },
         _ => Err(refuse()),
     }
 }
@@ -580,7 +577,7 @@ mod tests {
             &[crate::format::Operation::Parse]
         }
 
-        fn parse(&self, text: &str) -> Result<Value, crate::format::FormatError> {
+        fn parse(&self, text: &str) -> Result<crate::format::Parsed, crate::format::FormatError> {
             TomlAdapter.parse(text)
         }
 
@@ -607,19 +604,6 @@ mod tests {
             edit: FileEdit<'_>,
         ) -> Result<String, crate::format::FormatError> {
             Err(self.require(edit.operation()).unwrap_err().into())
-        }
-
-        fn span_index(
-            &self,
-            _text: &str,
-        ) -> Result<
-            std::collections::BTreeMap<crate::format::ConfigPath, crate::format::Span>,
-            crate::format::FormatError,
-        > {
-            Err(self
-                .require(crate::format::Operation::SpanIndex)
-                .unwrap_err()
-                .into())
         }
     }
 
@@ -687,7 +671,7 @@ mod tests {
             &[]
         }
 
-        fn parse(&self, _text: &str) -> Result<Value, crate::format::FormatError> {
+        fn parse(&self, _text: &str) -> Result<crate::format::Parsed, crate::format::FormatError> {
             Err(self
                 .require(crate::format::Operation::Parse)
                 .unwrap_err()
@@ -717,19 +701,6 @@ mod tests {
             edit: FileEdit<'_>,
         ) -> Result<String, crate::format::FormatError> {
             Err(self.require(edit.operation()).unwrap_err().into())
-        }
-
-        fn span_index(
-            &self,
-            _text: &str,
-        ) -> Result<
-            std::collections::BTreeMap<crate::format::ConfigPath, crate::format::Span>,
-            crate::format::FormatError,
-        > {
-            Err(self
-                .require(crate::format::Operation::SpanIndex)
-                .unwrap_err()
-                .into())
         }
     }
 
@@ -786,7 +757,7 @@ mod tests {
             false,
         );
         match result {
-            Err(ClapfigError::InvalidValue { key, reason }) => {
+            Err(ClapfigError::InvalidValue { key, reason, .. }) => {
                 assert_eq!(key, "mode");
                 assert!(
                     reason.contains("not in allowed set"),
@@ -1331,7 +1302,7 @@ mod tests {
     }
 
     fn doc_map(adapter: &dyn FormatAdapter, text: &str) -> crate::value::Map {
-        match adapter.parse(text).unwrap() {
+        match adapter.parse(text).unwrap().value {
             Value::Map(m) => m,
             other => panic!("expected map root, got {other:?}"),
         }

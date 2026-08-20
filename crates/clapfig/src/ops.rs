@@ -205,16 +205,16 @@ pub(crate) fn list_scope_file(
             source: Box::new(e),
             source_text: Some(std::sync::Arc::from(content.as_str())),
         })?;
-    let table = match parsed {
+    let table = match parsed.value {
         Value::Map(map) => map,
         other => {
-            return Err(ClapfigError::InvalidValue {
-                key: file_path.display().to_string(),
-                reason: format!(
+            return Err(ClapfigError::invalid_value(
+                file_path.display().to_string(),
+                format!(
                     "config documents must be maps at the root, got {}",
                     other.type_str()
                 ),
-            });
+            ));
         }
     };
 

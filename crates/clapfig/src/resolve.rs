@@ -170,16 +170,16 @@ pub(crate) fn resolve(
                     source: Box::new(e),
                     source_text: Some(Arc::from(content.as_str())),
                 })?;
-            let mut table = match parsed {
+            let mut table = match parsed.value {
                 Value::Map(map) => map,
                 other => {
-                    return Err(ClapfigError::InvalidValue {
-                        key: path.display().to_string(),
-                        reason: format!(
+                    return Err(ClapfigError::invalid_value(
+                        path.display().to_string(),
+                        format!(
                             "config documents must be maps at the root, got {}",
                             other.type_str()
                         ),
-                    });
+                    ));
                 }
             };
             if input.normalize_keys {
@@ -587,6 +587,7 @@ mod tests {
             env_prefix: Some("MYAPP".into()),
             unknown_key_hook: Some(std::sync::Arc::new(move |ctx| {
                 if ctx.path == "rogue_key" {
+                    assert_eq!(ctx.env_var, Some("MYAPP__ROGUE_KEY"));
                     saw.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 crate::strict::UnknownKeyDecision::Accept

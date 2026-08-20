@@ -384,8 +384,6 @@ fn deserialize_table<C: DeserializeOwned>(table: Map) -> Result<C, ClapfigError>
     // The value model's serde bridge carries datetimes through its
     // private marker struct, so this deserializes directly — no
     // serialize-reparse round trip (the hack the owned model retired).
-    from_value(Value::Map(table)).map_err(|e| ClapfigError::InvalidValue {
-        key: "<merged>".into(),
-        reason: e.to_string(),
-    })
+    from_value(Value::Map(table))
+        .map_err(|e| ClapfigError::invalid_value("<merged>", e.to_string()))
 }
