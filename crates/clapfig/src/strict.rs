@@ -292,12 +292,7 @@ impl StrictnessOverrides {
                     out.insert_schema(String::new(), value);
                 }
                 for (key, value) in merged {
-                    walk_selected_shape(
-                        &map.item,
-                        Some(value),
-                        &format!("{key}"),
-                        &mut out,
-                    );
+                    walk_selected_shape(&map.item, Some(value), key, &mut out);
                 }
             }
             DocumentRoot::Tagged(tagged) => {

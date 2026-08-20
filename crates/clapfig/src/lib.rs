@@ -829,7 +829,7 @@ pub use error::{
     ClapfigError, DiscoveryRecord, FileProbe, OriginFacts, ProbeOutcome, UnknownKeyInfo,
 };
 pub use ops::ConfigResult;
-pub use static_schema::Schema;
+pub use static_schema::{DocumentRoot, Schema};
 pub use strict::{CollectedUnknown, UnknownKeyContext, UnknownKeyDecision};
 pub use typed_builder::{TypedBuilder, TypedResolver};
 pub use types::{Boundary, ConfigAction, InputType, Layer, SearchMode, SearchPath};
@@ -931,7 +931,7 @@ impl Clapfig {
     ///     .app_name("myapp")
     ///     .load()?;
     /// ```
-    pub fn typed<C: crate::static_schema::Schema>() -> TypedBuilder<C> {
+    pub fn typed<C: crate::static_schema::DocumentRoot>() -> TypedBuilder<C> {
         TypedBuilder::new()
     }
 }

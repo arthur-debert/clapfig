@@ -126,20 +126,22 @@ pub(crate) fn validate_unknown_root(
 ///
 /// Object roots use [`validate_unknown`]. Map roots collect unknown keys
 /// inside entries (root keys are user data, not unknown).
+#[allow(dead_code)]
 pub(crate) fn validate_unknown_shape(
     table: &Map,
     shape: &crate::runtime::Shape,
     origin: &UnknownKeySource<'_>,
     ctx: &ValidateContext<'_>,
 ) -> Result<Vec<CollectedUnknown>, ClapfigError> {
-    match shape {
-        crate::runtime::Shape::Object(schema) => validate_unknown(table, schema, origin, ctx),
-        _ => {
-            let mut unknown: Vec<UnknownKey> = Vec::new();
-            crate::schema_walk::collect_unknown_against_root(table, shape, &mut unknown);
-            filter_through_cascade(table, origin, unknown, ctx)
+    let root = match shape {
+        crate::runtime::Shape::Object(schema) => DocumentRoot::Object(schema),
+        crate::runtime::Shape::Map(map) => DocumentRoot::Map(map),
+        crate::runtime::Shape::Tagged(tagged) => DocumentRoot::Tagged(tagged),
+        crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => {
+            unreachable!("illegal document roots are rejected by require_document_root")
         }
-    }
+    };
+    validate_unknown_root(table, root, origin, ctx)
 }
 
 /// Resolve an already-collected list of unknown paths against the cascade

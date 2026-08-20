@@ -3183,7 +3183,15 @@ mod tests {
             let path = dir.path().join(name);
             fs::write(&path, content).unwrap();
             for key in ["db.pool-size", "db.pool_size"] {
-                let result = get_scope(adapter, &demo_schema(), "local", &path, key, true).unwrap();
+                let result = get_scope(
+                    adapter,
+                    &Shape::Object(demo_schema()),
+                    "local",
+                    &path,
+                    key,
+                    true,
+                )
+                .unwrap();
                 match result {
                     ConfigResult::KeyValue {
                         key: reported,
@@ -3210,8 +3218,15 @@ mod tests {
         let path = dir.path().join("demo.toml");
         fs::write(&path, "[db]\npool-size = 5\npool_size = 6\n").unwrap();
         for key in ["db.pool-size", "db.pool_size"] {
-            let err =
-                get_scope(&TomlAdapter, &demo_schema(), "local", &path, key, true).unwrap_err();
+            let err = get_scope(
+                &TomlAdapter,
+                &Shape::Object(demo_schema()),
+                "local",
+                &path,
+                key,
+                true,
+            )
+            .unwrap_err();
             match err {
                 ClapfigError::NormalizedKeyCollision {
                     path: reported,
@@ -3243,8 +3258,15 @@ mod tests {
             "host = \"h\"\n\n[db]\npool-size = 5\npool_size = 6\n",
         )
         .unwrap();
-        let err =
-            get_scope(&TomlAdapter, &demo_schema(), "local", &path, "host", true).unwrap_err();
+        let err = get_scope(
+            &TomlAdapter,
+            &Shape::Object(demo_schema()),
+            "local",
+            &path,
+            "host",
+            true,
+        )
+        .unwrap_err();
         match err {
             ClapfigError::NormalizedKeyCollision {
                 path: reported,
@@ -3269,8 +3291,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.toml");
         for key in ["db.pool-size", "db.pool_size"] {
-            let err =
-                get_scope(&TomlAdapter, &demo_schema(), "local", &path, key, true).unwrap_err();
+            let err = get_scope(
+                &TomlAdapter,
+                &Shape::Object(demo_schema()),
+                "local",
+                &path,
+                key,
+                true,
+            )
+            .unwrap_err();
             match err {
                 ClapfigError::ScopeFileMissing {
                     scope,
