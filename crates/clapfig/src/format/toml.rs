@@ -1138,6 +1138,101 @@ pool_size = 5
         );
     }
 
+    fn nested_tagged() -> crate::runtime::TaggedShape {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let inner = crate::runtime::Shape::tagged("Inner", "kind")
+            .variant(
+                "alpha",
+                RtSchema::object("Alpha")
+                    .field("n", Field::integer())
+                    .build(),
+            )
+            .variant(
+                "beta",
+                RtSchema::object("Beta").field("s", Field::string()).build(),
+            )
+            .build();
+        crate::runtime::Shape::tagged("Outer", "mode")
+            .variant(
+                "wrap",
+                RtSchema::object("Wrap")
+                    .field("child", crate::runtime::Shape::from(inner))
+                    .build(),
+            )
+            .build()
+    }
+
+    fn uncomment_lines(text: &str) -> String {
+        text.lines()
+            .map(|line| line.strip_prefix('#').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn template_nested_tagged_example_is_a_complete_object() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let tagged = nested_tagged();
+        let text = TomlAdapter
+            .template(&Shape::Tagged(tagged.clone()))
+            .unwrap();
+        assert!(
+            !text.contains("##"),
+            "nested tagged must not be double-commented: {text}"
+        );
+        let uncommented = uncomment_lines(&text);
+        let map = match TomlAdapter.parse(&uncommented).unwrap().value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let child = map["child"].as_map().expect("child object");
+        assert_eq!(child["kind"], Value::String("alpha".into()));
+        finalize_root(
+            map,
+            &OriginMap::new(),
+            DocumentRoot::Tagged(&tagged),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn template_tagged_integer_placeholder_respects_bounds() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let pos = crate::runtime::Shape::tagged("N", "kind")
+            .variant(
+                "pos",
+                RtSchema::object("Pos")
+                    .field("n", Field::integer_in(Some(5), Some(10)))
+                    .build(),
+            )
+            .build();
+        let text = TomlAdapter.template(&Shape::Tagged(pos)).unwrap();
+        assert!(
+            text.contains("#n = 5"),
+            "positive-only range uses the lower bound: {text}"
+        );
+        assert!(!text.contains("#n = 0"), "{text}");
+
+        let neg = crate::runtime::Shape::tagged("N", "kind")
+            .variant(
+                "neg",
+                RtSchema::object("Neg")
+                    .field("n", Field::integer_in(Some(-10), Some(-1)))
+                    .build(),
+            )
+            .build();
+        let text = TomlAdapter.template(&Shape::Tagged(neg)).unwrap();
+        assert!(
+            text.contains("#n = -1"),
+            "negative-only range uses the upper bound: {text}"
+        );
+    }
+
     #[test]
     fn parse_scalars_and_containers() {
         let value = TomlAdapter

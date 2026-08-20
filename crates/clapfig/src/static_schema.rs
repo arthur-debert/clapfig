@@ -506,12 +506,10 @@ impl FieldStatic {
                 ))
             }
             FieldStatic::ArrayOf { schema: s, doc } if s.is_tagged() => {
+                let doc = effective_doc(doc, s.doc);
                 RuntimeShape::Array(array_shape_from_item(
-                    effective_doc(doc, s.doc),
-                    RuntimeShape::Tagged(tagged_static_with_doc(
-                        s,
-                        s.doc.iter().map(|d| (*d).to_string()).collect(),
-                    )),
+                    doc.clone(),
+                    RuntimeShape::Tagged(tagged_static_with_doc(s, doc)),
                     None,
                     false,
                     None,
@@ -557,12 +555,10 @@ impl FieldStatic {
                 ))
             }
             FieldStatic::MapOf { schema: s, doc } if s.is_tagged() => {
+                let doc = effective_doc(doc, s.doc);
                 RuntimeShape::Map(map_shape_from_item(
-                    effective_doc(doc, s.doc),
-                    RuntimeShape::Tagged(tagged_static_with_doc(
-                        s,
-                        s.doc.iter().map(|d| (*d).to_string()).collect(),
-                    )),
+                    doc.clone(),
+                    RuntimeShape::Tagged(tagged_static_with_doc(s, doc)),
                     None,
                     false,
                     None,
@@ -906,7 +902,10 @@ pub trait Schema {
     /// (`"plugins"`); individual array entries are not addressable as
     /// distinct paths at this layer so no `plugins[N]` form is emitted.
     /// Unit-enum leaves contribute only their own path (the variant set
-    /// is metadata on the leaf, not a separate sub-path).
+    /// is metadata on the leaf, not a separate sub-path). Internally
+    /// tagged unions contribute the tag key, then the union of every
+    /// variant's field paths: a name shared by two variants is listed
+    /// once, but descendants of that name still come from every variant.
     ///
     /// The default impl walks `Self::STATIC`. Override is rarely needed.
     fn field_paths() -> Vec<String> {
@@ -1086,48 +1085,25 @@ pub fn collect_field_paths(schema: &SchemaStatic, prefix: &str, out: &mut Vec<St
 }
 
 /// Depth-first inventory of a tagged schema: the tag key, then the union
-/// of variant field paths (shared names once).
+/// of variant field paths (shared names once). Every variant's field
+/// subtree is walked; uniqueness is per emitted path so a name shared
+/// by two variants still contributes each variant's distinct descendants.
 fn collect_tagged_field_paths(schema: &SchemaStatic, prefix: &str, out: &mut Vec<String>) {
     let tag_path = if prefix.is_empty() {
         schema.tagged_tag.to_string()
     } else {
         format!("{prefix}.{}", schema.tagged_tag)
     };
-    out.push(tag_path);
-    let mut seen = std::collections::HashSet::new();
+    out.push(tag_path.clone());
+    let mut collected = Vec::new();
     for variant in schema.tagged_variants {
-        for field in variant.schema.fields {
-            let dotted = if prefix.is_empty() {
-                field.name.to_string()
-            } else {
-                format!("{prefix}.{}", field.name)
-            };
-            if seen.insert(dotted.clone()) {
-                match &field.field {
-                    FieldStatic::Leaf(_) => out.push(dotted),
-                    FieldStatic::Nested { schema: child, .. }
-                    | FieldStatic::ArrayOf { schema: child, .. }
-                    | FieldStatic::MapOf { schema: child, .. }
-                        if child.is_enum() =>
-                    {
-                        out.push(dotted);
-                    }
-                    FieldStatic::Nested { schema: child, .. }
-                    | FieldStatic::ArrayOf { schema: child, .. }
-                    | FieldStatic::MapOf { schema: child, .. }
-                        if child.is_tagged() =>
-                    {
-                        out.push(dotted.clone());
-                        collect_tagged_field_paths(child, &dotted, out);
-                    }
-                    FieldStatic::Nested { schema: child, .. }
-                    | FieldStatic::ArrayOf { schema: child, .. }
-                    | FieldStatic::MapOf { schema: child, .. } => {
-                        out.push(dotted.clone());
-                        collect_field_paths(child, &dotted, out);
-                    }
-                }
-            }
+        collect_field_paths(variant.schema, prefix, &mut collected);
+    }
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(tag_path);
+    for path in collected {
+        if seen.insert(path.clone()) {
+            out.push(path);
         }
     }
 }
@@ -1670,6 +1646,91 @@ mod tests {
                 assert!(t.variants[1].schema.fields.is_empty());
             }
             other => panic!("expected Tagged, got {other:?}"),
+        }
+    }
+
+    static TAGGED_ITEM_SCHEMA: SchemaStatic = SchemaStatic {
+        name: "Block",
+        doc: &["A block type."],
+        strict: None,
+        fields: &[],
+        enum_variants: &[],
+        tagged_tag: "kind",
+        tagged_variants: &[
+            TaggedVariantStatic {
+                discriminator: "rust",
+                schema: &NESTED_INNER,
+            },
+            TaggedVariantStatic {
+                discriminator: "off",
+                schema: &OFF_OBJECT,
+            },
+        ],
+    };
+
+    static ARRAY_OF_TAGGED_CONTAINER: SchemaStatic = SchemaStatic {
+        name: "App",
+        doc: EMPTY_DOC,
+        strict: None,
+        fields: &[NamedFieldStatic {
+            name: "blocks",
+            field: FieldStatic::ArrayOf {
+                schema: &TAGGED_ITEM_SCHEMA,
+                doc: &["Installed blocks."],
+            },
+        }],
+        enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
+    };
+
+    static MAP_OF_TAGGED_CONTAINER: SchemaStatic = SchemaStatic {
+        name: "Sites",
+        doc: EMPTY_DOC,
+        strict: None,
+        fields: &[NamedFieldStatic {
+            name: "blocks",
+            field: FieldStatic::MapOf {
+                schema: &TAGGED_ITEM_SCHEMA,
+                doc: &["Named blocks."],
+            },
+        }],
+        enum_variants: &[],
+        tagged_tag: "",
+        tagged_variants: &[],
+    };
+
+    #[test]
+    fn array_of_tagged_field_site_doc_overrides_item_and_wrapper() {
+        let s = ARRAY_OF_TAGGED_CONTAINER.to_runtime();
+        match &s.fields[0].field {
+            RuntimeShape::Array(array) => {
+                assert_eq!(array.doc, vec!["Installed blocks.".to_string()]);
+                match array.item.as_ref() {
+                    RuntimeShape::Tagged(tagged) => {
+                        assert_eq!(tagged.doc, vec!["Installed blocks.".to_string()]);
+                    }
+                    other => panic!("expected Tagged item, got {other:?}"),
+                }
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_of_tagged_field_site_doc_overrides_item_and_wrapper() {
+        let s = MAP_OF_TAGGED_CONTAINER.to_runtime();
+        match &s.fields[0].field {
+            RuntimeShape::Map(map) => {
+                assert_eq!(map.doc, vec!["Named blocks.".to_string()]);
+                match map.item.as_ref() {
+                    RuntimeShape::Tagged(tagged) => {
+                        assert_eq!(tagged.doc, vec!["Named blocks.".to_string()]);
+                    }
+                    other => panic!("expected Tagged item, got {other:?}"),
+                }
+            }
+            other => panic!("expected Map, got {other:?}"),
         }
     }
 

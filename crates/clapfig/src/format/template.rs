@@ -250,6 +250,9 @@ fn emit_value_field<R: TemplateRenderer>(
 /// (defaulted to the discriminator) plus the variant's fields with
 /// placeholder defaults so a single `walk_level` pass emits uncommented
 /// assignments that the caller then comments as a block.
+///
+/// Nested tagged fields are materialized as the first child variant's
+/// complete object so the enclosing example is valid when uncommented.
 pub(crate) fn tagged_variant_example_schema(
     tagged: &TaggedShape,
     variant: &TaggedVariant,
@@ -300,7 +303,11 @@ fn with_example_defaults(shape: &Shape) -> Shape {
             map.item = Box::new(with_example_defaults(&map.item));
             Shape::Map(map)
         }
-        Shape::Tagged(tagged) => Shape::Tagged(tagged.clone()),
+        Shape::Tagged(tagged) => tagged
+            .variants
+            .first()
+            .map(|variant| Shape::Object(tagged_variant_example_schema(tagged, variant)))
+            .unwrap_or_else(|| Shape::Tagged(tagged.clone())),
     }
 }
 
@@ -311,7 +318,7 @@ fn example_leaf_value(ty: &LeafType) -> Value {
             .first()
             .cloned()
             .unwrap_or_else(|| Value::String(String::new())),
-        LeafType::Integer { .. } => Value::Integer(0),
+        LeafType::Integer { min, max } => Value::Integer(example_integer(*min, *max)),
         LeafType::Float => Value::Float(0.0),
         LeafType::Bool => Value::Boolean(false),
         LeafType::DateTime => Value::Datetime(
@@ -319,6 +326,19 @@ fn example_leaf_value(ty: &LeafType) -> Value {
                 .parse()
                 .expect("epoch datetime placeholder is valid"),
         ),
+    }
+}
+
+/// Placeholder integer that satisfies declared bounds: zero when it is
+/// in range, otherwise the lower bound of a positive-only range or the
+/// upper bound of a negative-only range.
+fn example_integer(min: Option<i64>, max: Option<i64>) -> i64 {
+    if min.is_none_or(|lo| 0 >= lo) && max.is_none_or(|hi| 0 <= hi) {
+        0
+    } else if let Some(lo) = min.filter(|lo| *lo > 0) {
+        lo
+    } else {
+        max.or(min).unwrap_or(0)
     }
 }
 
@@ -513,6 +533,68 @@ mod tests {
         let map = Shape::from(Field::map_of(LeafType::Float));
         let lines = leaf_annotations(view(&map), "TOML", &mut |_| unreachable!()).unwrap();
         assert_eq!(lines, ["Values: float"]);
+    }
+
+    #[test]
+    fn example_leaf_value_integer_respects_bounds() {
+        assert_eq!(
+            example_leaf_value(&LeafType::Integer {
+                min: Some(5),
+                max: Some(10)
+            }),
+            Value::Integer(5)
+        );
+        assert_eq!(
+            example_leaf_value(&LeafType::Integer {
+                min: Some(-10),
+                max: Some(-1)
+            }),
+            Value::Integer(-1)
+        );
+        assert_eq!(
+            example_leaf_value(&LeafType::Integer {
+                min: Some(-5),
+                max: Some(5)
+            }),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn tagged_variant_example_materializes_nested_tagged_as_first_variant() {
+        let inner = Shape::tagged("Inner", "kind")
+            .variant(
+                "alpha",
+                Schema::object("Alpha").field("n", Field::integer()).build(),
+            )
+            .variant(
+                "beta",
+                Schema::object("Beta").field("s", Field::string()).build(),
+            )
+            .build();
+        let outer = Shape::tagged("Outer", "mode")
+            .variant(
+                "wrap",
+                Schema::object("Wrap")
+                    .field("child", Shape::from(inner))
+                    .build(),
+            )
+            .build();
+        let example = tagged_variant_example_schema(&outer, &outer.variants[0]);
+        match &example
+            .fields
+            .iter()
+            .find(|f| f.name == "child")
+            .expect("wrap has child")
+            .field
+        {
+            Shape::Object(child) => {
+                assert!(child.fields.iter().any(|f| f.name == "kind"));
+                assert!(child.fields.iter().any(|f| f.name == "n"));
+                assert!(!child.fields.iter().any(|f| f.name == "s"));
+            }
+            other => panic!("nested tagged must materialize as an object, got {other:?}"),
+        }
     }
 
     #[test]

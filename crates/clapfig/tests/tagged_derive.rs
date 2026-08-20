@@ -187,6 +187,22 @@ fn nested_and_map_of_tagged_json_schema_compose() {
 }
 
 #[test]
+fn tagged_field_paths_union_nested_descendants_of_shared_names() {
+    assert_eq!(
+        Block::field_paths(),
+        vec![
+            "kind".to_string(),
+            "mount".to_string(),
+            "crate_path".to_string(),
+            "params".to_string(),
+            "params.shape".to_string(),
+            "params.artifact".to_string(),
+            "params.entry".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn tagged_config_gen_one_commented_example_per_variant() {
     use clapfig::format::{FormatAdapter, TomlAdapter};
 

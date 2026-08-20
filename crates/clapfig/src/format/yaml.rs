@@ -2185,6 +2185,65 @@ db:
         );
     }
 
+    fn nested_tagged() -> crate::runtime::TaggedShape {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let inner = crate::runtime::Shape::tagged("Inner", "kind")
+            .variant(
+                "alpha",
+                RtSchema::object("Alpha")
+                    .field("n", Field::integer())
+                    .build(),
+            )
+            .variant(
+                "beta",
+                RtSchema::object("Beta").field("s", Field::string()).build(),
+            )
+            .build();
+        crate::runtime::Shape::tagged("Outer", "mode")
+            .variant(
+                "wrap",
+                RtSchema::object("Wrap")
+                    .field("child", crate::runtime::Shape::from(inner))
+                    .build(),
+            )
+            .build()
+    }
+
+    fn uncomment_lines(text: &str) -> String {
+        text.lines()
+            .map(|line| line.strip_prefix('#').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn template_nested_tagged_example_is_a_complete_object() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let tagged = nested_tagged();
+        let text = YamlAdapter
+            .template(&Shape::Tagged(tagged.clone()))
+            .unwrap();
+        assert!(
+            !text.contains("##"),
+            "nested tagged must not be double-commented: {text}"
+        );
+        let uncommented = uncomment_lines(&text);
+        let map = parse_map(&uncommented);
+        let child = map["child"].as_map().expect("child object");
+        assert_eq!(child["kind"], Value::String("alpha".into()));
+        finalize_root(
+            map,
+            &OriginMap::new(),
+            DocumentRoot::Tagged(&tagged),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn template_escapes_keys_the_parser_would_misread() {
         // Schema names only forbid empty, `.`, `[`, `]` — a template must

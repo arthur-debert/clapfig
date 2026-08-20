@@ -1188,10 +1188,22 @@ fn serde_key_rejection(key: &str) -> &'static str {
              would reject keys a non-strict schema accepts. Use \
              `#[clapfig(strict = true)]` instead"
         }
-        "tag" | "content" | "untagged" => {
-            "it changes the value shape serde deserializes, and the schema has no \
-             representation for tagged/untagged unions — use `#[clapfig(value)]` on \
-             the field that holds the union type instead"
+        "tag" => {
+            "internally tagged unions are only honored on enums via \
+             `#[serde(tag = \"...\")]`; on this item it would change the value \
+             shape serde deserializes — use `#[clapfig(value)]` on the field \
+             that holds the union type instead"
+        }
+        "content" => {
+            "adjacent tagging (`tag` + `content`) is not supported — only \
+             internally tagged enums (`#[serde(tag = \"...\")]` without \
+             `content`) are. Use `#[clapfig(value)]` on the field that holds \
+             the union type instead"
+        }
+        "untagged" => {
+            "untagged unions have no schema representation; internally tagged \
+             `#[serde(tag = \"...\")]` is the supported form. Use \
+             `#[clapfig(value)]` on the field that holds the union type instead"
         }
         "transparent" => {
             "the schema keeps the struct's nested shape while serde deserializes \
