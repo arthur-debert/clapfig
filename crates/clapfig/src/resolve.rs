@@ -142,11 +142,20 @@ pub(crate) fn resolve(
     // strict outcomes never calls it.
     let cascade_active = input.strict_default || input.strict_overrides.has_any_strict();
 
+    // Default order: Files < Env < Url < Cli. Resolved before layer
+    // construction so omitting a layer excludes it entirely — including
+    // unknown-key validation. Building the env table first used to
+    // reject `APP__ROGUE` even when `Layer::Env` was not in the order;
+    // the files table had the same hole (parse + unknown-key still ran
+    // when `Layer::Files` was omitted).
+    let default_order = default_layer_order();
+    let order = input.layer_order.as_deref().unwrap_or(&default_order);
+
     // Files layer: parse → (optionally) normalize → validate → merge.
     // Validation runs against the parsed Table — never the raw text — so
     // normalized keys are checked in the same form they will reach the merge.
     let mut collected_unknowns: Vec<CollectedUnknown> = Vec::new();
-    let files_table = {
+    let files_table = if order.contains(&Layer::Files) {
         let mut t = Map::new();
         for (path, content) in &input.files {
             // Extensionless (rc-style) names fall back to the preferred
@@ -208,14 +217,9 @@ pub(crate) fn resolve(
             t = deep_merge(t, table);
         }
         t
+    } else {
+        Map::new()
     };
-
-    // Default order: Files < Env < Url < Cli. Resolved before layer
-    // construction so omitting a layer excludes it entirely — including
-    // unknown-key validation. Building the env table first used to
-    // reject `APP__ROGUE` even when `Layer::Env` was not in the order.
-    let default_order = default_layer_order();
-    let order = input.layer_order.as_deref().unwrap_or(&default_order);
 
     // Env layer. Sources travel with the table so unknown-key errors
     // name the exact variable that produced each path, not a
@@ -749,6 +753,25 @@ mod tests {
         let (table, _) = resolve(input).unwrap();
         // Env is not in layer_order, so the file value stands
         assert_eq!(get(&table, "port").unwrap().as_integer(), Some(3000));
+    }
+
+    #[test]
+    fn omitted_files_layer_ignores_unknown_file_keys() {
+        // Omitting Layer::Files excludes parse/unknown-key validation
+        // on supplied file contents — same "omit a layer to exclude it"
+        // rule as Env.
+        let spec = test_spec();
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\nrogue = 1\n".into())],
+            layer_order: Some(vec![Layer::Cli]),
+            cli_overrides: vec![("port".into(), Value::Integer(7777))],
+            ..empty_input(&spec)
+        };
+        let (table, collected) =
+            resolve(input).expect("omitted files must not fail on unknown file keys");
+        assert_eq!(get(&table, "port").unwrap().as_integer(), Some(7777));
+        assert!(collected.is_empty());
+        assert!(get(&table, "rogue").is_none());
     }
 
     #[test]

@@ -93,7 +93,14 @@ pub enum ProbeOutcome {
     Loaded,
     /// The file was probed and does not exist.
     Missing,
-    /// The probe ran and failed (I/O, parse, …).
+    /// Probe-time failure on an injected record (`error: …` in
+    /// [`ClapfigError::MissingRequired`] rendering).
+    ///
+    /// Production discovery does not produce this variant: a
+    /// non-NotFound read error aborts the whole resolve as
+    /// [`ClapfigError::IoError`] (an unreadable config file is not a
+    /// missing-key search). Parse failures after a successful read are
+    /// [`ClapfigError::ParseError`] on a [`Loaded`](Self::Loaded) probe.
     Error {
         /// Human-readable failure detail.
         message: String,
@@ -132,13 +139,17 @@ pub struct FileProbe {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiscoveryRecord {
     /// Candidate file probes, in search order, with outcomes.
+    /// Empty when `Layer::Files` was omitted from `layer_order` (the
+    /// files layer was not consulted).
     pub files: Vec<FileProbe>,
     /// Whether the environment layer was consulted (`false` when
-    /// `.no_env()`).
+    /// `.no_env()` or `Layer::Env` is omitted from `layer_order`).
     pub env: bool,
-    /// Whether the URL query layer was consulted.
+    /// Whether the URL query layer was consulted (`false` when no query
+    /// was supplied or `Layer::Url` is omitted).
     pub url: bool,
-    /// Whether programmatic overrides were consulted.
+    /// Whether programmatic overrides were consulted (`false` when none
+    /// were supplied or `Layer::Cli` is omitted).
     pub overrides: bool,
 }
 

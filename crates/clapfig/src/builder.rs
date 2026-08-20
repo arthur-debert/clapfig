@@ -955,12 +955,22 @@ impl Resolver {
         };
         let normalized = std::fs::canonicalize(&absolute).unwrap_or(absolute);
 
-        let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, &normalized);
-        let loaded = self.load_files_cached(&dirs)?;
         let order = self
             .layer_order
             .clone()
             .unwrap_or_else(resolve::default_layer_order);
+        // Omitting Files excludes discovery I/O and MissingRequired file
+        // probes — the same "omit a layer to exclude it entirely" rule
+        // as Env.
+        let loaded = if order.contains(&Layer::Files) {
+            let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, &normalized);
+            self.load_files_cached(&dirs)?
+        } else {
+            DiscoveryLoad {
+                files: Vec::new(),
+                probes: Vec::new(),
+            }
+        };
         let discovery = DiscoveryRecord {
             files: loaded.probes,
             env: self.env_prefix.is_some() && order.contains(&Layer::Env),
@@ -2861,6 +2871,35 @@ mod tests {
             ClapfigError::MissingRequired { discovery, .. } => {
                 assert!(!discovery.env);
                 assert!(discovery.overrides);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_omitted_files_layer_skips_probes() {
+        // A file that *would* supply the required key must not be
+        // probed (or merged) when Files is omitted from layer_order.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "name = \"present\"\n").unwrap();
+
+        let err = Clapfig::builder(required_only_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .layer_order(vec![])
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { key, discovery } => {
+                assert_eq!(key, "name");
+                assert!(
+                    discovery.files.is_empty(),
+                    "omitted Files layer must not list probes: {discovery:?}"
+                );
+                assert!(!discovery.env);
+                assert!(!discovery.overrides);
             }
             other => panic!("expected MissingRequired, got {other:?}"),
         }
