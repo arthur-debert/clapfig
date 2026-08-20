@@ -19,11 +19,15 @@
 //!
 //! - [`SearchMode::Merge`] — all found files are returned in priority order. The
 //!   caller (the resolve pipeline) deep-merges them so later files override earlier.
+//!   Misses are recorded as [`ProbeOutcome::Missing`](crate::ProbeOutcome::Missing).
 //! - [`SearchMode::FirstMatch`] — the list is searched from the **highest-priority
-//!   end** and the first file found is returned as the sole result.
+//!   end** and the first file found is returned as the sole result. Unvisited
+//!   lower-priority candidates are recorded as
+//!   [`ProbeOutcome::NotProbed`](crate::ProbeOutcome::NotProbed), never as missing.
 //!
-//! Missing files are silently skipped in both modes. Only actual I/O errors
-//! (permissions, etc.) are propagated.
+//! Loaded contents still skip misses; the probe record retains every candidate
+//! so [`ClapfigError::MissingRequired`] can name the search. Only actual I/O
+//! errors (permissions, etc.) are propagated.
 //!
 //! # Persistence
 //!

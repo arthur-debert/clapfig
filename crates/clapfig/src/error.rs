@@ -26,6 +26,7 @@
 //! module's [`FormatError`](crate::format::FormatError)) rather than
 //! re-invented, so you still get their full detail.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -102,6 +103,17 @@ pub enum ProbeOutcome {
     NotProbed,
 }
 
+impl fmt::Display for ProbeOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Loaded => f.write_str("loaded"),
+            Self::Missing => f.write_str("missing"),
+            Self::Error { message } => write!(f, "error: {message}"),
+            Self::NotProbed => f.write_str("not probed"),
+        }
+    }
+}
+
 /// One discovery probe of a candidate config file, with its outcome.
 ///
 /// The record names paths actually probed (stem-mode included), not the
@@ -133,8 +145,9 @@ pub struct DiscoveryRecord {
 impl DiscoveryRecord {
     /// Empty record: no probes, no non-file layers consulted.
     ///
-    /// WS01 holding state for [`ClapfigError::MissingRequired`]; the
-    /// discovery workstream fills it.
+    /// Production resolution fills this from the real search; the
+    /// synthetic resolve path injects it so tests do not touch the
+    /// filesystem.
     pub fn empty() -> Self {
         Self::default()
     }
@@ -297,13 +310,17 @@ pub enum ClapfigError {
 
     /// A required field declared by the [`Schema`](crate::runtime::Schema)
     /// was not supplied by any layer and has no default.
-    #[error("Missing required key: {key}")]
+    ///
+    /// An absent key has no winning origin — including a nested leaf
+    /// whose parent map exists from some input type. The message lists
+    /// file probes and consulted non-file input types, never an origin
+    /// line.
+    #[error("{}", format_missing_required(.key, .discovery))]
     MissingRequired {
         key: String,
         /// Files probed (with outcomes) and non-file input types
         /// consulted. An absent key has no winning origin — this is the
-        /// search, not an origin. Empty until the discovery workstream
-        /// fills it.
+        /// search, not an origin.
         discovery: DiscoveryRecord,
     },
 
@@ -396,15 +413,36 @@ impl ClapfigError {
         }
     }
 
-    /// Required-key absence with an empty discovery record.
-    ///
-    /// WS01 holding state: the discovery workstream fills `discovery`.
-    pub(crate) fn missing_required(key: impl Into<String>) -> Self {
+    /// Required-key absence carrying the discovery record of the search
+    /// that did not find `key`.
+    pub(crate) fn missing_required(key: impl Into<String>, discovery: DiscoveryRecord) -> Self {
         ClapfigError::MissingRequired {
             key: key.into(),
-            discovery: DiscoveryRecord::empty(),
+            discovery,
         }
     }
+}
+
+fn format_missing_required(key: &str, discovery: &DiscoveryRecord) -> String {
+    use std::fmt::Write;
+    let mut out = format!("Missing required key: {key}");
+    for probe in &discovery.files {
+        let _ = write!(out, "\n  {} ({})", probe.path.display(), probe.outcome);
+    }
+    let mut consulted = Vec::new();
+    if discovery.env {
+        consulted.push("env");
+    }
+    if discovery.url {
+        consulted.push("url");
+    }
+    if discovery.overrides {
+        consulted.push("overrides");
+    }
+    if !consulted.is_empty() {
+        let _ = write!(out, "\n  consulted: {}", consulted.join(", "));
+    }
+    out
 }
 
 fn format_unknown_keys(infos: &[UnknownKeyInfo]) -> String {
@@ -594,14 +632,99 @@ mod tests {
 
     #[test]
     fn missing_required_carries_discovery_not_an_origin() {
-        let err = ClapfigError::missing_required("database.url");
+        let discovery = DiscoveryRecord {
+            files: vec![
+                FileProbe {
+                    path: "/etc/myapp.toml".into(),
+                    outcome: ProbeOutcome::Missing,
+                },
+                FileProbe {
+                    path: "/proj/.myapp.toml".into(),
+                    outcome: ProbeOutcome::NotProbed,
+                },
+            ],
+            env: true,
+            url: false,
+            overrides: true,
+        };
+        let err = ClapfigError::missing_required("database.url", discovery.clone());
         match err {
-            ClapfigError::MissingRequired { key, discovery } => {
+            ClapfigError::MissingRequired {
+                key,
+                discovery: got,
+            } => {
                 assert_eq!(key, "database.url");
-                assert_eq!(discovery, DiscoveryRecord::empty());
+                assert_eq!(got, discovery);
             }
             other => panic!("expected MissingRequired, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn missing_required_display_lists_probes_and_consulted_types_not_an_origin() {
+        let err = ClapfigError::missing_required(
+            "database.url",
+            DiscoveryRecord {
+                files: vec![
+                    FileProbe {
+                        path: "/etc/myapp.toml".into(),
+                        outcome: ProbeOutcome::Missing,
+                    },
+                    FileProbe {
+                        path: "/home/me/.myapp.toml".into(),
+                        outcome: ProbeOutcome::Loaded,
+                    },
+                    FileProbe {
+                        path: "/proj/.myapp.toml".into(),
+                        outcome: ProbeOutcome::NotProbed,
+                    },
+                ],
+                env: true,
+                url: false,
+                overrides: true,
+            },
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("Missing required key: database.url"),
+            "{msg}"
+        );
+        assert!(msg.contains("/etc/myapp.toml (missing)"), "{msg}");
+        assert!(msg.contains("/home/me/.myapp.toml (loaded)"), "{msg}");
+        assert!(msg.contains("/proj/.myapp.toml (not probed)"), "{msg}");
+        assert!(msg.contains("consulted: env, overrides"), "{msg}");
+        assert!(
+            !msg.contains("consulted: env, url"),
+            "url was not consulted: {msg}"
+        );
+        assert!(
+            !msg.contains("set by"),
+            "MissingRequired must not name a winning origin: {msg}"
+        );
+        assert!(
+            !msg.contains("origin"),
+            "MissingRequired must not name a winning origin: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_required_empty_discovery_is_the_key_line_only() {
+        let msg = ClapfigError::missing_required("name", DiscoveryRecord::empty()).to_string();
+        assert_eq!(msg, "Missing required key: name");
+    }
+
+    #[test]
+    fn probe_outcome_display_uses_spec_vocabulary() {
+        assert_eq!(ProbeOutcome::Loaded.to_string(), "loaded");
+        assert_eq!(ProbeOutcome::Missing.to_string(), "missing");
+        assert_eq!(ProbeOutcome::NotProbed.to_string(), "not probed");
+        assert_eq!(
+            ProbeOutcome::Error {
+                message: "permission denied".into(),
+            }
+            .to_string(),
+            "error: permission denied"
+        );
     }
 
     #[test]

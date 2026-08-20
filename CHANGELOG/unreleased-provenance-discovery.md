@@ -1,0 +1,5 @@
+**Provenance discovery** ([#152](https://github.com/arthur-debert/clapfig/issues/152), epic [#146](https://github.com/arthur-debert/clapfig/issues/146)) — `ClapfigError::MissingRequired` now carries the filled discovery record of the search that did not find the key. An absent key has no winning origin (including a nested leaf whose parent map exists).
+
+- File probes report `loaded` / `missing` / `error` / `not probed`. Under `SearchMode::FirstMatch`, candidates the search never reached are `not probed`, not `missing`. Under `SearchMode::Merge`, every candidate is probed: hits are `loaded`, misses are `missing`. Stem-based discovery names the paths actually probed (each enabled extension in a directory), not a dump of the format registry.
+- Non-file input types consulted (env unless `.no_env()`, URL when a query was supplied, programmatic overrides when any were supplied) are listed on the same record. The error's `Display` enumerates probes and consulted types; it does not name an origin.
+- The probe record is injectable on the synthetic resolve path (`ResolveInput.discovery`) so the core walk stays I/O-free.

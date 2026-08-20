@@ -2,7 +2,8 @@
 //! config table.
 //!
 //! Operates on pre-loaded data (`ResolveInput`) with no I/O, making the full
-//! pipeline testable with synthetic inputs. Steps:
+//! pipeline testable with synthetic inputs (files, env, and the discovery
+//! probe record). Steps:
 //!
 //! 1. Build each layer independently (files, env, URL, CLI)
 //! 2. Merge layers in the configured order (default: files < env < URL < CLI)
@@ -18,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::env;
-use crate::error::ClapfigError;
+use crate::error::{ClapfigError, DiscoveryRecord};
 use crate::format::{self, FormatRegistry};
 use crate::merge::deep_merge;
 use crate::normalize::{normalize_key, normalize_table};
@@ -43,7 +44,14 @@ pub(crate) struct ResolveInput<'a> {
     /// silent parse under another format.
     pub registry: &'a FormatRegistry,
     /// File contents in precedence order: first = lowest priority, last = highest.
+    /// Loaded files only — misses and unprobed candidates live on
+    /// [`discovery`](Self::discovery), not here.
     pub files: Vec<(PathBuf, String)>,
+    /// Every candidate probe (loaded / missing / error / not probed) plus
+    /// which non-file input types were consulted. Attached to
+    /// [`ClapfigError::MissingRequired`]. Injectable so this walk stays
+    /// I/O-free; production discovery fills it from the real search.
+    pub discovery: DiscoveryRecord,
     /// Raw environment variable pairs (pass `std::env::vars().collect()` or synthetic data).
     pub env_vars: Vec<(String, String)>,
     /// Env var prefix (e.g. `"MYAPP"`). `None` means env disabled.
@@ -287,7 +295,7 @@ pub(crate) fn resolve(
     // declared defaults so `finalize` only has to check required fields.
     schema_walk::fill_defaults_into(&mut merged, input.schema);
 
-    let output = schema_walk::finalize(merged, input.schema)?;
+    let output = schema_walk::finalize(merged, input.schema, &input.discovery)?;
     Ok((output, collected_unknowns))
 }
 
@@ -315,6 +323,7 @@ mod tests {
             schema,
             registry: toml_only_registry(),
             files: vec![],
+            discovery: DiscoveryRecord::empty(),
             env_vars: vec![],
             env_prefix: None,
             #[cfg(feature = "url")]
@@ -1012,5 +1021,86 @@ mod tests {
             get(&table, "database.url").unwrap().as_str(),
             Some("pg://y")
         );
+    }
+
+    fn required_name_schema() -> Schema {
+        Schema::object("Req")
+            .field("name", crate::runtime::Field::string())
+            .build()
+    }
+
+    #[test]
+    fn missing_required_uses_injected_discovery_record() {
+        // The core walk is I/O-free: probes on ResolveInput are the
+        // record MissingRequired reports, including FirstMatch's
+        // not-probed candidates. No filesystem is touched.
+        let schema = required_name_schema();
+        let discovery = DiscoveryRecord {
+            files: vec![
+                crate::error::FileProbe {
+                    path: "/etc/app.toml".into(),
+                    outcome: crate::error::ProbeOutcome::Missing,
+                },
+                crate::error::FileProbe {
+                    path: "/proj/app.toml".into(),
+                    outcome: crate::error::ProbeOutcome::NotProbed,
+                },
+            ],
+            env: true,
+            url: false,
+            overrides: true,
+        };
+        let input = ResolveInput {
+            discovery: discovery.clone(),
+            ..empty_input(&schema)
+        };
+        let err = resolve(input).unwrap_err();
+        match err {
+            ClapfigError::MissingRequired {
+                key,
+                discovery: got,
+            } => {
+                assert_eq!(key, "name");
+                assert_eq!(got, discovery);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_missing_leaf_is_missing_required_with_injected_discovery() {
+        // Parent map present from a file; required leaf absent. Same
+        // diagnostic as a top-level miss — no nearest-ancestor origin.
+        let schema = Schema::object("Req")
+            .nested(
+                "db",
+                Schema::object("Db").field("url", crate::runtime::Field::string()),
+            )
+            .build();
+        let discovery = DiscoveryRecord {
+            files: vec![crate::error::FileProbe {
+                path: "app.toml".into(),
+                outcome: crate::error::ProbeOutcome::Loaded,
+            }],
+            env: false,
+            url: false,
+            overrides: false,
+        };
+        let input = ResolveInput {
+            files: vec![("app.toml".into(), "[db]\n".into())],
+            discovery: discovery.clone(),
+            ..empty_input(&schema)
+        };
+        let err = resolve(input).unwrap_err();
+        match err {
+            ClapfigError::MissingRequired {
+                key,
+                discovery: got,
+            } => {
+                assert_eq!(key, "db.url");
+                assert_eq!(got, discovery);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
     }
 }
