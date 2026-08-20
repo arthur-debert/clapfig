@@ -31,9 +31,11 @@ Constraints already decided, not reopened:
 - Maps are unordered ([ADR-0001](../adr/0001-clapfig-owns-its-value-model.md),
   #99 closed as not planned). Declaration order is not a schema shape.
 - Merge is key-wise deep merge; arrays replace wholesale
-  (`docs/spec/provenance.md` Out Of Scope). Tagged-union validation runs
-  *after* merge, on the winning tree, and uses the origin tree provenance
-  already landed.
+  (`docs/spec/provenance.md` Out Of Scope). Tagged-union *branch
+  selection* runs after merge, on the winning tree, and uses the origin
+  tree provenance already landed. Unknown-key checking on tagged
+  objects is two-phase (true unknowns per-file pre-merge; selected-
+  variant unknowns post-merge); merge itself does not change.
 - Formats are adapters ([ADR-0002](../adr/0002-formats-are-adapters-with-declared-capabilities.md)).
   Schema composition is format-agnostic. TOML remains the baseline test
   for what a shape may mean.
@@ -50,10 +52,14 @@ Constraints already decided, not reopened:
   Walkers take `Shape`. That layout is not reopened here.
 
 **Shape** is a schema node — leaf, object, homogeneous map, homogeneous
-array, or tagged union — usable at the document root, as a field, as a
-map entry, as an array item, and as a union variant. Today's named-field
-object is one constructor, not the node. Do not call a shape a "schema
-type" or a "field kind."
+array, or tagged union — usable as a field, as a map entry, and as an
+array item. Legal **document roots** are the object-shaped constructors:
+Object, Map, and internally tagged objects. Leaf and Array as document
+roots fail the TOML baseline (a TOML document is a table; load returns
+`value::Map`; `resolve` rejects a non-map document). A tagged-union
+variant is an object (`Schema` / the `Object` constructor), not an
+arbitrary shape. Today's named-field object is one constructor, not the
+node. Do not call a shape a "schema type" or a "field kind."
 
 ## Problem
 
@@ -115,16 +121,19 @@ scope here.
 ## Goals
 
 1. **Shape is the schema node.** Every consumer that today walks
-   `Schema` / `Field` walks a shape. The document root *is* a shape. A
-   shape is usable in every position a field's value is usable today.
+   `Schema` / `Field` walks a shape. The document root is a shape, and
+   the legal roots are Object, Map, and internally tagged objects (not
+   Leaf or Array). A shape is usable in every position a field's value
+   is usable today (field, map entry, array item). Union-variant
+   position is an object, not an arbitrary shape.
 2. **Five constructors, composable.** Leaf (today's `LeafType`, including
    closed enums and the `Value` escape hatch). Object (today's `Schema`:
    named fields). Homogeneous Map (unordered string keys, item is a
    shape). Homogeneous Array (item is a shape). Tagged union (a
-   discriminator field whose closed value set selects the rest of the
-   object). The two map encodings and two array encodings collapse: a
-   map of leaves and a map of objects are the same constructor with a
-   different item shape.
+   discriminator field whose closed, unique, non-empty value set selects
+   the rest of the object). The two map encodings and two array encodings
+   collapse: a map of leaves and a map of objects are the same
+   constructor with a different item shape.
 3. **Root map.** A schema whose root is a homogeneous map loads, validates,
    exports JSON Schema (`type: object` + `additionalProperties: <item>`),
    and generates a template without inventing a parent field. The typed
@@ -143,6 +152,9 @@ scope here.
 5. **Post-merge branch selection.** Merge stays key-wise. Kind from one
    input type and variant fields from another is legal; validation sees
    the merged object and the winning origins. No new merge rule.
+   Unknown-key checking is two-phase: true unknowns (not the tag, not a
+   field of any variant) stay per-file / per-env pre-merge; selected-
+   variant unknowns run after branch selection on the merged object.
 6. **Derive and runtime stay twins.** An internally tagged enum deriving
    `Schema` (via `#[serde(tag = "...")]`) emits the same runtime tagged
    shape the fluent builder can construct. A root-map typed load emits
@@ -194,8 +206,12 @@ scope here.
 
 ## Proposed Shape
 
-Five constructors. Every walker takes a shape; the document root is a
-shape. Today's named-field object is the `Object` constructor.
+Five constructors. Every walker takes a shape. The document root is a
+shape, but only object-shaped constructors are legal there: `Object`,
+`Map`, and `Tagged`. `Leaf` and `Array` are nested shapes only — TOML
+cannot represent a scalar or array document, and load still returns
+`value::Map`. This Spec does not invent a root-scalar or root-array
+return API. Today's named-field object is the `Object` constructor.
 
 ```text
 Shape =
@@ -203,11 +219,12 @@ Shape =
   | Object { fields: [(name, Shape)], … }
   | Map   { item: Shape }
   | Array { item: Shape }
-  | Tagged { tag: name, variants: [(discriminator, Shape)] }
+  | Tagged { tag: name, variants: [(discriminator, Object)] }
 ```
 
 How those constructors sit in Rust (`Shape` enum, `Schema` remaining the
-object, `Field` not a second node, map/array encodings collapsed) is
+object, `Field` not a second node, map/array encodings collapsed, tagged
+variants as `Schema` not `Shape`) is
 [ADR-0010](../adr/0010-shape-is-the-schema-node.md). This section is
 what users write, what files mean, and what artifacts look like.
 
@@ -215,7 +232,8 @@ what users write, what files mean, and what artifacts look like.
 
 **Leaf** is unchanged in meaning: primitives, closed enums, and `Value`.
 Homogeneous leaf arrays/maps are `Array` / `Map` with a leaf item — the
-same constructors as arrays/maps of objects.
+same constructors as arrays/maps of objects. Leaf is not a legal
+document root.
 
 **Object** is today's named-field product. Absence rules stay: an absent
 nested object is the empty table; `Option<NestedStruct>` is not a shape.
@@ -236,6 +254,8 @@ entries. A `transparent` newtype wrapping a map is not added.
 
 **Array** is homogeneous. Item is any shape. An absent array is the empty
 array, as today. JSON Schema: `type: array` with `items: <item>`.
+Array (like Leaf) is not a legal document root; nested use is
+unchanged.
 
 ### Tagged unions
 
@@ -263,16 +283,26 @@ The tag name is declared on the enum (`serde(tag = ...)`). It is **not**
 a field of the variant type. Derive that finds a variant field with the
 same name as the tag is a derive-time error (schema and serde would
 fight). The tag key is reserved on that object: required, closed (the
-variant discriminators), never an unknown key.
+variant discriminators: unique, non-empty, at least one), never an
+unknown key.
 
 Variant discriminators follow the same rename rules as unit-enum
 variants (`rename` / `rename_all` on serde or clapfig). The allowed set
-is closed; that is the union analogue of `LeafType::Enum`.
+is closed, unique, and non-empty: at least one variant; post-rename
+discriminator values are unique and non-empty. That is the union
+analogue of `LeafType::Enum`. An empty tagged union, an empty
+discriminator spelling, or a post-rename collision is an authoring
+error — derive-time for `#[derive(Schema)]`, construction-time for the
+fluent builder. Tests lock `rename` and `rename_all` collisions the
+same way unit-enum derive already does.
 
-Each variant is an **object** of the variant's own fields. A unit
-variant is the empty object: the file carries only the tag
-(`kind = "off"`). A variant that is itself a Map, Array, Leaf, or Tagged
-is out of scope — that is a different serde representation.
+Each variant is an **object** (`Schema` / the `Object` constructor) of
+the variant's own fields. The algebra writes
+`variants: [(discriminator, Object)]` for that invariant: a variant is
+not an arbitrary `Shape`. A unit variant is the empty object: the file
+carries only the tag (`kind = "off"`). A variant that is itself a Map,
+Array, Leaf, or Tagged is out of scope — that is a different serde
+representation.
 
 `params` as a nested table whose type differs per variant is still this
 union: two objects that happen to contain different nested field types.
@@ -282,14 +312,51 @@ does not care; Edward's file format does. Shared fields (`mount` on
 every block) are written on each variant.
 
 After merge, clapfig reads the tag, selects the variant, and validates
-the rest of the object against that variant's fields.
+the rest of the object against that variant's fields. Merge stays
+key-wise; branch selection does not change which keys survive.
+
+**Unknown keys on tagged objects, two phases.** Provenance keeps
+unknown-key validation per-file (and per env table) *pre-merge*. Tagged
+unions also need a selected branch, which exists only after merge. Both
+are true; neither is waived. Merge semantics do not change.
+
+1. **Pre-merge (each file and env layer, as today).** Treat the tagged
+   object as the union of the tag key and every variant's fields. A key
+   that is the tag, or a field of *any* variant, is known at this phase.
+   A key that is none of those is a true unknown: run it through the
+   existing strictness cascade / `on_unknown_key` callback / `Collect`,
+   using that layer's own spans (file) or env-var names — not the merged
+   origin tree. This phase does **not** read that layer's discriminator
+   to select a branch. A sparse layer that supplies rust-only keys and
+   no `kind` is legal here; a sparse layer that supplies
+   `totally_unknown` is not.
+
+2. **Post-merge (after branch selection).** Read the winning
+   discriminator (winner origin of the tag). Select that variant.
+   Unknown-key the merged object against the *selected* variant: the
+   tag plus that variant's fields are known; a branch-exclusive key that
+   belongs only to another variant is now unknown. The same strictness
+   cascade, callback, and `Collect` path apply. Locations come from the
+   merged origin tree (winner-only). An overwritten lower-layer key
+   reports the winner's origin, never a loser; a key that survived from
+   a lower layer reports that layer.
+
+Strictness lookup is the existing cascade: nearest ancestor schema node
+with an explicit `strict`, else the builder default. The tagged object
+is that parent. Keys the cascade marks lenient never reach the
+callback; cascade-strict keys go through `on_unknown_key` (`Reject` /
+`Accept` / `Collect`) the same way a named-field object's unknown keys
+do today. `Collect` entries from either phase append to the same
+`load_with_unknowns` list.
 
 **Layered discriminator.** File A supplies `kind = "rust"`. File B
 supplies rust-only keys. An env var later sets `kind = "payload"`. Merge
 produces a payload-kind object that may still contain rust-only keys.
-Validation against the payload variant reports those as unknown keys,
-each naming its origin. That is the honest result of key-wise merge plus
-post-merge branch selection; clapfig does not rewind the merge.
+Phase 1 accepts those rust-only keys on each layer (they belong to some
+variant). Phase 2 reports them as unknown against the payload variant,
+each naming its winning origin. That is the honest result of key-wise
+merge plus post-merge branch selection; clapfig does not rewind the
+merge.
 
 **Derive.** Internally tagged `Schema` enums honor `#[serde(tag = "...")]`
 — the same policy already used for `rename` / `rename_all`. Inventing
@@ -379,7 +446,11 @@ constructors should see unchanged load and artifacts.
 - **Implementing #98 as a root flag on today's `Schema`.** "Object or
   map at the top, everything below unchanged" looks small and ships a
   second special case. The walkers then still cannot put a tagged union
-  in a map entry. Resist. Root map falls out of shape-at-root.
+  in a map entry. Resist. Root map falls out of Map being a legal
+  document root.
+- **Root Leaf or Array.** Tempting once Shape is the node. TOML cannot
+  be a scalar or array document; load returns `value::Map`. This Spec
+  does not invent a root-value return API. Nested Leaf and Array stay.
 - **Sibling-lookup for `params`.** Faster to demo on Edward's current
   file, and it is the example the #100 Decision comment still writes.
   It does not compose (nested discriminators, unions as map items) and
@@ -425,11 +496,15 @@ constructors should see unchanged load and artifacts.
   behavior is regression-locked. Callers matching on `Field` exhaustively
   (the enum is not `non_exhaustive` today) will not compile; that is
   the point of the changelog note. No deprecation window.
-- **Observability.** No new tracing doctrine. Branch selection is a
-  post-merge validation step: `trace` names the discriminator path, the
-  selected variant, and (on failure) the origin of the discriminator
-  or of the offending variant field. Values stay out of logs
-  (provenance two-contract rule).
+- **Observability.** No new tracing doctrine, and no exemption for
+  discriminators. Branch selection is a post-merge validation step:
+  `trace` records that selection happened, naming the discriminator
+  *path*, the winning origin of that path, and the value *type*
+  (string). It does not emit the discriminator string or the selected
+  variant name — that name is the user's resolved value. User-facing
+  errors may still quote the offending discriminator (`InvalidValue`
+  naming `"rus"`), per the provenance two-contract rule. Tracing events
+  never contain config values (`docs/spec/provenance.md`; ADR-0009).
 - **Provenance.** Already landed. Tagged-union and root-map errors must
   go through `InvalidValue` / `MissingRequired` / unknown-key so they
   inherit origin and discovery. A second pass that only has serde
@@ -458,18 +533,39 @@ CI fixture.
   at the *root* (not under a synthetic property); template has no
   invented parent table. `config set` of a dynamic entry key refuses
   with the existing class of error.
+- **Illegal document roots.** A schema whose root is Leaf or Array is
+  rejected (derive-time for a typed root that is a scalar or `Vec<T>`;
+  runtime-construction for a root Leaf/Array shape). No new return type
+  is added. Nested Leaf and Array keep working as field values, map
+  items, and array items.
 - **Tagged union, runtime and derive.** `#[serde(tag = "kind")]` two
   variant structs: good rust instance loads and typed-deserializes;
   unknown discriminator is `InvalidValue` on the tag field with origin
   and allowed set; missing tag is `MissingRequired` with discovery, not
   an origin; a payload-only key on a rust instance is an unknown-key
-  error located on that key. A unit variant loads as tag-only.
+  error located on that key. A unit variant loads as tag-only. Variant
+  payloads are objects: constructing a tagged shape whose variant is
+  Map, Array, Leaf, or Tagged is a construction error.
+- **Discriminator authoring.** Empty tagged union, empty discriminator
+  spelling, and post-rename collisions (`rename` two variants onto the
+  same string; `rename_all` mapping two variants onto the same string)
+  are derive-time errors and runtime-construction errors. UI fixtures
+  lock the derive messages, matching unit-enum derive.
 - **Tag/field clash.** A variant field named the same as `serde(tag)`
   is a derive-time error. UI fixture locks the message.
-- **Sparse layers.** Discriminator from file, variant field from env
-  (and the reverse); discriminator from env *changing* the kind while
-  the other layer still supplies the old kind's keys — unknown-key /
-  type errors against the winning kind, origins on the losing keys.
+- **Sparse layers, both directions.** Discriminator from file, variant
+  field from env, and the reverse. A file or env layer that supplies a
+  variant-specific key *without* a discriminator on that layer is legal
+  at phase 1 and validated against the selected variant at phase 2. A
+  true unknown (`not_a_field_of_any_variant`) on a sparse file layer is
+  rejected pre-merge, even with no discriminator on that layer; the
+  same for a sparse env layer. Discriminator from env *changing* the
+  kind while the other layer still supplies the old kind's keys: phase
+  1 accepts those keys (they belong to some variant); phase 2 reports
+  them as unknown against the winning kind, origins on the losing keys
+  (winner-only: an overwritten key names the winner, not the loser).
+  Callback / `Collect` / cascade-lenient behavior is covered in both
+  phases and both file→env and env→file directions.
 - **Composition.** `Map { item: Tagged { … } }` (the Edward-shaped
   config without a parent field, or with one — both). `Array { item:
   Tagged { … } }`. Nested tagged objects. Each path through unknown-key,
@@ -492,6 +588,9 @@ CI fixture.
   UI trybuild fixtures lock the messages.
 - **Provenance lock.** Every new `InvalidValue` in the tests above
   carries origin facts; no new error path that only has a dotted key.
+- **Tracing lock.** Branch-selection `trace` events name discriminator
+  path, origin, and value type; they do not contain the discriminator
+  string or the selected variant name.
 
 Prior art to copy: `crates/clapfig/tests/derive_array_of.rs` and the
 MapOf coverage in `derive_schema.rs` / `runtime.rs` builder tests for
@@ -510,14 +609,18 @@ them.
 - **The contract:** the shape node (runtime + static mirror + builder
   methods + `Schema` trait root), signatures only where behavior is
   pending; existing object-root schemas still construct; data-model
-  tests (construction, "root may be a map", "tagged has a closed
-  discriminator set"). Architecture-reviewable in isolation.
+  tests (construction, "root may be a map", "Leaf and Array are not
+  legal document roots", "tagged has a closed unique non-empty
+  discriminator set", "tagged variants are objects").
+  Architecture-reviewable in isolation.
   [ADR-0010](../adr/0010-shape-is-the-schema-node.md) is this node's
   layout.
 - **Walk:** `schema_walk` (unknown keys, defaults, finalize) and the
-  strictness cascade treat Map/Array/Tagged at any depth, including
-  root. Demoable as "root map unknown key is located" and "wrong
-  variant field is an unknown key against the selected kind."
+  strictness cascade treat Map/Array/Tagged at any depth. Map and Tagged
+  also at document root; Array only nested. Demoable as "root map
+  unknown key is located" and "wrong variant field is an unknown key
+  against the selected kind" (two-phase: true unknowns pre-merge,
+  branch-exclusive keys post-merge).
 - **Derive:** `serde(tag)` enums; `BTreeMap<String, T>` / `HashMap` as
   the typed root. Demoable as Edward-shaped Rust types loading without
   `#[clapfig(value)]` on `params` *when those params are fields of the
@@ -543,6 +646,7 @@ up; it does not share this contract.
 - `#[clapfig(tag)]` as a serde-independent spelling.
 - `#[serde(transparent)]` newtypes for root maps.
 - Merge-semantics changes.
+- Root Leaf or Array (no new load return API; nested use only).
 - Dynamic-key and indexed-path persistence addressing.
 - Heterogeneous root (known fields + additionalProperties of a different
   shape).
