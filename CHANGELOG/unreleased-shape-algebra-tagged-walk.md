@@ -1,0 +1,6 @@
+**Shape algebra tagged walk** ([#168](https://github.com/arthur-debert/clapfig/issues/168), epic [#164](https://github.com/arthur-debert/clapfig/issues/164)) — runtime two-phase walk for internally tagged unions. Hard cut, no shims (per project policy). JSON Schema `oneOf` and per-variant `config gen` stay SHP01-WS05 stubs. Root-map load stays SHP01-WS03.
+
+- **Tagged object-root load.** `Clapfig::builder` accepts a tagged document root and resolves it. Merge stays key-wise; branch selection runs after merge.
+- **Two-phase unknown keys.** Pre-merge (each file/env layer): a key is known if it is the tag or a field of *any* variant; true unknowns go through the existing cascade / callback / `Collect` once. Post-merge: after the winning discriminator selects a variant, only branch-exclusive keys (a field of some other variant, not of the selected variant, not the tag) are checked, with winner origins. A true unknown that survived phase 1 is not a phase-2 candidate.
+- **Errors.** Unknown discriminator is `InvalidValue` on the tag with origin and allowed set. Missing discriminator is `MissingRequired` with discovery (no origin). Variant field type/missing errors use the normal error model including provenance.
+- **Tracing.** Branch-selection `trace` events name discriminator path, origin, and value type — never the discriminator string or variant name.

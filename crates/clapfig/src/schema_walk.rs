@@ -1,11 +1,14 @@
 //! Schema-driven walks of a value [`Map`] against a [`Shape`]: the
 //! resolve pipeline's validation stages as free functions.
 //!
-//! Document-root entry points take [`Shape`]. Object-root callers still
-//! pass [`Schema`] (the [`Shape::Object`] payload); a root [`Shape::Map`]
-//! treats the document table as the map itself (keys are user data, not
-//! unknown). Homogeneous maps and arrays of leaves or of objects share
-//! [`Shape::Map`] / [`Shape::Array`]. Tagged walk is SHP01-WS04.
+//! Document-root entry points take [`DocumentRoot`]. Object-root callers
+//! still pass [`Schema`] (the [`Shape::Object`] payload); a root
+//! [`Shape::Map`] treats the document table as the map itself (keys are
+//! user data, not unknown). Tagged objects use a two-phase unknown-key
+//! walk: pre-merge union of the tag plus every variant's fields, then
+//! post-merge branch-exclusive keys against the selected variant.
+//! Homogeneous maps and arrays of leaves or of objects share
+//! [`Shape::Map`] / [`Shape::Array`].
 //!
 //! Every function here recurses a parsed table and the schema tree side
 //! by side:
@@ -38,12 +41,13 @@
 //!   afterwards).
 //!
 //! [`Schema`]: crate::runtime::Schema
+//! [`DocumentRoot`]: crate::runtime::DocumentRoot
 //! [`UnknownKey`]: crate::validate::UnknownKey
 
 use crate::error::{ClapfigError, DiscoveryRecord};
 use crate::format::ConfigPath;
 use crate::origin::{Origin, OriginMap, OriginNode};
-use crate::runtime::{NamedField, Schema, Shape};
+use crate::runtime::{DocumentRoot, NamedField, Schema, Shape, TaggedShape};
 use crate::validate::UnknownKey;
 use crate::value::{Map, Value};
 
@@ -91,41 +95,6 @@ pub(crate) fn collect_unknown_paths(
                 });
             }
             Some(nf) => collect_unknown_against_shape(value, &nf.field, &full, &child, unknown),
-        }
-    }
-}
-
-/// Walk `table` against a document-root [`Shape`].
-///
-/// Object roots use [`collect_unknown_paths`]. Map roots treat every
-/// top-level key as a user-supplied entry (not unknown) and recurse into
-/// each value against the item shape. Tagged is SHP01-WS04.
-pub(crate) fn collect_unknown_against_root(
-    table: &Map,
-    shape: &Shape,
-    unknown: &mut Vec<UnknownKey>,
-) {
-    match shape {
-        Shape::Object(schema) => {
-            collect_unknown_paths(table, schema, "", &ConfigPath::new(), unknown);
-        }
-        Shape::Map(map) => {
-            let path = ConfigPath::new();
-            for (entry_key, entry_value) in table {
-                collect_unknown_against_shape(
-                    entry_value,
-                    &map.item,
-                    entry_key,
-                    &path.clone().key(entry_key),
-                    unknown,
-                );
-            }
-        }
-        Shape::Tagged(_) => {
-            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
-        }
-        Shape::Leaf(_) | Shape::Array(_) => {
-            unreachable!("illegal document roots are rejected by require_document_root")
         }
     }
 }
@@ -179,8 +148,424 @@ fn collect_unknown_against_shape(
                 }
             }
         }
-        Shape::Tagged(_) => {
-            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+        Shape::Tagged(tagged) => {
+            if let Value::Map(inner) = value {
+                collect_unknown_tagged_phase1(inner, tagged, prefix, path, unknown);
+            }
+        }
+    }
+}
+
+/// Walk `table` against a document root. Object roots use the named-field
+/// walker; tagged roots run phase 1 (union of tag + every variant field).
+pub(crate) fn collect_unknown_paths_root(
+    table: &Map,
+    root: DocumentRoot<'_>,
+    prefix: &str,
+    path: &ConfigPath,
+    unknown: &mut Vec<UnknownKey>,
+) {
+    match root {
+        DocumentRoot::Object(schema) => collect_unknown_paths(table, schema, prefix, path, unknown),
+        DocumentRoot::Map(map) => {
+            for (entry_key, entry_value) in table {
+                collect_unknown_against_shape(
+                    entry_value,
+                    &map.item,
+                    entry_key,
+                    &path.clone().key(entry_key),
+                    unknown,
+                );
+            }
+        }
+        DocumentRoot::Tagged(tagged) => {
+            collect_unknown_tagged_phase1(table, tagged, prefix, path, unknown)
+        }
+    }
+}
+
+/// Phase 1: a key is known if it is the tag or a field of *any* variant.
+/// True unknowns are collected here; branch-exclusive keys are not.
+fn collect_unknown_tagged_phase1(
+    table: &Map,
+    tagged: &TaggedShape,
+    prefix: &str,
+    path: &ConfigPath,
+    unknown: &mut Vec<UnknownKey>,
+) {
+    for (key, value) in table {
+        let full = join_prefix(prefix, key);
+        let child = path.clone().key(key);
+        if key == &tagged.tag {
+            continue;
+        }
+        let shapes = tagged.field_shapes(key);
+        if shapes.is_empty() {
+            unknown.push(UnknownKey {
+                path: full,
+                leaf: key.clone(),
+                config_path: child,
+            });
+        } else {
+            collect_unknown_against_shapes_union(value, &shapes, &full, &child, unknown);
+        }
+    }
+}
+
+/// Recurse unknown-key collection through every shape a name is declared
+/// as across variants, so a nested key valid for any variant is known at
+/// phase 1.
+fn collect_unknown_against_shapes_union(
+    value: &Value,
+    shapes: &[&Shape],
+    prefix: &str,
+    path: &ConfigPath,
+    unknown: &mut Vec<UnknownKey>,
+) {
+    let objects: Vec<&Schema> = shapes
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Object(schema) => Some(schema),
+            _ => None,
+        })
+        .collect();
+    if !objects.is_empty() {
+        if let Value::Map(inner) = value {
+            collect_unknown_union_objects(inner, &objects, prefix, path, unknown);
+        }
+        return;
+    }
+    let tagged: Vec<&TaggedShape> = shapes
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Tagged(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    if let Some(inner_tagged) = tagged.first()
+        && let Value::Map(inner) = value
+    {
+        collect_unknown_tagged_phase1(inner, inner_tagged, prefix, path, unknown);
+        return;
+    }
+    let map_items: Vec<&Shape> = shapes
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Map(map) => Some(map.item.as_ref()),
+            _ => None,
+        })
+        .collect();
+    if !map_items.is_empty()
+        && let Value::Map(entries) = value
+    {
+        for (entry_key, entry_value) in entries {
+            let entry_path = format!("{prefix}.{entry_key}");
+            collect_unknown_against_shapes_union(
+                entry_value,
+                &map_items,
+                &entry_path,
+                &path.clone().key(entry_key),
+                unknown,
+            );
+        }
+        return;
+    }
+    let array_items: Vec<&Shape> = shapes
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Array(array) => Some(array.item.as_ref()),
+            _ => None,
+        })
+        .collect();
+    if !array_items.is_empty()
+        && let Value::Array(items) = value
+    {
+        for (i, item) in items.iter().enumerate() {
+            let indexed = format!("{prefix}[{i}]");
+            collect_unknown_against_shapes_union(
+                item,
+                &array_items,
+                &indexed,
+                &path.clone().index(i),
+                unknown,
+            );
+        }
+        return;
+    }
+    if let Some(shape) = shapes.first() {
+        collect_unknown_against_shape(value, shape, prefix, path, unknown);
+    }
+}
+
+fn collect_unknown_union_objects(
+    table: &Map,
+    schemas: &[&Schema],
+    prefix: &str,
+    path: &ConfigPath,
+    unknown: &mut Vec<UnknownKey>,
+) {
+    for (key, value) in table {
+        let full = join_prefix(prefix, key);
+        let child = path.clone().key(key);
+        let field_shapes: Vec<&Shape> = schemas
+            .iter()
+            .filter_map(|schema| find_field(schema, key).map(|nf| &nf.field))
+            .collect();
+        if field_shapes.is_empty() {
+            unknown.push(UnknownKey {
+                path: full,
+                leaf: key.clone(),
+                config_path: child,
+            });
+        } else {
+            collect_unknown_against_shapes_union(value, &field_shapes, &full, &child, unknown);
+        }
+    }
+}
+
+fn join_prefix(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
+/// Phase 2: after merge and branch selection, collect keys that belong
+/// to some other variant but not the selected one (and are not the tag).
+/// True unknowns are not candidates.
+pub(crate) fn collect_branch_exclusive_root(
+    table: &Map,
+    root: DocumentRoot<'_>,
+    unknown: &mut Vec<UnknownKey>,
+) {
+    match root {
+        DocumentRoot::Object(schema) => {
+            collect_branch_exclusive_object(table, schema, "", &ConfigPath::new(), unknown)
+        }
+        DocumentRoot::Map(map) => {
+            let path = ConfigPath::new();
+            for (entry_key, entry_value) in table {
+                collect_branch_exclusive_in_shape(
+                    entry_value,
+                    &map.item,
+                    entry_key,
+                    &path.clone().key(entry_key),
+                    unknown,
+                );
+            }
+        }
+        DocumentRoot::Tagged(tagged) => {
+            collect_branch_exclusive_tagged(table, tagged, "", &ConfigPath::new(), unknown)
+        }
+    }
+}
+
+fn collect_branch_exclusive_object(
+    table: &Map,
+    schema: &Schema,
+    prefix: &str,
+    path: &ConfigPath,
+    unknown: &mut Vec<UnknownKey>,
+) {
+    for nf in &schema.fields {
+        if let Some(value) = table.get(&nf.name) {
+            collect_branch_exclusive_in_shape(
+                value,
+                &nf.field,
+                &join_prefix(prefix, &nf.name),
+                &path.clone().key(&nf.name),
+                unknown,
+            );
+        }
+    }
+}
+
+fn collect_branch_exclusive_in_shape(
+    value: &Value,
+    shape: &Shape,
+    prefix: &str,
+    path: &ConfigPath,
+    unknown: &mut Vec<UnknownKey>,
+) {
+    match shape {
+        Shape::Leaf(_) => {}
+        Shape::Object(nested) => {
+            if let Value::Map(inner) = value {
+                collect_branch_exclusive_object(inner, nested, prefix, path, unknown);
+            }
+        }
+        Shape::Array(array) => {
+            if let Value::Array(items) = value {
+                for (i, item) in items.iter().enumerate() {
+                    collect_branch_exclusive_in_shape(
+                        item,
+                        &array.item,
+                        &format!("{prefix}[{i}]"),
+                        &path.clone().index(i),
+                        unknown,
+                    );
+                }
+            }
+        }
+        Shape::Map(map) => {
+            if let Value::Map(entries) = value {
+                for (entry_key, entry_value) in entries {
+                    collect_branch_exclusive_in_shape(
+                        entry_value,
+                        &map.item,
+                        &format!("{prefix}.{entry_key}"),
+                        &path.clone().key(entry_key),
+                        unknown,
+                    );
+                }
+            }
+        }
+        Shape::Tagged(tagged) => {
+            if let Value::Map(inner) = value {
+                collect_branch_exclusive_tagged(inner, tagged, prefix, path, unknown);
+            }
+        }
+    }
+}
+
+fn collect_branch_exclusive_tagged(
+    table: &Map,
+    tagged: &TaggedShape,
+    prefix: &str,
+    path: &ConfigPath,
+    unknown: &mut Vec<UnknownKey>,
+) {
+    let Some(selected) = tagged.selected(table) else {
+        return;
+    };
+    let other_fields: Vec<(&str, &Shape)> = tagged
+        .variants
+        .iter()
+        .filter(|v| v.discriminator != selected.discriminator)
+        .flat_map(|v| v.schema.fields.iter().map(|f| (f.name.as_str(), &f.field)))
+        .collect();
+    for (key, value) in table {
+        if key == &tagged.tag {
+            continue;
+        }
+        let full = join_prefix(prefix, key);
+        let child = path.clone().key(key);
+        if let Some(nf) = find_field(&selected.schema, key) {
+            let nested_others: Vec<&Shape> = other_fields
+                .iter()
+                .filter(|(name, _)| *name == key.as_str())
+                .map(|(_, shape)| *shape)
+                .collect();
+            collect_exclusive_against_shape(
+                value,
+                &nf.field,
+                &nested_others,
+                &full,
+                &child,
+                unknown,
+            );
+        } else if other_fields.iter().any(|(name, _)| *name == key.as_str()) {
+            unknown.push(UnknownKey {
+                path: full,
+                leaf: key.clone(),
+                config_path: child,
+            });
+        }
+    }
+}
+
+fn collect_exclusive_against_shape(
+    value: &Value,
+    selected: &Shape,
+    others: &[&Shape],
+    prefix: &str,
+    path: &ConfigPath,
+    unknown: &mut Vec<UnknownKey>,
+) {
+    match selected {
+        Shape::Leaf(_) => {}
+        Shape::Object(schema) => {
+            let other_objects: Vec<&Schema> = others
+                .iter()
+                .filter_map(|s| match s {
+                    Shape::Object(o) => Some(o),
+                    _ => None,
+                })
+                .collect();
+            if let Value::Map(inner) = value {
+                for (key, nested) in inner {
+                    let full = join_prefix(prefix, key);
+                    let child = path.clone().key(key);
+                    if let Some(nf) = find_field(schema, key) {
+                        let nested_others: Vec<&Shape> = other_objects
+                            .iter()
+                            .filter_map(|o| find_field(o, key).map(|f| &f.field))
+                            .collect();
+                        collect_exclusive_against_shape(
+                            nested,
+                            &nf.field,
+                            &nested_others,
+                            &full,
+                            &child,
+                            unknown,
+                        );
+                    } else if other_objects.iter().any(|o| find_field(o, key).is_some()) {
+                        unknown.push(UnknownKey {
+                            path: full,
+                            leaf: key.clone(),
+                            config_path: child,
+                        });
+                    }
+                }
+            }
+        }
+        Shape::Tagged(tagged) => {
+            if let Value::Map(inner) = value {
+                collect_branch_exclusive_tagged(inner, tagged, prefix, path, unknown);
+            }
+        }
+        Shape::Map(map) => {
+            let other_items: Vec<&Shape> = others
+                .iter()
+                .filter_map(|s| match s {
+                    Shape::Map(m) => Some(m.item.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            if let Value::Map(entries) = value {
+                for (entry_key, entry_value) in entries {
+                    collect_exclusive_against_shape(
+                        entry_value,
+                        &map.item,
+                        &other_items,
+                        &format!("{prefix}.{entry_key}"),
+                        &path.clone().key(entry_key),
+                        unknown,
+                    );
+                }
+            }
+        }
+        Shape::Array(array) => {
+            let other_items: Vec<&Shape> = others
+                .iter()
+                .filter_map(|s| match s {
+                    Shape::Array(a) => Some(a.item.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            if let Value::Array(items) = value {
+                for (i, item) in items.iter().enumerate() {
+                    collect_exclusive_against_shape(
+                        item,
+                        &array.item,
+                        &other_items,
+                        &format!("{prefix}[{i}]"),
+                        &path.clone().index(i),
+                        unknown,
+                    );
+                }
+            }
         }
     }
 }
@@ -210,52 +595,6 @@ pub(crate) fn fill_defaults_into(table: &mut Map, origins: &mut OriginMap, schem
     let path = crate::trace::trace_event_enabled().then(ConfigPath::new);
     fill_defaults_at(table, origins, schema, "", path, &mut filled);
     crate::trace::defaults_filled(filled);
-}
-
-/// Fill defaults against a document-root [`Shape`].
-///
-/// Object roots use [`fill_defaults_into`]. Map roots never synthesize
-/// entries (keys are user data); they push item defaults into existing
-/// entries. An absent root map is the empty table already in `table`.
-pub(crate) fn fill_defaults_into_shape(table: &mut Map, origins: &mut OriginMap, shape: &Shape) {
-    match shape {
-        Shape::Object(schema) => fill_defaults_into(table, origins, schema),
-        Shape::Map(map) => {
-            let mut filled = 0usize;
-            let path = crate::trace::trace_event_enabled().then(ConfigPath::new);
-            fill_defaults_in_root_map(table, origins, map, path, &mut filled);
-            crate::trace::defaults_filled(filled);
-        }
-        Shape::Tagged(_) => {
-            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
-        }
-        Shape::Leaf(_) | Shape::Array(_) => {
-            unreachable!("illegal document roots are rejected by require_document_root")
-        }
-    }
-}
-
-fn fill_defaults_in_root_map(
-    table: &mut Map,
-    origins: &mut OriginMap,
-    map: &crate::runtime::MapShape,
-    path: Option<ConfigPath>,
-    filled: &mut usize,
-) {
-    let keys: Vec<String> = table.keys().cloned().collect();
-    for key in keys {
-        let entry_cfg = path.as_ref().map(|p| p.clone().key(&key));
-        if let Some(entry) = table.get_mut(&key) {
-            if !origins.contains_key(&key) {
-                origins.insert(
-                    key.clone(),
-                    OriginNode::from_value(entry, Origin::default(&key)),
-                );
-            }
-            let node = origins.get_mut(&key).expect("just ensured origin node");
-            fill_defaults_in_value(entry, node, &map.item, &key, entry_cfg, filled);
-        }
-    }
 }
 
 fn fill_defaults_at(
@@ -412,8 +751,25 @@ fn fill_defaults_for_field(
                 fill_defaults_in_value(entry, node, shape, schema_key, child, filled);
             }
         }
-        Shape::Tagged(_) => {
-            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+        Shape::Tagged(tagged) => {
+            // An absent tagged object materializes as the empty table
+            // (same absence rule as a nested object); MissingRequired on
+            // the tag fires in finalize. Defaults fill only the selected
+            // variant, after the discriminator is present.
+            let created = !table.contains_key(name);
+            table
+                .entry(name.to_string())
+                .or_insert_with(|| Value::Map(Map::new()));
+            if created {
+                origins.entry(name.to_string()).or_insert_with(|| {
+                    OriginNode::map(Origin::default(schema_key), OriginMap::new())
+                });
+                trace_default_filled(child.as_ref(), "map", filled);
+            }
+            if let Some(Value::Map(inner)) = table.get_mut(name) {
+                let child_origins = child_map_origins(origins, name, schema_key);
+                fill_defaults_tagged(inner, child_origins, tagged, schema_key, child, filled);
+            }
         }
     }
 }
@@ -493,8 +849,78 @@ fn fill_defaults_in_value(
                 }
             }
         }
-        Shape::Tagged(_) => {
-            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+        Shape::Tagged(tagged) => {
+            if let Value::Map(inner) = value {
+                fill_defaults_tagged(
+                    inner,
+                    origin.map_children_mut(),
+                    tagged,
+                    schema_key,
+                    path,
+                    filled,
+                );
+            }
+        }
+    }
+}
+
+/// Fill defaults for a tagged object: only the selected variant's fields,
+/// and only when the discriminator already names a known variant.
+fn fill_defaults_tagged(
+    table: &mut Map,
+    origins: &mut OriginMap,
+    tagged: &TaggedShape,
+    prefix: &str,
+    path: Option<ConfigPath>,
+    filled: &mut usize,
+) {
+    if let Some(variant) = tagged.selected(table) {
+        fill_defaults_at(table, origins, &variant.schema, prefix, path, filled);
+    }
+}
+
+fn fill_defaults_in_root_map(
+    table: &mut Map,
+    origins: &mut OriginMap,
+    map: &crate::runtime::MapShape,
+    path: Option<ConfigPath>,
+    filled: &mut usize,
+) {
+    let keys: Vec<String> = table.keys().cloned().collect();
+    for key in keys {
+        let entry_cfg = path.as_ref().map(|p| p.clone().key(&key));
+        if let Some(entry) = table.get_mut(&key) {
+            if !origins.contains_key(&key) {
+                origins.insert(
+                    key.clone(),
+                    OriginNode::from_value(entry, Origin::default(&key)),
+                );
+            }
+            let node = origins.get_mut(&key).expect("just ensured origin node");
+            fill_defaults_in_value(entry, node, &map.item, &key, entry_cfg, filled);
+        }
+    }
+}
+
+/// Populate defaults against a document root (object, map, or tagged).
+pub(crate) fn fill_defaults_into_root(
+    table: &mut Map,
+    origins: &mut OriginMap,
+    root: DocumentRoot<'_>,
+) {
+    match root {
+        DocumentRoot::Object(schema) => fill_defaults_into(table, origins, schema),
+        DocumentRoot::Map(map) => {
+            let mut filled = 0usize;
+            let path = crate::trace::trace_event_enabled().then(ConfigPath::new);
+            fill_defaults_in_root_map(table, origins, map, path, &mut filled);
+            crate::trace::defaults_filled(filled);
+        }
+        DocumentRoot::Tagged(tagged) => {
+            let mut filled = 0usize;
+            let path = crate::trace::trace_event_enabled().then(ConfigPath::new);
+            fill_defaults_tagged(table, origins, tagged, "", path, &mut filled);
+            crate::trace::defaults_filled(filled);
         }
     }
 }
@@ -559,57 +985,6 @@ pub(crate) fn finalize(
     Ok(merged)
 }
 
-/// Finalize a merged table against a document-root [`Shape`].
-///
-/// Object roots use [`finalize`]. Map roots coerce and type-check each
-/// entry against the item shape; they do not invent a parent field or
-/// require any particular key to exist (an absent map is empty).
-pub(crate) fn finalize_shape(
-    mut merged: Map,
-    origins: &OriginMap,
-    shape: &Shape,
-    discovery: &DiscoveryRecord,
-) -> Result<Map, ClapfigError> {
-    match shape {
-        Shape::Object(schema) => {
-            return finalize(merged, origins, schema, discovery);
-        }
-        Shape::Map(map) => {
-            coerce_root(&mut merged, shape);
-            let path = ConfigPath::new();
-            for (entry_key, entry_value) in &merged {
-                check_field(
-                    Some(entry_value),
-                    origins,
-                    &map.item,
-                    entry_key,
-                    &path.clone().key(entry_key),
-                    discovery,
-                )?;
-            }
-        }
-        Shape::Tagged(_) => {
-            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
-        }
-        Shape::Leaf(_) | Shape::Array(_) => {
-            unreachable!("illegal document roots are rejected by require_document_root")
-        }
-    }
-    Ok(merged)
-}
-
-fn coerce_root(table: &mut Map, shape: &Shape) {
-    match shape {
-        Shape::Object(schema) => coerce_leaf_values(table, schema),
-        Shape::Map(map) => {
-            for entry in table.values_mut() {
-                coerce_value(entry, &map.item);
-            }
-        }
-        Shape::Tagged(_) | Shape::Leaf(_) | Shape::Array(_) => {}
-    }
-}
-
 /// Schema-driven value coercion: for every leaf the schema declares
 /// [`LeafType::DateTime`](crate::runtime::LeafType::DateTime), a merged
 /// string value that parses as one of TOML's four datetime lexical forms
@@ -659,7 +1034,13 @@ pub(crate) fn coerce_value(value: &mut Value, shape: &Shape) {
                 }
             }
         }
-        Shape::Tagged(_) => {}
+        Shape::Tagged(tagged) => {
+            if let Value::Map(inner) = value
+                && let Some(variant) = tagged.selected(inner)
+            {
+                coerce_leaf_values(inner, &variant.schema);
+            }
+        }
     }
 }
 
@@ -816,8 +1197,113 @@ fn check_field(
                 path,
             )),
         },
-        Shape::Tagged(_) => {
-            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+        Shape::Tagged(tagged) => match value {
+            None => {
+                // Absent tagged object → MissingRequired on the tag
+                // (discovery, no origin). fill_defaults materializes an
+                // empty table on the load path; schema-only tests may
+                // still arrive here with None.
+                Err(ClapfigError::missing_required(
+                    tag_display(display, &tagged.tag),
+                    discovery.clone(),
+                ))
+            }
+            Some(Value::Map(inner)) => {
+                check_tagged(inner, origins, tagged, display, path, discovery)
+            }
+            Some(other) => Err(ClapfigError::invalid_value_at(
+                display.to_string(),
+                format!("expected map, got {}", value_type_name(other)),
+                origins,
+                path,
+            )),
+        },
+    }
+}
+
+fn tag_display(object_display: &str, tag: &str) -> String {
+    if object_display.is_empty() {
+        tag.to_string()
+    } else {
+        format!("{object_display}.{tag}")
+    }
+}
+
+/// Post-merge branch selection + selected-variant required/type checks.
+fn check_tagged(
+    table: &Map,
+    origins: &OriginMap,
+    tagged: &TaggedShape,
+    object_display: &str,
+    path: &ConfigPath,
+    discovery: &DiscoveryRecord,
+) -> Result<(), ClapfigError> {
+    let tag_key = tag_display(object_display, &tagged.tag);
+    let tag_path = path.clone().key(&tagged.tag);
+    match table.get(&tagged.tag) {
+        None => Err(ClapfigError::missing_required(tag_key, discovery.clone())),
+        Some(value) => {
+            if let Some(origin) = crate::origin::lookup(origins, &tag_path) {
+                crate::trace::tagged_branch_selected(&tag_path, &origin.label(), value.type_str());
+            } else {
+                crate::trace::tagged_branch_selected(&tag_path, "unknown", value.type_str());
+            }
+            tagged
+                .discriminator_leaf_type()
+                .check(value)
+                .map_err(|reason| {
+                    ClapfigError::invalid_value_at(tag_key.clone(), reason, origins, &tag_path)
+                })?;
+            let disc = value
+                .as_str()
+                .expect("enum check passed: discriminator is a string in the allowed set");
+            let variant = tagged
+                .variant(disc)
+                .expect("enum check passed: discriminator names a variant");
+            check_required_and_types(
+                table,
+                origins,
+                &variant.schema,
+                object_display,
+                path,
+                discovery,
+            )
+        }
+    }
+}
+
+/// Finalize a merged table against a document root.
+pub(crate) fn finalize_root(
+    mut merged: Map,
+    origins: &OriginMap,
+    root: DocumentRoot<'_>,
+    discovery: &DiscoveryRecord,
+) -> Result<Map, ClapfigError> {
+    match root {
+        DocumentRoot::Object(schema) => finalize(merged, origins, schema, discovery),
+        DocumentRoot::Map(map) => {
+            for entry in merged.values_mut() {
+                coerce_value(entry, &map.item);
+            }
+            let path = ConfigPath::new();
+            for (entry_key, entry_value) in &merged {
+                check_field(
+                    Some(entry_value),
+                    origins,
+                    &map.item,
+                    entry_key,
+                    &path.clone().key(entry_key),
+                    discovery,
+                )?;
+            }
+            Ok(merged)
+        }
+        DocumentRoot::Tagged(tagged) => {
+            if let Some(variant) = tagged.selected(&merged) {
+                coerce_leaf_values(&mut merged, &variant.schema);
+            }
+            check_tagged(&merged, origins, tagged, "", &ConfigPath::new(), discovery)?;
+            Ok(merged)
         }
     }
 }
@@ -1419,5 +1905,182 @@ mod tests {
                 .layer,
             crate::types::InputType::Env
         );
+    }
+
+    fn tagged_block() -> crate::runtime::TaggedShape {
+        crate::runtime::Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .field("mount", RtField::string())
+                    .field("crate_path", RtField::string().optional())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .field("mount", RtField::string())
+                    .field("artifact", RtField::string())
+                    .build(),
+            )
+            .variant("off", Schema::object("Off").build())
+            .build()
+    }
+
+    fn unknown_paths_tagged(table: &Map, tagged: &crate::runtime::TaggedShape) -> Vec<String> {
+        let mut unknown = Vec::new();
+        collect_unknown_paths_root(
+            table,
+            DocumentRoot::Tagged(tagged),
+            "",
+            &ConfigPath::new(),
+            &mut unknown,
+        );
+        unknown.into_iter().map(|u| u.path).collect()
+    }
+
+    fn exclusive_paths_tagged(table: &Map, tagged: &crate::runtime::TaggedShape) -> Vec<String> {
+        let mut unknown = Vec::new();
+        collect_branch_exclusive_root(table, DocumentRoot::Tagged(tagged), &mut unknown);
+        unknown.into_iter().map(|u| u.path).collect()
+    }
+
+    #[test]
+    fn tagged_phase1_accepts_tag_and_any_variant_field() {
+        let tagged = tagged_block();
+        let table = parse("kind = \"rust\"\nmount = \".\"\nartifact = \"x\"\n");
+        assert!(unknown_paths_tagged(&table, &tagged).is_empty());
+    }
+
+    #[test]
+    fn tagged_phase1_flags_true_unknown_without_requiring_discriminator() {
+        let tagged = tagged_block();
+        let table = parse("mount = \".\"\nnot_a_field = 1\n");
+        assert_eq!(unknown_paths_tagged(&table, &tagged), vec!["not_a_field"]);
+    }
+
+    #[test]
+    fn tagged_phase1_does_not_flag_branch_exclusive_keys() {
+        let tagged = tagged_block();
+        let table = parse("kind = \"rust\"\nmount = \".\"\nartifact = \"x\"\n");
+        assert!(unknown_paths_tagged(&table, &tagged).is_empty());
+        assert_eq!(exclusive_paths_tagged(&table, &tagged), vec!["artifact"]);
+    }
+
+    #[test]
+    fn tagged_phase2_skips_true_unknowns() {
+        let tagged = tagged_block();
+        let table = parse("kind = \"rust\"\nmount = \".\"\nnot_a_field = 1\n");
+        assert_eq!(unknown_paths_tagged(&table, &tagged), vec!["not_a_field"]);
+        assert!(exclusive_paths_tagged(&table, &tagged).is_empty());
+    }
+
+    #[test]
+    fn tagged_finalize_good_rust_instance() {
+        let tagged = tagged_block();
+        let table = parse("kind = \"rust\"\nmount = \".\"\n");
+        let out = finalize_root(
+            table,
+            &OriginMap::new(),
+            DocumentRoot::Tagged(&tagged),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap();
+        assert_eq!(out["kind"], Value::String("rust".into()));
+        assert_eq!(out["mount"], Value::String(".".into()));
+    }
+
+    #[test]
+    fn tagged_finalize_unit_variant_is_tag_only() {
+        let tagged = tagged_block();
+        let table = parse("kind = \"off\"\n");
+        let out = finalize_root(
+            table,
+            &OriginMap::new(),
+            DocumentRoot::Tagged(&tagged),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap();
+        assert_eq!(out["kind"], Value::String("off".into()));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn tagged_finalize_unknown_discriminator_is_invalid_value_with_allowed_set() {
+        let tagged = tagged_block();
+        let table = parse("kind = \"rus\"\nmount = \".\"\n");
+        let err = finalize_root(
+            table,
+            &OriginMap::new(),
+            DocumentRoot::Tagged(&tagged),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::InvalidValue { key, reason, .. } => {
+                assert_eq!(key, "kind");
+                assert!(reason.contains("not in allowed set"), "{reason}");
+                assert!(reason.contains("rust"), "{reason}");
+                assert!(reason.contains("payload"), "{reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tagged_finalize_missing_tag_is_missing_required_with_discovery() {
+        let tagged = tagged_block();
+        let table = parse("mount = \".\"\n");
+        let discovery = DiscoveryRecord {
+            files: vec![crate::error::FileProbe {
+                path: "app.toml".into(),
+                outcome: crate::error::ProbeOutcome::Loaded,
+            }],
+            env: true,
+            ..DiscoveryRecord::empty()
+        };
+        let err = finalize_root(
+            table,
+            &OriginMap::new(),
+            DocumentRoot::Tagged(&tagged),
+            &discovery,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { key, discovery: d } => {
+                assert_eq!(key, "kind");
+                assert_eq!(d.files.len(), 1);
+                assert!(d.env);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+        let msg = ClapfigError::missing_required("kind", discovery).to_string();
+        assert!(
+            !msg.contains("set by"),
+            "MissingRequired must not name a winning origin: {msg}"
+        );
+    }
+
+    #[test]
+    fn tagged_fill_defaults_only_selected_variant() {
+        let tagged = crate::runtime::Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .field("mount", RtField::string().default("."))
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .field("artifact", RtField::string().default("none"))
+                    .build(),
+            )
+            .build();
+        let mut table = parse("kind = \"rust\"\n");
+        let mut origins = OriginMap::new();
+        fill_defaults_into_root(&mut table, &mut origins, DocumentRoot::Tagged(&tagged));
+        assert_eq!(table.get("mount"), Some(&Value::String(".".into())));
+        assert!(!table.contains_key("artifact"));
     }
 }

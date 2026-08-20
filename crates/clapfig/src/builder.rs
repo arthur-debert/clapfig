@@ -26,7 +26,7 @@ use crate::ops::{self, ConfigResult};
 use crate::overrides;
 use crate::persist;
 use crate::resolve::{self, ResolveInput};
-use crate::runtime::{Schema, Shape};
+use crate::runtime::{DocumentRoot, MapShape, Schema, Shape, TaggedShape};
 use crate::strict::{StrictnessOverrides, UnknownKeyHook};
 use crate::types::{ConfigAction, Layer, SearchMode, SearchPath};
 use crate::value::{Map, Value};
@@ -76,8 +76,33 @@ enum FileNaming {
 /// [`Clapfig::typed`](crate::Clapfig::typed), whose
 /// [`TypedBuilder`](crate::TypedBuilder) forwards to this
 /// builder.
+/// Document root stored on the builder / resolver.
+enum StoredRoot {
+    Object(Arc<Schema>),
+    Map(Arc<MapShape>),
+    Tagged(Arc<TaggedShape>),
+}
+
+impl StoredRoot {
+    fn as_document(&self) -> DocumentRoot<'_> {
+        match self {
+            StoredRoot::Object(schema) => DocumentRoot::Object(schema.as_ref()),
+            StoredRoot::Map(map) => DocumentRoot::Map(map.as_ref()),
+            StoredRoot::Tagged(tagged) => DocumentRoot::Tagged(tagged.as_ref()),
+        }
+    }
+
+    fn as_shape(&self) -> Shape {
+        match self {
+            StoredRoot::Object(schema) => Shape::Object((**schema).clone()),
+            StoredRoot::Map(map) => Shape::Map((**map).clone()),
+            StoredRoot::Tagged(tagged) => Shape::Tagged((**tagged).clone()),
+        }
+    }
+}
+
 pub struct Builder {
-    shape: Arc<Shape>,
+    schema: StoredRoot,
     app_name: Option<String>,
     file_naming: Option<FileNaming>,
     formats: Option<Vec<String>>,
@@ -99,15 +124,42 @@ pub struct Builder {
 
 impl Builder {
     pub(crate) fn new(schema: Schema) -> Self {
-        Self::from_shape(Arc::new(Shape::Object(schema)))
+        Self::from_arc(Arc::new(schema))
+    }
+
+    /// Construct a builder reusing an already-`Arc<Schema>`-cached schema
+    /// (e.g. the per-type cache the `clapfig::Schema` derive maintains).
+    /// Skips the per-builder allocation of the schema tree that
+    /// [`new`](Self::new) performs.
+    pub(crate) fn from_arc(schema: Arc<Schema>) -> Self {
+        Self::from_root(StoredRoot::Object(schema))
+    }
+
+    pub(crate) fn from_tagged(tagged: TaggedShape) -> Self {
+        Self::from_root(StoredRoot::Tagged(Arc::new(tagged)))
+    }
+
+    pub(crate) fn from_map(map: MapShape) -> Self {
+        Self::from_root(StoredRoot::Map(Arc::new(map)))
     }
 
     /// Construct a builder from an already-`Arc<Shape>`-cached document
-    /// root (e.g. the per-type cache the `clapfig::Schema` derive
-    /// maintains for object and map roots).
+    /// root (typed HashMap/BTreeMap roots, or an object-root derive cache).
     pub(crate) fn from_shape(shape: Arc<Shape>) -> Self {
+        match Arc::try_unwrap(shape).unwrap_or_else(|arc| (*arc).clone()) {
+            Shape::Object(schema) => Self::from_arc(Arc::new(schema)),
+            Shape::Map(map) => Self::from_map(map),
+            Shape::Tagged(tagged) => Self::from_tagged(tagged),
+            other => {
+                other.require_document_root();
+                unreachable!("illegal document roots are rejected by require_document_root")
+            }
+        }
+    }
+
+    fn from_root(schema: StoredRoot) -> Self {
         Self {
-            shape,
+            schema,
             app_name: None,
             file_naming: None,
             formats: None,
@@ -446,7 +498,7 @@ impl Builder {
     pub fn cli_overrides_from<S: Serialize>(mut self, source: &S) -> Self {
         let pairs = flatten::flatten(source)
             .expect("clapfig: failed to flatten CLI source for auto-matching");
-        let valid = overrides::valid_keys_shape(&self.shape);
+        let valid = overrides::valid_keys_root(self.schema.as_document());
         for (key, value) in pairs {
             if let Some(v) = value
                 && valid.contains(&key)
@@ -585,14 +637,14 @@ impl Builder {
         // Validate `strict_at` paths against the schema and merge with the
         // schema's own per-node `strict` settings into a single cascade
         // map.
-        let strict_overrides = crate::strict::build_strict_overrides_shape(
+        let strict_overrides = crate::strict::build_strict_overrides_root(
             &self.strict_at_overrides,
             self.normalize_keys,
-            &self.shape,
+            self.schema.as_document(),
         )?;
 
         Ok(Resolver {
-            shape: self.shape,
+            schema: self.schema,
             app_name,
             naming,
             registry,
@@ -786,7 +838,7 @@ impl Builder {
                         };
                         let template = ops::generate_template(
                             adapter.as_ref(),
-                            &self.shape,
+                            &self.schema.as_shape(),
                             self.normalize_keys,
                         )?;
                         if let Some(parent) = path.parent() {
@@ -807,14 +859,17 @@ impl Builder {
                         let preferred = registry
                             .preferred()
                             .expect("effective_registry always registers an adapter");
-                        let template =
-                            ops::generate_template(preferred, &self.shape, self.normalize_keys)?;
+                        let template = ops::generate_template(
+                            preferred,
+                            &self.schema.as_shape(),
+                            self.normalize_keys,
+                        )?;
                         Ok(ConfigResult::Template(template))
                     }
                 }
             }
             ConfigAction::Schema { output } => {
-                let value = crate::json_schema::generate_from_shape(&self.shape);
+                let value = crate::json_schema::generate_from_shape(&self.schema.as_shape());
                 let schema = serde_json::to_string_pretty(&value)
                     .expect("serde_json::Value serialization is infallible");
                 match output {
@@ -836,14 +891,14 @@ impl Builder {
             }
             ConfigAction::Get { key, scope } => match scope {
                 None => {
-                    let schema = Arc::clone(&self.shape);
+                    let shape = self.schema.as_shape();
                     let normalize_keys = self.normalize_keys;
                     // Merged view: display renders in the preferred
                     // (first-enabled) format's spelling.
                     let registry = self.effective_registry()?;
                     let table = self.load()?;
                     get_from_table(
-                        &schema,
+                        &shape,
                         &table,
                         key,
                         normalize_keys,
@@ -856,7 +911,7 @@ impl Builder {
                     let (path, adapter) = self.resolve_scope_persist_path(Some(name))?;
                     get_scope(
                         adapter.as_ref(),
-                        &self.shape,
+                        &self.schema.as_shape(),
                         name,
                         &path,
                         key,
@@ -868,7 +923,7 @@ impl Builder {
                 let (path, adapter) = self.resolve_scope_persist_path(scope.as_deref())?;
                 persist::persist_value(
                     adapter.as_ref(),
-                    &self.shape,
+                    &self.schema.as_shape(),
                     &path,
                     key,
                     value,
@@ -894,7 +949,7 @@ impl Builder {
 /// [crate-level "Tree-walk resolution" section](crate#tree-walk-resolution--the-resolver-handle)
 /// for the full design rationale.
 pub struct Resolver {
-    shape: Arc<Shape>,
+    schema: StoredRoot,
     app_name: String,
     naming: FileNaming,
     registry: FormatRegistry,
@@ -1002,7 +1057,7 @@ impl Resolver {
         };
 
         let input = ResolveInput {
-            shape: Arc::clone(&self.shape),
+            schema: self.schema.as_document(),
             registry: &self.registry,
             files: loaded.files,
             discovery,
@@ -3128,15 +3183,7 @@ mod tests {
             let path = dir.path().join(name);
             fs::write(&path, content).unwrap();
             for key in ["db.pool-size", "db.pool_size"] {
-                let result = get_scope(
-                    adapter,
-                    &Shape::Object(demo_schema()),
-                    "local",
-                    &path,
-                    key,
-                    true,
-                )
-                .unwrap();
+                let result = get_scope(adapter, &demo_schema(), "local", &path, key, true).unwrap();
                 match result {
                     ConfigResult::KeyValue {
                         key: reported,
@@ -3163,15 +3210,8 @@ mod tests {
         let path = dir.path().join("demo.toml");
         fs::write(&path, "[db]\npool-size = 5\npool_size = 6\n").unwrap();
         for key in ["db.pool-size", "db.pool_size"] {
-            let err = get_scope(
-                &TomlAdapter,
-                &Shape::Object(demo_schema()),
-                "local",
-                &path,
-                key,
-                true,
-            )
-            .unwrap_err();
+            let err =
+                get_scope(&TomlAdapter, &demo_schema(), "local", &path, key, true).unwrap_err();
             match err {
                 ClapfigError::NormalizedKeyCollision {
                     path: reported,
@@ -3203,15 +3243,8 @@ mod tests {
             "host = \"h\"\n\n[db]\npool-size = 5\npool_size = 6\n",
         )
         .unwrap();
-        let err = get_scope(
-            &TomlAdapter,
-            &Shape::Object(demo_schema()),
-            "local",
-            &path,
-            "host",
-            true,
-        )
-        .unwrap_err();
+        let err =
+            get_scope(&TomlAdapter, &demo_schema(), "local", &path, "host", true).unwrap_err();
         match err {
             ClapfigError::NormalizedKeyCollision {
                 path: reported,
@@ -3236,15 +3269,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.toml");
         for key in ["db.pool-size", "db.pool_size"] {
-            let err = get_scope(
-                &TomlAdapter,
-                &Shape::Object(demo_schema()),
-                "local",
-                &path,
-                key,
-                true,
-            )
-            .unwrap_err();
+            let err =
+                get_scope(&TomlAdapter, &demo_schema(), "local", &path, key, true).unwrap_err();
             match err {
                 ClapfigError::ScopeFileMissing {
                     scope,

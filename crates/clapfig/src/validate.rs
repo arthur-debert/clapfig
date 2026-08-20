@@ -11,11 +11,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{ClapfigError, UnknownKeyInfo};
-use crate::format::{ConfigPath, PathSegment, SpanEntry, byte_offset_to_line_col};
-use crate::runtime::Schema;
+use crate::format::{ConfigPath, PathSegment, Span, SpanEntry, byte_offset_to_line_col};
+use crate::origin::OriginMap;
+use crate::runtime::{DocumentRoot, Schema};
 use crate::strict::{
     CollectedUnknown, StrictnessOverrides, UnknownKeyContext, UnknownKeyDecision, UnknownKeyHook,
 };
+use crate::types::InputType;
 use crate::value::{Map, Value};
 
 /// Per-resolution strictness configuration passed into the validate path.
@@ -50,6 +52,11 @@ pub(crate) enum UnknownKeySource<'a> {
     },
     Env {
         sources: &'a crate::env::EnvSources,
+    },
+    /// Post-merge branch-exclusive keys: locations come from the merged
+    /// origin tree (winner-only), not a single layer's spans.
+    Merged {
+        origins: &'a OriginMap,
     },
 }
 
@@ -87,14 +94,31 @@ pub(crate) struct UnknownKey {
 /// [`UnknownKeyDecision::Collect`] — empty for callers that don't use
 /// the collect path. Reject decisions surface as
 /// `ClapfigError::UnknownKeys`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_unknown(
     table: &Map,
     schema: &Schema,
     origin: &UnknownKeySource<'_>,
     ctx: &ValidateContext<'_>,
 ) -> Result<Vec<CollectedUnknown>, ClapfigError> {
+    validate_unknown_root(table, DocumentRoot::Object(schema), origin, ctx)
+}
+
+/// Same as [`validate_unknown`], walking a document root (object or tagged).
+pub(crate) fn validate_unknown_root(
+    table: &Map,
+    root: DocumentRoot<'_>,
+    origin: &UnknownKeySource<'_>,
+    ctx: &ValidateContext<'_>,
+) -> Result<Vec<CollectedUnknown>, ClapfigError> {
     let mut unknown: Vec<UnknownKey> = Vec::new();
-    crate::schema_walk::collect_unknown_paths(table, schema, "", &ConfigPath::new(), &mut unknown);
+    crate::schema_walk::collect_unknown_paths_root(
+        table,
+        root,
+        "",
+        &ConfigPath::new(),
+        &mut unknown,
+    );
     filter_through_cascade(table, origin, unknown, ctx)
 }
 
@@ -147,7 +171,7 @@ pub(crate) fn filter_through_cascade(
     }
     let source_arc: Option<Arc<str>> = match origin {
         UnknownKeySource::File { source, .. } => Some(Arc::from(*source)),
-        UnknownKeySource::Env { .. } => None,
+        UnknownKeySource::Env { .. } | UnknownKeySource::Merged { .. } => None,
     };
     let mut rejected: Vec<UnknownKeyInfo> = Vec::new();
     let mut collected: Vec<CollectedUnknown> = Vec::new();
@@ -171,26 +195,8 @@ pub(crate) fn filter_through_cascade(
         // line rather than inventing a heuristic. Normalization, when
         // enabled, already rewrote the table and span-index paths
         // before this walk; the key span still points at the original
-        // spelling.
-        let (file, line, env_var, span) = match origin {
-            UnknownKeySource::File {
-                path,
-                source,
-                spans,
-            } => {
-                let key_span = spans.get(&config_path).and_then(|e| e.key);
-                let line = key_span
-                    .map(|s| byte_offset_to_line_col(source, s.start).0)
-                    .unwrap_or(0);
-                (Some(*path), line, None, key_span)
-            }
-            UnknownKeySource::Env { sources } => (
-                None,
-                0,
-                crate::env::env_source_names(sources, &config_path),
-                None,
-            ),
-        };
+        // spelling. Merged (phase 2) locations come from the origin tree.
+        let located = locate_unknown_key(origin, &config_path, source_arc.as_ref());
         let value_ref = lookup_value(table, &config_path);
 
         if let Some(callback) = ctx.callback {
@@ -207,12 +213,16 @@ pub(crate) fn filter_through_cascade(
                 path: &key,
                 leaf: &leaf,
                 value: value_ref,
-                file,
-                line: if line > 0 { Some(line) } else { None },
-                span,
-                env_var: env_var.as_deref(),
-                url_key: None,
-                input_type: None,
+                file: located.file,
+                line: if located.line > 0 {
+                    Some(located.line)
+                } else {
+                    None
+                },
+                span: located.span,
+                env_var: located.env_var.as_deref(),
+                url_key: located.url_key.as_deref(),
+                input_type: located.input_type,
             };
             match callback(&context) {
                 UnknownKeyDecision::Accept => continue,
@@ -221,12 +231,16 @@ pub(crate) fn filter_through_cascade(
                         path: key,
                         leaf,
                         value: value_ref.cloned(),
-                        file: file.map(Path::to_path_buf),
-                        line: if line > 0 { Some(line) } else { None },
-                        span,
-                        env_var: env_var.clone(),
-                        url_key: None,
-                        input_type: None,
+                        file: located.file.map(Path::to_path_buf),
+                        line: if located.line > 0 {
+                            Some(located.line)
+                        } else {
+                            None
+                        },
+                        span: located.span,
+                        env_var: located.env_var,
+                        url_key: located.url_key,
+                        input_type: located.input_type,
                     });
                     continue;
                 }
@@ -236,21 +250,99 @@ pub(crate) fn filter_through_cascade(
 
         rejected.push(UnknownKeyInfo {
             key,
-            path: file
+            path: located
+                .file
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| std::path::PathBuf::from("<env>")),
-            line,
-            source: source_arc.clone(),
-            env_var,
-            span,
-            url_key: None,
-            input_type: None,
+            line: located.line,
+            source: located.source,
+            env_var: located.env_var,
+            span: located.span,
+            url_key: located.url_key,
+            input_type: located.input_type,
         });
     }
     if rejected.is_empty() {
         Ok(collected)
     } else {
         Err(ClapfigError::UnknownKeys(rejected))
+    }
+}
+
+struct LocatedUnknown<'a> {
+    file: Option<&'a Path>,
+    line: usize,
+    env_var: Option<String>,
+    span: Option<Span>,
+    url_key: Option<String>,
+    input_type: Option<InputType>,
+    source: Option<Arc<str>>,
+}
+
+fn locate_unknown_key<'a>(
+    origin: &'a UnknownKeySource<'_>,
+    config_path: &ConfigPath,
+    file_source: Option<&'a Arc<str>>,
+) -> LocatedUnknown<'a> {
+    match origin {
+        UnknownKeySource::File {
+            path,
+            source,
+            spans,
+        } => {
+            let key_span = spans.get(config_path).and_then(|e| e.key);
+            let line = key_span
+                .map(|s| byte_offset_to_line_col(source, s.start).0)
+                .unwrap_or(0);
+            LocatedUnknown {
+                file: Some(*path),
+                line,
+                env_var: None,
+                span: key_span,
+                url_key: None,
+                input_type: None,
+                source: file_source.cloned(),
+            }
+        }
+        UnknownKeySource::Env { sources } => LocatedUnknown {
+            file: None,
+            line: 0,
+            env_var: crate::env::env_source_names(sources, config_path),
+            span: None,
+            url_key: None,
+            input_type: None,
+            source: None,
+        },
+        UnknownKeySource::Merged { origins } => {
+            let Some(found) = crate::origin::lookup(origins, config_path) else {
+                return LocatedUnknown {
+                    file: None,
+                    line: 0,
+                    env_var: None,
+                    span: None,
+                    url_key: None,
+                    input_type: None,
+                    source: None,
+                };
+            };
+            let line = match (found.span, found.source.as_deref()) {
+                (Some(span), Some(src)) => byte_offset_to_line_col(src, span.start).0,
+                _ => 0,
+            };
+            LocatedUnknown {
+                file: found.file.as_deref(),
+                line,
+                env_var: if found.env_vars.is_empty() {
+                    None
+                } else {
+                    Some(found.env_vars.join(", "))
+                },
+                span: found.span,
+                url_key: found.url_key.clone(),
+                input_type: Some(found.layer),
+                source: found.source.clone(),
+            }
+        }
     }
 }
 

@@ -13,8 +13,9 @@
 //!
 //! Walkers take [`Shape`]. [`Clapfig::builder`](crate::Clapfig::builder)
 //! accepts `impl Into<Shape>` so object-root callers keep passing a
-//! [`Schema`]. Root Map loads; Tagged still constructs as a loud stub
-//! (tagged walk is SHP01-WS04).
+//! [`Schema`]. Root Map loads as a homogeneous map of the item shape.
+//! Tagged object-root and nested tagged objects load via the two-phase
+//! walk (SHP01-WS04).
 //!
 //! # Example
 //!
@@ -41,7 +42,7 @@
 //!     .build();
 //! ```
 
-use crate::value::Value;
+use crate::value::{Map, Value};
 
 /// Named-field object — the [`Shape::Object`] constructor, not the schema
 /// node (ADR-0010).
@@ -525,8 +526,19 @@ pub enum Shape {
     /// Homogeneous array. Item is any shape. Not a legal document root.
     Array(ArrayShape),
     /// Internally tagged union of objects, selected by a discriminator
-    /// field. A legal document root; tagged walk is SHP01-WS04.
+    /// field. A legal document root; the two-phase tagged walk is
+    /// SHP01-WS04.
     Tagged(TaggedShape),
+}
+
+/// Document-root constructor the resolve pipeline walks.
+///
+/// Object, Map, and Tagged document roots load.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DocumentRoot<'a> {
+    Object(&'a Schema),
+    Map(&'a MapShape),
+    Tagged(&'a TaggedShape),
 }
 
 impl Shape {
@@ -704,8 +716,9 @@ impl Shape {
                 Ok(())
             }
             (Shape::Map(_), other) => Err(format!("expected map, got {}", value_type_name(other))),
-            (Shape::Tagged(_), _) => {
-                todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+            (Shape::Tagged(_), Value::Map(_)) => Ok(()),
+            (Shape::Tagged(_), other) => {
+                Err(format!("expected map, got {}", value_type_name(other)))
             }
         }
     }
@@ -920,7 +933,8 @@ impl ArrayShapeBuilder {
 /// unit variant is the empty object. Variants that are Map, Array, Leaf,
 /// or Tagged are rejected at construction.
 ///
-/// A legal document root; tagged walk is SHP01-WS04.
+/// A legal document root. The two-phase tagged walk (pre-merge union of
+/// variant fields, post-merge branch selection) is SHP01-WS04.
 #[derive(Debug, Clone)]
 pub struct TaggedShape {
     pub name: String,
@@ -938,6 +952,51 @@ pub struct TaggedShape {
 pub struct TaggedVariant {
     pub discriminator: String,
     pub schema: Schema,
+}
+
+impl TaggedShape {
+    /// Variant whose discriminator matches `name`.
+    pub(crate) fn variant(&self, name: &str) -> Option<&TaggedVariant> {
+        self.variants.iter().find(|v| v.discriminator == name)
+    }
+
+    /// Selected variant after merge: the tag value is a string matching a
+    /// closed discriminator. Missing or non-matching tags yield `None`
+    /// (finalize reports `MissingRequired` / `InvalidValue`).
+    pub(crate) fn selected<'a>(&'a self, table: &Map) -> Option<&'a TaggedVariant> {
+        match table.get(&self.tag) {
+            Some(Value::String(name)) => self.variant(name),
+            _ => None,
+        }
+    }
+
+    /// Closed discriminator set as a [`LeafType::Enum`] so unknown /
+    /// mistyped tags reuse the leaf error wording (origin + allowed set).
+    pub(crate) fn discriminator_leaf_type(&self) -> LeafType {
+        LeafType::Enum {
+            values: self
+                .variants
+                .iter()
+                .map(|v| Value::String(v.discriminator.clone()))
+                .collect(),
+        }
+    }
+
+    /// Every field shape declared for `key` across variants (empty if
+    /// no variant owns the name). Phase 1 treats a key as known when this
+    /// is non-empty.
+    pub(crate) fn field_shapes(&self, key: &str) -> Vec<&Shape> {
+        self.variants
+            .iter()
+            .filter_map(|v| {
+                v.schema
+                    .fields
+                    .iter()
+                    .find(|f| f.name == key)
+                    .map(|f| &f.field)
+            })
+            .collect()
+    }
 }
 
 /// Fluent builder for [`TaggedShape`].
@@ -1510,8 +1569,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "tagged walk is SHP01-WS04")]
-    fn clapfig_builder_does_not_silently_load_root_tagged() {
+    fn clapfig_builder_accepts_root_tagged() {
         let _ = crate::Clapfig::builder(
             Shape::tagged("Block", "kind")
                 .variant("rust", object("Rust"))

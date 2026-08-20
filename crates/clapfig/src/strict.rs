@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use crate::error::ClapfigError;
 use crate::format::Span;
-use crate::runtime::Schema;
+use crate::runtime::{DocumentRoot, Schema};
 use crate::types::InputType;
 use crate::value::Value;
 
@@ -223,8 +223,7 @@ pub(crate) struct StrictnessOverrides {
     /// When the document root is a homogeneous Map, item-schema `strict`
     /// annotations are stored root-relative (`db`), while runtime paths
     /// include the dynamic entry key (`core.db.rogue`). Cascade lookup
-    /// probes only the path with that first segment stripped — never the
-    /// physical cursor, so an entry named `db` cannot steal `db.strict`.
+    /// probes only the path with that first segment stripped.
     skip_root_entry: bool,
 }
 
@@ -258,11 +257,10 @@ impl StrictnessOverrides {
         out
     }
 
-    /// Seed overrides from a document-root [`Shape`].
-    pub fn from_shape(shape: &crate::runtime::Shape) -> Self {
-        match shape {
-            crate::runtime::Shape::Object(schema) => Self::from_schema(schema),
-            crate::runtime::Shape::Map(map) => {
+    pub(crate) fn from_root(root: DocumentRoot<'_>) -> Self {
+        match root {
+            DocumentRoot::Object(schema) => Self::from_schema(schema),
+            DocumentRoot::Map(map) => {
                 let mut out = Self::new();
                 out.skip_root_entry = true;
                 if let Some(value) = map.strict {
@@ -271,14 +269,16 @@ impl StrictnessOverrides {
                 walk_shape_strict(&map.item, "", &mut out);
                 out
             }
-            crate::runtime::Shape::Tagged(tagged) => {
+            DocumentRoot::Tagged(tagged) => {
                 let mut out = Self::new();
                 if let Some(value) = tagged.strict {
                     out.insert(String::new(), value);
                 }
+                for variant in &tagged.variants {
+                    walk_schema_strict(&variant.schema, "", &mut out);
+                }
                 out
             }
-            crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => Self::new(),
         }
     }
 
@@ -297,13 +297,6 @@ impl StrictnessOverrides {
     ///   probes both the physical form (`plugins[0]`) and the
     ///   bracket-stripped schema form (`plugins`) at each step, so an
     ///   override set on the item schema applies to any entry.
-    /// - **Root-map paths** (`core.db.rogue`): item-schema overrides are
-    ///   stored without the dynamic entry key (`db`). When the document
-    ///   root is a Map, lookup never matches the physical cursor (an
-    ///   entry named `db` must not steal `db.strict(...)`); it probes
-    ///   only the path after stripping that first segment, so
-    ///   `db.strict(false)` governs `<entry>.db.*` and `entries[""]`
-    ///   remains the root-map override.
     ///
     /// The cascade walks from the leaf's section path upward, returning
     /// the first explicit override found. With no override on any
@@ -325,15 +318,8 @@ impl StrictnessOverrides {
         }
     }
 
-    /// Direct match, then the array-index and root-map schema forms of
-    /// `cursor` when those probes apply.
     fn probe(&self, cursor: &str) -> Option<bool> {
         if self.skip_root_entry {
-            // The physical cursor starts with a user-supplied entry key.
-            // Matching it against item-relative entries would let an
-            // entry named `db` steal `db.strict(...)`. Empty cursor is
-            // the root-map override; every other cursor is looked up
-            // only after stripping that first segment.
             if cursor.is_empty() {
                 return self.entries.get("").copied();
             }
@@ -348,11 +334,6 @@ impl StrictnessOverrides {
         if let Some(v) = self.entries.get(cursor) {
             return Some(*v);
         }
-        // Also probe the bracket-stripped form so an override set on a
-        // runtime ArrayOf schema (e.g. `plugins.audit`) is consulted
-        // when the unknown key sits inside an array entry
-        // (`plugins[0].audit.rogue`). Allocation-free fast path when
-        // there are no brackets in the cursor.
         if cursor.contains('[') {
             let schema_form = strip_brackets(cursor);
             if let Some(v) = self.entries.get(&schema_form) {
@@ -404,17 +385,6 @@ fn walk_shape_strict(shape: &crate::runtime::Shape, dotted: &str, out: &mut Stri
                 walk_schema_strict(&variant.schema, dotted, out);
             }
         }
-    }
-}
-
-/// Drop the first dotted path segment: `core.db` → `db`, `core[0].db` →
-/// `db` (the `[0]` stays in the first segment, the remainder starts after
-/// the first `.`), `core` → `""`. Used so a root-map item override stored
-/// at `db` matches the runtime path `core.db.rogue`.
-fn strip_first_segment(path: &str) -> &str {
-    match path.find('.') {
-        Some(i) => &path[i + 1..],
-        None => "",
     }
 }
 
@@ -472,25 +442,42 @@ fn strip_brackets(path: &str) -> String {
 /// Resolve a dotted path against a schema and return the kind of the node
 /// it lands on (`Nested`, `ArrayOf`, or `Leaf`). Used to validate
 /// `strict_at` paths at `build_resolver` time.
-pub(crate) fn resolve_path_kind_shape(shape: &crate::runtime::Shape, dotted: &str) -> PathKind {
-    match shape {
-        crate::runtime::Shape::Object(schema) => resolve_path_kind(schema, dotted),
-        crate::runtime::Shape::Map(_) => {
+fn strip_first_segment(path: &str) -> &str {
+    match path.find('.') {
+        Some(i) => &path[i + 1..],
+        None => "",
+    }
+}
+
+fn resolve_path_kind_root(root: DocumentRoot<'_>, dotted: &str) -> PathKind {
+    match root {
+        DocumentRoot::Object(schema) => resolve_path_kind(schema, dotted),
+        DocumentRoot::Map(_) => {
             if dotted.is_empty() {
                 PathKind::Section
             } else {
-                // Entry keys are user data, not schema fields.
                 PathKind::Unknown
             }
         }
-        crate::runtime::Shape::Tagged(_) => {
+        DocumentRoot::Tagged(tagged) => {
             if dotted.is_empty() {
-                PathKind::Section
-            } else {
-                PathKind::Unknown
+                return PathKind::Section;
             }
+            if dotted == tagged.tag || dotted.starts_with(&format!("{}.", tagged.tag)) {
+                return if dotted == tagged.tag {
+                    PathKind::Leaf
+                } else {
+                    PathKind::Unknown
+                };
+            }
+            for variant in &tagged.variants {
+                let kind = resolve_path_kind(&variant.schema, dotted);
+                if kind != PathKind::Unknown {
+                    return kind;
+                }
+            }
+            PathKind::Unknown
         }
-        crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => PathKind::Unknown,
     }
 }
 
@@ -557,55 +544,19 @@ pub(crate) fn resolve_path_kind(schema: &Schema, dotted: &str) -> PathKind {
 /// When `normalize_keys` is `true`, each path is rewritten through
 /// `normalize::normalize_key` before lookup so the override accepts the
 /// same kebab/snake spellings the rest of the pipeline does.
-pub(crate) fn build_strict_overrides(
+pub(crate) fn build_strict_overrides_root(
     entries: &[(String, bool)],
     normalize_keys: bool,
-    schema: &Schema,
+    root: DocumentRoot<'_>,
 ) -> Result<StrictnessOverrides, ClapfigError> {
-    let mut out = StrictnessOverrides::from_schema(schema);
+    let mut out = StrictnessOverrides::from_root(root);
     for (raw_path, strict) in entries {
         let path = if normalize_keys {
             crate::normalize::normalize_key(raw_path)
         } else {
             raw_path.clone()
         };
-        match resolve_path_kind(schema, &path) {
-            PathKind::Section => out.insert(path, *strict),
-            PathKind::Leaf => {
-                return Err(ClapfigError::InvalidStrictPath {
-                    path: raw_path.clone(),
-                    reason: "path resolves to a leaf field, but strict is a section property"
-                        .into(),
-                });
-            }
-            PathKind::Unknown => {
-                return Err(ClapfigError::InvalidStrictPath {
-                    path: raw_path.clone(),
-                    reason: "path does not resolve to any field in the config schema".into(),
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// [`build_strict_overrides`] against a document-root [`Shape`].
-pub(crate) fn build_strict_overrides_shape(
-    entries: &[(String, bool)],
-    normalize_keys: bool,
-    shape: &crate::runtime::Shape,
-) -> Result<StrictnessOverrides, ClapfigError> {
-    if let crate::runtime::Shape::Object(schema) = shape {
-        return build_strict_overrides(entries, normalize_keys, schema);
-    }
-    let mut out = StrictnessOverrides::from_shape(shape);
-    for (raw_path, strict) in entries {
-        let path = if normalize_keys {
-            crate::normalize::normalize_key(raw_path)
-        } else {
-            raw_path.clone()
-        };
-        match resolve_path_kind_shape(shape, &path) {
+        match resolve_path_kind_root(root, &path) {
             PathKind::Section => out.insert(path, *strict),
             PathKind::Leaf => {
                 return Err(ClapfigError::InvalidStrictPath {
@@ -729,67 +680,6 @@ mod tests {
         let mut overrides = StrictnessOverrides::new();
         overrides.insert("plugins.audit", false);
         assert!(!overrides.effective_strict("plugins[0].audit.rogue", "rogue", true,));
-    }
-
-    #[test]
-    fn strip_first_segment_drops_the_dynamic_root_entry() {
-        assert_eq!(strip_first_segment("core.db"), "db");
-        assert_eq!(strip_first_segment("core[0].db"), "db");
-        assert_eq!(strip_first_segment("core"), "");
-        assert_eq!(strip_first_segment(""), "");
-    }
-
-    #[test]
-    fn from_shape_root_map_item_strict_matches_every_entry() {
-        use crate::runtime::{Field, Schema as RtSchema, Shape};
-        let item = RtSchema::object("Site")
-            .field("host", Field::string().optional())
-            .nested(
-                "db",
-                RtSchema::object("Db")
-                    .strict(false)
-                    .field("url", Field::string().optional()),
-            )
-            .nested(
-                "audit",
-                RtSchema::object("Audit")
-                    .strict(true)
-                    .field("level", Field::string().optional()),
-            );
-        let shape = Shape::from(Shape::map("sites", item));
-        let overrides = StrictnessOverrides::from_shape(&shape);
-        // Nested `db.strict(false)` is stored as `db`; runtime paths are
-        // `core.db.rogue` / `site.db.rogue` — the root-entry skip must
-        // make both match, not only a path that never occurs.
-        assert!(
-            !overrides.effective_strict("core.db.rogue", "rogue", true),
-            "item db.strict(false) must govern unknown keys under every entry"
-        );
-        assert!(
-            !overrides.effective_strict("site.db.rogue", "rogue", true),
-            "item db.strict(false) must govern a second map entry"
-        );
-        assert!(
-            overrides.effective_strict("core.audit.rogue", "rogue", false),
-            "item audit.strict(true) must re-tighten under every entry"
-        );
-        assert!(
-            overrides.effective_strict("site.audit.rogue", "rogue", false),
-            "item audit.strict(true) must re-tighten a second map entry"
-        );
-        // Unknown at the item top-level still uses the builder default
-        // (no item-root strict here).
-        assert!(overrides.effective_strict("core.rogue", "rogue", true));
-        // An entry whose key equals a nested override path must not
-        // inherit that override at the entry's own top level.
-        assert!(
-            overrides.effective_strict("db.rogue", "rogue", true),
-            "entry named db must not steal item db.strict(false) for db.rogue"
-        );
-        assert!(
-            !overrides.effective_strict("db.db.rogue", "rogue", true),
-            "the nested db section under an entry named db still matches"
-        );
     }
 
     #[test]

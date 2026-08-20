@@ -154,6 +154,21 @@ pub(crate) fn validation_complete() {
     tracing::debug!(target: TARGET, "validation complete");
 }
 
+/// Post-merge tagged-union branch selection.
+///
+/// Names the discriminator **path**, the winning origin, and the tag
+/// value **type**. Never the discriminator string or the variant name
+/// (provenance two-contract: tracing does not contain values).
+pub(crate) fn tagged_branch_selected(key: &ConfigPath, origin: &str, value_type: &str) {
+    tracing::trace!(
+        target: TARGET,
+        key = %key,
+        origin,
+        value_type,
+        "tagged branch selected"
+    );
+}
+
 /// `config set` wrote `key` to `path`. The assigned value is never recorded.
 pub(crate) fn persist_set(path: &Path, key: &str) {
     tracing::debug!(
@@ -192,7 +207,7 @@ mod tests {
     use crate::error::ClapfigError;
     use crate::format::TomlAdapter;
     use crate::persist;
-    use crate::runtime::{Field as RtField, Schema};
+    use crate::runtime::{Field as RtField, Schema, Shape};
     use crate::types::{Layer, SearchPath};
     use crate::value::Value;
 
@@ -634,6 +649,57 @@ mod tests {
             named(&events, "persist set").is_empty(),
             "failed persist must not emit persist set:\n{}",
             blob(&events)
+        );
+    }
+
+    #[test]
+    fn tagged_branch_selection_names_path_origin_and_type_not_discriminator() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.toml"),
+            "kind = \"rust\"\nmount = \".\"\n",
+        )
+        .unwrap();
+        let shape = Shape::from(
+            Shape::tagged("Block", "kind")
+                .variant(
+                    "rust",
+                    Schema::object("Rust").field("mount", RtField::string()),
+                )
+                .variant(
+                    "payload",
+                    Schema::object("Payload").field("artifact", RtField::string()),
+                )
+                .build(),
+        );
+        let (events, result) = capture(|| {
+            Clapfig::builder(shape)
+                .app_name("app")
+                .file_name("app.toml")
+                .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+                .no_env()
+                .load()
+        });
+        result.expect("tagged rust instance");
+        let logs = blob(&events);
+        let selected = named(&events, "tagged branch selected");
+        assert_eq!(
+            selected.len(),
+            1,
+            "expected one branch-selection event:\n{logs}"
+        );
+        assert_eq!(selected[0].field("key"), Some("kind"));
+        assert!(
+            selected[0]
+                .field("origin")
+                .is_some_and(|o| o.starts_with("file:")),
+            "branch selection must name origin, got {:?}",
+            selected[0].field("origin")
+        );
+        assert_eq!(selected[0].field("value_type"), Some("string"));
+        assert!(
+            !logs.contains("rust") && !logs.contains("payload"),
+            "trace must not contain the discriminator string or variant name:\n{logs}"
         );
     }
 }

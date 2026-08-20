@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::origin::{Origin, OriginMap, OriginNode};
-use crate::runtime::Schema;
+use crate::runtime::{DocumentRoot, Schema};
 use crate::value::{Map, Value};
 
 /// Convert dotted-key overrides into a nested config value [`Map`].
@@ -79,8 +79,21 @@ fn set_nested_with_origin(
 /// Returns dotted paths like `"host"`, `"database.url"`, `"database.pool_size"`.
 /// Section names (nested structs) are excluded — only leaf fields are returned.
 pub fn valid_keys(schema: &Schema) -> HashSet<String> {
+    valid_keys_root(DocumentRoot::Object(schema))
+}
+
+pub(crate) fn valid_keys_root(root: DocumentRoot<'_>) -> HashSet<String> {
     let mut keys = HashSet::new();
-    collect_keys(schema, "", &mut keys);
+    match root {
+        DocumentRoot::Object(schema) => collect_keys(schema, "", &mut keys),
+        DocumentRoot::Map(_) => {}
+        DocumentRoot::Tagged(tagged) => {
+            keys.insert(tagged.tag.clone());
+            for variant in &tagged.variants {
+                collect_keys(&variant.schema, "", &mut keys);
+            }
+        }
+    }
     keys
 }
 
@@ -91,8 +104,8 @@ pub fn valid_keys(schema: &Schema) -> HashSet<String> {
 pub fn valid_keys_shape(shape: &crate::runtime::Shape) -> HashSet<String> {
     match shape {
         crate::runtime::Shape::Object(schema) => valid_keys(schema),
+        crate::runtime::Shape::Tagged(tagged) => valid_keys_root(DocumentRoot::Tagged(tagged)),
         crate::runtime::Shape::Map(_)
-        | crate::runtime::Shape::Tagged(_)
         | crate::runtime::Shape::Leaf(_)
         | crate::runtime::Shape::Array(_) => HashSet::new(),
     }
