@@ -20,7 +20,7 @@ use crate::value::{Map, Value};
 
 use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
-    tagged_template_stub, walk_level, walk_root,
+    tagged_variant_example_schema, walk_level, walk_root,
 };
 use super::{ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, Span, SpanEntry};
 
@@ -448,6 +448,10 @@ impl TemplateRenderer for TomlTemplate {
     ) -> Result<(), FormatError> {
         use std::fmt::Write;
 
+        if let Shape::Tagged(tagged) = item {
+            return emit_tagged_toml_entries(self, out, prefix, name, tagged, true);
+        }
+
         // Nested anonymous arrays (`Array<Array<…>>`) have no `[[path]]`
         // spelling — a second header is another entry of the same array,
         // not a nested array. Emit a commented inline assignment that
@@ -476,6 +480,10 @@ impl TemplateRenderer for TomlTemplate {
         item: &Shape,
     ) -> Result<(), FormatError> {
         use std::fmt::Write;
+
+        if let Shape::Tagged(tagged) = item {
+            return emit_tagged_toml_entries(self, out, prefix, name, tagged, false);
+        }
 
         if has_array_in_array(item) {
             emit_object_doc(out, item);
@@ -506,6 +514,10 @@ impl TemplateRenderer for TomlTemplate {
         _doc: &[String],
     ) -> Result<(), FormatError> {
         use std::fmt::Write;
+
+        if let Shape::Tagged(tagged) = item {
+            return emit_tagged_toml_root_map(self, out, tagged);
+        }
 
         // Value-shaped items are assignments, not tables: a leaf or
         // array/map of leaves has no `[<key>]` spelling, and routing
@@ -545,6 +557,87 @@ impl TemplateRenderer for TomlTemplate {
         push_commented_block(out, &buf);
         Ok(())
     }
+
+    fn tagged(
+        &mut self,
+        out: &mut String,
+        prefix: &String,
+        name: Option<&str>,
+        tagged: &crate::runtime::TaggedShape,
+    ) -> Result<(), FormatError> {
+        use std::fmt::Write;
+
+        for (i, variant) in tagged.variants.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let example = tagged_variant_example_schema(tagged, variant);
+            let mut buf = String::new();
+            if let Some(name) = name {
+                let path = section_path(prefix, name);
+                let _ = writeln!(buf, "[{path}]");
+                walk_level(self, &example, &path, &mut buf)?;
+            } else {
+                walk_level(self, &example, prefix, &mut buf)?;
+            }
+            push_commented_block(out, &buf);
+        }
+        Ok(())
+    }
+}
+
+fn emit_tagged_toml_entries(
+    renderer: &mut TomlTemplate,
+    out: &mut String,
+    prefix: &str,
+    name: &str,
+    tagged: &crate::runtime::TaggedShape,
+    array: bool,
+) -> Result<(), FormatError> {
+    use std::fmt::Write;
+
+    let path = section_path(prefix, name);
+    let entry = if array {
+        path.clone()
+    } else {
+        format!("{path}.<key>")
+    };
+    for (i, variant) in tagged.variants.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if array {
+            let _ = writeln!(out, "#[[{entry}]]");
+        } else {
+            let _ = writeln!(out, "#[{entry}]");
+        }
+        let example = tagged_variant_example_schema(tagged, variant);
+        let mut buf = String::new();
+        walk_level(renderer, &example, &entry, &mut buf)?;
+        push_commented_block(out, &buf);
+    }
+    Ok(())
+}
+
+fn emit_tagged_toml_root_map(
+    renderer: &mut TomlTemplate,
+    out: &mut String,
+    tagged: &crate::runtime::TaggedShape,
+) -> Result<(), FormatError> {
+    use std::fmt::Write;
+
+    let entry = "<key>";
+    for (i, variant) in tagged.variants.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let _ = writeln!(out, "#[{entry}]");
+        let example = tagged_variant_example_schema(tagged, variant);
+        let mut buf = String::new();
+        walk_level(renderer, &example, &entry.to_string(), &mut buf)?;
+        push_commented_block(out, &buf);
+    }
+    Ok(())
 }
 
 fn emit_object_doc(out: &mut String, item: &Shape) {
@@ -593,7 +686,18 @@ fn example_shape_value(shape: &Shape) -> Value {
             entry.insert("<key>".into(), example_shape_value(&map.item));
             Value::Map(entry)
         }),
-        Shape::Tagged(_) => tagged_template_stub(),
+        Shape::Tagged(tagged) => tagged
+            .variants
+            .first()
+            .map(|variant| {
+                let example = tagged_variant_example_schema(tagged, variant);
+                let mut map = Map::new();
+                for nf in &example.fields {
+                    map.insert(nf.name.clone(), example_shape_value(&nf.field));
+                }
+                Value::Map(map)
+            })
+            .unwrap_or(Value::Map(Map::new())),
     }
 }
 
@@ -650,9 +754,30 @@ fn emit_toml_item(
             let _ = writeln!(out, "[[{path}]]");
             emit_toml_item(renderer, out, path, &array.item)
         }
-        Shape::Tagged(_) => tagged_template_stub(),
+        Shape::Tagged(tagged) => emit_tagged_toml_item(renderer, out, path, tagged),
         Shape::Leaf(_) => unreachable!("value-field containers are emitted as leaves"),
     }
+}
+
+fn emit_tagged_toml_item(
+    renderer: &mut TomlTemplate,
+    out: &mut String,
+    path: &str,
+    tagged: &crate::runtime::TaggedShape,
+) -> Result<(), FormatError> {
+    use std::fmt::Write;
+
+    for (i, variant) in tagged.variants.iter().enumerate() {
+        if i > 0 {
+            let _ = writeln!(out, "[{path}]");
+        }
+        let example = tagged_variant_example_schema(tagged, variant);
+        walk_level(renderer, &example, &path.to_string(), out)?;
+        if i + 1 < tagged.variants.len() {
+            out.push('\n');
+        }
+    }
+    Ok(())
 }
 
 /// Format an owned [`Value`] as it would appear inline in a TOML file (no
@@ -934,6 +1059,82 @@ pool_size = 5
         assert!(
             nested_map.contains("#[<key>.<key>]"),
             "nested map item adds an inner table header: {nested_map}"
+        );
+    }
+
+    fn tagged_block() -> crate::runtime::TaggedShape {
+        use crate::runtime::{Field, Schema as RtSchema};
+        crate::runtime::Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                RtSchema::object("Rust")
+                    .field("mount", Field::string())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                RtSchema::object("Payload")
+                    .field("mount", Field::string())
+                    .field("artifact", Field::string())
+                    .build(),
+            )
+            .build()
+    }
+
+    #[test]
+    fn template_tagged_one_commented_example_per_variant() {
+        let text = TomlAdapter
+            .template(&Shape::Tagged(tagged_block()))
+            .unwrap();
+        assert!(
+            text.contains("#kind = \"rust\""),
+            "rust example must be commented: {text}"
+        );
+        assert!(
+            text.contains("#kind = \"payload\""),
+            "payload example must be commented: {text}"
+        );
+        assert!(
+            text.contains("#mount = \"\""),
+            "variant fields are commented placeholders: {text}"
+        );
+        assert!(
+            text.contains("#artifact = \"\""),
+            "payload-only field appears in its example: {text}"
+        );
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                panic!("tagged template must not emit uncommented lines: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn template_tagged_field_is_commented_sections() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .field("host", Field::string().default("localhost"))
+            .field("block", Shape::from(tagged_block()))
+            .build();
+        let text = TomlAdapter.template(&Shape::Object(schema)).unwrap();
+        assert!(
+            text.contains("host = \"localhost\""),
+            "sibling object-root leaves stay uncommented: {text}"
+        );
+        assert!(
+            text.contains("#[block]"),
+            "tagged field is a commented section: {text}"
+        );
+        assert!(text.contains("#kind = \"rust\""), "{text}");
+        assert!(text.contains("#kind = \"payload\""), "{text}");
+        let uncommented_kind = text.lines().any(|line| {
+            let t = line.trim();
+            t.starts_with("kind") && !t.starts_with('#')
+        });
+        assert!(
+            !uncommented_kind,
+            "no uncommented mixed-variant object: {text}"
         );
     }
 

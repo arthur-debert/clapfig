@@ -5,7 +5,7 @@ error[E0277]: `Vec<u8>` is not a legal clapfig document root
   |                                       ^^^^^^^ illegal document root
   |
   = help: the trait `DocumentRoot` is not implemented for `Vec<u8>`
-  = note: legal roots: a named-field struct deriving Schema, or BTreeMap<String, T> / HashMap<String, T> where T: Schema
+  = note: legal roots: a named-field struct deriving Schema, an internally tagged #[serde(tag = "...")] enum deriving Schema, or BTreeMap<String, T> / HashMap<String, T> where T: Schema
   = note: Leaf and Array (scalars, Vec<T>, unit-only enums as the document type) are not legal document roots
 help: the following other types implement trait `DocumentRoot`
  --> src/static_schema.rs
@@ -28,7 +28,7 @@ error[E0277]: `Vec<u8>` is not a legal clapfig document root
   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ illegal document root
   |
   = help: the trait `DocumentRoot` is not implemented for `Vec<u8>`
-  = note: legal roots: a named-field struct deriving Schema, or BTreeMap<String, T> / HashMap<String, T> where T: Schema
+  = note: legal roots: a named-field struct deriving Schema, an internally tagged #[serde(tag = "...")] enum deriving Schema, or BTreeMap<String, T> / HashMap<String, T> where T: Schema
   = note: Leaf and Array (scalars, Vec<T>, unit-only enums as the document type) are not legal document roots
 help: the following other types implement trait `DocumentRoot`
  --> src/static_schema.rs

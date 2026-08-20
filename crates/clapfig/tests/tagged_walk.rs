@@ -1,7 +1,7 @@
 //! Runtime two-phase tagged walk (SHP01-WS04 / #168).
 //!
 //! Internally tagged object-root (and nested tagged fields) load through
-//! the existing resolve pipeline. JSON Schema / templates stay WS05 stubs.
+//! the existing resolve pipeline. JSON Schema / templates are SHP01-WS05.
 
 use std::fs;
 use std::sync::Arc;

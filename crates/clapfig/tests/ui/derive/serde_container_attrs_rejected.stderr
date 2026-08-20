@@ -16,8 +16,8 @@ error: #[serde(untagged)] on a enum deriving clapfig::Schema is not supported: i
 19 | #[serde(untagged)]
    |         ^^^^^^^^
 
-error: #[serde(tag)] on a enum deriving clapfig::Schema is not supported: it changes the value shape serde deserializes, and the schema has no representation for tagged/untagged unions — use `#[clapfig(value)]` on the field that holds the union type instead. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
-  --> tests/ui/derive/serde_container_attrs_rejected.rs:26:9
+error: #[serde(content)] on a enum deriving clapfig::Schema is not supported: it changes the value shape serde deserializes, and the schema has no representation for tagged/untagged unions — use `#[clapfig(value)]` on the field that holds the union type instead. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+  --> tests/ui/derive/serde_container_attrs_rejected.rs:26:23
    |
-26 | #[serde(tag = "kind")]
-   |         ^^^
+26 | #[serde(tag = "kind", content = "body")]
+   |                       ^^^^^^^
