@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::env::EnvSources;
+use crate::env::EnvWinners;
 use crate::error::OriginFacts;
 use crate::format::{ConfigPath, PathSegment, Span, SpanEntry};
 use crate::types::InputType;
@@ -48,8 +48,9 @@ pub(crate) struct Origin {
     pub span: Option<Span>,
     /// Full file text, shared across origins from the same parse.
     pub source: Option<Arc<str>>,
-    /// Original environment variable name(s), when `layer` is
-    /// [`InputType::Env`].
+    /// Winning original environment variable name, when `layer` is
+    /// [`InputType::Env`]. A vec so a node can still carry aliases if a
+    /// caller has them; the env walk records one last-writer name.
     pub env_vars: Vec<String>,
     /// URL query-parameter key as received (dotted, percent-decoded),
     /// when `layer` is [`InputType::Url`].
@@ -81,7 +82,7 @@ impl Origin {
         }
     }
 
-    /// An environment-variable origin, naming the original variable(s).
+    /// An environment-variable origin, naming the winning original variable.
     pub(crate) fn env(vars: impl Into<Vec<String>>) -> Self {
         Self {
             layer: OriginLayer::Env,
@@ -311,13 +312,17 @@ fn walk_file_value(
     }
 }
 
-/// Build an origin map from an env-derived table and the original
-/// variable names recorded for each dotted path.
-pub(crate) fn origin_map_from_env(table: &Map, sources: &EnvSources) -> OriginMap {
-    walk_env_map(table, "", sources)
+/// Build an origin map from an env-derived table and the last-writer
+/// variable names recorded in lockstep with insertion.
+///
+/// Each node's origin names only the variable that produced the winning
+/// value at that path (ADR-0004 winner-only). Env source aggregation
+/// stays on unknown-key errors.
+pub(crate) fn origin_map_from_env(table: &Map, winners: &EnvWinners) -> OriginMap {
+    walk_env_map(table, "", winners)
 }
 
-fn walk_env_map(table: &Map, prefix: &str, sources: &EnvSources) -> OriginMap {
+fn walk_env_map(table: &Map, prefix: &str, winners: &EnvWinners) -> OriginMap {
     table
         .iter()
         .map(|(key, value)| {
@@ -326,15 +331,21 @@ fn walk_env_map(table: &Map, prefix: &str, sources: &EnvSources) -> OriginMap {
             } else {
                 format!("{prefix}.{key}")
             };
-            (key.clone(), walk_env_value(value, &dotted, sources))
+            (key.clone(), walk_env_value(value, &dotted, winners))
         })
         .collect()
 }
 
-fn walk_env_value(value: &Value, dotted: &str, sources: &EnvSources) -> OriginNode {
-    let origin = Origin::env(crate::env::env_source_vars(sources, dotted));
+fn walk_env_value(value: &Value, dotted: &str, winners: &EnvWinners) -> OriginNode {
+    let origin = Origin::env(
+        winners
+            .get(dotted)
+            .cloned()
+            .map(|name| vec![name])
+            .unwrap_or_default(),
+    );
     match value {
-        Value::Map(m) => OriginNode::map(origin, walk_env_map(m, dotted, sources)),
+        Value::Map(m) => OriginNode::map(origin, walk_env_map(m, dotted, winners)),
         Value::Array(items) => OriginNode::array(
             origin.clone(),
             items
@@ -458,5 +469,62 @@ mod tests {
         assert_eq!(facts.env_var.as_deref(), Some("MYAPP__PORT, MYAPP__port"));
         assert!(facts.file.is_none());
         assert!(facts.key.is_none());
+    }
+
+    fn env_origin_vars(origins: &OriginMap, dotted: &str) -> Vec<String> {
+        let mut path = ConfigPath::new();
+        for seg in dotted.split('.') {
+            path = path.key(seg);
+        }
+        lookup(origins, &path)
+            .map(|o| o.env_vars.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn env_origin_map_names_only_the_winning_variable() {
+        let (table, _, winners) = crate::env::env_to_table_with_sources(
+            "APP",
+            [
+                ("APP__DATABASE__URL".into(), "x".into()),
+                ("APP__DATABASE".into(), "oops".into()),
+            ],
+        );
+        let origins = origin_map_from_env(&table, &winners);
+        assert_eq!(env_origin_vars(&origins, "database"), ["APP__DATABASE"]);
+        assert!(lookup(&origins, &ConfigPath::new().key("database").key("url")).is_none());
+    }
+
+    #[test]
+    fn env_origin_map_nested_replaces_flat_winner() {
+        let (table, _, winners) = crate::env::env_to_table_with_sources(
+            "APP",
+            [
+                ("APP__DATABASE".into(), "oops".into()),
+                ("APP__DATABASE__URL".into(), "x".into()),
+            ],
+        );
+        let origins = origin_map_from_env(&table, &winners);
+        assert_eq!(
+            env_origin_vars(&origins, "database"),
+            ["APP__DATABASE__URL"]
+        );
+        assert_eq!(
+            env_origin_vars(&origins, "database.url"),
+            ["APP__DATABASE__URL"]
+        );
+    }
+
+    #[test]
+    fn env_origin_map_case_collision_is_last_writer() {
+        let (table, _, winners) = crate::env::env_to_table_with_sources(
+            "APP",
+            [
+                ("APP__host".into(), "first".into()),
+                ("APP__HOST".into(), "second".into()),
+            ],
+        );
+        let origins = origin_map_from_env(&table, &winners);
+        assert_eq!(env_origin_vars(&origins, "host"), ["APP__HOST"]);
     }
 }

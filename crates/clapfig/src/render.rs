@@ -62,10 +62,11 @@ fn render_invalid_value_plain(err: &ClapfigError, origin: &crate::error::OriginF
         let (line, col) = crate::format::byte_offset_to_line_col(src, span.start);
         if let Some(line_text) = src.lines().nth(line.saturating_sub(1)) {
             let col0 = col.saturating_sub(1);
-            let gutter = format!("\n{:>4} | ", line);
+            let gutter = line_gutter(line);
+            out.push('\n');
             out.push_str(&gutter);
             out.push_str(line_text);
-            let pad = " ".repeat("     | ".len() + col0);
+            let pad = " ".repeat(gutter.len() + col0);
             let carets = "^".repeat(caret_len_chars(src, span, line_text, col0));
             let _ = write!(out, "\n{pad}{carets}");
         }
@@ -123,9 +124,9 @@ fn render_unknown_keys_plain(infos: &[crate::error::UnknownKeyInfo]) -> String {
             );
         }
         if let Some((line_text, col, caret_len)) = snippet.body {
-            let gutter = format!("{:>4} | ", snippet.line);
+            let gutter = line_gutter(snippet.line);
             let _ = write!(out, "\n{gutter}{line_text}");
-            let pad = " ".repeat("     | ".len() + col);
+            let pad = " ".repeat(gutter.len() + col);
             let carets = "^".repeat(caret_len);
             let _ = write!(out, "\n{pad}{carets} unknown key");
         }
@@ -157,11 +158,12 @@ fn render_parse_error_plain(
         let (line, col) = crate::format::byte_offset_to_line_col(src, span.start);
         let _ = write!(out, ":{}:{}", line, col);
         if let Some(line_text) = src.lines().nth(line - 1) {
-            let gutter = format!("\n{:>4} | ", line);
+            let gutter = line_gutter(line);
+            out.push('\n');
             out.push_str(&gutter);
             out.push_str(line_text);
             let col0 = col.saturating_sub(1);
-            let pad = " ".repeat("     | ".len() + col0);
+            let pad = " ".repeat(gutter.len() + col0);
             let carets = "^".repeat(caret_len_chars(src, span, line_text, col0));
             let _ = write!(out, "\n{pad}{carets}");
         }
@@ -175,6 +177,12 @@ struct UnknownKeySnippet<'a> {
     line: usize,
     /// Source line, 0-based character column, and caret length in characters.
     body: Option<(&'a str, usize, usize)>,
+}
+
+/// `"   12 | "` — or wider when `line` exceeds four digits. Caret
+/// padding must use this width, not a fixed 7-character gutter.
+fn line_gutter(line: usize) -> String {
+    format!("{:>4} | ", line)
 }
 
 /// Caret width in characters for a byte `span` on `line_text`.
@@ -542,6 +550,14 @@ mod tests {
     }
 
     #[test]
+    fn line_gutter_widens_for_five_digit_lines() {
+        assert_eq!(line_gutter(1), "   1 | ");
+        assert_eq!(line_gutter(9999), "9999 | ");
+        assert_eq!(line_gutter(10000), "10000 | ");
+        assert!(line_gutter(10000).len() > line_gutter(1).len());
+    }
+
+    #[test]
     fn plain_fallback_carets_use_character_column() {
         // No span: leaf-find must convert the byte offset of `typo`
         // (after a 4-byte emoji) into a character column, and caret the
@@ -562,7 +578,7 @@ mod tests {
         let prefix = caret.split('^').next().expect("caret prefix");
         assert_eq!(
             prefix.chars().count(),
-            "     | ".len() + 2,
+            line_gutter(1).len() + 2,
             "caret should sit under 'typo' (2 columns of prefix), got: {out}"
         );
         assert_eq!(

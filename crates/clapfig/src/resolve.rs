@@ -265,7 +265,7 @@ pub(crate) fn resolve(
     // mismatches between env's heuristic value parsing (e.g. string
     // "1.5" for an integer field) don't fail validation — that's
     // still the job of the final-merge type check inside `finalize`.
-    if cascade_active && let Some((env_table_ref, sources)) = env_layer.as_ref() {
+    if cascade_active && let Some((env_table_ref, sources, _)) = env_layer.as_ref() {
         let mut env_filtered = validate_unknown(
             env_table_ref,
             input.schema,
@@ -274,8 +274,8 @@ pub(crate) fn resolve(
         )?;
         collected_unknowns.append(&mut env_filtered);
     }
-    let env_layer = env_layer.map(|(table, sources)| {
-        let origins = origin_map_from_env(&table, &sources);
+    let env_layer = env_layer.map(|(table, _, winners)| {
+        let origins = origin_map_from_env(&table, &winners);
         (table, origins)
     });
 
@@ -1267,6 +1267,65 @@ mod tests {
         assert!(
             msg.contains("set by environment variable MYAPP__PORT"),
             "{msg}"
+        );
+    }
+
+    #[test]
+    fn invalid_value_env_names_only_the_winning_variable() {
+        let spec = test_spec();
+        let input = ResolveInput {
+            env_vars: vec![
+                ("MYAPP__DATABASE__URL".into(), "postgres://ok".into()),
+                ("MYAPP__DATABASE".into(), "oops".into()),
+            ],
+            env_prefix: Some("MYAPP".into()),
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "database", crate::types::InputType::Env);
+        assert_eq!(facts.env_var.as_deref(), Some("MYAPP__DATABASE"));
+        let msg = err.to_string();
+        assert!(msg.contains("MYAPP__DATABASE"), "{msg}");
+        assert!(
+            !msg.contains("MYAPP__DATABASE__URL"),
+            "losing nested var must not appear on the origin: {msg}"
+        );
+    }
+
+    #[test]
+    fn invalid_value_env_nested_replaces_flat_origin() {
+        let spec = test_spec();
+        let input = ResolveInput {
+            env_vars: vec![
+                ("MYAPP__DATABASE".into(), "oops".into()),
+                ("MYAPP__DATABASE__POOL_SIZE".into(), "nope".into()),
+            ],
+            env_prefix: Some("MYAPP".into()),
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "database.pool_size", crate::types::InputType::Env);
+        assert_eq!(facts.env_var.as_deref(), Some("MYAPP__DATABASE__POOL_SIZE"));
+    }
+
+    #[test]
+    fn invalid_value_env_case_collision_names_last_writer() {
+        let spec = test_spec();
+        let input = ResolveInput {
+            env_vars: vec![
+                ("MYAPP__port".into(), "first".into()),
+                ("MYAPP__PORT".into(), "second".into()),
+            ],
+            env_prefix: Some("MYAPP".into()),
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "port", crate::types::InputType::Env);
+        assert_eq!(facts.env_var.as_deref(), Some("MYAPP__PORT"));
+        assert!(
+            !err.to_string().contains("MYAPP__port"),
+            "losing case variant must not appear on the origin: {}",
+            err
         );
     }
 

@@ -371,7 +371,7 @@ mod tests {
         // Reconstructing an uppercased path would tell the user to
         // unset MYAPP__ROGUE_KEY, which does not remove MYAPP__rogue_key
         // on a case-sensitive platform.
-        let (table, sources) = crate::env::env_to_table_with_sources(
+        let (table, sources, _) = crate::env::env_to_table_with_sources(
             "MYAPP",
             [("MYAPP__rogue_key".into(), "1".into())],
         );
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn env_origin_lists_every_source_name_that_collapsed_onto_the_path() {
-        let (table, sources) = crate::env::env_to_table_with_sources(
+        let (table, sources, _) = crate::env::env_to_table_with_sources(
             "MYAPP",
             [
                 ("MYAPP__rogue_key".into(), "1".into()),
@@ -425,7 +425,7 @@ mod tests {
     fn env_origin_names_variable_when_unknown_is_a_nested_section() {
         // MYAPP__DATABASE__ROGUE is stored under `database.rogue`, but
         // with no `database` field the walker reports `database`.
-        let (table, sources) = crate::env::env_to_table_with_sources(
+        let (table, sources, _) = crate::env::env_to_table_with_sources(
             "MYAPP",
             [("MYAPP__DATABASE__ROGUE".into(), "1".into())],
         );
@@ -446,7 +446,7 @@ mod tests {
     fn env_origin_lists_flat_and_nested_names_after_nested_overwrite() {
         // Flat then nested: the table is the nested section, but both
         // original names touched this path and must be listed.
-        let (table, sources) = crate::env::env_to_table_with_sources(
+        let (table, sources, _) = crate::env::env_to_table_with_sources(
             "MYAPP",
             [
                 ("MYAPP__DATABASE".into(), "flat".into()),
@@ -473,7 +473,7 @@ mod tests {
     fn env_origin_lists_flat_and_nested_names_after_flat_overwrite() {
         // Nested then flat: the table holds the flat value, but the
         // nested variable is still set in the environment.
-        let (table, sources) = crate::env::env_to_table_with_sources(
+        let (table, sources, _) = crate::env::env_to_table_with_sources(
             "MYAPP",
             [
                 ("MYAPP__DATABASE__ROGUE".into(), "1".into()),
@@ -500,7 +500,7 @@ mod tests {
     fn env_origin_passes_variable_name_to_callback_and_collect() {
         // `env_var` is already computed for UnknownKeyInfo; the callback
         // context and collected-unknown list must see the same name.
-        let (table, sources) = crate::env::env_to_table_with_sources(
+        let (table, sources, _) = crate::env::env_to_table_with_sources(
             "MYAPP",
             [("MYAPP__rogue_key".into(), "1".into())],
         );

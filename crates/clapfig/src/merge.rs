@@ -22,17 +22,21 @@ pub(crate) fn deep_merge(
     for (key, overlay_val) in overlay {
         match (base.remove(&key), overlay_val) {
             (Some(Value::Map(base_map)), Value::Map(overlay_map)) => {
-                let (_base_origin, base_om) = take_map_children(base_origins.remove(&key));
+                let (base_origin, base_om) = take_map_children(base_origins.remove(&key));
                 let (overlay_origin, overlay_om) = take_map_children(overlay_origins.remove(&key));
                 let (merged, merged_o) = deep_merge(base_map, overlay_map, base_om, overlay_om);
                 base.insert(key.clone(), Value::Map(merged));
-                let origin = overlay_origin.unwrap_or_else(|| Origin::default(key.clone()));
+                let origin = overlay_origin
+                    .or(base_origin)
+                    .unwrap_or_else(|| Origin::default(key.clone()));
                 base_origins.insert(key, OriginNode::map(origin, merged_o));
             }
             (_, overlay_val) => {
                 base.insert(key.clone(), overlay_val);
                 if let Some(origin) = overlay_origins.remove(&key) {
                     base_origins.insert(key, origin);
+                } else {
+                    base_origins.remove(&key);
                 }
             }
         }
@@ -292,6 +296,55 @@ mod tests {
         assert!(
             lookup(&origins, &ConfigPath::new().key("a").key("b")).is_none(),
             "quoted dotted key is one segment, not [a] b"
+        );
+    }
+
+    #[test]
+    fn lockstep_overlay_without_origin_drops_base_origin() {
+        let base = table("port = 8080");
+        let overlay = table("port = 3000");
+        let mut base_o = OriginMap::new();
+        base_o.insert("port".into(), file_leaf("base.toml"));
+        let (merged, origins) = deep_merge(base, overlay, base_o, OriginMap::new());
+        assert_eq!(merged["port"].as_integer().unwrap(), 3000);
+        assert!(
+            lookup(&origins, &ConfigPath::new().key("port")).is_none(),
+            "missing overlay origin must not leave the replaced base origin"
+        );
+    }
+
+    #[test]
+    fn lockstep_map_merge_keeps_base_origin_when_overlay_origin_missing() {
+        let base = table(
+            r#"
+            [database]
+            url = "postgres://old"
+            "#,
+        );
+        let overlay = table(
+            r#"
+            [database]
+            pool_size = 20
+            "#,
+        );
+        let mut base_o = OriginMap::new();
+        let mut base_db = OriginMap::new();
+        base_db.insert("url".into(), file_leaf("base.toml"));
+        base_o.insert("database".into(), file_map("base.toml", base_db));
+
+        let (merged, origins) = deep_merge(base, overlay, base_o, OriginMap::new());
+        let db = merged["database"].as_map().unwrap();
+        assert_eq!(db["url"].as_str().unwrap(), "postgres://old");
+        assert_eq!(db["pool_size"].as_integer().unwrap(), 20);
+        assert_eq!(winner_file(&origins, "database"), "base.toml");
+        assert_eq!(winner_file(&origins, "database.url"), "base.toml");
+        assert!(
+            lookup(
+                &origins,
+                &ConfigPath::new().key("database").key("pool_size")
+            )
+            .is_none(),
+            "overlay leaf with no origin must not inherit a synthesized default"
         );
     }
 }
