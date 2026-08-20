@@ -9,12 +9,11 @@
 //! `runtime::Schema` in a per-type `OnceLock`; all existing schema
 //! consumers walk the cached runtime view.
 //!
-//! [`ShapeStatic`] is the const mirror of [`runtime::Shape`](crate::runtime::Shape),
-//! the schema node. [`SchemaStatic`] remains the named-field object
-//! constructor (ADR-0010). Derive emits [`SchemaStatic`] trees
-//! (named-field objects, unit-only enums, and internally tagged enums
-//! via `tagged_tag` / `tagged_variants`). `HashMap`/`BTreeMap` typed
-//! roots construct [`Shape::Map`](crate::runtime::Shape::Map) at
+//! [`SchemaStatic`] is the named-field object constructor (ADR-0010).
+//! Derive emits [`SchemaStatic`] trees (named-field objects, unit-only
+//! enums, and internally tagged enums via `tagged_tag` /
+//! `tagged_variants`). `HashMap`/`BTreeMap` typed roots construct
+//! [`Shape::Map`](crate::runtime::Shape::Map) at
 //! [`Schema::shape`](Schema::shape) time. Walkers take
 //! [`runtime::Shape`](crate::runtime::Shape).
 //!
@@ -66,45 +65,6 @@ pub struct SchemaStatic {
     /// Tagged variants (discriminator → object schema). Empty when this
     /// schema is not tagged.
     pub tagged_variants: &'static [TaggedVariantStatic],
-}
-
-/// `const`-friendly mirror of [`runtime::Shape`](crate::runtime::Shape).
-///
-/// Five constructors matching the runtime node. Object-root and tagged
-/// derive emit [`SchemaStatic`] (tagged metadata lives on that struct);
-/// a root Map is a typed `BTreeMap`/`HashMap` and does not emit a
-/// `ShapeStatic` const.
-///
-/// Tagged variants are objects ([`SchemaStatic`]), not an arbitrary
-/// [`ShapeStatic`]. `to_runtime` enforces the same construction
-/// invariants as [`Shape::tagged`](crate::runtime::Shape::tagged):
-/// non-empty tag without `.`/`[`/`]`, at least one variant, unique
-/// non-empty discriminators, no unit-enum schema in variant position,
-/// and no variant field named the tag. `ShapeStatic::Object` rejects a
-/// unit-enum [`SchemaStatic`] — unit enums are [`ShapeStatic::Leaf`].
-#[derive(Debug)]
-pub enum ShapeStatic {
-    Leaf(LeafStatic),
-    Object(&'static SchemaStatic),
-    Map {
-        name: &'static str,
-        doc: &'static [&'static str],
-        strict: Option<bool>,
-        item: &'static ShapeStatic,
-    },
-    Array {
-        name: &'static str,
-        doc: &'static [&'static str],
-        strict: Option<bool>,
-        item: &'static ShapeStatic,
-    },
-    Tagged {
-        name: &'static str,
-        doc: &'static [&'static str],
-        strict: Option<bool>,
-        tag: &'static str,
-        variants: &'static [TaggedVariantStatic],
-    },
 }
 
 /// `const`-friendly mirror of [`runtime::TaggedVariant`](crate::runtime::TaggedVariant).
@@ -292,67 +252,6 @@ impl SchemaStatic {
     /// emits [`Shape::Tagged`](crate::runtime::Shape::Tagged).
     pub fn is_tagged(&self) -> bool {
         !self.tagged_tag.is_empty()
-    }
-}
-
-impl ShapeStatic {
-    /// Convert to the owned runtime node.
-    ///
-    /// Tagged construction invariants (empty tag, reserved path
-    /// characters in the tag, empty union, empty or duplicate
-    /// discriminators, unit-enum variants, variant fields named as the
-    /// tag) panic here — the same deferred-authoring-error pattern as a
-    /// malformed datetime default. `ShapeStatic::Object` of a unit-enum
-    /// schema also panics (unit enums are `Leaf`). Leaf and Array
-    /// convert; they remain illegal as *document* roots
-    /// ([`runtime::Shape::require_document_root`](crate::runtime::Shape::require_document_root)).
-    pub fn to_runtime(&self) -> RuntimeShape {
-        match self {
-            ShapeStatic::Leaf(leaf) => RuntimeShape::Leaf(leaf.to_runtime()),
-            ShapeStatic::Object(schema) => {
-                assert!(
-                    !schema.is_enum(),
-                    "clapfig: ShapeStatic::Object must be a named-field object, got unit enum `{}`",
-                    schema.name
-                );
-                RuntimeShape::Object(schema.to_runtime())
-            }
-            ShapeStatic::Map {
-                name,
-                doc,
-                strict,
-                item,
-            } => RuntimeShape::Map(RuntimeMapShape {
-                name: (*name).to_string(),
-                doc: doc.iter().map(|s| (*s).to_string()).collect(),
-                strict: *strict,
-                item: Box::new(item.to_runtime()),
-                default: None,
-                optional: false,
-                env: None,
-            }),
-            ShapeStatic::Array {
-                name,
-                doc,
-                strict,
-                item,
-            } => RuntimeShape::Array(RuntimeArrayShape {
-                name: (*name).to_string(),
-                doc: doc.iter().map(|s| (*s).to_string()).collect(),
-                strict: *strict,
-                item: Box::new(item.to_runtime()),
-                default: None,
-                optional: false,
-                env: None,
-            }),
-            ShapeStatic::Tagged {
-                name,
-                doc,
-                strict,
-                tag,
-                variants,
-            } => RuntimeShape::Tagged(tagged_static_to_runtime(name, doc, *strict, tag, variants)),
-        }
     }
 }
 
@@ -1576,23 +1475,6 @@ mod tests {
         assert!(std::ptr::eq(r, a.as_ref()));
     }
 
-    static STRING_LEAF: ShapeStatic = ShapeStatic::Leaf(LeafStatic {
-        doc: EMPTY_DOC,
-        ty: LeafTypeStatic::String,
-        default: None,
-        optional: false,
-        env: None,
-    });
-
-    static INNER_OBJECT: ShapeStatic = ShapeStatic::Object(&NESTED_INNER);
-
-    static ROOT_MAP: ShapeStatic = ShapeStatic::Map {
-        name: "blocks",
-        doc: EMPTY_DOC,
-        strict: None,
-        item: &INNER_OBJECT,
-    };
-
     static OFF_OBJECT: SchemaStatic = SchemaStatic {
         name: "Off",
         doc: EMPTY_DOC,
@@ -1602,55 +1484,6 @@ mod tests {
         tagged_tag: "",
         tagged_variants: &[],
     };
-
-    static TAGGED_BLOCK: ShapeStatic = ShapeStatic::Tagged {
-        name: "Block",
-        doc: EMPTY_DOC,
-        strict: None,
-        tag: "kind",
-        variants: &[
-            TaggedVariantStatic {
-                discriminator: "rust",
-                schema: &NESTED_INNER,
-            },
-            TaggedVariantStatic {
-                discriminator: "off",
-                schema: &OFF_OBJECT,
-            },
-        ],
-    };
-
-    #[test]
-    fn shape_static_object_and_map_to_runtime() {
-        let object = ShapeStatic::Object(&MINIMAL_SCHEMA).to_runtime();
-        assert!(matches!(object, RuntimeShape::Object(_)));
-        assert!(object.is_legal_document_root());
-
-        let map = ROOT_MAP.to_runtime();
-        match &map {
-            RuntimeShape::Map(m) => {
-                assert_eq!(m.name, "blocks");
-                assert!(matches!(m.item.as_ref(), RuntimeShape::Object(_)));
-            }
-            other => panic!("expected Map, got {other:?}"),
-        }
-        assert!(map.is_legal_document_root());
-    }
-
-    #[test]
-    fn shape_static_tagged_to_runtime_preserves_closed_set() {
-        let shape = TAGGED_BLOCK.to_runtime();
-        match shape {
-            RuntimeShape::Tagged(t) => {
-                assert_eq!(t.tag, "kind");
-                assert_eq!(t.variants.len(), 2);
-                assert_eq!(t.variants[0].discriminator, "rust");
-                assert_eq!(t.variants[1].discriminator, "off");
-                assert!(t.variants[1].schema.fields.is_empty());
-            }
-            other => panic!("expected Tagged, got {other:?}"),
-        }
-    }
 
     static TAGGED_ITEM_SCHEMA: SchemaStatic = SchemaStatic {
         name: "Block",
@@ -1735,152 +1568,5 @@ mod tests {
             }
             other => panic!("expected Map, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn shape_static_leaf_and_array_convert_but_are_not_document_roots() {
-        let leaf = STRING_LEAF.to_runtime();
-        assert!(matches!(leaf, RuntimeShape::Leaf(_)));
-        assert!(!leaf.is_legal_document_root());
-
-        let array = ShapeStatic::Array {
-            name: "flags",
-            doc: EMPTY_DOC,
-            strict: None,
-            item: &STRING_LEAF,
-        }
-        .to_runtime();
-        assert!(matches!(array, RuntimeShape::Array(_)));
-        assert!(!array.is_legal_document_root());
-    }
-
-    static EMPTY_TAGGED: ShapeStatic = ShapeStatic::Tagged {
-        name: "Block",
-        doc: EMPTY_DOC,
-        strict: None,
-        tag: "kind",
-        variants: &[],
-    };
-
-    static EMPTY_TAG: ShapeStatic = ShapeStatic::Tagged {
-        name: "Block",
-        doc: EMPTY_DOC,
-        strict: None,
-        tag: "",
-        variants: &[TaggedVariantStatic {
-            discriminator: "rust",
-            schema: &NESTED_INNER,
-        }],
-    };
-
-    static DUPLICATE_TAGGED: ShapeStatic = ShapeStatic::Tagged {
-        name: "Block",
-        doc: EMPTY_DOC,
-        strict: None,
-        tag: "kind",
-        variants: &[
-            TaggedVariantStatic {
-                discriminator: "rust",
-                schema: &NESTED_INNER,
-            },
-            TaggedVariantStatic {
-                discriminator: "rust",
-                schema: &NESTED_INNER,
-            },
-        ],
-    };
-
-    static UNIT_ENUM_VARIANT: ShapeStatic = ShapeStatic::Tagged {
-        name: "Block",
-        doc: EMPTY_DOC,
-        strict: None,
-        tag: "kind",
-        variants: &[TaggedVariantStatic {
-            discriminator: "letter",
-            schema: &ENUM_PDF_PAGE,
-        }],
-    };
-
-    static DOTTED_TAG: ShapeStatic = ShapeStatic::Tagged {
-        name: "Block",
-        doc: EMPTY_DOC,
-        strict: None,
-        tag: "k.ind",
-        variants: &[TaggedVariantStatic {
-            discriminator: "rust",
-            schema: &NESTED_INNER,
-        }],
-    };
-
-    static TAG_CLASH_OBJECT: SchemaStatic = SchemaStatic {
-        name: "Rust",
-        doc: EMPTY_DOC,
-        strict: None,
-        fields: &[NamedFieldStatic {
-            name: "kind",
-            field: FieldStatic::Leaf(LeafStatic {
-                doc: EMPTY_DOC,
-                ty: LeafTypeStatic::String,
-                default: None,
-                optional: false,
-                env: None,
-            }),
-        }],
-        enum_variants: &[],
-        tagged_tag: "",
-        tagged_variants: &[],
-    };
-
-    static TAG_FIELD_CLASH: ShapeStatic = ShapeStatic::Tagged {
-        name: "Block",
-        doc: EMPTY_DOC,
-        strict: None,
-        tag: "kind",
-        variants: &[TaggedVariantStatic {
-            discriminator: "rust",
-            schema: &TAG_CLASH_OBJECT,
-        }],
-    };
-
-    #[test]
-    #[should_panic(expected = "must have at least one variant")]
-    fn shape_static_tagged_rejects_empty_union() {
-        let _ = EMPTY_TAGGED.to_runtime();
-    }
-
-    #[test]
-    #[should_panic(expected = "discriminator field name must not be empty")]
-    fn shape_static_tagged_rejects_empty_tag() {
-        let _ = EMPTY_TAG.to_runtime();
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate tagged discriminator")]
-    fn shape_static_tagged_rejects_duplicate_discriminators() {
-        let _ = DUPLICATE_TAGGED.to_runtime();
-    }
-
-    #[test]
-    #[should_panic(expected = "must be an object, got unit enum")]
-    fn shape_static_tagged_rejects_unit_enum_variant() {
-        let _ = UNIT_ENUM_VARIANT.to_runtime();
-    }
-
-    #[test]
-    #[should_panic(expected = "contains '.'")]
-    fn shape_static_tagged_rejects_tag_with_dot() {
-        let _ = DOTTED_TAG.to_runtime();
-    }
-
-    #[test]
-    #[should_panic(expected = "must not declare a field named \"kind\"")]
-    fn shape_static_tagged_rejects_variant_field_named_as_tag() {
-        let _ = TAG_FIELD_CLASH.to_runtime();
-    }
-
-    #[test]
-    #[should_panic(expected = "must be a named-field object, got unit enum")]
-    fn shape_static_object_rejects_unit_enum() {
-        let _ = ShapeStatic::Object(&ENUM_PDF_PAGE).to_runtime();
     }
 }
