@@ -2,7 +2,8 @@
 //! config table.
 //!
 //! Operates on pre-loaded data (`ResolveInput`) with no I/O, making the full
-//! pipeline testable with synthetic inputs. Steps:
+//! pipeline testable with synthetic inputs (files, env, and the discovery
+//! probe record). Steps:
 //!
 //! 1. Build each layer independently (files, env, URL, CLI)
 //! 2. Merge layers in the configured order (default: files < env < URL < CLI)
@@ -18,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::env;
-use crate::error::ClapfigError;
+use crate::error::{ClapfigError, DiscoveryRecord};
 use crate::format::{self, FormatRegistry};
 use crate::merge::deep_merge;
 use crate::normalize::{normalize_key, normalize_table};
@@ -43,7 +44,14 @@ pub(crate) struct ResolveInput<'a> {
     /// silent parse under another format.
     pub registry: &'a FormatRegistry,
     /// File contents in precedence order: first = lowest priority, last = highest.
+    /// Loaded files only — misses and unprobed candidates live on
+    /// [`discovery`](Self::discovery), not here.
     pub files: Vec<(PathBuf, String)>,
+    /// Every candidate probe (loaded / missing / error / not probed) plus
+    /// which non-file input types were consulted. Attached to
+    /// [`ClapfigError::MissingRequired`]. Injectable so this walk stays
+    /// I/O-free; production discovery fills it from the real search.
+    pub discovery: DiscoveryRecord,
     /// Raw environment variable pairs (pass `std::env::vars().collect()` or synthetic data).
     pub env_vars: Vec<(String, String)>,
     /// Env var prefix (e.g. `"MYAPP"`). `None` means env disabled.
@@ -134,11 +142,20 @@ pub(crate) fn resolve(
     // strict outcomes never calls it.
     let cascade_active = input.strict_default || input.strict_overrides.has_any_strict();
 
+    // Default order: Files < Env < Url < Cli. Resolved before layer
+    // construction so omitting a layer excludes it entirely — including
+    // unknown-key validation. Building the env table first used to
+    // reject `APP__ROGUE` even when `Layer::Env` was not in the order;
+    // the files table had the same hole (parse + unknown-key still ran
+    // when `Layer::Files` was omitted).
+    let default_order = default_layer_order();
+    let order = input.layer_order.as_deref().unwrap_or(&default_order);
+
     // Files layer: parse → (optionally) normalize → validate → merge.
     // Validation runs against the parsed Table — never the raw text — so
     // normalized keys are checked in the same form they will reach the merge.
     let mut collected_unknowns: Vec<CollectedUnknown> = Vec::new();
-    let files_table = {
+    let files_table = if order.contains(&Layer::Files) {
         let mut t = Map::new();
         for (path, content) in &input.files {
             // Extensionless (rc-style) names fall back to the preferred
@@ -200,14 +217,9 @@ pub(crate) fn resolve(
             t = deep_merge(t, table);
         }
         t
+    } else {
+        Map::new()
     };
-
-    // Default order: Files < Env < Url < Cli. Resolved before layer
-    // construction so omitting a layer excludes it entirely — including
-    // unknown-key validation. Building the env table first used to
-    // reject `APP__ROGUE` even when `Layer::Env` was not in the order.
-    let default_order = default_layer_order();
-    let order = input.layer_order.as_deref().unwrap_or(&default_order);
 
     // Env layer. Sources travel with the table so unknown-key errors
     // name the exact variable that produced each path, not a
@@ -287,7 +299,7 @@ pub(crate) fn resolve(
     // declared defaults so `finalize` only has to check required fields.
     schema_walk::fill_defaults_into(&mut merged, input.schema);
 
-    let output = schema_walk::finalize(merged, input.schema)?;
+    let output = schema_walk::finalize(merged, input.schema, &input.discovery)?;
     Ok((output, collected_unknowns))
 }
 
@@ -315,6 +327,7 @@ mod tests {
             schema,
             registry: toml_only_registry(),
             files: vec![],
+            discovery: DiscoveryRecord::empty(),
             env_vars: vec![],
             env_prefix: None,
             #[cfg(feature = "url")]
@@ -743,6 +756,25 @@ mod tests {
     }
 
     #[test]
+    fn omitted_files_layer_ignores_unknown_file_keys() {
+        // Omitting Layer::Files excludes parse/unknown-key validation
+        // on supplied file contents — same "omit a layer to exclude it"
+        // rule as Env.
+        let spec = test_spec();
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\nrogue = 1\n".into())],
+            layer_order: Some(vec![Layer::Cli]),
+            cli_overrides: vec![("port".into(), Value::Integer(7777))],
+            ..empty_input(&spec)
+        };
+        let (table, collected) =
+            resolve(input).expect("omitted files must not fail on unknown file keys");
+        assert_eq!(get(&table, "port").unwrap().as_integer(), Some(7777));
+        assert!(collected.is_empty());
+        assert!(get(&table, "rogue").is_none());
+    }
+
+    #[test]
     fn omitted_env_layer_ignores_unknown_env_keys() {
         // Omitting Layer::Env excludes the layer entirely: an unknown
         // env key must not fail unknown-key validation or invoke the
@@ -1012,5 +1044,86 @@ mod tests {
             get(&table, "database.url").unwrap().as_str(),
             Some("pg://y")
         );
+    }
+
+    fn required_name_schema() -> Schema {
+        Schema::object("Req")
+            .field("name", crate::runtime::Field::string())
+            .build()
+    }
+
+    #[test]
+    fn missing_required_uses_injected_discovery_record() {
+        // The core walk is I/O-free: probes on ResolveInput are the
+        // record MissingRequired reports, including FirstMatch's
+        // not-probed candidates. No filesystem is touched.
+        let schema = required_name_schema();
+        let discovery = DiscoveryRecord {
+            files: vec![
+                crate::error::FileProbe {
+                    path: "/etc/app.toml".into(),
+                    outcome: crate::error::ProbeOutcome::Missing,
+                },
+                crate::error::FileProbe {
+                    path: "/proj/app.toml".into(),
+                    outcome: crate::error::ProbeOutcome::NotProbed,
+                },
+            ],
+            env: true,
+            url: false,
+            overrides: true,
+        };
+        let input = ResolveInput {
+            discovery: discovery.clone(),
+            ..empty_input(&schema)
+        };
+        let err = resolve(input).unwrap_err();
+        match err {
+            ClapfigError::MissingRequired {
+                key,
+                discovery: got,
+            } => {
+                assert_eq!(key, "name");
+                assert_eq!(got, discovery);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_missing_leaf_is_missing_required_with_injected_discovery() {
+        // Parent map present from a file; required leaf absent. Same
+        // diagnostic as a top-level miss — no nearest-ancestor origin.
+        let schema = Schema::object("Req")
+            .nested(
+                "db",
+                Schema::object("Db").field("url", crate::runtime::Field::string()),
+            )
+            .build();
+        let discovery = DiscoveryRecord {
+            files: vec![crate::error::FileProbe {
+                path: "app.toml".into(),
+                outcome: crate::error::ProbeOutcome::Loaded,
+            }],
+            env: false,
+            url: false,
+            overrides: false,
+        };
+        let input = ResolveInput {
+            files: vec![("app.toml".into(), "[db]\n".into())],
+            discovery: discovery.clone(),
+            ..empty_input(&schema)
+        };
+        let err = resolve(input).unwrap_err();
+        match err {
+            ClapfigError::MissingRequired {
+                key,
+                discovery: got,
+            } => {
+                assert_eq!(key, "db.url");
+                assert_eq!(got, discovery);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
     }
 }

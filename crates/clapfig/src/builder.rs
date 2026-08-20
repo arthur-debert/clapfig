@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
-use crate::error::ClapfigError;
+use crate::error::{ClapfigError, DiscoveryRecord, FileProbe, ProbeOutcome};
 use crate::file;
 use crate::flatten;
 use crate::format::{self, FormatAdapter, FormatRegistry};
@@ -900,6 +900,20 @@ pub struct Resolver {
     file_cache: Mutex<std::collections::HashMap<PathBuf, String>>,
 }
 
+/// Loaded files plus every candidate probe (hits, misses, FirstMatch
+/// not-probed).
+struct DiscoveryLoad {
+    files: Vec<(PathBuf, String)>,
+    probes: Vec<FileProbe>,
+}
+
+/// One directory's probe: the file loaded from it, if any, and every
+/// candidate's outcome.
+struct DirProbe {
+    loaded: Option<(PathBuf, String)>,
+    probes: Vec<FileProbe>,
+}
+
 impl Resolver {
     pub fn resolve_at(&self, start_dir: impl AsRef<std::path::Path>) -> Result<Map, ClapfigError> {
         self.resolve_at_inner(start_dir.as_ref())
@@ -941,13 +955,43 @@ impl Resolver {
         };
         let normalized = std::fs::canonicalize(&absolute).unwrap_or(absolute);
 
-        let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, &normalized);
-        let files = self.load_files_cached(&dirs)?;
+        let order = self
+            .layer_order
+            .clone()
+            .unwrap_or_else(resolve::default_layer_order);
+        // Omitting Files excludes discovery I/O and MissingRequired file
+        // probes — the same "omit a layer to exclude it entirely" rule
+        // as Env.
+        let loaded = if order.contains(&Layer::Files) {
+            let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, &normalized);
+            self.load_files_cached(&dirs)?
+        } else {
+            DiscoveryLoad {
+                files: Vec::new(),
+                probes: Vec::new(),
+            }
+        };
+        let discovery = DiscoveryRecord {
+            files: loaded.probes,
+            env: self.env_prefix.is_some() && order.contains(&Layer::Env),
+            url: {
+                #[cfg(feature = "url")]
+                {
+                    !self.url_overrides.is_empty() && order.contains(&Layer::Url)
+                }
+                #[cfg(not(feature = "url"))]
+                {
+                    false
+                }
+            },
+            overrides: !self.cli_overrides.is_empty() && order.contains(&Layer::Cli),
+        };
 
         let input = ResolveInput {
             schema: self.schema.as_ref(),
             registry: &self.registry,
-            files,
+            files: loaded.files,
+            discovery,
             env_vars: self.env_vars.clone(),
             env_prefix: self.env_prefix.clone(),
             #[cfg(feature = "url")]
@@ -967,54 +1011,146 @@ impl Resolver {
         Ok((table, unknowns))
     }
 
-    fn load_files_cached(&self, dirs: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, ClapfigError> {
+    /// Load discovered files and retain every candidate probe.
+    ///
+    /// Loaded contents go to the resolve pipeline. Every candidate —
+    /// including misses and, under [`SearchMode::FirstMatch`], directories
+    /// the search never reached — is recorded as a [`FileProbe`] so
+    /// [`ClapfigError::MissingRequired`] can name the search. FirstMatch
+    /// still stops *reading* at the first hit; unvisited candidates are
+    /// enumerated as [`ProbeOutcome::NotProbed`] without I/O.
+    fn load_files_cached(&self, dirs: &[PathBuf]) -> Result<DiscoveryLoad, ClapfigError> {
         match self.search_mode {
             SearchMode::Merge => {
-                let mut out = Vec::new();
+                let mut files = Vec::new();
+                let mut probes = Vec::new();
                 for dir in dirs {
-                    if let Some(found) = self.find_in_dir(dir)? {
-                        out.push(found);
+                    let DirProbe {
+                        loaded,
+                        probes: dir_probes,
+                    } = self.probe_dir(dir)?;
+                    probes.extend(dir_probes);
+                    if let Some(found) = loaded {
+                        files.push(found);
                     }
                 }
-                Ok(out)
+                Ok(DiscoveryLoad { files, probes })
             }
             SearchMode::FirstMatch => {
-                for dir in dirs.iter().rev() {
-                    if let Some(found) = self.find_in_dir(dir)? {
-                        return Ok(vec![found]);
+                let mut files = Vec::new();
+                let mut probes = vec![Vec::new(); dirs.len()];
+                let mut matched = false;
+                for (i, dir) in dirs.iter().enumerate().rev() {
+                    if matched {
+                        probes[i] = self.not_probed_dir(dir);
+                        continue;
+                    }
+                    let DirProbe {
+                        loaded,
+                        probes: dir_probes,
+                    } = self.probe_dir(dir)?;
+                    probes[i] = dir_probes;
+                    if let Some(found) = loaded {
+                        files.push(found);
+                        matched = true;
                     }
                 }
-                Ok(Vec::new())
+                Ok(DiscoveryLoad {
+                    files,
+                    probes: probes.into_iter().flatten().collect(),
+                })
             }
         }
     }
 
-    /// Discover this resolver's config file inside one directory.
+    /// Candidate paths this resolver would probe in `dir` (exact name, or
+    /// each enabled extension for stem naming). Used to enumerate
+    /// FirstMatch's unvisited directories as `not probed` without I/O.
+    fn candidate_paths(&self, dir: &Path) -> Vec<PathBuf> {
+        match &self.naming {
+            FileNaming::Exact(name) => vec![dir.join(name)],
+            FileNaming::Stem(stem) => {
+                let mut paths = Vec::new();
+                for adapter in self.registry.iter() {
+                    for ext in adapter.extensions() {
+                        paths.push(dir.join(format!("{stem}.{ext}")));
+                    }
+                }
+                paths
+            }
+        }
+    }
+
+    fn not_probed_dir(&self, dir: &Path) -> Vec<FileProbe> {
+        self.candidate_paths(dir)
+            .into_iter()
+            .map(|path| FileProbe {
+                path,
+                outcome: ProbeOutcome::NotProbed,
+            })
+            .collect()
+    }
+
+    /// Probe every candidate in one directory.
     ///
     /// Exact naming probes the single configured name. Stem naming probes
     /// `<stem>.<ext>` across every enabled adapter's extensions; more
     /// than one hit in the same directory is the spec's hard
     /// [`AmbiguousConfigFiles`](ClapfigError::AmbiguousConfigFiles) error
     /// (no silent precedence, no merging of same-stem siblings).
-    fn find_in_dir(&self, dir: &Path) -> Result<Option<(PathBuf, String)>, ClapfigError> {
+    fn probe_dir(&self, dir: &Path) -> Result<DirProbe, ClapfigError> {
         match &self.naming {
             FileNaming::Exact(name) => {
                 let path = dir.join(name);
-                Ok(self.read_cached(&path)?.map(|contents| (path, contents)))
+                match self.read_cached(&path)? {
+                    Some(contents) => Ok(DirProbe {
+                        loaded: Some((path.clone(), contents)),
+                        probes: vec![FileProbe {
+                            path,
+                            outcome: ProbeOutcome::Loaded,
+                        }],
+                    }),
+                    None => Ok(DirProbe {
+                        loaded: None,
+                        probes: vec![FileProbe {
+                            path,
+                            outcome: ProbeOutcome::Missing,
+                        }],
+                    }),
+                }
             }
             FileNaming::Stem(stem) => {
+                let mut probes = Vec::new();
                 let mut found: Vec<(PathBuf, String)> = Vec::new();
                 for adapter in self.registry.iter() {
                     for ext in adapter.extensions() {
                         let path = dir.join(format!("{stem}.{ext}"));
-                        if let Some(contents) = self.read_cached(&path)? {
-                            found.push((path, contents));
+                        match self.read_cached(&path)? {
+                            Some(contents) => {
+                                probes.push(FileProbe {
+                                    path: path.clone(),
+                                    outcome: ProbeOutcome::Loaded,
+                                });
+                                found.push((path, contents));
+                            }
+                            None => {
+                                probes.push(FileProbe {
+                                    path,
+                                    outcome: ProbeOutcome::Missing,
+                                });
+                            }
                         }
                     }
                 }
                 match found.len() {
-                    0 => Ok(None),
-                    1 => Ok(found.pop()),
+                    0 => Ok(DirProbe {
+                        loaded: None,
+                        probes,
+                    }),
+                    1 => Ok(DirProbe {
+                        loaded: found.pop(),
+                        probes,
+                    }),
                     _ => Err(ClapfigError::AmbiguousConfigFiles {
                         dir: dir.to_path_buf(),
                         files: found.into_iter().map(|(p, _)| p).collect(),
@@ -1476,7 +1612,15 @@ mod tests {
             .load();
 
         match result {
-            Err(ClapfigError::MissingRequired { key, .. }) => assert_eq!(key, "name"),
+            Err(ClapfigError::MissingRequired { key, discovery }) => {
+                assert_eq!(key, "name");
+                assert_eq!(discovery.files.len(), 1);
+                assert_eq!(discovery.files[0].path, dir.path().join("demo.toml"));
+                assert_eq!(discovery.files[0].outcome, ProbeOutcome::Missing);
+                assert!(!discovery.env);
+                assert!(!discovery.url);
+                assert!(!discovery.overrides);
+            }
             other => panic!("expected MissingRequired(name), got {other:?}"),
         }
     }
@@ -2476,6 +2620,310 @@ mod tests {
         // Merge: port from dir2 (higher priority), host from dir1 (lower priority)
         assert_eq!(table.get("port"), Some(&Value::Integer(2000)));
         assert_eq!(table.get("host"), Some(&Value::String("base".into())));
+    }
+
+    fn required_only_schema() -> Schema {
+        Schema::object("Req")
+            .field("name", RtField::string())
+            .build()
+    }
+
+    fn probe_by_file_name<'a>(
+        files: &'a [FileProbe],
+        dir: &std::path::Path,
+        name: &str,
+    ) -> &'a FileProbe {
+        let want = dir.join(name);
+        files
+            .iter()
+            .find(|p| p.path == want)
+            .unwrap_or_else(|| panic!("missing probe for {}", want.display()))
+    }
+
+    #[test]
+    fn missing_required_first_match_marks_lower_priority_not_probed() {
+        // High-priority file exists (but lacks the required key); the
+        // lower-priority candidate is never read — not probed, not missing.
+        let low = TempDir::new().unwrap();
+        let high = TempDir::new().unwrap();
+        fs::write(low.path().join("demo.toml"), "name = \"low\"\n").unwrap();
+        fs::write(high.path().join("demo.toml"), "# no name\n").unwrap();
+
+        let err = Clapfig::builder(required_only_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![
+                SearchPath::Path(low.path().to_path_buf()),
+                SearchPath::Path(high.path().to_path_buf()),
+            ])
+            .search_mode(SearchMode::FirstMatch)
+            .no_env()
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { key, discovery } => {
+                assert_eq!(key, "name");
+                assert_eq!(discovery.files.len(), 2);
+                assert_eq!(
+                    probe_by_file_name(&discovery.files, low.path(), "demo.toml").outcome,
+                    ProbeOutcome::NotProbed
+                );
+                assert_eq!(
+                    probe_by_file_name(&discovery.files, high.path(), "demo.toml").outcome,
+                    ProbeOutcome::Loaded
+                );
+                assert!(!discovery.env);
+                assert!(!discovery.overrides);
+                let msg = ClapfigError::MissingRequired { key, discovery }.to_string();
+                assert!(msg.contains("not probed"), "{msg}");
+                assert!(
+                    !msg.contains("set by"),
+                    "MissingRequired must not name a winning origin: {msg}"
+                );
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_merge_marks_misses_missing_and_hits_loaded() {
+        let miss = TempDir::new().unwrap();
+        let hit = TempDir::new().unwrap();
+        fs::write(hit.path().join("demo.toml"), "# no name\n").unwrap();
+
+        let err = Clapfig::builder(required_only_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![
+                SearchPath::Path(miss.path().to_path_buf()),
+                SearchPath::Path(hit.path().to_path_buf()),
+            ])
+            .search_mode(SearchMode::Merge)
+            .no_env()
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { key, discovery } => {
+                assert_eq!(key, "name");
+                assert_eq!(discovery.files.len(), 2);
+                assert_eq!(
+                    probe_by_file_name(&discovery.files, miss.path(), "demo.toml").outcome,
+                    ProbeOutcome::Missing
+                );
+                assert_eq!(
+                    probe_by_file_name(&discovery.files, hit.path(), "demo.toml").outcome,
+                    ProbeOutcome::Loaded
+                );
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_stem_names_paths_actually_probed_not_the_registry() {
+        // toml + json enabled: both extensions in the directory are
+        // probes. yaml is compiled in but not enabled — its path must
+        // not appear (the record is not a dump of the format registry).
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "# no name\n").unwrap();
+        fs::write(dir.path().join("demo.yaml"), "name: yaml-must-not-count\n").unwrap();
+
+        let err = Clapfig::builder(required_only_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .formats(["toml", "json"])
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { key, discovery } => {
+                assert_eq!(key, "name");
+                let names: Vec<_> = discovery
+                    .files
+                    .iter()
+                    .map(|p| p.path.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(names, vec!["demo.toml", "demo.json"]);
+                assert_eq!(discovery.files[0].outcome, ProbeOutcome::Loaded);
+                assert_eq!(discovery.files[1].outcome, ProbeOutcome::Missing);
+                assert!(
+                    discovery.files.iter().all(|p| !p
+                        .path
+                        .extension()
+                        .is_some_and(|e| e == "yaml" || e == "yml")),
+                    "stem discovery must not dump un-enabled formats: {discovery:?}"
+                );
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_first_match_stem_enumerates_unprobed_extensions() {
+        // FirstMatch stops reading at the high-priority directory; the
+        // lower-priority dir's enabled extensions still exist as
+        // not-probed candidates.
+        let low = TempDir::new().unwrap();
+        let high = TempDir::new().unwrap();
+        fs::write(high.path().join("demo.toml"), "# no name\n").unwrap();
+
+        let err = Clapfig::builder(required_only_schema())
+            .app_name("demo")
+            .file_stem("demo")
+            .formats(["toml", "json"])
+            .search_paths(vec![
+                SearchPath::Path(low.path().to_path_buf()),
+                SearchPath::Path(high.path().to_path_buf()),
+            ])
+            .search_mode(SearchMode::FirstMatch)
+            .no_env()
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { discovery, .. } => {
+                assert_eq!(discovery.files.len(), 4);
+                assert_eq!(
+                    probe_by_file_name(&discovery.files, low.path(), "demo.toml").outcome,
+                    ProbeOutcome::NotProbed
+                );
+                assert_eq!(
+                    probe_by_file_name(&discovery.files, low.path(), "demo.json").outcome,
+                    ProbeOutcome::NotProbed
+                );
+                assert_eq!(
+                    probe_by_file_name(&discovery.files, high.path(), "demo.toml").outcome,
+                    ProbeOutcome::Loaded
+                );
+                assert_eq!(
+                    probe_by_file_name(&discovery.files, high.path(), "demo.json").outcome,
+                    ProbeOutcome::Missing
+                );
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_missing_leaf_with_parent_map_is_still_missing_required() {
+        // File supplies `[db]` (parent map from an input type) but not
+        // the required leaf. Same MissingRequired diagnostic — no
+        // nearest-ancestor origin.
+        let schema = Schema::object("Req")
+            .nested("db", Schema::object("Db").field("url", RtField::string()))
+            .build();
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "[db]\n").unwrap();
+
+        let err = Clapfig::builder(schema)
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { key, discovery } => {
+                assert_eq!(key, "db.url");
+                assert_eq!(discovery.files.len(), 1);
+                assert_eq!(discovery.files[0].outcome, ProbeOutcome::Loaded);
+                let msg = ClapfigError::MissingRequired { key, discovery }.to_string();
+                assert!(
+                    !msg.contains("set by"),
+                    "nested miss must not claim a parent origin: {msg}"
+                );
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_reports_env_consulted_when_enabled() {
+        let dir = TempDir::new().unwrap();
+        let err = Clapfig::builder(required_only_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .env_prefix("CLAPFIG_WS06_NO_SUCH_PREFIX")
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { discovery, .. } => {
+                assert!(discovery.env);
+                assert!(!discovery.overrides);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_reports_overrides_consulted_when_supplied() {
+        let dir = TempDir::new().unwrap();
+        let err = Clapfig::builder(required_only_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .cli_override("other", Some("x"))
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { discovery, .. } => {
+                assert!(!discovery.env);
+                assert!(discovery.overrides);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_omitted_files_layer_skips_probes() {
+        // A file that *would* supply the required key must not be
+        // probed (or merged) when Files is omitted from layer_order.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "name = \"present\"\n").unwrap();
+
+        let err = Clapfig::builder(required_only_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .layer_order(vec![])
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { key, discovery } => {
+                assert_eq!(key, "name");
+                assert!(
+                    discovery.files.is_empty(),
+                    "omitted Files layer must not list probes: {discovery:?}"
+                );
+                assert!(!discovery.env);
+                assert!(!discovery.overrides);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "url")]
+    #[test]
+    fn missing_required_reports_url_consulted_when_enabled() {
+        let dir = TempDir::new().unwrap();
+        let err = Clapfig::builder(required_only_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .url_query("other=x")
+            .load()
+            .unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { discovery, .. } => {
+                assert!(discovery.url);
+                assert!(!discovery.overrides);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
     }
 
     #[test]

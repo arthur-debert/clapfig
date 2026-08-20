@@ -20,14 +20,16 @@
 //!   datetime leaves per ADR-0001; integer values become [`Value::Float`]
 //!   on float leaves, matching what serde accepts), then recursively
 //!   type-checks every value against its `LeafType`, enum-checks
-//!   `LeafType::Enum`, and enforces required fields. Returns the merged
+//!   `LeafType::Enum`, and enforces required fields. A required miss
+//!   becomes [`ClapfigError::MissingRequired`] carrying the injected
+//!   discovery record (an absent key has no origin). Returns the merged
 //!   value [`Map`] (the typed [`TypedBuilder`](crate::TypedBuilder)
 //!   deserializes that map into `C` afterwards).
 //!
 //! [`Schema`]: crate::runtime::Schema
 //! [`UnknownKey`]: crate::validate::UnknownKey
 
-use crate::error::ClapfigError;
+use crate::error::{ClapfigError, DiscoveryRecord};
 use crate::runtime::{Field, NamedField, Schema};
 use crate::validate::UnknownKey;
 use crate::value::{Map, Value};
@@ -216,9 +218,18 @@ pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
 /// Finalize a merged table: apply schema-driven coercions
 /// (datetime strings, integer-for-float), then enforce required fields
 /// and per-leaf types. Returns the merged map on success.
-pub(crate) fn finalize(mut merged: Map, schema: &Schema) -> Result<Map, ClapfigError> {
+///
+/// `discovery` is attached to [`ClapfigError::MissingRequired`] — an
+/// absent key has no origin, it has the search that did not find it.
+/// Callers without a probe record (schema-only unit tests) pass
+/// [`DiscoveryRecord::empty`].
+pub(crate) fn finalize(
+    mut merged: Map,
+    schema: &Schema,
+    discovery: &DiscoveryRecord,
+) -> Result<Map, ClapfigError> {
     coerce_leaf_values(&mut merged, schema);
-    check_required_and_types(&merged, schema, "")?;
+    check_required_and_types(&merged, schema, "", discovery)?;
     Ok(merged)
 }
 
@@ -315,6 +326,7 @@ fn check_required_and_types(
     table: &Map,
     schema: &Schema,
     prefix: &str,
+    discovery: &DiscoveryRecord,
 ) -> Result<(), ClapfigError> {
     for nf in &schema.fields {
         let path = if prefix.is_empty() {
@@ -326,7 +338,7 @@ fn check_required_and_types(
             Field::Leaf(leaf) => match table.get(&nf.name) {
                 None => {
                     if !leaf.optional {
-                        return Err(ClapfigError::missing_required(path));
+                        return Err(ClapfigError::missing_required(path, discovery.clone()));
                     }
                 }
                 Some(value) => {
@@ -341,10 +353,10 @@ fn check_required_and_types(
                     // required. Recurse with an empty table so the missing-
                     // required check below fires for inner leaves.
                     let empty = Map::new();
-                    check_required_and_types(&empty, nested, &path)?;
+                    check_required_and_types(&empty, nested, &path, discovery)?;
                 }
                 Some(Value::Map(inner)) => {
-                    check_required_and_types(inner, nested, &path)?;
+                    check_required_and_types(inner, nested, &path, discovery)?;
                 }
                 Some(other) => {
                     return Err(ClapfigError::invalid_value(
@@ -364,7 +376,7 @@ fn check_required_and_types(
                         let indexed = format!("{path}[{i}]");
                         match item {
                             Value::Map(inner) => {
-                                check_required_and_types(inner, item_schema, &indexed)?;
+                                check_required_and_types(inner, item_schema, &indexed, discovery)?;
                             }
                             other => {
                                 return Err(ClapfigError::invalid_value(
@@ -393,7 +405,12 @@ fn check_required_and_types(
                         let entry_path = format!("{path}.{entry_key}");
                         match entry_value {
                             Value::Map(inner) => {
-                                check_required_and_types(inner, item_schema, &entry_path)?;
+                                check_required_and_types(
+                                    inner,
+                                    item_schema,
+                                    &entry_path,
+                                    discovery,
+                                )?;
                             }
                             other => {
                                 return Err(ClapfigError::invalid_value(
@@ -457,6 +474,12 @@ mod tests {
 
     fn parse(toml_text: &str) -> Map {
         crate::fixtures::test::parse_toml(toml_text)
+    }
+
+    /// Schema-only finalize: no probe record. Production resolve injects
+    /// the real discovery via the three-argument [`super::finalize`].
+    fn finalize(merged: Map, schema: &Schema) -> Result<Map, ClapfigError> {
+        super::finalize(merged, schema, &DiscoveryRecord::empty())
     }
 
     fn unknown_paths(table: &Map, schema: &Schema) -> Vec<String> {
@@ -816,5 +839,39 @@ mod tests {
             ClapfigError::MissingRequired { key, .. } => assert_eq!(key, "db.pool_size"),
             other => panic!("expected MissingRequired(db.pool_size), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nested_missing_leaf_carries_injected_discovery_not_an_origin() {
+        // Parent map present (`[db]`), required leaf absent. Same
+        // MissingRequired diagnostic as a top-level miss — no nearest-
+        // ancestor origin. The probe record is the one the caller injected.
+        let schema = test_schema();
+        let table = parse("name = \"x\"\nport = 8080\nhost = \"h\"\nlevel = \"info\"\n[db]\n");
+        let discovery = DiscoveryRecord {
+            files: vec![crate::error::FileProbe {
+                path: "/tmp/app.toml".into(),
+                outcome: crate::error::ProbeOutcome::Loaded,
+            }],
+            env: true,
+            url: false,
+            overrides: false,
+        };
+        let err = super::finalize(table, &schema, &discovery).unwrap_err();
+        match err {
+            ClapfigError::MissingRequired {
+                key,
+                discovery: got,
+            } => {
+                assert_eq!(key, "db.pool_size");
+                assert_eq!(got, discovery);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+        let msg = ClapfigError::missing_required("db.pool_size", discovery).to_string();
+        assert!(
+            !msg.contains("set by"),
+            "MissingRequired must not name a winning origin: {msg}"
+        );
     }
 }
