@@ -355,24 +355,17 @@ fn value_to_json(value: &Value, path: &mut Vec<PathSegment>) -> Result<Json, For
 
 /// Extract the key segments of a [`ConfigPath`], refusing `//`-prefixed
 /// segments, which live in the reserved comment namespace and can never
-/// address a configuration key.
+/// address a configuration key, and refusing index segments (file edits
+/// address map keys).
 fn key_segments(path: &ConfigPath) -> Result<Vec<&str>, FormatError> {
-    path.segments()
-        .iter()
-        .filter_map(|seg| match seg {
-            PathSegment::Key(k) => Some(if k.starts_with(COMMENT_PREFIX) {
-                Err(FormatError::Edit {
-                    format: FORMAT,
-                    message: reserved_key_message(&format!("'{k}'")),
-                })
-            } else {
-                Ok(k.as_str())
-            }),
-            // File edits address map keys via dotted persist paths;
-            // index segments belong to span/origin trees.
-            PathSegment::Index(_) => None,
-        })
-        .collect()
+    let keys = super::edit::map_key_segments(path, FORMAT)?;
+    if let Some(k) = keys.iter().copied().find(|k| k.starts_with(COMMENT_PREFIX)) {
+        return Err(FormatError::Edit {
+            format: FORMAT,
+            message: reserved_key_message(&format!("'{k}'")),
+        });
+    }
+    Ok(keys)
 }
 
 /// The JSON document tree behind the shared edit walkers (`format::edit`)
@@ -1376,6 +1369,28 @@ mod tests {
             .unwrap_err();
         match err {
             FormatError::Edit { message, .. } => assert!(message.contains("path conflict")),
+            other => panic!("expected Edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_indexed_path_is_typed_error() {
+        let path = ConfigPath::new().key("plugins").index(0).key("host");
+        let value = Value::from("x");
+        let err = JsonAdapter
+            .edit(
+                "{}",
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap_err();
+        match err {
+            FormatError::Edit { message, .. } => {
+                assert!(message.contains("[0]"), "{message}");
+            }
             other => panic!("expected Edit, got {other:?}"),
         }
     }

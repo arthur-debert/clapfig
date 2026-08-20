@@ -123,11 +123,11 @@ impl FormatAdapter for YamlAdapter {
         let operation = edit.operation();
         match edit {
             FileEdit::Set { path, value, .. } => {
-                let keys = key_segments(path);
+                let keys = key_segments(path)?;
                 set_in_source(source, &keys, value, operation)
             }
             FileEdit::Unset { path } => {
-                let keys = key_segments(path);
+                let keys = key_segments(path)?;
                 unset_in_source(source, &keys)
             }
         }
@@ -299,17 +299,10 @@ fn value_to_norway(value: &Value) -> serde_norway::Value {
 
 // --- editing (yamlpath/yamlpatch span surgery) ---------------------------
 
-/// The key segments of a [`ConfigPath`], for the edit path below.
-fn key_segments(path: &ConfigPath) -> Vec<&str> {
-    path.segments()
-        .iter()
-        .filter_map(|seg| match seg {
-            PathSegment::Key(k) => Some(k.as_str()),
-            // File edits address map keys via dotted persist paths;
-            // index segments belong to span/origin trees.
-            PathSegment::Index(_) => None,
-        })
-        .collect()
+/// The key segments of a [`ConfigPath`], for the edit path below. Index
+/// segments refuse rather than silently retargeting the edit.
+fn key_segments(path: &ConfigPath) -> Result<Vec<&str>, FormatError> {
+    super::edit::map_key_segments(path, "yaml")
 }
 
 /// Convert an owned [`Value`] into a `yaml_serde::Value` — the type
@@ -1606,6 +1599,21 @@ db:
         match err {
             FormatError::Edit { message, .. } => {
                 assert!(message.contains("path conflict"), "message: {message}");
+            }
+            other => panic!("expected Edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_indexed_path_is_typed_error() {
+        let path = ConfigPath::new().key("plugins").index(0).key("host");
+        let value = Value::from("x");
+        let err = YamlAdapter
+            .edit("", set_edit(&path, &value, SetTarget::MissingKey))
+            .unwrap_err();
+        match err {
+            FormatError::Edit { message, .. } => {
+                assert!(message.contains("[0]"), "{message}");
             }
             other => panic!("expected Edit, got {other:?}"),
         }

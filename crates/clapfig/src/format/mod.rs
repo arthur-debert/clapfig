@@ -364,7 +364,9 @@ pub enum FileEdit<'a> {
     /// Set the value at a path, replacing an existing value or creating
     /// the path, per `target`.
     Set {
-        /// Structured path of the target node.
+        /// Structured path of the target node. File edits address map
+        /// keys; a path carrying [`PathSegment::Index`] is a typed
+        /// [`FormatError::Edit`].
         path: &'a ConfigPath,
         /// The value to write.
         value: &'a Value,
@@ -374,7 +376,9 @@ pub enum FileEdit<'a> {
     },
     /// Remove the key at a path.
     Unset {
-        /// Structured path of the target node.
+        /// Structured path of the target node. File edits address map
+        /// keys; a path carrying [`PathSegment::Index`] is a typed
+        /// [`FormatError::Edit`].
         path: &'a ConfigPath,
     },
 }

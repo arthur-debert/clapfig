@@ -19,7 +19,7 @@ use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
     walk_level,
 };
-use super::{FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span};
+use super::{FileEdit, FormatAdapter, FormatError, Operation, Parsed, Span};
 
 /// The TOML format behind the adapter contract.
 ///
@@ -116,11 +116,11 @@ impl FormatAdapter for TomlAdapter {
         match edit {
             FileEdit::Set { path, value, .. } => {
                 check_datetime_offsets(value)?;
-                let keys = key_segments(path);
+                let keys = key_segments(path)?;
                 super::edit::write_at_path(doc.as_item_mut(), &keys, value_to_toml_edit(value))?;
             }
             FileEdit::Unset { path } => {
-                let keys = key_segments(path);
+                let keys = key_segments(path)?;
                 super::edit::unset_at_path(doc.as_item_mut(), &keys);
             }
         }
@@ -197,17 +197,10 @@ fn value_to_toml(value: &Value) -> toml::Value {
 }
 
 /// The key segments of a [`ConfigPath`](super::ConfigPath), for the edit
-/// walkers below.
-fn key_segments(path: &super::ConfigPath) -> Vec<&str> {
-    path.segments()
-        .iter()
-        .filter_map(|seg| match seg {
-            PathSegment::Key(k) => Some(k.as_str()),
-            // File edits address map keys via dotted persist paths;
-            // index segments belong to span/origin trees.
-            PathSegment::Index(_) => None,
-        })
-        .collect()
+/// walkers below. Index segments refuse rather than silently retargeting
+/// the edit.
+fn key_segments(path: &super::ConfigPath) -> Result<Vec<&str>, FormatError> {
+    super::edit::map_key_segments(path, "toml")
 }
 
 /// The TOML document tree behind the shared edit walkers
@@ -707,6 +700,28 @@ pool_size = 5
             .unwrap_err();
         match err {
             FormatError::Edit { message, .. } => assert!(message.contains("path conflict")),
+            other => panic!("expected Edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_indexed_path_is_typed_error() {
+        let path = ConfigPath::new().key("plugins").index(0).key("host");
+        let value = Value::from("x");
+        let err = TomlAdapter
+            .edit(
+                "port = 1\n",
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap_err();
+        match err {
+            FormatError::Edit { message, .. } => {
+                assert!(message.contains("[0]"), "{message}");
+            }
             other => panic!("expected Edit, got {other:?}"),
         }
     }

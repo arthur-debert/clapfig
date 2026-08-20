@@ -587,6 +587,7 @@ mod tests {
             env_prefix: Some("MYAPP".into()),
             unknown_key_hook: Some(std::sync::Arc::new(move |ctx| {
                 if ctx.path == "rogue_key" {
+                    assert_eq!(ctx.env_var, Some("MYAPP__ROGUE_KEY"));
                     saw.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 crate::strict::UnknownKeyDecision::Accept
