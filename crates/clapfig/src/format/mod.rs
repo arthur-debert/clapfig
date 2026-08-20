@@ -285,6 +285,39 @@ pub struct Span {
     pub end: usize,
 }
 
+impl Span {
+    /// Convert a parser byte range into a clapfig span.
+    pub(crate) fn from_range(range: std::ops::Range<usize>) -> Self {
+        Self {
+            start: range.start,
+            end: range.end,
+        }
+    }
+}
+
+/// 1-indexed line and character column of a byte offset in `src`.
+///
+/// Column counts Unicode scalar values, not bytes — renderers pad and
+/// draw carets in characters. Line and column are derived from byte
+/// spans at render time (provenance spec); validation stores the span
+/// and uses this to fill the public 1-indexed `line` field.
+pub(crate) fn byte_offset_to_line_col(src: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut col = 1;
+    for (i, c) in src.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if c == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 /// One span-index entry: the key token's range (if any) and the value's
 /// range (ADR-0006).
 ///
@@ -311,24 +344,25 @@ pub struct SpanEntry {
 /// The value tree and path → span index produced by one
 /// [`FormatAdapter::parse`] (ADR-0005).
 ///
-/// `spans` covers every path in `value` when an adapter fills it. YAML
-/// fills the index (ADR-0008). An empty map is holding state for adapters
-/// that have not landed their span slice yet, not a legal degradation of
-/// the finished contract. Callers that only want a [`Value`] (persist,
-/// some tests) use [`Parsed::value`].
+/// `spans` covers every path in `value` when an adapter fills it. TOML
+/// fills the index (ADR-0005), YAML fills it (ADR-0008), and JSON fills
+/// it (ADR-0007). An empty map is holding state for dummy/test adapters
+/// ([`Parsed::from_value`]), not a legal degradation of the finished
+/// contract. Callers that only want a [`Value`] (persist, some tests)
+/// use [`Parsed::value`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Parsed {
     /// The document as a clapfig [`Value`] tree.
     pub value: Value,
-    /// Path → [`SpanEntry`] index. YAML fills this (ADR-0008); other
-    /// adapters still return empty until their workstream lands. A
-    /// successful parse of the finished contract covers every path in
-    /// [`value`](Self::value).
+    /// Path → [`SpanEntry`] index. TOML (ADR-0005), YAML (ADR-0008), and
+    /// JSON (ADR-0007) cover every path in [`value`](Self::value). Dummy
+    /// adapters and [`Parsed::from_value`] still return empty.
     pub spans: BTreeMap<ConfigPath, SpanEntry>,
 }
 
 impl Parsed {
-    /// Today's value tree with an empty span index (WS01 holding state).
+    /// A value tree with an empty span index — dummy adapters, persist
+    /// callers, and tests that only need the tree.
     pub(crate) fn from_value(value: Value) -> Self {
         Self {
             value,
@@ -478,9 +512,9 @@ pub trait FormatAdapter: Send + Sync {
     /// One parse produces both (ADR-0005): JSON strips `//` comment keys
     /// and YAML resolves aliases in this same walk, so a second pass over
     /// the text cannot stay in sync. Callers that only want the tree use
-    /// [`Parsed::value`]. YAML fills the span index (ADR-0008); TOML and
-    /// JSON still return an empty map until their workstreams land. The
-    /// finished contract covers every path in `value`.
+    /// [`Parsed::value`]. TOML, YAML, and JSON fill the span index; dummy
+    /// adapters still return an empty map. The finished contract covers
+    /// every path in `value`.
     fn parse(&self, text: &str) -> Result<Parsed, FormatError>;
 
     /// Serialize a [`Value`] tree to this format's source text.
@@ -839,8 +873,8 @@ mod tests {
     #[test]
     fn parse_returns_empty_span_index_as_holding_state() {
         // Empty documents have no child paths, so every adapter's index
-        // is empty here. YAML fills non-empty documents (ADR-0008);
-        // TOML/JSON still return empty on those until their slices land.
+        // is empty here. Non-empty documents are filled by TOML
+        // (ADR-0005), YAML (ADR-0008), and JSON (ADR-0007).
         for (adapter, text) in [
             (&toml::TomlAdapter as &dyn FormatAdapter, ""),
             (&yaml::YamlAdapter, ""),

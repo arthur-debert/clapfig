@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::format::{ConfigPath, PathSegment, SpanEntry};
 use crate::value::{Map, Value};
 
 /// Two distinct keys in the same table collapsed to the same normalized form.
@@ -153,6 +154,39 @@ pub fn normalize_table(table: &mut Map) -> Result<(), KeyCollision> {
     check_collisions(table)?;
     rewrite_table(table);
     Ok(())
+}
+
+/// Normalize a parsed table and rewrite span-index paths with the same
+/// `-` → `_` rule (ADR-0006). Collision check runs once before either
+/// rewrite; span entries themselves are unchanged so the snippet still
+/// shows the user's original spelling.
+pub(crate) fn normalize_table_and_spans(
+    table: &mut Map,
+    spans: &mut BTreeMap<ConfigPath, SpanEntry>,
+) -> Result<(), KeyCollision> {
+    normalize_table(table)?;
+    normalize_spans(spans);
+    Ok(())
+}
+
+/// Rewrite span-index path keys with the same `-` → `_` rule as
+/// [`normalize_table`]. Index segments are unchanged.
+pub(crate) fn normalize_spans(spans: &mut BTreeMap<ConfigPath, SpanEntry>) {
+    let old = std::mem::take(spans);
+    for (path, entry) in old {
+        spans.insert(normalize_config_path(path), entry);
+    }
+}
+
+fn normalize_config_path(path: ConfigPath) -> ConfigPath {
+    let mut out = ConfigPath::new();
+    for segment in path.segments() {
+        out = match segment {
+            PathSegment::Key(k) => out.key(normalize_key(k)),
+            PathSegment::Index(i) => out.index(*i),
+        };
+    }
+    out
 }
 
 fn rewrite_table(table: &mut Map) {
@@ -441,6 +475,23 @@ mod tests {
         assert!(normalize_table(&mut t).is_err());
         assert!(t.contains_key("unrelated-ok"));
         assert!(t.contains_key("my-section"));
+    }
+
+    #[test]
+    fn normalize_spans_rewrites_key_segments_and_keeps_indexes() {
+        use crate::format::Span;
+
+        let mut spans = BTreeMap::new();
+        let kebab = ConfigPath::new().key("my-list").index(1).key("kebab-key");
+        let entry = SpanEntry {
+            key: Some(Span { start: 10, end: 19 }),
+            value: Span { start: 22, end: 23 },
+        };
+        spans.insert(kebab, entry);
+        normalize_spans(&mut spans);
+        let snake = ConfigPath::new().key("my_list").index(1).key("kebab_key");
+        assert_eq!(spans.get(&snake).copied(), Some(entry));
+        assert_eq!(spans.len(), 1);
     }
 
     #[test]
