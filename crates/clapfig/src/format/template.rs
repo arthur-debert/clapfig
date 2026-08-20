@@ -19,7 +19,7 @@
 
 use std::fmt::Write;
 
-use crate::runtime::{Field, Leaf, LeafType, Schema};
+use crate::runtime::{LeafType, Schema, Shape};
 use crate::value::Value;
 
 use super::FormatError;
@@ -56,14 +56,15 @@ pub(crate) trait TemplateRenderer: Sized {
     /// container methods, where it must precede the header line.
     fn level_doc(&mut self, _out: &mut Self::Out, _doc: &[String]) {}
 
-    /// Emit one leaf: doc/`Allowed:`/`Accepts:` annotations, then a real
+    /// Emit one value-shaped field (a leaf, or a homogeneous array/map of
+    /// leaves): doc/`Allowed:`/`Accepts:` annotations, then a real
     /// assignment (default present) or a commented placeholder.
     fn leaf(
         &mut self,
         out: &mut Self::Out,
         ctx: &Self::Ctx,
         name: &str,
-        leaf: &Leaf,
+        field: ValueView<'_>,
     ) -> Result<(), FormatError>;
 
     /// Emit a nested object (TOML `[section]`).
@@ -109,35 +110,91 @@ pub(crate) fn walk_level<R: TemplateRenderer>(
     renderer.level_doc(out, &schema.doc);
     if R::LEAVES_FIRST {
         for nf in &schema.fields {
-            if let Field::Leaf(leaf) = &nf.field {
+            if nf.field.is_value_field() {
                 renderer.check_field_name(&nf.name)?;
-                renderer.leaf(out, ctx, &nf.name, leaf)?;
+                emit_value_field(renderer, out, ctx, &nf.name, &nf.field)?;
             }
         }
     }
     for nf in &schema.fields {
         match &nf.field {
-            Field::Leaf(leaf) => {
+            shape if shape.is_value_field() => {
                 if !R::LEAVES_FIRST {
                     renderer.check_field_name(&nf.name)?;
-                    renderer.leaf(out, ctx, &nf.name, leaf)?;
+                    emit_value_field(renderer, out, ctx, &nf.name, shape)?;
                 }
             }
-            Field::Nested(child) => {
+            Shape::Object(child) => {
                 renderer.check_field_name(&nf.name)?;
                 renderer.nested(out, ctx, &nf.name, child)?;
             }
-            Field::ArrayOf(child) => {
-                renderer.check_field_name(&nf.name)?;
-                renderer.array_of(out, ctx, &nf.name, child)?;
-            }
-            Field::MapOf(child) => {
-                renderer.check_field_name(&nf.name)?;
-                renderer.map_of(out, ctx, &nf.name, child)?;
-            }
+            Shape::Array(array) => match array.item.as_ref() {
+                Shape::Object(child) => {
+                    renderer.check_field_name(&nf.name)?;
+                    renderer.array_of(out, ctx, &nf.name, child)?;
+                }
+                _ => unreachable!("value-field arrays are emitted above"),
+            },
+            Shape::Map(map) => match map.item.as_ref() {
+                Shape::Object(child) => {
+                    renderer.check_field_name(&nf.name)?;
+                    renderer.map_of(out, ctx, &nf.name, child)?;
+                }
+                _ => unreachable!("value-field maps are emitted above"),
+            },
+            Shape::Tagged(_) => panic!(
+                "clapfig: tagged templates are SHP01-WS05; object-root schemas in this slice have no tagged fields"
+            ),
+            Shape::Leaf(_) => unreachable!("leaves are value fields"),
         }
     }
     Ok(())
+}
+
+/// A value-shaped field as the template leaf renderer sees it: a leaf,
+/// or a homogeneous array/map of leaves.
+#[derive(Clone, Copy)]
+pub(crate) struct ValueView<'a> {
+    pub doc: &'a [String],
+    pub default: Option<&'a Value>,
+    pub optional: bool,
+    pub shape: &'a Shape,
+}
+
+impl<'a> ValueView<'a> {
+    fn from_shape(shape: &'a Shape) -> Self {
+        match shape {
+            Shape::Leaf(leaf) => Self {
+                doc: &leaf.doc,
+                default: leaf.default.as_ref(),
+                optional: leaf.optional,
+                shape,
+            },
+            Shape::Array(array) => Self {
+                doc: &array.doc,
+                default: array.default.as_ref(),
+                optional: array.optional,
+                shape,
+            },
+            Shape::Map(map) => Self {
+                doc: &map.doc,
+                default: map.default.as_ref(),
+                optional: map.optional,
+                shape,
+            },
+            Shape::Object(_) | Shape::Tagged(_) => unreachable!("not a value field"),
+        }
+    }
+}
+
+fn emit_value_field<R: TemplateRenderer>(
+    renderer: &mut R,
+    out: &mut R::Out,
+    ctx: &R::Ctx,
+    name: &str,
+    shape: &Shape,
+) -> Result<(), FormatError> {
+    renderer.leaf(out, ctx, name, ValueView::from_shape(shape))
 }
 
 /// Doc lines ready for a comment payload: trailing whitespace trimmed,
@@ -159,58 +216,67 @@ pub(crate) fn doc_lines(doc: &[String]) -> Vec<String> {
 /// one value in the format's inline spelling (fallible for JSON, whose
 /// conversion refuses some values).
 pub(crate) fn leaf_annotations(
-    leaf: &Leaf,
+    field: ValueView<'_>,
     format_display: &str,
     inline: &mut dyn FnMut(&Value) -> Result<String, FormatError>,
 ) -> Result<Vec<String>, FormatError> {
-    let mut lines = doc_lines(&leaf.doc);
-    // Enum leaves list their value set; array-of-enum leaves
-    // (`Vec<UnitEnum>` flattened to `Array(Enum)`) list the same set —
-    // the constraint applies per item.
-    let enum_values = match &leaf.ty {
-        LeafType::Enum { values } => Some(values),
-        LeafType::Array(item) => match item.as_ref() {
-            LeafType::Enum { values } => Some(values),
-            _ => None,
-        },
-        _ => None,
-    };
-    if let Some(values) = enum_values {
+    let mut lines = doc_lines(field.doc);
+    // Enum leaves list their value set; array-of-enum fields
+    // (`Vec<UnitEnum>`) list the same set — the constraint applies per
+    // item.
+    if let Some(values) = enum_values_of(field.shape) {
         let mut listed = Vec::with_capacity(values.len());
         for value in values {
             listed.push(inline(value)?);
         }
         lines.push(format!("Allowed: {}", listed.join(" | ")));
     }
-    if matches!(&leaf.ty, LeafType::Value) {
+    if matches!(field.shape, Shape::Leaf(leaf) if matches!(leaf.ty, LeafType::Value)) {
         lines.push(format!("Accepts: any {format_display} value"));
     }
-    match &leaf.ty {
-        LeafType::Array(elem) => lines.push(format!("Elements: {}", describe_leaf_type(elem))),
-        LeafType::Map(elem) => lines.push(format!("Values: {}", describe_leaf_type(elem))),
+    match field.shape {
+        Shape::Array(array) => {
+            lines.push(format!("Elements: {}", describe_shape_item(&array.item)))
+        }
+        Shape::Map(map) => lines.push(format!("Values: {}", describe_shape_item(&map.item))),
         _ => {}
     }
     // Same absence rule as JSON Schema `required` and `fill_defaults_into`:
-    // an absent non-optional array/map leaf materializes as `[]`/`{}`, so
-    // the runtime does not reject it and the template must not mark it
+    // an absent non-optional array/map materializes as `[]`/`{}`, so the
+    // runtime does not reject it and the template must not mark it
     // required.
-    if !leaf.optional
-        && leaf.default.is_none()
-        && !matches!(leaf.ty, LeafType::Array(_) | LeafType::Map(_))
+    if !field.optional
+        && field.default.is_none()
+        && !matches!(field.shape, Shape::Array(_) | Shape::Map(_))
     {
         lines.push("Required.".to_string());
     }
     Ok(lines)
 }
 
-/// Human-readable name of a leaf type for the `Elements:`/`Values:`
+fn enum_values_of(shape: &Shape) -> Option<&[Value]> {
+    match shape {
+        Shape::Leaf(leaf) => match &leaf.ty {
+            LeafType::Enum { values } => Some(values),
+            _ => None,
+        },
+        Shape::Array(array) => enum_values_of(&array.item),
+        _ => None,
+    }
+}
+
+/// Human-readable name of an item shape for the `Elements:`/`Values:`
 /// hints, recursing through containers (`array of integer`).
-fn describe_leaf_type(ty: &LeafType) -> String {
-    match ty {
-        LeafType::Array(elem) => format!("array of {}", describe_leaf_type(elem)),
-        LeafType::Map(elem) => format!("map of {}", describe_leaf_type(elem)),
-        LeafType::Value => "any value".to_string(),
-        other => other.name().to_string(),
+fn describe_shape_item(shape: &Shape) -> String {
+    match shape {
+        Shape::Array(array) => format!("array of {}", describe_shape_item(&array.item)),
+        Shape::Map(map) => format!("map of {}", describe_shape_item(&map.item)),
+        Shape::Leaf(leaf) => match &leaf.ty {
+            LeafType::Value => "any value".to_string(),
+            other => other.name().to_string(),
+        },
+        Shape::Object(_) => "object".to_string(),
+        Shape::Tagged(_) => "tagged".to_string(),
     }
 }
 
@@ -220,18 +286,21 @@ fn describe_leaf_type(ty: &LeafType) -> String {
 /// TOML/JSON, `''` for YAML; enums and any-value leaves use it too) and
 /// `datetime_hint` the epoch example (quoted in JSON, bare elsewhere).
 pub(crate) fn placeholder(
-    ty: &LeafType,
+    shape: &Shape,
     string_hint: &'static str,
     datetime_hint: &'static str,
 ) -> &'static str {
-    match ty {
-        LeafType::String | LeafType::Enum { .. } | LeafType::Value => string_hint,
-        LeafType::Integer { .. } => "0",
-        LeafType::Float => "0.0",
-        LeafType::Bool => "false",
-        LeafType::DateTime => datetime_hint,
-        LeafType::Array(_) => "[]",
-        LeafType::Map(_) => "{}",
+    match shape {
+        Shape::Array(_) => "[]",
+        Shape::Map(_) => "{}",
+        Shape::Leaf(leaf) => match &leaf.ty {
+            LeafType::String | LeafType::Enum { .. } | LeafType::Value => string_hint,
+            LeafType::Integer { .. } => "0",
+            LeafType::Float => "0.0",
+            LeafType::Bool => "false",
+            LeafType::DateTime => datetime_hint,
+        },
+        Shape::Object(_) | Shape::Tagged(_) => unreachable!("not a value field"),
     }
 }
 
@@ -263,31 +332,20 @@ pub(crate) fn push_commented_block(out: &mut String, block: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::Field;
 
-    fn leaf(ty: LeafType, doc: &[&str]) -> Leaf {
-        Leaf {
-            doc: doc.iter().map(ToString::to_string).collect(),
-            ty,
-            default: None,
-            optional: false,
-            env: None,
-        }
+    fn view(shape: &Shape) -> ValueView<'_> {
+        ValueView::from_shape(shape)
     }
 
     #[test]
     fn leaf_annotations_orders_doc_then_allowed_then_accepts_then_required() {
         // The fixture leaves are required-defaultless, so the trailing
         // `Required.` marker appears after the type annotations.
-        let lines = leaf_annotations(
-            &leaf(
-                LeafType::Enum {
-                    values: vec![Value::from("a"), Value::from("b")],
-                },
-                &["Doc line.  ", ""],
-            ),
-            "TOML",
-            &mut |v| Ok(format!("<{}>", v.type_str())),
-        )
+        let shape = Shape::from(Field::enum_of(["a", "b"]).doc("Doc line.  ").doc(""));
+        let lines = leaf_annotations(view(&shape), "TOML", &mut |v| {
+            Ok(format!("<{}>", v.type_str()))
+        })
         .unwrap();
         // Doc prose (trailing whitespace trimmed, blanks kept) precedes
         // the Allowed listing, rendered through the per-format closure.
@@ -296,7 +354,8 @@ mod tests {
             ["Doc line.", "", "Allowed: <string> | <string>", "Required."]
         );
 
-        let lines = leaf_annotations(&leaf(LeafType::Value, &[]), "YAML", &mut |_| {
+        let shape = Shape::from(Field::value());
+        let lines = leaf_annotations(view(&shape), "YAML", &mut |_| {
             unreachable!("no enum values to render")
         })
         .unwrap();
@@ -305,14 +364,12 @@ mod tests {
 
     #[test]
     fn leaf_annotations_skip_required_for_optional_and_defaulted_leaves() {
-        let mut optional = leaf(LeafType::String, &[]);
-        optional.optional = true;
-        let lines = leaf_annotations(&optional, "TOML", &mut |_| unreachable!()).unwrap();
+        let optional = Shape::from(Field::string().optional());
+        let lines = leaf_annotations(view(&optional), "TOML", &mut |_| unreachable!()).unwrap();
         assert!(lines.is_empty(), "{lines:?}");
 
-        let mut defaulted = leaf(LeafType::String, &[]);
-        defaulted.default = Some(Value::from("x"));
-        let lines = leaf_annotations(&defaulted, "TOML", &mut |_| unreachable!()).unwrap();
+        let defaulted = Shape::from(Field::string().default("x"));
+        let lines = leaf_annotations(view(&defaulted), "TOML", &mut |_| unreachable!()).unwrap();
         assert!(lines.is_empty(), "{lines:?}");
     }
 
@@ -320,55 +377,49 @@ mod tests {
     fn leaf_annotations_hint_container_element_types() {
         // Non-optional, defaultless array/map leaves still skip `Required.`:
         // absence materializes as `[]`/`{}`, matching JSON Schema `required`.
-        let arr = leaf(LeafType::Array(Box::new(LeafType::String)), &[]);
-        let lines = leaf_annotations(&arr, "TOML", &mut |_| unreachable!()).unwrap();
+        let arr = Shape::from(Field::array_of_type(LeafType::String));
+        let lines = leaf_annotations(view(&arr), "TOML", &mut |_| unreachable!()).unwrap();
         assert_eq!(lines, ["Elements: string"]);
 
-        let nested = leaf(
-            LeafType::Array(Box::new(LeafType::Array(Box::new(LeafType::Integer {
-                min: None,
-                max: None,
-            })))),
-            &[],
-        );
-        let lines = leaf_annotations(&nested, "TOML", &mut |_| unreachable!()).unwrap();
+        let nested = Shape::from(Field::array_of_type(Field::array_of_type(Field::integer())));
+        let lines = leaf_annotations(view(&nested), "TOML", &mut |_| unreachable!()).unwrap();
         assert_eq!(lines, ["Elements: array of integer"]);
 
-        let map = leaf(LeafType::Map(Box::new(LeafType::Float)), &[]);
-        let lines = leaf_annotations(&map, "TOML", &mut |_| unreachable!()).unwrap();
+        let map = Shape::from(Field::map_of(LeafType::Float));
+        let lines = leaf_annotations(view(&map), "TOML", &mut |_| unreachable!()).unwrap();
         assert_eq!(lines, ["Values: float"]);
     }
 
     #[test]
     fn placeholder_varies_only_the_string_and_datetime_arms() {
-        for ty in [
-            LeafType::String,
-            LeafType::Enum { values: vec![] },
-            LeafType::Value,
+        for shape in [
+            Shape::from(Field::string()),
+            Shape::from(Field::enum_of(Vec::<&str>::new())),
+            Shape::from(Field::value()),
         ] {
-            assert_eq!(placeholder(&ty, "\"\"", "dt"), "\"\"");
-            assert_eq!(placeholder(&ty, "''", "dt"), "''");
+            assert_eq!(placeholder(&shape, "\"\"", "dt"), "\"\"");
+            assert_eq!(placeholder(&shape, "''", "dt"), "''");
         }
-        assert_eq!(placeholder(&LeafType::DateTime, "s", "dt-hint"), "dt-hint");
+        assert_eq!(
+            placeholder(&Shape::from(Field::datetime()), "s", "dt-hint"),
+            "dt-hint"
+        );
+        assert_eq!(placeholder(&Shape::from(Field::integer()), "s", "dt"), "0");
+        assert_eq!(placeholder(&Shape::from(Field::float()), "s", "dt"), "0.0");
+        assert_eq!(
+            placeholder(&Shape::from(Field::boolean()), "s", "dt"),
+            "false"
+        );
         assert_eq!(
             placeholder(
-                &LeafType::Integer {
-                    min: None,
-                    max: None
-                },
+                &Shape::from(Field::array_of_type(LeafType::String)),
                 "s",
                 "dt"
             ),
-            "0"
-        );
-        assert_eq!(placeholder(&LeafType::Float, "s", "dt"), "0.0");
-        assert_eq!(placeholder(&LeafType::Bool, "s", "dt"), "false");
-        assert_eq!(
-            placeholder(&LeafType::Array(Box::new(LeafType::String)), "s", "dt"),
             "[]"
         );
         assert_eq!(
-            placeholder(&LeafType::Map(Box::new(LeafType::String)), "s", "dt"),
+            placeholder(&Shape::from(Field::map_of(LeafType::String)), "s", "dt"),
             "{}"
         );
     }

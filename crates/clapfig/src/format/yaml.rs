@@ -44,7 +44,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use crate::runtime::{Field, Leaf, Schema};
+use crate::runtime::Schema;
 use crate::value::{Map, Value};
 
 use super::template::{
@@ -898,10 +898,11 @@ fn unset_in_source(source: &str, keys: &[&str]) -> Result<String, FormatError> {
 /// itself be commented, or the generated document would carry a null.
 fn has_active_content(schema: &Schema) -> bool {
     schema.fields.iter().any(|nf| match &nf.field {
-        Field::Leaf(leaf) => leaf.default.is_some(),
-        Field::Nested(child) => has_active_content(child),
-        // Array-of and map-of sections render as fully commented examples.
-        Field::ArrayOf(_) | Field::MapOf(_) => false,
+        crate::runtime::Shape::Leaf(leaf) => leaf.default.is_some(),
+        crate::runtime::Shape::Object(child) => has_active_content(child),
+        crate::runtime::Shape::Array(array) => array.default.is_some(),
+        crate::runtime::Shape::Map(map) => map.default.is_some(),
+        crate::runtime::Shape::Tagged(_) => false,
     })
 }
 
@@ -925,13 +926,13 @@ impl TemplateRenderer for YamlTemplate {
         out: &mut String,
         depth: &usize,
         name: &str,
-        leaf: &Leaf,
+        field: super::template::ValueView<'_>,
     ) -> Result<(), FormatError> {
         let indent = "  ".repeat(*depth);
-        for line in leaf_annotations(leaf, "YAML", &mut |v| Ok(format_inline_yaml(v)))? {
+        for line in leaf_annotations(field, "YAML", &mut |v| Ok(format_inline_yaml(v)))? {
             push_comment_line(out, &indent, &line);
         }
-        match &leaf.default {
+        match field.default {
             Some(value) => {
                 let _ = writeln!(
                     out,
@@ -941,7 +942,7 @@ impl TemplateRenderer for YamlTemplate {
                 );
             }
             None => {
-                let hint = placeholder(&leaf.ty, "''", "1970-01-01T00:00:00Z");
+                let hint = placeholder(field.shape, "''", "1970-01-01T00:00:00Z");
                 let _ = writeln!(out, "{indent}#{}: {hint}", inline_scalar(name));
             }
         }

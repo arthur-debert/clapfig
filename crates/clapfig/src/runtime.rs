@@ -1,5 +1,5 @@
-//! Runtime-defined schemas: owned [`Shape`] / [`Schema`] / [`Field`] /
-//! [`LeafType`] types and a fluent builder, for callers without a compile-time
+//! Runtime-defined schemas: owned [`Shape`] / [`Schema`] / [`LeafType`]
+//! types and a fluent builder, for callers without a compile-time
 //! `#[derive(clapfig::Schema)]` struct.
 //!
 //! [`Shape`] is the schema node (ADR-0010, `docs/spec/shape-algebra.md`):
@@ -7,12 +7,14 @@
 //! internally tagged union. [`Schema`] is the named-field **object**
 //! constructor (`Schema::object`), not the node, and is not renamed to
 //! `Object`. [`clapfig::Schema`](crate::Schema) is the derive trait.
+//! An object's field value is a [`Shape`] — there is no second field-node
+//! enum. Homogeneous maps and arrays of leaves or of objects are the same
+//! [`Shape::Map`] / [`Shape::Array`] constructor with a different item.
 //!
-//! Walkers still take `&Schema` today; SHP01-WS02 switches them to
-//! [`Shape`]. Until then, [`Clapfig::builder`](crate::Clapfig::builder)
+//! Walkers take [`Shape`]. [`Clapfig::builder`](crate::Clapfig::builder)
 //! accepts `impl Into<Shape>` so object-root callers keep passing a
 //! [`Schema`]. Root Map and Tagged shapes construct; loading them is a
-//! loud stub, not a silent object walk.
+//! loud stub (root-map load is SHP01-WS03; tagged walk is SHP01-WS04).
 //!
 //! # Example
 //!
@@ -45,10 +47,10 @@ use crate::value::Value;
 /// node (ADR-0010).
 ///
 /// Constructed via [`Schema::object`] and the fluent builder, or directly
-/// as a plain data struct. The clapfig resolve pipeline still walks
-/// `&Schema` today (SHP01-WS02 switches walkers to [`Shape`]). Object-root
-/// callers hand this to [`Clapfig::builder`](crate::Clapfig::builder),
-/// which takes `impl Into<Shape>`.
+/// as a plain data struct. Object-root callers hand this to
+/// [`Clapfig::builder`](crate::Clapfig::builder), which takes
+/// `impl Into<Shape>` and walks the resulting [`Shape::Object`]. Each
+/// field's value is a [`Shape`].
 #[derive(Debug, Clone)]
 pub struct Schema {
     pub name: String,
@@ -95,20 +97,22 @@ impl SchemaBuilder {
         self
     }
 
-    /// Add a leaf field.
+    /// Add a field whose value is any [`Shape`].
     ///
-    /// `name` is treated as a single TOML key and cannot contain `.` (the
-    /// dotted-path separator), `[`, or `]` (array-index syntax), and cannot
-    /// be empty. Violating this panics — the cost of constructing a schema
-    /// with an ambiguous segment now is strictly less than the cost of
-    /// debugging silent `KeyNotFound`s at every consumer (the resolve
-    /// pipeline, persist, cascade lookup) down the line.
-    pub fn field(mut self, name: impl Into<String>, field: FieldBuilder) -> Self {
+    /// Typical call sites pass a [`FieldBuilder`] (`Field::string()`,
+    /// `Field::array_of_type(...)`, …). `name` is treated as a single
+    /// TOML key and cannot contain `.` (the dotted-path separator), `[`,
+    /// or `]` (array-index syntax), and cannot be empty. Violating this
+    /// panics — the cost of constructing a schema with an ambiguous
+    /// segment now is strictly less than the cost of debugging silent
+    /// `KeyNotFound`s at every consumer (the resolve pipeline, persist,
+    /// cascade lookup) down the line.
+    pub fn field(mut self, name: impl Into<String>, field: impl Into<Shape>) -> Self {
         let name = name.into();
         validate_field_name(&self.schema, &name);
         self.schema.fields.push(NamedField {
             name,
-            field: Field::Leaf(field.build()),
+            field: field.into(),
         });
         self
     }
@@ -120,19 +124,22 @@ impl SchemaBuilder {
         validate_field_name(&self.schema, &name);
         self.schema.fields.push(NamedField {
             name,
-            field: Field::Nested(child.build()),
+            field: Shape::Object(child.build()),
         });
         self
     }
 
     /// Add an array of nested objects (TOML `[[name]]`). Same `name`
-    /// constraints as [`field`](Self::field).
+    /// constraints as [`field`](Self::field). A map or array of leaves
+    /// uses [`Field::array_of_type`] instead — both are [`Shape::Array`]
+    /// with a different item.
     pub fn array_of(mut self, name: impl Into<String>, item: SchemaBuilder) -> Self {
         let name = name.into();
         validate_field_name(&self.schema, &name);
+        let item_schema = item.build();
         self.schema.fields.push(NamedField {
-            name,
-            field: Field::ArrayOf(item.build()),
+            name: name.clone(),
+            field: Shape::Array(ArrayShape::of_object(name, item_schema)),
         });
         self
     }
@@ -144,13 +151,16 @@ impl SchemaBuilder {
     /// checks, required-field enforcement, and nested unknown-key
     /// detection all recurse into entry tables. Keys are arbitrary
     /// user-supplied strings, so the cascade walks the item schema
-    /// rather than the map level for strictness purposes.
+    /// rather than the map level for strictness purposes. A map of
+    /// leaves uses [`Field::map_of`] — both are [`Shape::Map`] with a
+    /// different item.
     pub fn map_of(mut self, name: impl Into<String>, item: SchemaBuilder) -> Self {
         let name = name.into();
         validate_field_name(&self.schema, &name);
+        let item_schema = item.build();
         self.schema.fields.push(NamedField {
-            name,
-            field: Field::MapOf(item.build()),
+            name: name.clone(),
+            field: Shape::Map(MapShape::of_object(name, item_schema)),
         });
         self
     }
@@ -161,31 +171,23 @@ impl SchemaBuilder {
     }
 }
 
-/// A named field on a [`Schema`].
+/// A named field on a [`Schema`]. The field's value is a [`Shape`]
+/// (ADR-0010) — not a second node type.
 #[derive(Debug, Clone)]
 pub struct NamedField {
     pub name: String,
-    pub field: Field,
+    pub field: Shape,
 }
 
-/// A schema field — leaf scalar / array, nested object, array-of-objects,
-/// or map-of-objects.
-#[derive(Debug, Clone)]
-pub enum Field {
-    Leaf(Leaf),
-    /// A single nested object — TOML `[section]`.
-    Nested(Schema),
-    /// An array of nested objects — TOML `[[plugins]]`. Deserializes to
-    /// `Vec<T>` where `T` is a struct deriving [`Schema`](crate::Schema);
-    /// an absent array loads as the empty `Vec`.
-    ArrayOf(Schema),
-    /// A string-keyed map of nested objects — TOML `[plugins.<key>]` with
-    /// arbitrary `<key>` names. Sibling of [`ArrayOf`](Field::ArrayOf) for
-    /// the dual shape: keyed map of objects instead of indexed array of
-    /// objects. Deserializes to `BTreeMap<String, T>` / `HashMap<String, T>`
-    /// where `T` is a struct deriving [`Schema`](crate::Schema).
-    MapOf(Schema),
-}
+/// Constructor namespace for field-position shapes (`Field::string()`,
+/// `Field::array_of_type(...)`, …).
+///
+/// An object's field value is a [`Shape`]; there is no second field-node
+/// enum (ADR-0010). Homogeneous arrays and maps of leaves are
+/// [`Shape::Array`] / [`Shape::Map`] with a leaf item — the same
+/// constructors [`SchemaBuilder::array_of`] / [`SchemaBuilder::map_of`]
+/// use with an object item.
+pub enum Field {}
 
 impl Field {
     /// Start a leaf builder for a string value.
@@ -237,14 +239,21 @@ impl Field {
         FieldBuilder::new(LeafType::DateTime)
     }
 
-    /// Start a leaf builder for a homogeneous array.
-    pub fn array_of_type(item: LeafType) -> FieldBuilder {
-        FieldBuilder::new(LeafType::Array(Box::new(item)))
+    /// Start a builder for a homogeneous array whose item is `item`.
+    ///
+    /// A `LeafType` or [`FieldBuilder`] converts to a leaf item; an
+    /// object item is [`SchemaBuilder::array_of`]. Both are
+    /// [`Shape::Array`].
+    pub fn array_of_type(item: impl Into<Shape>) -> FieldBuilder {
+        FieldBuilder::from_shape(Shape::Array(ArrayShape::of_item(item.into())))
     }
 
-    /// Start a leaf builder for a string-keyed map with homogeneous values.
-    pub fn map_of(value: LeafType) -> FieldBuilder {
-        FieldBuilder::new(LeafType::Map(Box::new(value)))
+    /// Start a builder for a string-keyed map whose values are `value`.
+    ///
+    /// A `LeafType` or [`FieldBuilder`] converts to a leaf item; an
+    /// object item is [`SchemaBuilder::map_of`]. Both are [`Shape::Map`].
+    pub fn map_of(value: impl Into<Shape>) -> FieldBuilder {
+        FieldBuilder::from_shape(Shape::Map(MapShape::of_item(value.into())))
     }
 
     /// Start a leaf builder constrained to one of `values`.
@@ -308,11 +317,6 @@ pub enum LeafType {
     /// matching one of the forms are coerced during finalization —
     /// schema-driven coercion, per ADR-0001.
     DateTime,
-    /// Homogeneous array. The boxed `LeafType` is the element type.
-    Array(Box<LeafType>),
-    /// String-keyed map with homogeneous values. The boxed `LeafType` is the
-    /// value type.
-    Map(Box<LeafType>),
     /// Constrained value: must equal one of the listed values.
     Enum {
         values: Vec<Value>,
@@ -334,8 +338,6 @@ impl LeafType {
             LeafType::Float => "float",
             LeafType::Bool => "bool",
             LeafType::DateTime => "datetime",
-            LeafType::Array(_) => "array",
-            LeafType::Map(_) => "map",
             LeafType::Enum { .. } => "enum",
             LeafType::Value => "value",
         }
@@ -343,7 +345,8 @@ impl LeafType {
 
     /// Check whether a [`Value`] is shape-compatible with this leaf type.
     ///
-    /// Containers (`Array`, `Map`) recurse into their elements. `Enum` checks
+    /// Homogeneous arrays and maps are [`Shape::Array`] / [`Shape::Map`]
+    /// and are checked by the Shape walker, not here. `Enum` checks
     /// literal equality against the allowed-value set. `Integer` also
     /// enforces its declared bounds, and `Float` accepts integer values
     /// (serde accepts them for `f64` fields; the finalize pass coerces the
@@ -371,18 +374,6 @@ impl LeafType {
             (LeafType::Float, Value::Integer(_)) => Ok(()),
             (LeafType::Bool, Value::Boolean(_)) => Ok(()),
             (LeafType::DateTime, Value::Datetime(_)) => Ok(()),
-            (LeafType::Array(elem), Value::Array(items)) => {
-                for (i, item) in items.iter().enumerate() {
-                    elem.check(item).map_err(|e| format!("array[{i}]: {e}"))?;
-                }
-                Ok(())
-            }
-            (LeafType::Map(elem), Value::Map(table)) => {
-                for (k, v) in table {
-                    elem.check(v).map_err(|e| format!("map[{k}]: {e}"))?;
-                }
-                Ok(())
-            }
             (LeafType::Enum { values }, v) => {
                 if values.iter().any(|allowed| allowed == v) {
                     Ok(())
@@ -408,63 +399,103 @@ impl LeafType {
     }
 }
 
-/// Fluent builder for a [`Leaf`] field.
+/// Fluent builder for a field-position [`Shape`] (typically a leaf, or a
+/// homogeneous map/array of leaves).
 #[derive(Debug, Clone)]
 pub struct FieldBuilder {
-    leaf: Leaf,
+    shape: Shape,
 }
 
 impl FieldBuilder {
     fn new(ty: LeafType) -> Self {
         Self {
-            leaf: Leaf {
+            shape: Shape::Leaf(Leaf {
                 doc: Vec::new(),
                 ty,
                 default: None,
                 optional: false,
                 env: None,
-            },
+            }),
         }
+    }
+
+    fn from_shape(shape: Shape) -> Self {
+        Self { shape }
     }
 
     /// Append a doc-comment line.
     pub fn doc(mut self, line: impl Into<String>) -> Self {
-        self.leaf.doc.push(line.into());
+        match &mut self.shape {
+            Shape::Leaf(leaf) => leaf.doc.push(line.into()),
+            Shape::Map(map) => map.doc.push(line.into()),
+            Shape::Array(array) => array.doc.push(line.into()),
+            other => panic!(
+                "clapfig: .doc() is only valid on Leaf, Map, and Array, got {}",
+                other.constructor_name()
+            ),
+        }
         self
     }
 
     /// Set the default value injected when no layer supplies one.
     pub fn default<V: Into<Value>>(mut self, value: V) -> Self {
-        self.leaf.default = Some(value.into());
+        let value = value.into();
+        match &mut self.shape {
+            Shape::Leaf(leaf) => leaf.default = Some(value),
+            Shape::Map(map) => map.default = Some(value),
+            Shape::Array(array) => array.default = Some(value),
+            other => panic!(
+                "clapfig: .default() is only valid on Leaf, Map, and Array, got {}",
+                other.constructor_name()
+            ),
+        }
         self
     }
 
     /// Mark this field optional — absence after merge is accepted.
     pub fn optional(mut self) -> Self {
-        self.leaf.optional = true;
+        match &mut self.shape {
+            Shape::Leaf(leaf) => leaf.optional = true,
+            Shape::Map(map) => map.optional = true,
+            Shape::Array(array) => array.optional = true,
+            other => panic!(
+                "clapfig: .optional() is only valid on Leaf, Map, and Array, got {}",
+                other.constructor_name()
+            ),
+        }
         self
     }
 
     /// Override the env-var name for this field. Without this, the env layer
     /// derives a name from the field path.
     pub fn env(mut self, name: impl Into<String>) -> Self {
-        self.leaf.env = Some(name.into());
+        let name = name.into();
+        match &mut self.shape {
+            Shape::Leaf(leaf) => leaf.env = Some(name),
+            Shape::Map(map) => map.env = Some(name),
+            Shape::Array(array) => array.env = Some(name),
+            other => panic!(
+                "clapfig: .env() is only valid on Leaf, Map, and Array, got {}",
+                other.constructor_name()
+            ),
+        }
         self
     }
 
-    pub(crate) fn build(self) -> Leaf {
-        self.leaf
+    pub(crate) fn build(self) -> Shape {
+        self.shape
     }
 }
 
 /// A schema node: leaf, named-field object, homogeneous map, homogeneous
 /// array, or internally tagged union.
 ///
-/// This is the node walkers will take (SHP01-WS02). [`Schema`] remains the
-/// named-field object — the [`Shape::Object`] constructor — not this enum
-/// and not renamed to `Object` (ADR-0010). An object's field value is a
-/// [`Shape`]; [`Field`] is not a second node in this contract (the public
-/// collapse of `Field` / `LeafType::Map` / `LeafType::Array` is SHP01-WS02).
+/// This is the node walkers take. [`Schema`] remains the named-field
+/// object — the [`Shape::Object`] constructor — not this enum and not
+/// renamed to `Object` (ADR-0010). An object's field value is a
+/// [`Shape`]; there is no second field-node enum. Homogeneous maps and
+/// arrays of leaves or of objects are the same [`Map`](Shape::Map) /
+/// [`Array`](Shape::Array) constructor with a different item.
 ///
 /// Legal document roots are [`Object`](Shape::Object), [`Map`](Shape::Map),
 /// and [`Tagged`](Shape::Tagged). [`Leaf`](Shape::Leaf) and
@@ -527,6 +558,9 @@ impl Shape {
                 doc: Vec::new(),
                 strict: None,
                 item: Box::new(item.into()),
+                default: None,
+                optional: false,
+                env: None,
             },
         }
     }
@@ -539,6 +573,9 @@ impl Shape {
                 doc: Vec::new(),
                 strict: None,
                 item: Box::new(item.into()),
+                default: None,
+                optional: false,
+                env: None,
             },
         }
     }
@@ -595,6 +632,67 @@ impl Shape {
             ),
         }
     }
+
+    /// Field-site doc lines (leaf / map / array header, or the object's
+    /// own doc).
+    pub(crate) fn field_doc(&self) -> &[String] {
+        match self {
+            Shape::Leaf(leaf) => &leaf.doc,
+            Shape::Object(schema) => &schema.doc,
+            Shape::Map(map) => &map.doc,
+            Shape::Array(array) => &array.doc,
+            Shape::Tagged(tagged) => &tagged.doc,
+        }
+    }
+
+    /// True when this field renders and address as a value (scalar, enum,
+    /// `Value`, or a homogeneous array/map of those) rather than a nested
+    /// object, array-of-tables, or map-of-objects.
+    pub(crate) fn is_value_field(&self) -> bool {
+        match self {
+            Shape::Leaf(_) => true,
+            Shape::Array(array) => array.item.is_value_field(),
+            Shape::Map(map) => map.item.is_value_field(),
+            Shape::Object(_) | Shape::Tagged(_) => false,
+        }
+    }
+
+    /// Type-check `value` against this shape. Object / tagged payloads
+    /// are checked field-by-field by the walker; this only asserts the
+    /// container kind. Homogeneous arrays and maps recurse into items.
+    pub(crate) fn check_value(&self, value: &Value) -> Result<(), String> {
+        match (self, value) {
+            (Shape::Leaf(leaf), v) => leaf.ty.check(v),
+            (Shape::Object(_), Value::Map(_)) => Ok(()),
+            (Shape::Object(_), other) => {
+                Err(format!("expected map, got {}", value_type_name(other)))
+            }
+            (Shape::Array(array), Value::Array(items)) => {
+                for (i, item) in items.iter().enumerate() {
+                    array
+                        .item
+                        .check_value(item)
+                        .map_err(|e| format!("array[{i}]: {e}"))?;
+                }
+                Ok(())
+            }
+            (Shape::Array(_), other) => {
+                Err(format!("expected array, got {}", value_type_name(other)))
+            }
+            (Shape::Map(map), Value::Map(table)) => {
+                for (k, v) in table {
+                    map.item
+                        .check_value(v)
+                        .map_err(|e| format!("map[{k}]: {e}"))?;
+                }
+                Ok(())
+            }
+            (Shape::Map(_), other) => Err(format!("expected map, got {}", value_type_name(other))),
+            (Shape::Tagged(_), _) => {
+                todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+            }
+        }
+    }
 }
 
 impl From<Schema> for Shape {
@@ -617,7 +715,13 @@ impl From<Leaf> for Shape {
 
 impl From<FieldBuilder> for Shape {
     fn from(builder: FieldBuilder) -> Self {
-        Shape::Leaf(builder.build())
+        builder.build()
+    }
+}
+
+impl From<LeafType> for Shape {
+    fn from(ty: LeafType) -> Self {
+        Shape::leaf(ty)
     }
 }
 
@@ -660,13 +764,44 @@ impl From<TaggedShapeBuilder> for Shape {
 /// Homogeneous unordered map: string keys, item is any [`Shape`].
 ///
 /// Node header (`name` / `doc` / `strict`) parallels [`Schema`]. A legal
-/// document root; walkers consume this in SHP01-WS02 / WS03.
+/// document root. When this map is a named field, `optional` / `default`
+/// / `env` are the field-site attrs (a map of leaves used to carry them
+/// on the collapsed `LeafType::Map` leaf).
 #[derive(Debug, Clone)]
 pub struct MapShape {
     pub name: String,
     pub doc: Vec<String>,
     pub strict: Option<bool>,
     pub item: Box<Shape>,
+    pub default: Option<Value>,
+    pub optional: bool,
+    pub env: Option<String>,
+}
+
+impl MapShape {
+    fn of_item(item: Shape) -> Self {
+        Self {
+            name: String::new(),
+            doc: Vec::new(),
+            strict: None,
+            item: Box::new(item),
+            default: None,
+            optional: false,
+            env: None,
+        }
+    }
+
+    fn of_object(name: String, item: Schema) -> Self {
+        Self {
+            name,
+            doc: item.doc.clone(),
+            strict: None,
+            item: Box::new(Shape::Object(item)),
+            default: None,
+            optional: false,
+            env: None,
+        }
+    }
 }
 
 /// Fluent builder for [`MapShape`].
@@ -696,13 +831,45 @@ impl MapShapeBuilder {
 
 /// Homogeneous array: item is any [`Shape`].
 ///
-/// Not a legal document root. Node header parallels [`Schema`].
+/// Not a legal document root. Node header parallels [`Schema`]. When this
+/// array is a named field, `optional` / `default` / `env` are the
+/// field-site attrs (a array of leaves used to carry them on the
+/// collapsed `LeafType::Array` leaf).
 #[derive(Debug, Clone)]
 pub struct ArrayShape {
     pub name: String,
     pub doc: Vec<String>,
     pub strict: Option<bool>,
     pub item: Box<Shape>,
+    pub default: Option<Value>,
+    pub optional: bool,
+    pub env: Option<String>,
+}
+
+impl ArrayShape {
+    fn of_item(item: Shape) -> Self {
+        Self {
+            name: String::new(),
+            doc: Vec::new(),
+            strict: None,
+            item: Box::new(item),
+            default: None,
+            optional: false,
+            env: None,
+        }
+    }
+
+    fn of_object(name: String, item: Schema) -> Self {
+        Self {
+            name,
+            doc: item.doc.clone(),
+            strict: None,
+            item: Box::new(Shape::Object(item)),
+            default: None,
+            optional: false,
+            env: None,
+        }
+    }
 }
 
 /// Fluent builder for [`ArrayShape`].
@@ -944,7 +1111,7 @@ mod tests {
         assert_eq!(s.name, "App");
         assert_eq!(s.doc, vec!["Top-level config".to_string()]);
         assert_eq!(s.fields.len(), 2);
-        assert!(matches!(s.fields[0].field, Field::Leaf(_)));
+        assert!(matches!(s.fields[0].field, Shape::Leaf(_)));
     }
 
     #[test]
@@ -956,11 +1123,11 @@ mod tests {
             )
             .build();
         match &s.fields[0].field {
-            Field::Nested(inner) => {
+            Shape::Object(inner) => {
                 assert_eq!(inner.name, "Db");
                 assert_eq!(inner.fields.len(), 1);
             }
-            other => panic!("expected Nested, got {other:?}"),
+            other => panic!("expected Object, got {other:?}"),
         }
     }
 
@@ -973,12 +1140,15 @@ mod tests {
     #[test]
     fn enum_of_collects_values() {
         let f = Field::enum_of(["debug", "info"]).build();
-        match &f.ty {
-            LeafType::Enum { values } => {
-                assert_eq!(values.len(), 2);
-                assert_eq!(values[0], Value::String("debug".into()));
-            }
-            other => panic!("expected Enum, got {other:?}"),
+        match &f {
+            Shape::Leaf(leaf) => match &leaf.ty {
+                LeafType::Enum { values } => {
+                    assert_eq!(values.len(), 2);
+                    assert_eq!(values[0], Value::String("debug".into()));
+                }
+                other => panic!("expected Enum, got {other:?}"),
+            },
+            other => panic!("expected Leaf, got {other:?}"),
         }
     }
 
@@ -1082,7 +1252,10 @@ mod tests {
     #[test]
     fn field_value_constructs_value_leaf() {
         let f = Field::value().build();
-        assert!(matches!(f.ty, LeafType::Value));
+        match f {
+            Shape::Leaf(leaf) => assert!(matches!(leaf.ty, LeafType::Value)),
+            other => panic!("expected Leaf, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1100,13 +1273,13 @@ mod tests {
     }
 
     #[test]
-    fn leaf_type_check_array_recurses() {
-        let arr = LeafType::Array(Box::new(unbounded_integer()));
+    fn shape_check_array_recurses() {
+        let arr = Shape::from(Field::array_of_type(unbounded_integer()));
         let good = Value::Array(vec![Value::Integer(1), Value::Integer(2)]);
-        assert!(arr.check(&good).is_ok());
+        assert!(arr.check_value(&good).is_ok());
 
         let bad = Value::Array(vec![Value::Integer(1), Value::String("oops".into())]);
-        let err = arr.check(&bad).unwrap_err();
+        let err = arr.check_value(&bad).unwrap_err();
         assert!(err.contains("array[1]"));
         assert!(err.contains("expected integer"));
     }
@@ -1157,14 +1330,14 @@ mod tests {
     }
 
     #[test]
-    fn leaf_type_check_map_recurses() {
-        let map = LeafType::Map(Box::new(unbounded_integer()));
+    fn shape_check_map_recurses() {
+        let map = Shape::from(Field::map_of(unbounded_integer()));
         let mut t = crate::value::Map::new();
         t.insert("a".into(), Value::Integer(1));
-        assert!(map.check(&Value::Map(t.clone())).is_ok());
+        assert!(map.check_value(&Value::Map(t.clone())).is_ok());
 
         t.insert("b".into(), Value::String("oops".into()));
-        let err = map.check(&Value::Map(t)).unwrap_err();
+        let err = map.check_value(&Value::Map(t)).unwrap_err();
         assert!(err.contains("map[b]"));
     }
 

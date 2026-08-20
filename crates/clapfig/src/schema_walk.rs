@@ -1,5 +1,9 @@
-//! Schema-driven walks of a value [`Map`] against a [`Schema`]: the
+//! Schema-driven walks of a value [`Map`] against a [`Shape`]: the
 //! resolve pipeline's validation stages as free functions.
+//!
+//! Object-root entry points still take [`Schema`] (the [`Shape::Object`]
+//! payload); every field's value is a [`Shape`]. Homogeneous maps and
+//! arrays of leaves or of objects share [`Shape::Map`] / [`Shape::Array`].
 //!
 //! Every function here recurses a parsed table and the schema tree side
 //! by side:
@@ -37,7 +41,7 @@
 use crate::error::{ClapfigError, DiscoveryRecord};
 use crate::format::ConfigPath;
 use crate::origin::{Origin, OriginMap, OriginNode};
-use crate::runtime::{Field, NamedField, Schema};
+use crate::runtime::{NamedField, Schema, Shape};
 use crate::validate::UnknownKey;
 use crate::value::{Map, Value};
 
@@ -48,10 +52,10 @@ use crate::value::{Map, Value};
 /// the adapter indexed — so span lookup does not reconstruct from the
 /// display string (a quoted dotted MapOf key stays one segment).
 ///
-/// For nested objects (`Field::Nested`) the recursion descends into the
-/// sub-table; for `Field::ArrayOf`, each entry is validated against the
-/// item schema (with an `[index]` path segment); for `Field::MapOf`,
-/// each entry's value is validated against the item schema (with the
+/// For nested objects (`Shape::Object`) the recursion descends into the
+/// sub-table; for `Shape::Array`, each entry is validated against the
+/// item shape (with an `[index]` path segment); for `Shape::Map`,
+/// each entry's value is validated against the item shape (with the
 /// user-supplied key forming a path segment).
 ///
 /// The same walker serves the per-file pass and the env layer. Env
@@ -84,63 +88,62 @@ pub(crate) fn collect_unknown_paths(
                     config_path: child,
                 });
             }
-            Some(NamedField {
-                field: Field::Leaf(_),
-                ..
-            }) => {
-                // Leaf — type checking happens later in `finalize`.
+            Some(nf) => collect_unknown_against_shape(value, &nf.field, &full, &child, unknown),
+        }
+    }
+}
+
+/// Recurse unknown-key collection into a field's [`Shape`].
+fn collect_unknown_against_shape(
+    value: &Value,
+    shape: &Shape,
+    prefix: &str,
+    path: &ConfigPath,
+    unknown: &mut Vec<UnknownKey>,
+) {
+    match shape {
+        Shape::Leaf(_) => {
+            // Leaf — type checking happens later in `finalize`.
+        }
+        Shape::Object(nested) => {
+            if let Value::Map(t) = value {
+                collect_unknown_paths(t, nested, prefix, path, unknown);
             }
-            Some(NamedField {
-                field: Field::Nested(nested),
-                ..
-            }) => {
-                if let Value::Map(t) = value {
-                    collect_unknown_paths(t, nested, &full, &child, unknown);
+        }
+        Shape::Array(array) => {
+            if let Value::Array(items) = value {
+                for (i, item) in items.iter().enumerate() {
+                    let indexed = format!("{prefix}[{i}]");
+                    collect_unknown_against_shape(
+                        item,
+                        &array.item,
+                        &indexed,
+                        &path.clone().index(i),
+                        unknown,
+                    );
                 }
             }
-            Some(NamedField {
-                field: Field::ArrayOf(item_schema),
-                ..
-            }) => {
-                if let Value::Array(items) = value {
-                    for (i, item) in items.iter().enumerate() {
-                        if let Value::Map(t) = item {
-                            let indexed = format!("{full}[{i}]");
-                            collect_unknown_paths(
-                                t,
-                                item_schema,
-                                &indexed,
-                                &child.clone().index(i),
-                                unknown,
-                            );
-                        }
-                    }
+        }
+        Shape::Map(map) => {
+            // Map keys are user data, not unknown. Recurse into each
+            // entry's value against the item shape. A quoted dotted
+            // entry key is one [`ConfigPath`] segment even though
+            // `prefix` flattens it.
+            if let Value::Map(entries) = value {
+                for (entry_key, entry_value) in entries {
+                    let entry_path = format!("{prefix}.{entry_key}");
+                    collect_unknown_against_shape(
+                        entry_value,
+                        &map.item,
+                        &entry_path,
+                        &path.clone().key(entry_key),
+                        unknown,
+                    );
                 }
             }
-            Some(NamedField {
-                field: Field::MapOf(item_schema),
-                ..
-            }) => {
-                // Each map entry's value is a nested object. The entry key
-                // forms a path segment, so `plugins.audit.rogue` is the
-                // path for an unknown key inside the `audit` entry of a
-                // `plugins` MapOf. A quoted dotted entry key is one
-                // [`ConfigPath`] segment even though `prefix` flattens it.
-                if let Value::Map(entries) = value {
-                    for (entry_key, entry_value) in entries {
-                        if let Value::Map(t) = entry_value {
-                            let entry_path = format!("{full}.{entry_key}");
-                            collect_unknown_paths(
-                                t,
-                                item_schema,
-                                &entry_path,
-                                &child.clone().key(entry_key),
-                                unknown,
-                            );
-                        }
-                    }
-                }
-            }
+        }
+        Shape::Tagged(_) => {
+            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
         }
     }
 }
@@ -187,160 +190,209 @@ fn fill_defaults_at(
             format!("{prefix}.{}", nf.name)
         };
         let child = path.as_ref().map(|p| p.clone().key(&nf.name));
-        match &nf.field {
-            Field::Leaf(leaf) => {
-                if !table.contains_key(&nf.name) {
-                    if let Some(default) = &leaf.default {
-                        insert_default(
-                            table,
-                            origins,
-                            &nf.name,
-                            default.clone(),
-                            child.as_ref(),
-                            &schema_key,
-                            filled,
-                        );
-                    } else if !leaf.optional && matches!(leaf.ty, crate::runtime::LeafType::Map(_))
-                    {
-                        // A non-optional map leaf (bare `HashMap<String,
-                        // scalar>`, or `HashMap<String, UnitEnum>` flattened
-                        // to `Map(Enum)`) follows the `MapOf` absence rule:
-                        // entries are user-supplied, so an absent map is the
-                        // empty map — materialized here so the required
-                        // check passes and the typed deserialize yields an
-                        // empty map instead of a missing-field error.
-                        // Optional (`Option<Map<..>>`) leaves stay absent
-                        // and deserialize to `None`.
-                        insert_default(
-                            table,
-                            origins,
-                            &nf.name,
-                            Value::Map(Map::new()),
-                            child.as_ref(),
-                            &schema_key,
-                            filled,
-                        );
-                    } else if !leaf.optional
-                        && matches!(leaf.ty, crate::runtime::LeafType::Array(_))
-                    {
-                        // A non-optional array leaf without an explicit
-                        // default (bare `Vec<scalar>`, or `Vec<UnitEnum>`
-                        // flattened to `Array(Enum)`) follows the `ArrayOf`
-                        // absence rule the same way map leaves follow
-                        // `MapOf`'s: entries are user-supplied, so an absent
-                        // array is the empty array. Optional
-                        // (`Option<Vec<..>>`) leaves stay absent and
-                        // deserialize to `None`; a declared
-                        // `#[clapfig(default = [...])]` wins (branch above).
-                        insert_default(
-                            table,
-                            origins,
-                            &nf.name,
-                            Value::Array(Vec::new()),
-                            child.as_ref(),
-                            &schema_key,
-                            filled,
-                        );
-                    }
+        fill_defaults_for_field(
+            table,
+            origins,
+            &nf.name,
+            &nf.field,
+            &schema_key,
+            child,
+            filled,
+        );
+    }
+}
+
+fn fill_defaults_for_field(
+    table: &mut Map,
+    origins: &mut OriginMap,
+    name: &str,
+    shape: &Shape,
+    schema_key: &str,
+    child: Option<ConfigPath>,
+    filled: &mut usize,
+) {
+    match shape {
+        Shape::Leaf(leaf) => {
+            if !table.contains_key(name)
+                && let Some(default) = &leaf.default
+            {
+                insert_default(
+                    table,
+                    origins,
+                    name,
+                    default.clone(),
+                    child.as_ref(),
+                    schema_key,
+                    filled,
+                );
+            }
+        }
+        Shape::Object(nested) => {
+            let created = !table.contains_key(name);
+            let entry = table
+                .entry(name.to_string())
+                .or_insert_with(|| Value::Map(Map::new()));
+            if created {
+                origins.entry(name.to_string()).or_insert_with(|| {
+                    OriginNode::map(Origin::default(schema_key), OriginMap::new())
+                });
+                trace_default_filled(child.as_ref(), "map", filled);
+            }
+            if let Value::Map(t) = entry {
+                let child_origins = child_map_origins(origins, name, schema_key);
+                fill_defaults_at(t, child_origins, nested, schema_key, child, filled);
+            }
+        }
+        Shape::Array(array) => {
+            // Array entries are user-supplied — push defaults into
+            // existing entries, never synthesize missing array items.
+            // An absent non-optional array without a declared default
+            // materializes as the empty array. Optional arrays
+            // (`Option<Vec<..>>`) stay absent and deserialize to `None`.
+            if !table.contains_key(name) {
+                if let Some(default) = &array.default {
+                    insert_default(
+                        table,
+                        origins,
+                        name,
+                        default.clone(),
+                        child.as_ref(),
+                        schema_key,
+                        filled,
+                    );
+                    return;
+                }
+                if array.optional {
+                    return;
                 }
             }
-            Field::Nested(nested) => {
-                let created = !table.contains_key(&nf.name);
-                let entry = table
-                    .entry(nf.name.clone())
-                    .or_insert_with(|| Value::Map(Map::new()));
-                if created {
-                    origins.entry(nf.name.clone()).or_insert_with(|| {
-                        OriginNode::map(Origin::default(&schema_key), OriginMap::new())
-                    });
-                    trace_default_filled(child.as_ref(), "map", filled);
-                }
-                if let Value::Map(t) = entry {
-                    let child_origins = child_map_origins(origins, &nf.name, &schema_key);
-                    fill_defaults_at(t, child_origins, nested, &schema_key, child, filled);
+            let created = !table.contains_key(name);
+            let entry = table
+                .entry(name.to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if created {
+                origins
+                    .entry(name.to_string())
+                    .or_insert_with(|| OriginNode::array(Origin::default(schema_key), Vec::new()));
+                trace_default_filled(child.as_ref(), "array", filled);
+            }
+            if let Value::Array(items) = entry {
+                let child_origins = child_array_origins(origins, name, schema_key);
+                for (i, item) in items.iter_mut().enumerate() {
+                    let indexed = format!("{schema_key}[{i}]");
+                    let indexed_path = child.as_ref().map(|p| p.clone().index(i));
+                    fill_defaults_against_shape(
+                        item,
+                        child_origins,
+                        i,
+                        &array.item,
+                        &indexed,
+                        indexed_path,
+                        filled,
+                    );
                 }
             }
-            Field::ArrayOf(item_schema) => {
-                // Array entries are user-supplied — push defaults into
-                // existing entries, never synthesize missing array items.
-                // An absent array-of node itself materializes as the empty
-                // array (same as `MapOf` below): absence means "no
-                // entries", and the typed path's serde deserialize needs
-                // the `[]` to produce an empty `Vec` instead of a
-                // missing-field error.
-                let created = !table.contains_key(&nf.name);
-                let entry = table
-                    .entry(nf.name.clone())
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                if created {
-                    origins.entry(nf.name.clone()).or_insert_with(|| {
-                        OriginNode::array(Origin::default(&schema_key), Vec::new())
-                    });
-                    trace_default_filled(child.as_ref(), "array", filled);
+        }
+        Shape::Map(map) => {
+            // Map entries are user-supplied — push defaults into
+            // existing entries, never synthesize missing entries. An
+            // absent non-optional map without a declared default
+            // materializes as the empty map. Optional maps
+            // (`Option<Map<..>>`) stay absent and deserialize to `None`.
+            if !table.contains_key(name) {
+                if let Some(default) = &map.default {
+                    insert_default(
+                        table,
+                        origins,
+                        name,
+                        default.clone(),
+                        child.as_ref(),
+                        schema_key,
+                        filled,
+                    );
+                    return;
                 }
-                if let Value::Array(items) = entry {
-                    let child_origins = child_array_origins(origins, &nf.name, &schema_key);
-                    for (i, item) in items.iter_mut().enumerate() {
-                        if let Value::Map(t) = item {
-                            let indexed = format!("{schema_key}[{i}]");
-                            while child_origins.len() <= i {
-                                child_origins.push(OriginNode::map(
-                                    Origin::default(&indexed),
-                                    OriginMap::new(),
-                                ));
-                            }
-                            let entry_origins = child_origins[i].map_children_mut();
-                            let indexed_path = child.as_ref().map(|p| p.clone().index(i));
-                            fill_defaults_at(
-                                t,
-                                entry_origins,
-                                item_schema,
-                                &indexed,
-                                indexed_path,
-                                filled,
-                            );
-                        }
-                    }
+                if map.optional {
+                    return;
                 }
             }
-            Field::MapOf(item_schema) => {
-                // Map entries are user-supplied — push defaults into
-                // existing entries, never synthesize missing entries. An
-                // absent map-of node itself materializes as the empty map
-                // (same as `Nested` above): absence means "no entries",
-                // and the typed path's serde deserialize needs the `{}` to
-                // produce an empty `HashMap` instead of a missing-field
-                // error.
-                let created = !table.contains_key(&nf.name);
-                let entry = table
-                    .entry(nf.name.clone())
-                    .or_insert_with(|| Value::Map(Map::new()));
-                if created {
-                    origins.entry(nf.name.clone()).or_insert_with(|| {
-                        OriginNode::map(Origin::default(&schema_key), OriginMap::new())
-                    });
-                    trace_default_filled(child.as_ref(), "map", filled);
-                }
-                if let Value::Map(entries) = entry {
-                    let child_origins = child_map_origins(origins, &nf.name, &schema_key);
-                    for (entry_key, entry_value) in entries.iter_mut() {
-                        if let Value::Map(t) = entry_value {
-                            let entry_path = format!("{schema_key}.{entry_key}");
-                            let entry_origins =
-                                child_map_entry_origins(child_origins, entry_key, &entry_path);
-                            let entry_cfg = child.as_ref().map(|p| p.clone().key(entry_key));
-                            fill_defaults_at(
-                                t,
-                                entry_origins,
-                                item_schema,
-                                &entry_path,
-                                entry_cfg,
-                                filled,
-                            );
-                        }
-                    }
+            let created = !table.contains_key(name);
+            let entry = table
+                .entry(name.to_string())
+                .or_insert_with(|| Value::Map(Map::new()));
+            if created {
+                origins.entry(name.to_string()).or_insert_with(|| {
+                    OriginNode::map(Origin::default(schema_key), OriginMap::new())
+                });
+                trace_default_filled(child.as_ref(), "map", filled);
+            }
+            if let Value::Map(entries) = entry {
+                let child_origins = child_map_origins(origins, name, schema_key);
+                for (entry_key, entry_value) in entries.iter_mut() {
+                    let entry_path = format!("{schema_key}.{entry_key}");
+                    let entry_origins =
+                        child_map_entry_origins(child_origins, entry_key, &entry_path);
+                    let entry_cfg = child.as_ref().map(|p| p.clone().key(entry_key));
+                    fill_defaults_for_value(
+                        entry_value,
+                        entry_origins,
+                        &map.item,
+                        &entry_path,
+                        entry_cfg,
+                        filled,
+                    );
                 }
             }
+        }
+        Shape::Tagged(_) => {
+            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+        }
+    }
+}
+
+fn fill_defaults_against_shape(
+    item: &mut Value,
+    child_origins: &mut Vec<OriginNode>,
+    i: usize,
+    shape: &Shape,
+    indexed: &str,
+    indexed_path: Option<ConfigPath>,
+    filled: &mut usize,
+) {
+    match shape {
+        Shape::Object(item_schema) => {
+            if let Value::Map(t) = item {
+                while child_origins.len() <= i {
+                    child_origins.push(OriginNode::map(Origin::default(indexed), OriginMap::new()));
+                }
+                let entry_origins = child_origins[i].map_children_mut();
+                fill_defaults_at(t, entry_origins, item_schema, indexed, indexed_path, filled);
+            }
+        }
+        Shape::Leaf(_) | Shape::Array(_) | Shape::Map(_) => {}
+        Shape::Tagged(_) => {
+            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+        }
+    }
+}
+
+fn fill_defaults_for_value(
+    value: &mut Value,
+    origins: &mut OriginMap,
+    shape: &Shape,
+    schema_key: &str,
+    path: Option<ConfigPath>,
+    filled: &mut usize,
+) {
+    match shape {
+        Shape::Object(nested) => {
+            if let Value::Map(t) = value {
+                fill_defaults_at(t, origins, nested, schema_key, path, filled);
+            }
+        }
+        Shape::Leaf(_) | Shape::Array(_) | Shape::Map(_) => {}
+        Shape::Tagged(_) => {
+            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
         }
     }
 }
@@ -444,45 +496,43 @@ pub(crate) fn finalize(
 /// leaf type makes a value a candidate.
 fn coerce_leaf_values(table: &mut Map, schema: &Schema) {
     for nf in &schema.fields {
-        match &nf.field {
-            Field::Leaf(leaf) => {
-                if let Some(value) = table.get_mut(&nf.name) {
-                    coerce_value(value, &leaf.ty);
-                }
-            }
-            Field::Nested(nested) => {
-                if let Some(Value::Map(t)) = table.get_mut(&nf.name) {
-                    coerce_leaf_values(t, nested);
-                }
-            }
-            Field::ArrayOf(item_schema) => {
-                if let Some(Value::Array(items)) = table.get_mut(&nf.name) {
-                    for item in items {
-                        if let Value::Map(t) = item {
-                            coerce_leaf_values(t, item_schema);
-                        }
-                    }
-                }
-            }
-            Field::MapOf(item_schema) => {
-                if let Some(Value::Map(entries)) = table.get_mut(&nf.name) {
-                    for entry_value in entries.values_mut() {
-                        if let Value::Map(t) = entry_value {
-                            coerce_leaf_values(t, item_schema);
-                        }
-                    }
-                }
-            }
+        if let Some(value) = table.get_mut(&nf.name) {
+            coerce_value(value, &nf.field);
         }
     }
 }
 
-/// Coerce one value against its declared leaf type (datetime strings on
-/// datetime leaves, integers on float leaves), recursing through declared
-/// containers (`Array` elements, homogeneous `Map` values). Shared with
-/// the persist path, which validates `config set` values against the same
-/// leaf declarations.
-pub(crate) fn coerce_value(value: &mut Value, ty: &crate::runtime::LeafType) {
+/// Coerce one value against its declared shape (datetime strings on
+/// datetime leaves, integers on float leaves), recursing through
+/// declared containers. Shared with the persist path, which validates
+/// `config set` values against the same declarations.
+pub(crate) fn coerce_value(value: &mut Value, shape: &Shape) {
+    match shape {
+        Shape::Leaf(leaf) => coerce_leaf(value, &leaf.ty),
+        Shape::Object(nested) => {
+            if let Value::Map(t) = value {
+                coerce_leaf_values(t, nested);
+            }
+        }
+        Shape::Array(array) => {
+            if let Value::Array(items) = value {
+                for item in items {
+                    coerce_value(item, &array.item);
+                }
+            }
+        }
+        Shape::Map(map) => {
+            if let Value::Map(entries) = value {
+                for entry in entries.values_mut() {
+                    coerce_value(entry, &map.item);
+                }
+            }
+        }
+        Shape::Tagged(_) => {}
+    }
+}
+
+fn coerce_leaf(value: &mut Value, ty: &crate::runtime::LeafType) {
     use crate::runtime::LeafType;
     match ty {
         LeafType::DateTime => {
@@ -495,20 +545,6 @@ pub(crate) fn coerce_value(value: &mut Value, ty: &crate::runtime::LeafType) {
         LeafType::Float => {
             if let Value::Integer(i) = value {
                 *value = Value::Float(*i as f64);
-            }
-        }
-        LeafType::Array(elem) => {
-            if let Value::Array(items) = value {
-                for item in items {
-                    coerce_value(item, elem);
-                }
-            }
-        }
-        LeafType::Map(elem) => {
-            if let Value::Map(entries) = value {
-                for entry in entries.values_mut() {
-                    coerce_value(entry, elem);
-                }
             }
         }
         _ => {}
@@ -531,131 +567,128 @@ fn check_required_and_types(
             format!("{prefix}.{}", nf.name)
         };
         let child = path.clone().key(&nf.name);
-        match &nf.field {
-            Field::Leaf(leaf) => match table.get(&nf.name) {
-                None => {
-                    if !leaf.optional {
-                        return Err(ClapfigError::missing_required(display, discovery.clone()));
-                    }
+        check_field(
+            table.get(&nf.name),
+            origins,
+            &nf.field,
+            &display,
+            &child,
+            discovery,
+        )?;
+    }
+    Ok(())
+}
+
+fn check_field(
+    value: Option<&Value>,
+    origins: &OriginMap,
+    shape: &Shape,
+    display: &str,
+    path: &ConfigPath,
+    discovery: &DiscoveryRecord,
+) -> Result<(), ClapfigError> {
+    match shape {
+        Shape::Leaf(leaf) => match value {
+            None => {
+                if !leaf.optional {
+                    return Err(ClapfigError::missing_required(
+                        display.to_string(),
+                        discovery.clone(),
+                    ));
                 }
-                Some(value) => {
-                    leaf.ty.check(value).map_err(|reason| {
-                        ClapfigError::invalid_value_at(display.clone(), reason, origins, &child)
-                    })?;
-                }
-            },
-            Field::Nested(nested) => match table.get(&nf.name) {
-                None => {
-                    // A nested section is required if any of its leaves is
-                    // required. Recurse with an empty table so the missing-
-                    // required check below fires for inner leaves.
-                    let empty = Map::new();
-                    check_required_and_types(
-                        &empty,
-                        &OriginMap::new(),
-                        nested,
-                        &display,
-                        &child,
+                Ok(())
+            }
+            Some(value) => leaf.ty.check(value).map_err(|reason| {
+                ClapfigError::invalid_value_at(display.to_string(), reason, origins, path)
+            }),
+        },
+        Shape::Object(nested) => match value {
+            None => {
+                // A nested section is required if any of its leaves is
+                // required. Recurse with an empty table so the missing-
+                // required check below fires for inner leaves.
+                let empty = Map::new();
+                check_required_and_types(
+                    &empty,
+                    &OriginMap::new(),
+                    nested,
+                    display,
+                    path,
+                    discovery,
+                )
+            }
+            Some(Value::Map(inner)) => {
+                check_required_and_types(inner, origins, nested, display, path, discovery)
+            }
+            Some(other) => Err(ClapfigError::invalid_value_at(
+                display.to_string(),
+                format!("expected map, got {}", value_type_name(other)),
+                origins,
+                path,
+            )),
+        },
+        Shape::Array(array) => match value {
+            None => Ok(()),
+            Some(value) if array.item.is_value_field() => {
+                shape.check_value(value).map_err(|reason| {
+                    ClapfigError::invalid_value_at(display.to_string(), reason, origins, path)
+                })
+            }
+            Some(Value::Array(items)) => {
+                for (i, item) in items.iter().enumerate() {
+                    let indexed = format!("{display}[{i}]");
+                    let indexed_path = path.clone().index(i);
+                    check_field(
+                        Some(item),
+                        origins,
+                        &array.item,
+                        &indexed,
+                        &indexed_path,
                         discovery,
                     )?;
                 }
-                Some(Value::Map(inner)) => {
-                    check_required_and_types(inner, origins, nested, &display, &child, discovery)?;
-                }
-                Some(other) => {
-                    return Err(ClapfigError::invalid_value_at(
-                        display,
-                        format!("expected map, got {}", value_type_name(other)),
+                Ok(())
+            }
+            Some(other) => Err(ClapfigError::invalid_value_at(
+                display.to_string(),
+                format!("expected array, got {}", value_type_name(other)),
+                origins,
+                path,
+            )),
+        },
+        Shape::Map(map) => match value {
+            None => Ok(()),
+            Some(value) if map.item.is_value_field() => {
+                shape.check_value(value).map_err(|reason| {
+                    ClapfigError::invalid_value_at(display.to_string(), reason, origins, path)
+                })
+            }
+            Some(Value::Map(entries)) => {
+                for (entry_key, entry_value) in entries {
+                    let entry_path = format!("{display}.{entry_key}");
+                    let entry_cfg = path.clone().key(entry_key);
+                    check_field(
+                        Some(entry_value),
                         origins,
-                        &child,
-                    ));
+                        &map.item,
+                        &entry_path,
+                        &entry_cfg,
+                        discovery,
+                    )?;
                 }
-            },
-            Field::ArrayOf(item_schema) => match table.get(&nf.name) {
-                None => {
-                    // Absent array-of: empty list is the natural default,
-                    // not an error — `Vec<Nested>`-style fields can be
-                    // legitimately empty.
-                }
-                Some(Value::Array(items)) => {
-                    for (i, item) in items.iter().enumerate() {
-                        let indexed = format!("{display}[{i}]");
-                        let indexed_path = child.clone().index(i);
-                        match item {
-                            Value::Map(inner) => {
-                                check_required_and_types(
-                                    inner,
-                                    origins,
-                                    item_schema,
-                                    &indexed,
-                                    &indexed_path,
-                                    discovery,
-                                )?;
-                            }
-                            other => {
-                                return Err(ClapfigError::invalid_value_at(
-                                    indexed,
-                                    format!("expected map, got {}", value_type_name(other)),
-                                    origins,
-                                    &indexed_path,
-                                ));
-                            }
-                        }
-                    }
-                }
-                Some(other) => {
-                    return Err(ClapfigError::invalid_value_at(
-                        display,
-                        format!("expected array, got {}", value_type_name(other)),
-                        origins,
-                        &child,
-                    ));
-                }
-            },
-            Field::MapOf(item_schema) => match table.get(&nf.name) {
-                None => {
-                    // Absent map-of: empty map is the natural default, not
-                    // an error. Same rule as ArrayOf — user-supplied
-                    // entries can be zero.
-                }
-                Some(Value::Map(entries)) => {
-                    for (entry_key, entry_value) in entries {
-                        let entry_path = format!("{display}.{entry_key}");
-                        let entry_cfg = child.clone().key(entry_key);
-                        match entry_value {
-                            Value::Map(inner) => {
-                                check_required_and_types(
-                                    inner,
-                                    origins,
-                                    item_schema,
-                                    &entry_path,
-                                    &entry_cfg,
-                                    discovery,
-                                )?;
-                            }
-                            other => {
-                                return Err(ClapfigError::invalid_value_at(
-                                    entry_path,
-                                    format!("expected map, got {}", value_type_name(other)),
-                                    origins,
-                                    &entry_cfg,
-                                ));
-                            }
-                        }
-                    }
-                }
-                Some(other) => {
-                    return Err(ClapfigError::invalid_value_at(
-                        display,
-                        format!("expected map, got {}", value_type_name(other)),
-                        origins,
-                        &child,
-                    ));
-                }
-            },
+                Ok(())
+            }
+            Some(other) => Err(ClapfigError::invalid_value_at(
+                display.to_string(),
+                format!("expected map, got {}", value_type_name(other)),
+                origins,
+                path,
+            )),
+        },
+        Shape::Tagged(_) => {
+            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
         }
     }
-    Ok(())
 }
 
 /// Type name of a [`Value`] for error messages, in the same vocabulary as

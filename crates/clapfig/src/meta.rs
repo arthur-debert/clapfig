@@ -15,7 +15,7 @@
 //! metadata lookups DWIM-friendly so callers don't have to remember which
 //! shape the user typed.
 
-use crate::runtime::{Field, Schema};
+use crate::runtime::{Schema, Shape};
 
 /// Look up the doc-comment lines for a config key in a [`Schema`].
 ///
@@ -56,18 +56,21 @@ fn walk_segments(schema: &Schema, segments: &[&str]) -> Option<Vec<String>> {
     for field in &schema.fields {
         if segment_matches(&field.name, head) {
             if segments.len() == 1 {
-                return Some(match &field.field {
-                    Field::Leaf(leaf) => leaf.doc.clone(),
-                    Field::Nested(s) | Field::ArrayOf(s) | Field::MapOf(s) => s.doc.clone(),
-                });
+                return Some(field.field.field_doc().to_vec());
             }
             return match &field.field {
-                Field::Nested(nested) | Field::ArrayOf(nested) | Field::MapOf(nested) => {
-                    walk_segments(nested, &segments[1..])
-                }
-                // Hit a leaf with segments still pending — the rest of the
-                // path can't resolve.
-                Field::Leaf(_) => None,
+                Shape::Object(nested) => walk_segments(nested, &segments[1..]),
+                Shape::Array(array) => match array.item.as_ref() {
+                    Shape::Object(nested) => walk_segments(nested, &segments[1..]),
+                    _ => None,
+                },
+                Shape::Map(map) => match map.item.as_ref() {
+                    Shape::Object(nested) => walk_segments(nested, &segments[1..]),
+                    _ => None,
+                },
+                // Hit a leaf (or value-container) with segments still
+                // pending — the rest of the path can't resolve.
+                Shape::Leaf(_) | Shape::Tagged(_) => None,
             };
         }
     }

@@ -18,7 +18,7 @@
 
 #![cfg(feature = "derive")]
 
-use clapfig::runtime::{Field as RuntimeField, LeafType as RuntimeLeafType};
+use clapfig::runtime::Shape as RuntimeShape;
 use clapfig::value::Value;
 use clapfig::{Clapfig, ConfigAction, ConfigResult, Schema, SearchPath};
 use serde::{Deserialize, Serialize};
@@ -45,12 +45,15 @@ struct AppCfg {
 fn vec_of_struct_emits_structural_array_of_with_field_site_doc() {
     let s = AppCfg::schema();
     match &s.fields[0].field {
-        RuntimeField::ArrayOf(item) => {
-            assert_eq!(item.name, "Plugin");
-            // Field-site `///` doc wins over the item type's own doc.
-            assert_eq!(item.doc, vec!["Installed plugins.".to_string()]);
-        }
-        other => panic!("expected ArrayOf, got {other:?}"),
+        RuntimeShape::Array(array) => match array.item.as_ref() {
+            RuntimeShape::Object(item) => {
+                assert_eq!(item.name, "Plugin");
+                // Field-site `///` doc wins over the item type's own doc.
+                assert_eq!(item.doc, vec!["Installed plugins.".to_string()]);
+            }
+            other => panic!("expected Object item, got {other:?}"),
+        },
+        other => panic!("expected Array, got {other:?}"),
     }
 }
 
@@ -249,9 +252,9 @@ struct PrintCfg {
 fn vec_of_unit_enum_flattens_to_array_of_enum_leaf() {
     let s = PrintCfg::schema();
     match &s.fields[0].field {
-        RuntimeField::Leaf(leaf) => match &leaf.ty {
-            RuntimeLeafType::Array(inner) => match inner.as_ref() {
-                RuntimeLeafType::Enum { values } => {
+        RuntimeShape::Array(array) => match array.item.as_ref() {
+            RuntimeShape::Leaf(leaf) => match &leaf.ty {
+                clapfig::runtime::LeafType::Enum { values } => {
                     assert_eq!(
                         values,
                         &vec![Value::String("a4".into()), Value::String("letter".into())]
@@ -259,9 +262,9 @@ fn vec_of_unit_enum_flattens_to_array_of_enum_leaf() {
                 }
                 other => panic!("expected Enum inside Array, got {other:?}"),
             },
-            other => panic!("expected Array leaf type, got {other:?}"),
+            other => panic!("expected Leaf item, got {other:?}"),
         },
-        other => panic!("expected Leaf (array-of-enum flattened), got {other:?}"),
+        other => panic!("expected Array (array-of-enum flattened), got {other:?}"),
     }
 }
 

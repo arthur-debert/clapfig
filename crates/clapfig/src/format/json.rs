@@ -56,7 +56,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map as JsonMap, Value as Json};
 
-use crate::runtime::{Field, Leaf, LeafType, Schema};
+use crate::runtime::Schema;
 use crate::value::{Map, Value};
 
 use super::template::{TemplateRenderer, doc_lines, leaf_annotations, walk_level};
@@ -916,10 +916,10 @@ impl TemplateRenderer for JsonTemplate {
         out: &mut Self::Out,
         _ctx: &(),
         name: &str,
-        leaf: &Leaf,
+        field: super::template::ValueView<'_>,
     ) -> Result<(), FormatError> {
-        let mut lines = leaf_annotations(leaf, "JSON", &mut |v| inline_json(v, name))?;
-        match &leaf.default {
+        let mut lines = leaf_annotations(field, "JSON", &mut |v| inline_json(v, name))?;
+        match field.default {
             Some(default) => {
                 if !lines.is_empty() {
                     out.insert(comment_key(name), comment_value(lines));
@@ -933,7 +933,7 @@ impl TemplateRenderer for JsonTemplate {
                 // TOML's `#name = ""` line.
                 lines.push(assignment_snippet(
                     name,
-                    placeholder_json(&leaf.ty).to_string(),
+                    placeholder_json(field.shape).to_string(),
                 ));
                 out.insert(comment_key(name), comment_value(lines));
             }
@@ -1011,24 +1011,39 @@ fn example_object(
             });
         }
         let value = match &nf.field {
-            Field::Leaf(leaf) => match &leaf.default {
+            crate::runtime::Shape::Leaf(leaf) => match &leaf.default {
                 Some(default) => {
                     let mut path = vec![PathSegment::Key(context_key.to_string())];
                     value_to_json(default, &mut path)?
                 }
-                None => placeholder_value(&leaf.ty),
+                None => placeholder_value(&nf.field),
             },
-            Field::Nested(child) => Json::Object(example_object(child, context_key)?),
-            Field::ArrayOf(child) => {
-                Json::Array(vec![Json::Object(example_object(child, context_key)?)])
+            crate::runtime::Shape::Object(child) => {
+                Json::Object(example_object(child, context_key)?)
             }
-            Field::MapOf(child) => {
-                let mut entry = JsonMap::new();
-                entry.insert(
-                    "<key>".to_string(),
-                    Json::Object(example_object(child, context_key)?),
-                );
-                Json::Object(entry)
+            crate::runtime::Shape::Array(array) => match array.item.as_ref() {
+                crate::runtime::Shape::Object(child) => {
+                    Json::Array(vec![Json::Object(example_object(child, context_key)?)])
+                }
+                item => Json::Array(vec![placeholder_value(item)]),
+            },
+            crate::runtime::Shape::Map(map) => match map.item.as_ref() {
+                crate::runtime::Shape::Object(child) => {
+                    let mut entry = JsonMap::new();
+                    entry.insert(
+                        "<key>".to_string(),
+                        Json::Object(example_object(child, context_key)?),
+                    );
+                    Json::Object(entry)
+                }
+                item => {
+                    let mut entry = JsonMap::new();
+                    entry.insert("<key>".to_string(), placeholder_value(item));
+                    Json::Object(entry)
+                }
+            },
+            crate::runtime::Shape::Tagged(_) => {
+                panic!("clapfig: tagged templates are SHP01-WS05")
             }
         };
         obj.insert(nf.name.clone(), value);
@@ -1076,13 +1091,13 @@ fn inline_json(value: &Value, key: &str) -> Result<String, FormatError> {
 /// Placeholder rendered in an assignment snippet for a leaf without a
 /// default, hinting the expected value shape: the shared table with JSON's
 /// quoted spellings for the string and datetime arms.
-fn placeholder_json(ty: &LeafType) -> &'static str {
-    super::template::placeholder(ty, "\"\"", "\"1970-01-01T00:00:00Z\"")
+fn placeholder_json(shape: &crate::runtime::Shape) -> &'static str {
+    super::template::placeholder(shape, "\"\"", "\"1970-01-01T00:00:00Z\"")
 }
 
 /// [`placeholder_json`] as a `serde_json::Value`, for example objects.
-fn placeholder_value(ty: &LeafType) -> Json {
-    serde_json::from_str(placeholder_json(ty)).expect("placeholders are valid JSON")
+fn placeholder_value(shape: &crate::runtime::Shape) -> Json {
+    serde_json::from_str(placeholder_json(shape)).expect("placeholders are valid JSON")
 }
 
 #[cfg(test)]

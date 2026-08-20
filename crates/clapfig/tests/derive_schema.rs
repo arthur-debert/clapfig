@@ -560,7 +560,7 @@ fn struct_shape_wraps_schema_as_object() {
 fn unit_enum_field_flattens_to_runtime_leaf_enum() {
     let s = PdfDoc::schema();
     let leaf = match &s.fields[0].field {
-        clapfig::runtime::Field::Leaf(l) => l,
+        clapfig::runtime::Shape::Leaf(l) => l,
         other => panic!("expected Leaf, got {other:?}"),
     };
     match &leaf.ty {
@@ -851,7 +851,7 @@ struct DocWithDefaultEnum {
 fn default_on_enum_typed_field_round_trips_through_schema() {
     let s = DocWithDefaultEnum::schema();
     let leaf = match &s.fields[0].field {
-        clapfig::runtime::Field::Leaf(l) => l,
+        clapfig::runtime::Shape::Leaf(l) => l,
         other => panic!("expected Leaf, got {other:?}"),
     };
     match &leaf.ty {
@@ -903,7 +903,7 @@ struct DocWithOptionalEnum {
 fn option_of_unit_enum_emits_optional_leaf_enum() {
     let s = DocWithOptionalEnum::schema();
     let leaf = match &s.fields[0].field {
-        clapfig::runtime::Field::Leaf(l) => l,
+        clapfig::runtime::Shape::Leaf(l) => l,
         other => panic!("expected Leaf, got {other:?}"),
     };
     assert!(matches!(leaf.ty, clapfig::runtime::LeafType::Enum { .. }));
@@ -947,7 +947,7 @@ fn explicit_env_on_enum_typed_field_carries_through() {
     }
     let s = EnvEnumDoc::schema();
     let leaf = match &s.fields[0].field {
-        clapfig::runtime::Field::Leaf(l) => l,
+        clapfig::runtime::Shape::Leaf(l) => l,
         other => panic!("expected Leaf, got {other:?}"),
     };
     assert_eq!(leaf.env.as_deref(), Some("PAGE_SIZE_OVERRIDE"));

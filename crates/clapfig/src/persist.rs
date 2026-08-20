@@ -99,13 +99,13 @@ pub fn set_in_document(
         });
     }
 
-    let leaf_ty = lookup_leaf_type(schema, &canonical);
-    let mut value = parse_raw_value(raw_value, leaf_ty)
+    let field = lookup_field_shape(schema, &canonical);
+    let mut value = parse_raw_value(raw_value, field)
         .map_err(|reason| ClapfigError::invalid_value(key, reason))?;
-    if let Some(leaf_ty) = leaf_ty {
-        crate::schema_walk::coerce_value(&mut value, leaf_ty);
-        leaf_ty
-            .check(&value)
+    if let Some(shape) = field {
+        crate::schema_walk::coerce_value(&mut value, shape);
+        shape
+            .check_value(&value)
             .map_err(|reason| ClapfigError::invalid_value(key, reason))?;
     }
 
@@ -235,19 +235,19 @@ pub fn persist_value(
 
 /// Descend a runtime schema by dotted key path and return the target leaf's
 /// declared type. `None` when the path doesn't resolve to a leaf.
-fn lookup_leaf_type<'a>(
+fn lookup_field_shape<'a>(
     schema: &'a crate::runtime::Schema,
     dotted: &str,
-) -> Option<&'a crate::runtime::LeafType> {
+) -> Option<&'a crate::runtime::Shape> {
     let mut current = schema;
     let mut segments = dotted.split('.').peekable();
     while let Some(seg) = segments.next() {
         let nf = current.fields.iter().find(|f| f.name == seg)?;
         match &nf.field {
-            crate::runtime::Field::Leaf(leaf) if segments.peek().is_none() => {
-                return Some(&leaf.ty);
+            shape if shape.is_value_field() && segments.peek().is_none() => {
+                return Some(shape);
             }
-            crate::runtime::Field::Nested(inner) if segments.peek().is_some() => {
+            crate::runtime::Shape::Object(inner) if segments.peek().is_some() => {
                 current = inner;
             }
             _ => return None,
@@ -443,10 +443,17 @@ fn unaddressable_container(
         let nf = current.fields.iter().find(|f| f.name == seg)?;
         walked.push(seg);
         match &nf.field {
-            crate::runtime::Field::ArrayOf(_) => return Some((walked.join("."), "an array")),
-            crate::runtime::Field::MapOf(_) => return Some((walked.join("."), "a map")),
-            crate::runtime::Field::Nested(inner) => current = inner,
-            crate::runtime::Field::Leaf(_) => return None,
+            crate::runtime::Shape::Array(array) if !array.item.is_value_field() => {
+                return Some((walked.join("."), "an array"));
+            }
+            crate::runtime::Shape::Map(map) if !map.item.is_value_field() => {
+                return Some((walked.join("."), "a map"));
+            }
+            crate::runtime::Shape::Object(inner) => current = inner,
+            crate::runtime::Shape::Leaf(_)
+            | crate::runtime::Shape::Array(_)
+            | crate::runtime::Shape::Map(_)
+            | crate::runtime::Shape::Tagged(_) => return None,
         }
     }
     None
@@ -476,62 +483,57 @@ fn unaddressable_container(
 ///
 /// Errors are human-readable reasons for
 /// [`ClapfigError::InvalidValue`](crate::error::ClapfigError::InvalidValue).
-fn parse_raw_value(raw: &str, ty: Option<&crate::runtime::LeafType>) -> Result<Value, String> {
-    use crate::runtime::LeafType;
-    let Some(ty) = ty else {
+fn parse_raw_value(raw: &str, shape: Option<&crate::runtime::Shape>) -> Result<Value, String> {
+    use crate::runtime::{LeafType, Shape};
+    let Some(shape) = shape else {
         return Ok(crate::env::parse_env_value(raw));
     };
-    match ty {
-        LeafType::String => Ok(Value::String(raw.to_owned())),
-        LeafType::Integer { .. } => raw
-            .parse::<i64>()
-            .map(Value::Integer)
-            .map_err(|_| format!("expected integer, got '{raw}'")),
-        LeafType::Float => raw
-            .parse::<f64>()
-            .map(Value::Float)
-            .map_err(|_| format!("expected float, got '{raw}'")),
-        LeafType::Bool => {
-            if raw.eq_ignore_ascii_case("true") {
-                Ok(Value::Boolean(true))
-            } else if raw.eq_ignore_ascii_case("false") {
-                Ok(Value::Boolean(false))
-            } else {
-                Err(format!("expected bool ('true' or 'false'), got '{raw}'"))
+    match shape {
+        Shape::Array(_) => parse_inline_container(raw, "array", "[\"a\", \"b\"]"),
+        Shape::Map(_) => parse_inline_container(raw, "map", "{key = \"value\"}"),
+        Shape::Leaf(leaf) => match &leaf.ty {
+            LeafType::String => Ok(Value::String(raw.to_owned())),
+            LeafType::Integer { .. } => raw
+                .parse::<i64>()
+                .map(Value::Integer)
+                .map_err(|_| format!("expected integer, got '{raw}'")),
+            LeafType::Float => raw
+                .parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| format!("expected float, got '{raw}'")),
+            LeafType::Bool => {
+                if raw.eq_ignore_ascii_case("true") {
+                    Ok(Value::Boolean(true))
+                } else if raw.eq_ignore_ascii_case("false") {
+                    Ok(Value::Boolean(false))
+                } else {
+                    Err(format!("expected bool ('true' or 'false'), got '{raw}'"))
+                }
             }
-        }
-        LeafType::DateTime => Ok(Value::String(raw.to_owned())),
-        LeafType::Enum { values } => {
-            let sniffed = crate::env::parse_env_value(raw);
-            if values.contains(&sniffed) {
-                Ok(sniffed)
-            } else {
-                Ok(Value::String(raw.to_owned()))
+            LeafType::DateTime => Ok(Value::String(raw.to_owned())),
+            LeafType::Enum { values } => {
+                let sniffed = crate::env::parse_env_value(raw);
+                if values.contains(&sniffed) {
+                    Ok(sniffed)
+                } else {
+                    Ok(Value::String(raw.to_owned()))
+                }
             }
-        }
-        LeafType::Array(_) | LeafType::Map(_) => parse_inline_container(raw, ty),
-        LeafType::Value => Ok(crate::env::parse_env_value(raw)),
+            LeafType::Value => Ok(crate::env::parse_env_value(raw)),
+        },
+        Shape::Object(_) | Shape::Tagged(_) => Ok(crate::env::parse_env_value(raw)),
     }
 }
 
-/// Parse a raw `config set` string destined for an `Array`/`Map` leaf as
+/// Parse a raw `config set` string destined for an `Array`/`Map` field as
 /// a TOML inline value. TOML is the value model's baseline vocabulary
 /// (ADR-0001), so the CLI accepts one container syntax regardless of the
 /// file's format; the resulting [`Value`] is then written through the
 /// active format's adapter like any other. A raw string TOML cannot
 /// parse as a value errors naming the expected container type with an
 /// example spelling.
-fn parse_inline_container(raw: &str, ty: &crate::runtime::LeafType) -> Result<Value, String> {
-    let example = match ty {
-        crate::runtime::LeafType::Array(_) => "[\"a\", \"b\"]",
-        _ => "{key = \"value\"}",
-    };
-    let refuse = || {
-        format!(
-            "expected {} in TOML inline syntax (e.g. {example}), got '{raw}'",
-            ty.name()
-        )
-    };
+fn parse_inline_container(raw: &str, kind: &str, example: &str) -> Result<Value, String> {
+    let refuse = || format!("expected {kind} in TOML inline syntax (e.g. {example}), got '{raw}'");
     let doc = format!("v = {raw}");
     match crate::format::TomlAdapter.parse(&doc) {
         // Require exactly the probe key back: a raw string smuggling
@@ -876,63 +878,46 @@ mod tests {
 
     #[test]
     fn value_parsing_follows_declared_leaf_type() {
-        use crate::runtime::LeafType;
+        use crate::runtime::{Field, Shape};
         // The same raw string lands as different types depending on the
         // declared leaf — never on what the string looks like.
         assert_eq!(
-            parse_raw_value("123", Some(&LeafType::String)).unwrap(),
+            parse_raw_value("123", Some(&Shape::from(Field::string()))).unwrap(),
             Value::String("123".into())
         );
         assert_eq!(
-            parse_raw_value(
-                "123",
-                Some(&LeafType::Integer {
-                    min: None,
-                    max: None,
-                }),
-            )
-            .unwrap(),
+            parse_raw_value("123", Some(&Shape::from(Field::integer()))).unwrap(),
             Value::Integer(123)
         );
         assert_eq!(
-            parse_raw_value("123", Some(&LeafType::Float)).unwrap(),
+            parse_raw_value("123", Some(&Shape::from(Field::float()))).unwrap(),
             Value::Float(123.0)
         );
         assert_eq!(
-            parse_raw_value("TRUE", Some(&LeafType::Bool)).unwrap(),
+            parse_raw_value("TRUE", Some(&Shape::from(Field::boolean()))).unwrap(),
             Value::Boolean(true)
         );
     }
 
     #[test]
     fn value_parsing_errors_name_the_expected_type() {
-        use crate::runtime::LeafType;
-        for (raw, ty, expected) in [
-            (
-                "abc",
-                LeafType::Integer {
-                    min: None,
-                    max: None,
-                },
-                "expected integer",
-            ),
-            ("abc", LeafType::Float, "expected float"),
-            ("yes", LeafType::Bool, "expected bool"),
+        use crate::runtime::{Field, LeafType, Shape};
+        for (raw, shape, expected) in [
+            ("abc", Shape::from(Field::integer()), "expected integer"),
+            ("abc", Shape::from(Field::float()), "expected float"),
+            ("yes", Shape::from(Field::boolean()), "expected bool"),
             (
                 "a,b",
-                LeafType::Array(Box::new(LeafType::String)),
+                Shape::from(Field::array_of_type(LeafType::String)),
                 "expected array",
             ),
             (
                 "a=1",
-                LeafType::Map(Box::new(LeafType::Integer {
-                    min: None,
-                    max: None,
-                })),
+                Shape::from(Field::map_of(Field::integer())),
                 "expected map",
             ),
         ] {
-            let err = parse_raw_value(raw, Some(&ty)).unwrap_err();
+            let err = parse_raw_value(raw, Some(&shape)).unwrap_err();
             assert!(err.contains(expected), "{raw}: {err}");
             assert!(err.contains(raw), "{raw}: {err}");
         }
@@ -942,10 +927,10 @@ mod tests {
     fn value_parsing_without_leaf_type_keeps_the_heuristic() {
         // `Value` leaves and unresolvable keys have no declared shape to
         // parse toward — the env-style sniff stays.
-        use crate::runtime::LeafType;
+        use crate::runtime::{Field, Shape};
         assert_eq!(parse_raw_value("42", None).unwrap(), Value::Integer(42));
         assert_eq!(
-            parse_raw_value("1.5", Some(&LeafType::Value)).unwrap(),
+            parse_raw_value("1.5", Some(&Shape::from(Field::value()))).unwrap(),
             Value::Float(1.5)
         );
         assert_eq!(

@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::runtime::{Leaf, Schema};
+use crate::runtime::Schema;
 use crate::value::{Map, Value};
 
 use super::template::{
@@ -401,19 +401,19 @@ impl TemplateRenderer for TomlTemplate {
         out: &mut String,
         _prefix: &String,
         name: &str,
-        leaf: &Leaf,
+        field: super::template::ValueView<'_>,
     ) -> Result<(), FormatError> {
         use std::fmt::Write;
 
-        for line in leaf_annotations(leaf, "TOML", &mut |v| Ok(format_inline_toml(v)))? {
+        for line in leaf_annotations(field, "TOML", &mut |v| Ok(format_inline_toml(v)))? {
             push_comment_line(out, "", &line);
         }
-        match &leaf.default {
+        match field.default {
             Some(value) => {
                 let _ = writeln!(out, "{name} = {}", format_inline_toml(value));
             }
             None => {
-                let hint = placeholder(&leaf.ty, "\"\"", "1970-01-01T00:00:00Z");
+                let hint = placeholder(field.shape, "\"\"", "1970-01-01T00:00:00Z");
                 let _ = writeln!(out, "#{name} = {hint}");
             }
         }
