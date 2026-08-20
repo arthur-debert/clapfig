@@ -86,6 +86,17 @@ pub(crate) fn env_to_table_with_sources(
 /// in first-seen (path-sorted, then recorded) order so the error can
 /// still name every variable to unset.
 pub(crate) fn env_source_names(sources: &EnvSources, path: &str) -> Option<String> {
+    let names = env_source_vars(sources, path);
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join(", "))
+    }
+}
+
+/// Original variable names that produced `path` or any descendant, in
+/// first-seen order. Empty when nothing under `path` was set.
+pub(crate) fn env_source_vars(sources: &EnvSources, path: &str) -> Vec<String> {
     let prefix = format!("{path}.");
     let mut names = Vec::new();
     for (key, vars) in sources {
@@ -97,11 +108,7 @@ pub(crate) fn env_source_names(sources: &EnvSources, path: &str) -> Option<Strin
             }
         }
     }
-    if names.is_empty() {
-        None
-    } else {
-        Some(names.join(", "))
-    }
+    names
 }
 
 fn insert_nested(

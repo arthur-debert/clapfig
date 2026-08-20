@@ -48,8 +48,29 @@ pub fn render_plain(err: &ClapfigError) -> String {
             source,
             source_text,
         } => render_parse_error_plain(path, source.as_ref(), source_text.as_deref()),
+        ClapfigError::InvalidValue { origin, .. } => render_invalid_value_plain(err, origin),
         other => other.to_string(),
     }
+}
+
+fn render_invalid_value_plain(err: &ClapfigError, origin: &crate::error::OriginFacts) -> String {
+    use std::fmt::Write;
+    let mut out = err.to_string();
+    if origin.input_type == Some(crate::types::InputType::File)
+        && let (Some(span), Some(src)) = (origin.span, origin.source.as_deref())
+    {
+        let (line, col) = crate::format::byte_offset_to_line_col(src, span.start);
+        if let Some(line_text) = src.lines().nth(line.saturating_sub(1)) {
+            let col0 = col.saturating_sub(1);
+            let gutter = format!("\n{:>4} | ", line);
+            out.push_str(&gutter);
+            out.push_str(line_text);
+            let pad = " ".repeat("     | ".len() + col0);
+            let carets = "^".repeat(caret_len_chars(src, span, line_text, col0));
+            let _ = write!(out, "\n{pad}{carets}");
+        }
+    }
+    out
 }
 
 fn render_unknown_keys_plain(infos: &[crate::error::UnknownKeyInfo]) -> String {
@@ -356,6 +377,35 @@ fn build_diagnostic(err: &ClapfigError) -> RichDiagnostic {
                 help: None,
             }
         }
+        ClapfigError::InvalidValue {
+            key,
+            reason,
+            origin,
+        } => {
+            let Some(src) = origin.source.as_deref() else {
+                return RichDiagnostic::Plain(err.to_string());
+            };
+            let Some(span) = origin.span else {
+                return RichDiagnostic::Plain(err.to_string());
+            };
+            let source_name = origin
+                .file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| key.clone());
+            let labels = vec![LabeledSpan::at(
+                span.start..span.end,
+                format!("invalid value for '{key}'"),
+            )];
+            RichDiagnostic::WithSource {
+                message: format!("invalid value for '{key}': {reason}"),
+                labels,
+                source_name,
+                source_text: src.to_string(),
+                severity: miette::Severity::Error,
+                help: None,
+            }
+        }
         other => RichDiagnostic::Plain(other.to_string()),
     }
 }
@@ -571,6 +621,35 @@ mod tests {
         };
         let out = render_plain(&err);
         assert!(out.contains("database.url"));
+    }
+
+    #[test]
+    fn plain_invalid_value_carets_the_value_span() {
+        use crate::error::OriginFacts;
+        use crate::format::Span;
+        use crate::types::InputType;
+        let source: Arc<str> = Arc::from("port = \"oops\"\n");
+        let err = ClapfigError::InvalidValue {
+            key: "port".into(),
+            reason: "expected integer, got string".into(),
+            origin: Box::new(OriginFacts {
+                file: Some("app.toml".into()),
+                span: Some(Span { start: 7, end: 13 }),
+                source: Some(source),
+                input_type: Some(InputType::File),
+                ..OriginFacts::default()
+            }),
+        };
+        let out = render_plain(&err);
+        assert!(out.contains("Invalid value for 'port'"), "{out}");
+        assert!(out.contains("--> app.toml:1"), "{out}");
+        assert!(out.contains("port = \"oops\""), "{out}");
+        let caret = out.lines().find(|l| l.contains('^')).expect("{out}");
+        assert_eq!(
+            caret.chars().filter(|&c| c == '^').count(),
+            6,
+            "caret should cover \"oops\", got: {out}"
+        );
     }
 
     #[cfg(feature = "rich-errors")]

@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use crate::origin::{Origin, OriginMap, OriginNode};
 use crate::runtime::{Field, Schema};
 use crate::value::{Map, Value};
 
@@ -13,28 +14,64 @@ use crate::value::{Map, Value};
 /// `("database.url", Value::String("pg://"))` becomes `{database = {url = "pg://"}}`
 ///
 /// If multiple entries target the same key, the last one wins.
+#[cfg(test)]
 pub fn overrides_to_table(entries: &[(String, Value)]) -> Map {
-    let mut table = Map::new();
-    for (dotted_key, value) in entries {
-        set_nested(&mut table, dotted_key, value.clone());
-    }
-    table
+    let triples: Vec<(String, String, Value)> = entries
+        .iter()
+        .map(|(k, v)| (k.clone(), k.clone(), v.clone()))
+        .collect();
+    overrides_to_table_with_original_keys(&triples, |key| Origin::r#override(key)).0
 }
 
-fn set_nested(table: &mut Map, dotted_key: &str, value: Value) {
+/// Convert dotted-key overrides into a nested value map **and** a
+/// lockstep origin map. Each entry is `(merge_key, original_key, value)`:
+/// `merge_key` is the path after `normalize_keys`, `original_key` is the
+/// spelling the origin stores (URL query keys stay percent-decoded and
+/// dotted; override keys stay the caller-supplied spelling).
+pub(crate) fn overrides_to_table_with_original_keys(
+    entries: &[(String, String, Value)],
+    origin_for: impl Fn(&str) -> Origin,
+) -> (Map, OriginMap) {
+    let mut table = Map::new();
+    let mut origins = OriginMap::new();
+    for (merge_key, original_key, value) in entries {
+        set_nested_with_origin(
+            &mut table,
+            &mut origins,
+            merge_key,
+            value.clone(),
+            origin_for(original_key),
+        );
+    }
+    (table, origins)
+}
+
+fn set_nested_with_origin(
+    table: &mut Map,
+    origins: &mut OriginMap,
+    dotted_key: &str,
+    value: Value,
+    origin: Origin,
+) {
     let segments: Vec<&str> = dotted_key.split('.').collect();
     let (leaf, parents) = segments
         .split_last()
         .expect("split('.') always yields at least one segment");
     let mut current = table;
+    let mut current_origins = origins;
     for segment in parents {
         current = current
             .entry((*segment).to_string())
             .or_insert_with(|| Value::Map(Map::new()))
             .as_map_mut()
             .expect("clapfig: override path conflict — intermediate key is not a map");
+        let node = current_origins
+            .entry((*segment).to_string())
+            .or_insert_with(|| OriginNode::map(origin.clone(), OriginMap::new()));
+        current_origins = node.map_children_mut();
     }
-    current.insert((*leaf).to_string(), value);
+    current.insert((*leaf).to_string(), value.clone());
+    current_origins.insert((*leaf).to_string(), OriginNode::from_value(&value, origin));
 }
 
 /// Collect all valid leaf key paths from a schema.
