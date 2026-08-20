@@ -34,8 +34,8 @@ Constraints already decided, not reopened:
   (`docs/spec/provenance.md` Out Of Scope). Tagged-union *branch
   selection* runs after merge, on the winning tree, and uses the origin
   tree provenance already landed. Unknown-key checking on tagged
-  objects is two-phase (true unknowns per-file pre-merge; selected-
-  variant unknowns post-merge); merge itself does not change.
+  objects is two-phase (true unknowns per-file pre-merge; branch-
+  exclusive keys post-merge); merge itself does not change.
 - Formats are adapters ([ADR-0002](../adr/0002-formats-are-adapters-with-declared-capabilities.md)).
   Schema composition is format-agnostic. TOML remains the baseline test
   for what a shape may mean.
@@ -153,8 +153,9 @@ scope here.
    input type and variant fields from another is legal; validation sees
    the merged object and the winning origins. No new merge rule.
    Unknown-key checking is two-phase: true unknowns (not the tag, not a
-   field of any variant) stay per-file / per-env pre-merge; selected-
-   variant unknowns run after branch selection on the merged object.
+   field of any variant) stay per-file / per-env pre-merge; branch-
+   exclusive keys (a field of some other variant, not of the selected
+   variant) run after branch selection on the merged object.
 6. **Derive and runtime stay twins.** An internally tagged enum deriving
    `Schema` (via `#[serde(tag = "...")]`) emits the same runtime tagged
    shape the fluent builder can construct. A root-map typed load emits
@@ -332,14 +333,21 @@ are true; neither is waived. Merge semantics do not change.
    `totally_unknown` is not.
 
 2. **Post-merge (after branch selection).** Read the winning
-   discriminator (winner origin of the tag). Select that variant.
-   Unknown-key the merged object against the *selected* variant: the
-   tag plus that variant's fields are known; a branch-exclusive key that
-   belongs only to another variant is now unknown. The same strictness
-   cascade, callback, and `Collect` path apply. Locations come from the
-   merged origin tree (winner-only). An overwritten lower-layer key
-   reports the winner's origin, never a loser; a key that survived from
-   a lower layer reports that layer.
+   discriminator (winner origin of the tag). Select that variant. The
+   candidate set is **branch-exclusive keys only**: keys that belong to
+   at least one *non-selected* variant and not to the selected variant
+   (and are not the tag). True unknowns — keys that are not the tag and
+   not a field of any variant — are phase 1 only. They are not re-run
+   through the cascade, callback, or `Collect` here, even if they
+   survived into the merged tree (`Accept`, `Collect`, or a lenient
+   ancestor). A surviving true unknown produces exactly one callback
+   invocation and at most one collected entry.
+
+   For each branch-exclusive key, apply the same strictness cascade,
+   callback, and `Collect` path. Locations come from the merged origin
+   tree (winner-only). An overwritten lower-layer key reports the
+   winner's origin, never a loser; a key that survived from a lower
+   layer reports that layer.
 
 Strictness lookup is the existing cascade: nearest ancestor schema node
 with an explicit `strict`, else the builder default. The tagged object
@@ -347,7 +355,8 @@ is that parent. Keys the cascade marks lenient never reach the
 callback; cascade-strict keys go through `on_unknown_key` (`Reject` /
 `Accept` / `Collect`) the same way a named-field object's unknown keys
 do today. `Collect` entries from either phase append to the same
-`load_with_unknowns` list.
+`load_with_unknowns` list. A given key is a candidate of at most one
+phase, so it is never collected or callback-invoked twice.
 
 **Layered discriminator.** File A supplies `kind = "rust"`. File B
 supplies rust-only keys. An env var later sets `kind = "payload"`. Merge
@@ -559,9 +568,12 @@ CI fixture.
   at phase 1 and validated against the selected variant at phase 2. A
   true unknown (`not_a_field_of_any_variant`) on a sparse file layer is
   rejected pre-merge, even with no discriminator on that layer; the
-  same for a sparse env layer. Discriminator from env *changing* the
-  kind while the other layer still supplies the old kind's keys: phase
-  1 accepts those keys (they belong to some variant); phase 2 reports
+  same for a sparse env layer. A true unknown that survives phase 1
+  (`Accept`, `Collect`, or cascade-lenient) is not a phase-2 candidate:
+  callback and Collect fire exactly once (`Reject`: load fails at phase
+  1 with one invocation). Discriminator from env *changing* the kind
+  while the other layer still supplies the old kind's keys: phase 1
+  accepts those keys (they belong to some variant); phase 2 reports
   them as unknown against the winning kind, origins on the losing keys
   (winner-only: an overwritten key names the winner, not the loser).
   Callback / `Collect` / cascade-lenient behavior is covered in both
@@ -620,7 +632,8 @@ them.
   also at document root; Array only nested. Demoable as "root map
   unknown key is located" and "wrong variant field is an unknown key
   against the selected kind" (two-phase: true unknowns pre-merge,
-  branch-exclusive keys post-merge).
+  branch-exclusive keys post-merge; a surviving true unknown is not
+  re-collected).
 - **Derive:** `serde(tag)` enums; `BTreeMap<String, T>` / `HashMap` as
   the typed root. Demoable as Edward-shaped Rust types loading without
   `#[clapfig(value)]` on `params` *when those params are fields of the
