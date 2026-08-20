@@ -842,9 +842,12 @@ pub use types::{Boundary, ConfigAction, InputType, Layer, SearchMode, SearchPath
 ///   derives [`Schema`] via `#[derive(clapfig::Schema)]`,
 ///   and `load()` returns a typed `C`.
 /// - [`Clapfig::builder(schema)`](Clapfig::builder) — the Map-out path:
-///   the schema is an owned [`runtime::Schema`](crate::runtime::Schema)
-///   built at run time, and `load()` returns a value
-///   [`Map`](crate::value::Map).
+///   the schema is `impl Into<runtime::Shape>` (a
+///   [`runtime::Schema`](crate::runtime::Schema) converts as
+///   [`Shape::Object`](crate::runtime::Shape::Object)), and `load()`
+///   returns a value [`Map`](crate::value::Map). Object-root load is
+///   unchanged; root Map / Tagged construction is in, resolve of those
+///   roots is a later workstream.
 ///
 /// Both produce builders with the same surface — `app_name`,
 /// `search_paths`, `env_prefix`, `cli_override`, `post_validate`, `load`,
@@ -852,9 +855,20 @@ pub use types::{Boundary, ConfigAction, InputType, Layer, SearchMode, SearchPath
 pub struct Clapfig;
 
 impl Clapfig {
-    /// Entry point for the Map-out path: build a config pipeline from an
-    /// owned [`Schema`](crate::runtime::Schema) instead of a compile-time
+    /// Entry point for the Map-out path: build a config pipeline from a
+    /// [`runtime::Shape`](crate::runtime::Shape) instead of a compile-time
     /// derive.
+    ///
+    /// `schema` is `impl Into<Shape>` so today's object-root callers keep
+    /// passing a [`runtime::Schema`](crate::runtime::Schema) (`From` wraps
+    /// it as [`Shape::Object`](crate::runtime::Shape::Object)). Legal
+    /// document roots are Object, Map, and Tagged; Leaf and Array are
+    /// valid nested shapes and panic when used as the document root.
+    ///
+    /// Resolve still walks today's object schema (SHP01-WS02 switches the
+    /// pipeline). A root Map or Tagged therefore `todo!()` here — it must
+    /// not load as if it were an object. Object-root `load()` is
+    /// unchanged.
     ///
     /// Returns a [`Builder`] with the same surface as
     /// [`Self::typed`] — `app_name`, `search_paths`, `env_prefix`,
@@ -875,8 +889,22 @@ impl Clapfig {
     ///     .app_name("myapp")
     ///     .load()?;
     /// ```
-    pub fn builder(schema: crate::runtime::Schema) -> Builder {
-        Builder::new(schema)
+    pub fn builder(schema: impl Into<crate::runtime::Shape>) -> Builder {
+        let shape = schema.into();
+        shape.require_document_root();
+        match shape {
+            crate::runtime::Shape::Object(schema) => Builder::new(schema),
+            crate::runtime::Shape::Map(_) | crate::runtime::Shape::Tagged(_) => {
+                todo!(
+                    "clapfig: root Map and Tagged shapes are constructible (SHP01-WS01) \
+                     but the resolve pipeline still walks today's object schema \
+                     (SHP01-WS02); root-map load is SHP01-WS03 and tagged walk is SHP01-WS04"
+                )
+            }
+            crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => {
+                unreachable!("illegal document roots are rejected by require_document_root")
+            }
+        }
     }
 
     /// Entry point for the typed path: build a config pipeline from a

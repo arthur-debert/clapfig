@@ -526,6 +526,37 @@ fn unit_enum_schema_carries_variant_names_post_rename() {
 }
 
 #[test]
+fn unit_enum_shape_is_leaf_enum_preserving_renamed_variants() {
+    match PdfPageSize::shape() {
+        clapfig::runtime::Shape::Leaf(leaf) => match leaf.ty {
+            clapfig::runtime::LeafType::Enum { values } => {
+                assert_eq!(
+                    values,
+                    [
+                        clapfig::value::Value::String("a4".into()),
+                        clapfig::value::Value::String("letter".into()),
+                        clapfig::value::Value::String("legal".into()),
+                    ]
+                );
+            }
+            other => panic!("expected Enum, got {other:?}"),
+        },
+        other => panic!("expected Leaf, got {other:?}"),
+    }
+}
+
+#[test]
+fn struct_shape_wraps_schema_as_object() {
+    match PdfDoc::shape() {
+        clapfig::runtime::Shape::Object(schema) => {
+            assert_eq!(schema.name, "PdfDoc");
+            assert_eq!(schema.fields.len(), 1);
+        }
+        other => panic!("expected Object, got {other:?}"),
+    }
+}
+
+#[test]
 fn unit_enum_field_flattens_to_runtime_leaf_enum() {
     let s = PdfDoc::schema();
     let leaf = match &s.fields[0].field {
