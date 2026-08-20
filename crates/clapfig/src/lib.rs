@@ -122,6 +122,32 @@
 //!   format `config gen` renders and file seeding uses. The Discovery
 //!   section below spells out the full file-name contract.
 //!
+//! # Design: clapfig traces itself
+//!
+//! Clapfig traces liberally. Every stage of resolution — discovery,
+//! parsing, layer construction, merge, validation, persistence — emits
+//! structured [tracing](https://docs.rs/tracing) events, so that when
+//! behavior does not match a user's expectation, the answer is in the
+//! logs, not in a debugger attached to a fork.
+//!
+//! `tracing` is an unconditional dependency. Events are no-ops when no
+//! subscriber is installed. Enable the full story with
+//! `RUST_LOG=clapfig=trace`.
+//!
+//! Level discipline:
+//!
+//! - **`trace`** — the full story: every discovery probe (hits and
+//!   misses), every merge overlay win with both origins and value
+//!   *types*, defaults filled.
+//! - **`debug`** — per-stage summaries.
+//! - **`info` and above** — silent on a healthy load.
+//!
+//! **Values never appear in events**, at any level. Config values
+//! routinely include tokens and passwords, and clapfig has no sensitivity
+//! metadata. Logs carry key paths, origins, value types, and precedence
+//! decisions only. User-facing errors may still quote the offending
+//! value; that is a different contract.
+//!
 //! # Core library — no CLI framework required
 //!
 //! The core of clapfig has **no dependency on any CLI framework**. Config
@@ -784,6 +810,7 @@ mod persist;
 mod resolve;
 mod schema_walk;
 mod strict;
+mod trace;
 mod typed_builder;
 #[cfg(feature = "url")]
 mod url;

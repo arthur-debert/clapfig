@@ -7,7 +7,8 @@
 //! key/type validation against the schema, template seeding for missing
 //! files, classifying each set request onto its capability-matrix row
 //! ([`SetTarget`] — replace vs create-key vs create-file, so refusals
-//! name the operation actually attempted), key-spelling resolution under
+//! name the operation actually attempted), emitting `debug` persist events
+//! (path and key; never the assigned value), key-spelling resolution under
 //! [`normalize_keys`](crate::Builder::normalize_keys) (dash and
 //! underscore spellings are equivalent; the spelling already present in
 //! the document is the one edited, and a document holding both
@@ -186,6 +187,8 @@ fn stamp_collision_path(err: ClapfigError, file_path: &Path) -> ClapfigError {
 /// Wrapper around [`set_in_document`] with file I/O: reads the file
 /// (if it exists), patches it, writes back. Creates parent directories if
 /// needed. Collision errors from the document layer get this file's path.
+/// A successful write emits a `debug` persist event naming the file and
+/// key, never the assigned value.
 pub fn persist_value(
     adapter: &dyn FormatAdapter,
     schema: &crate::runtime::Schema,
@@ -226,6 +229,7 @@ pub fn persist_value(
         source: e,
     })?;
 
+    crate::trace::persist_set(file_path, key);
     Ok(ConfigResult::value_set(adapter, key.into(), value.into()))
 }
 
@@ -289,6 +293,8 @@ pub fn unset_in_document(
 
 /// I/O wrapper: reads file, removes the key, writes back.
 /// If the file doesn't exist, succeeds silently (nothing to unset).
+/// A successful unset (including the missing-file no-op) emits a `debug`
+/// persist event naming the file and key.
 pub fn unset_value(
     adapter: &dyn FormatAdapter,
     file_path: &Path,
@@ -298,6 +304,7 @@ pub fn unset_value(
     let content = match std::fs::read_to_string(file_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::trace::persist_unset(file_path, key);
             return Ok(ConfigResult::ValueUnset { key: key.into() });
         }
         Err(e) => {
@@ -316,6 +323,7 @@ pub fn unset_value(
         source: e,
     })?;
 
+    crate::trace::persist_unset(file_path, key);
     Ok(ConfigResult::ValueUnset { key: key.into() })
 }
 

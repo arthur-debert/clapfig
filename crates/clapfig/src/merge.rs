@@ -5,7 +5,12 @@
 //! Origins merge in the same walk (ADR-0004): when a value wins, its origin
 //! wins. Arrays replace wholesale; the origin subtree replaces wholesale
 //! with them.
+//!
+//! Every overlay win (an existing value replaced, including file-vs-file
+//! inside `Layer::Files`) emits a `trace` event naming both origins and
+//! both value **types**, never the values (ADR-0004, ADR-0009).
 
+use crate::format::ConfigPath;
 use crate::origin::{Origin, OriginMap, OriginNode, take_map_children};
 use crate::value::{Map, Value};
 
@@ -13,7 +18,24 @@ use crate::value::{Map, Value};
 ///
 /// If both sides have a Map for the same key, recurse. Otherwise
 /// `overlay`'s value **and** origin win. Arrays are not merged element-wise.
+/// Replacing an existing value fires [`crate::trace::overlay_win`].
 pub(crate) fn deep_merge(
+    base: Map,
+    overlay: Map,
+    base_origins: OriginMap,
+    overlay_origins: OriginMap,
+) -> (Map, OriginMap) {
+    deep_merge_at(
+        ConfigPath::new(),
+        base,
+        overlay,
+        base_origins,
+        overlay_origins,
+    )
+}
+
+fn deep_merge_at(
+    path: ConfigPath,
     mut base: Map,
     overlay: Map,
     mut base_origins: OriginMap,
@@ -22,16 +44,27 @@ pub(crate) fn deep_merge(
     for (key, overlay_val) in overlay {
         match (base.remove(&key), overlay_val) {
             (Some(Value::Map(base_map)), Value::Map(overlay_map)) => {
+                let child = path.clone().key(&key);
                 let (base_origin, base_om) = take_map_children(base_origins.remove(&key));
                 let (overlay_origin, overlay_om) = take_map_children(overlay_origins.remove(&key));
-                let (merged, merged_o) = deep_merge(base_map, overlay_map, base_om, overlay_om);
+                let (merged, merged_o) =
+                    deep_merge_at(child, base_map, overlay_map, base_om, overlay_om);
                 base.insert(key.clone(), Value::Map(merged));
                 let origin = overlay_origin
                     .or(base_origin)
                     .unwrap_or_else(|| Origin::default(key.clone()));
                 base_origins.insert(key, OriginNode::map(origin, merged_o));
             }
-            (_, overlay_val) => {
+            (base_val, overlay_val) => {
+                if let Some(ref loser) = base_val {
+                    crate::trace::overlay_win(
+                        &path.clone().key(&key),
+                        &origin_node_label(overlay_origins.get(&key)),
+                        &origin_node_label(base_origins.get(&key)),
+                        overlay_val.type_str(),
+                        loser.type_str(),
+                    );
+                }
                 base.insert(key.clone(), overlay_val);
                 if let Some(origin) = overlay_origins.remove(&key) {
                     base_origins.insert(key, origin);
@@ -42,6 +75,11 @@ pub(crate) fn deep_merge(
         }
     }
     (base, base_origins)
+}
+
+fn origin_node_label(node: Option<&OriginNode>) -> String {
+    node.map(|n| n.origin.label())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 #[cfg(test)]
