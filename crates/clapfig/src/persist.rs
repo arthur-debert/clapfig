@@ -28,16 +28,17 @@ use crate::value::Value;
 /// Pure function: patch a config document string, setting `key` to
 /// `raw_value`, through `adapter`.
 ///
-/// Validates the key against an owned [`Schema`](crate::runtime::Schema)
+/// Validates the key against an owned [`Shape`](crate::runtime::Shape)
 /// and parses the raw value **according to the leaf's declared
 /// [`LeafType`](crate::runtime::LeafType)** (see [`parse_raw_value`]) —
 /// with schema-driven datetime coercion for `DateTime` leaves (ADR-0001)
 /// — so a typo in the key name or a value the leaf type cannot accept
 /// fails, naming the expected type, before the file is touched. A key
-/// addressing an `ArrayOf`/`MapOf` section (or its interior) fails with
-/// the targeted [`ClapfigError::UnaddressableKey`] instead of a bare
-/// key-not-found: dotted CLI keys cannot say which entry they mean, so
-/// the config file is the surface for editing those sections.
+/// addressing an `ArrayOf`/`MapOf` section, a root Map entry, or a path
+/// inside one fails with the targeted
+/// [`ClapfigError::UnaddressableKey`] instead of a bare key-not-found:
+/// dotted CLI keys cannot say which entry they mean, so the config file
+/// is the surface for editing those sections.
 ///
 /// With `normalize_keys`, the action key follows the load path's
 /// acceptance: dash and underscore spellings are equivalent. The key is
@@ -77,16 +78,16 @@ use crate::value::Value;
 /// Returns the modified document string.
 pub fn set_in_document(
     adapter: &dyn FormatAdapter,
-    schema: &crate::runtime::Schema,
+    shape: &crate::runtime::Shape,
     content: Option<&str>,
     key: &str,
     raw_value: &str,
     normalize_keys: bool,
 ) -> Result<String, ClapfigError> {
     let canonical = canonical_key(key, normalize_keys);
-    let valid_keys = crate::overrides::valid_keys(schema);
+    let valid_keys = crate::overrides::valid_keys_shape(shape);
     if !valid_keys.contains(&canonical) {
-        if let Some((section, kind)) = unaddressable_container(schema, &canonical) {
+        if let Some((section, kind)) = unaddressable_container_shape(shape, &canonical) {
             return Err(ClapfigError::UnaddressableKey {
                 key: key.into(),
                 section,
@@ -95,11 +96,11 @@ pub fn set_in_document(
         }
         return Err(ClapfigError::KeyNotFound {
             key: key.into(),
-            suggestion: crate::meta::nearest_key(schema, &canonical, normalize_keys),
+            suggestion: crate::meta::nearest_key_shape(shape, &canonical, normalize_keys),
         });
     }
 
-    let field = lookup_field_shape(schema, &canonical);
+    let field = lookup_field_shape_root(shape, &canonical);
     let mut value = parse_raw_value(raw_value, field)
         .map_err(|reason| ClapfigError::invalid_value(key, reason))?;
     if let Some(shape) = field {
@@ -134,7 +135,7 @@ pub fn set_in_document(
                 .require(Operation::EditCreateFile)
                 .map_err(crate::format::FormatError::from)
                 .map_err(ClapfigError::from)?;
-            let seeded = crate::ops::generate_template(adapter, schema, normalize_keys)?;
+            let seeded = crate::ops::generate_template(adapter, shape, normalize_keys)?;
             // The seeded template spells every key the way the enabled
             // normalization emits (kebab-case when on), so the edit path
             // uses that emitted spelling and lands on the template's own
@@ -191,7 +192,7 @@ fn stamp_collision_path(err: ClapfigError, file_path: &Path) -> ClapfigError {
 /// key, never the assigned value.
 pub fn persist_value(
     adapter: &dyn FormatAdapter,
-    schema: &crate::runtime::Schema,
+    shape: &crate::runtime::Shape,
     file_path: &Path,
     key: &str,
     value: &str,
@@ -210,7 +211,7 @@ pub fn persist_value(
 
     let new_content = set_in_document(
         adapter,
-        schema,
+        shape,
         content.as_deref(),
         key,
         value,
@@ -433,6 +434,44 @@ fn dotted_config_path(key: &str) -> ConfigPath {
 /// label (`"an array"` / `"a map"`) for [`ClapfigError::UnaddressableKey`].
 /// `None` means the key misses the schema some other way (a plain
 /// key-not-found).
+fn unaddressable_container_shape(
+    shape: &crate::runtime::Shape,
+    canonical: &str,
+) -> Option<(String, &'static str)> {
+    match shape {
+        crate::runtime::Shape::Object(schema) => unaddressable_container(schema, canonical),
+        crate::runtime::Shape::Map(map) => {
+            // Any persist key against a root map is a dynamic entry (or a
+            // path inside one). Same refuse as a named MapOf.
+            Some((root_map_section_label(map), "a map"))
+        }
+        crate::runtime::Shape::Tagged(_)
+        | crate::runtime::Shape::Leaf(_)
+        | crate::runtime::Shape::Array(_) => None,
+    }
+}
+
+fn root_map_section_label(map: &crate::runtime::MapShape) -> String {
+    if map.name.is_empty() {
+        "(root)".into()
+    } else {
+        map.name.clone()
+    }
+}
+
+fn lookup_field_shape_root<'a>(
+    shape: &'a crate::runtime::Shape,
+    dotted: &str,
+) -> Option<&'a crate::runtime::Shape> {
+    match shape {
+        crate::runtime::Shape::Object(schema) => lookup_field_shape(schema, dotted),
+        crate::runtime::Shape::Map(_) => None,
+        crate::runtime::Shape::Tagged(_)
+        | crate::runtime::Shape::Leaf(_)
+        | crate::runtime::Shape::Array(_) => None,
+    }
+}
+
 fn unaddressable_container(
     schema: &crate::runtime::Schema,
     canonical: &str,
@@ -551,11 +590,19 @@ mod tests {
     use super::*;
     use crate::fixtures::test::{enum_schema, test_schema};
     use crate::format::TomlAdapter;
+    use crate::runtime::Shape;
     use std::fs;
     use tempfile::TempDir;
 
     fn set_toml(content: Option<&str>, key: &str, value: &str) -> Result<String, ClapfigError> {
-        set_in_document(&TomlAdapter, &test_schema(), content, key, value, false)
+        set_in_document(
+            &TomlAdapter,
+            &Shape::Object(test_schema()),
+            content,
+            key,
+            value,
+            false,
+        )
     }
 
     fn persist_toml(
@@ -563,7 +610,14 @@ mod tests {
         key: &str,
         value: &str,
     ) -> Result<ConfigResult, ClapfigError> {
-        persist_value(&TomlAdapter, &test_schema(), path, key, value, false)
+        persist_value(
+            &TomlAdapter,
+            &Shape::Object(test_schema()),
+            path,
+            key,
+            value,
+            false,
+        )
     }
 
     // --- validation tests ---
@@ -600,7 +654,7 @@ mod tests {
 
         fn template(
             &self,
-            _schema: &crate::runtime::Schema,
+            _shape: &crate::runtime::Shape,
         ) -> Result<String, crate::format::FormatError> {
             Err(self
                 .require(crate::format::Operation::Template)
@@ -635,7 +689,7 @@ mod tests {
         // Key exists in the document → replacing an existing value.
         let u = refusal(set_in_document(
             &ParseOnly,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some("port = 1\n"),
             "port",
             "2",
@@ -646,7 +700,7 @@ mod tests {
         // File exists, key does not → creating a missing key.
         let u = refusal(set_in_document(
             &ParseOnly,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some("port = 1\n"),
             "debug",
             "true",
@@ -658,7 +712,12 @@ mod tests {
         // template seeding (ParseOnly's template also refuses; the
         // create-file refusal must win).
         let u = refusal(set_in_document(
-            &ParseOnly, &schema, None, "port", "1", false,
+            &ParseOnly,
+            &Shape::Object(schema.clone()),
+            None,
+            "port",
+            "1",
+            false,
         ));
         assert_eq!(u.operation, Operation::EditCreateFile);
     }
@@ -697,7 +756,7 @@ mod tests {
 
         fn template(
             &self,
-            _schema: &crate::runtime::Schema,
+            _shape: &crate::runtime::Shape,
         ) -> Result<String, crate::format::FormatError> {
             Err(self
                 .require(crate::format::Operation::Template)
@@ -721,7 +780,7 @@ mod tests {
         // it, so that is the honest earliest error.
         let u = refusal(set_in_document(
             &RefusesAll,
-            &test_schema(),
+            &Shape::Object(test_schema()),
             Some("port = 1\n"),
             "port",
             "2",
@@ -740,7 +799,7 @@ mod tests {
     fn set_kebab_key_suggests_snake_when_normalization_is_off() {
         let err = set_in_document(
             &TomlAdapter,
-            &test_schema(),
+            &Shape::Object(test_schema()),
             Some(""),
             "database.pool-size",
             "10",
@@ -760,7 +819,7 @@ mod tests {
     fn set_rejects_invalid_enum_value() {
         let result = set_in_document(
             &TomlAdapter,
-            &enum_schema(),
+            &Shape::Object(enum_schema()),
             Some(""),
             "mode",
             "garbage",
@@ -782,7 +841,7 @@ mod tests {
     fn set_accepts_valid_enum_value() {
         let result = set_in_document(
             &TomlAdapter,
-            &enum_schema(),
+            &Shape::Object(enum_schema()),
             Some(""),
             "mode",
             "fast",
@@ -825,7 +884,7 @@ mod tests {
 
         let result = persist_value(
             &TomlAdapter,
-            &enum_schema(),
+            &Shape::Object(enum_schema()),
             &path,
             "mode",
             "garbage",
@@ -959,7 +1018,7 @@ mod tests {
             .build();
         let result = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "tags",
             "[\"a\", \"b\"]",
@@ -969,8 +1028,15 @@ mod tests {
         assert!(result.contains("tags = [\"a\", \"b\"]"), "{result}");
 
         // Element types are still checked against the declared element.
-        let err =
-            set_in_document(&TomlAdapter, &schema, Some(""), "tags", "[1, 2]", false).unwrap_err();
+        let err = set_in_document(
+            &TomlAdapter,
+            &Shape::Object(schema.clone()),
+            Some(""),
+            "tags",
+            "[1, 2]",
+            false,
+        )
+        .unwrap_err();
         match err {
             ClapfigError::InvalidValue { reason, .. } => {
                 assert!(reason.contains("expected string"), "{reason}");
@@ -994,7 +1060,7 @@ mod tests {
             .build();
         let result = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "limits",
             "{cpu = 2, mem = 8}",
@@ -1019,7 +1085,7 @@ mod tests {
             .build();
         let err = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "tags",
             "[]\nother = 1",
@@ -1038,7 +1104,15 @@ mod tests {
         let schema = Schema::object("T")
             .field("gear", Field::enum_of(["1", "2", "reverse"]).optional())
             .build();
-        let result = set_in_document(&TomlAdapter, &schema, Some(""), "gear", "1", false).unwrap();
+        let result = set_in_document(
+            &TomlAdapter,
+            &Shape::Object(schema.clone()),
+            Some(""),
+            "gear",
+            "1",
+            false,
+        )
+        .unwrap();
         assert!(result.contains("gear = \"1\""), "{result}");
     }
 
@@ -1048,7 +1122,15 @@ mod tests {
         let schema = Schema::object("T")
             .field("level", Field::enum_of([1i64, 2i64, 3i64]).optional())
             .build();
-        let result = set_in_document(&TomlAdapter, &schema, Some(""), "level", "2", false).unwrap();
+        let result = set_in_document(
+            &TomlAdapter,
+            &Shape::Object(schema.clone()),
+            Some(""),
+            "level",
+            "2",
+            false,
+        )
+        .unwrap();
         assert!(result.contains("level = 2"), "{result}");
     }
 
@@ -1081,7 +1163,7 @@ mod tests {
     fn set_into_map_of_interior_names_the_section() {
         let err = set_in_document(
             &TomlAdapter,
-            &container_schema(),
+            &Shape::Object(container_schema()),
             Some(""),
             "servers.web.host",
             "example.com",
@@ -1102,7 +1184,7 @@ mod tests {
     fn set_into_array_of_interior_names_the_section() {
         let err = set_in_document(
             &TomlAdapter,
-            &container_schema(),
+            &Shape::Object(container_schema()),
             Some(""),
             "plugins.name",
             "x",
@@ -1123,8 +1205,15 @@ mod tests {
         // The section path walks through Nested wrappers, and targeting
         // the container field itself (no interior segment) refuses too.
         for key in ["outer.inner.web.port", "outer.inner"] {
-            let err = set_in_document(&TomlAdapter, &container_schema(), Some(""), key, "1", false)
-                .unwrap_err();
+            let err = set_in_document(
+                &TomlAdapter,
+                &Shape::Object(container_schema()),
+                Some(""),
+                key,
+                "1",
+                false,
+            )
+            .unwrap_err();
             match err {
                 ClapfigError::UnaddressableKey { section, kind, .. } => {
                     assert_eq!(section, "outer.inner", "{key}");
@@ -1139,7 +1228,7 @@ mod tests {
     fn set_unknown_key_off_containers_is_still_key_not_found() {
         let err = set_in_document(
             &TomlAdapter,
-            &container_schema(),
+            &Shape::Object(container_schema()),
             Some(""),
             "nonexistent.path",
             "1",
@@ -1160,7 +1249,7 @@ mod tests {
             .build();
         let err = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "my-servers.web.host",
             "h",
@@ -1184,7 +1273,7 @@ mod tests {
             .build();
         let result = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "stamp",
             "2024-01-02T03:04:05Z",
@@ -1198,7 +1287,7 @@ mod tests {
 
         let err = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "stamp",
             "not-a-date",
@@ -1309,9 +1398,15 @@ mod tests {
         // the next load). The kebab action key must work too.
         for (adapter, doc) in docs("pool-size") {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let out =
-                    set_in_document(adapter, &test_schema(), Some(&doc), action_key, "20", true)
-                        .unwrap();
+                let out = set_in_document(
+                    adapter,
+                    &Shape::Object(test_schema()),
+                    Some(&doc),
+                    action_key,
+                    "20",
+                    true,
+                )
+                .unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -1336,9 +1431,15 @@ mod tests {
         // not rewrite the document to kebab.
         for (adapter, doc) in docs("pool_size") {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let out =
-                    set_in_document(adapter, &test_schema(), Some(&doc), action_key, "20", true)
-                        .unwrap();
+                let out = set_in_document(
+                    adapter,
+                    &Shape::Object(test_schema()),
+                    Some(&doc),
+                    action_key,
+                    "20",
+                    true,
+                )
+                .unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -1368,7 +1469,7 @@ mod tests {
         for (adapter, base) in bases {
             let out = set_in_document(
                 adapter,
-                &test_schema(),
+                &Shape::Object(test_schema()),
                 Some(base),
                 "database.pool_size",
                 "20",
@@ -1396,8 +1497,15 @@ mod tests {
         let adapters: [&dyn FormatAdapter; 3] = [&TomlAdapter, &YamlAdapter, &JsonAdapter];
         for adapter in adapters {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let out =
-                    set_in_document(adapter, &test_schema(), None, action_key, "20", true).unwrap();
+                let out = set_in_document(
+                    adapter,
+                    &Shape::Object(test_schema()),
+                    None,
+                    action_key,
+                    "20",
+                    true,
+                )
+                .unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -1427,7 +1535,7 @@ mod tests {
         // the canonical leaf.
         let result = set_in_document(
             &TomlAdapter,
-            &test_schema(),
+            &Shape::Object(test_schema()),
             Some(""),
             "database.pool-size",
             "not_a_number",
@@ -1506,8 +1614,14 @@ mod tests {
         // editing one of the two entries and leaving the file unloadable.
         for (adapter, doc) in colliding_docs() {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let result =
-                    set_in_document(adapter, &test_schema(), Some(doc), action_key, "20", true);
+                let result = set_in_document(
+                    adapter,
+                    &Shape::Object(test_schema()),
+                    Some(doc),
+                    action_key,
+                    "20",
+                    true,
+                );
                 assert_collision(
                     result,
                     "database",
@@ -1532,7 +1646,14 @@ mod tests {
             )
             .build();
         let doc = "[my-db]\nsize = 1\n\n[my_db]\nsize = 2\n";
-        let result = set_in_document(&TomlAdapter, &schema, Some(doc), "my_db.size", "3", true);
+        let result = set_in_document(
+            &TomlAdapter,
+            &Shape::Object(schema.clone()),
+            Some(doc),
+            "my_db.size",
+            "3",
+            true,
+        );
         assert_collision(result, "", "my_db", &["my-db", "my_db"], "intermediate");
     }
 
@@ -1545,7 +1666,14 @@ mod tests {
         // edited.
         for (adapter, doc) in colliding_docs() {
             let doc = with_host(adapter, doc);
-            let result = set_in_document(adapter, &test_schema(), Some(&doc), "host", "h2", true);
+            let result = set_in_document(
+                adapter,
+                &Shape::Object(test_schema()),
+                Some(&doc),
+                "host",
+                "h2",
+                true,
+            );
             assert_collision(
                 result,
                 "database",
@@ -1613,7 +1741,7 @@ mod tests {
         for result in [
             persist_value(
                 &TomlAdapter,
-                &test_schema(),
+                &Shape::Object(test_schema()),
                 &path,
                 "database.pool_size",
                 "20",

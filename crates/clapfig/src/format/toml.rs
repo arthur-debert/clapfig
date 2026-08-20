@@ -20,7 +20,7 @@ use crate::value::{Map, Value};
 
 use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
-    tagged_template_stub, walk_level,
+    tagged_template_stub, walk_level, walk_root,
 };
 use super::{ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, Span, SpanEntry};
 
@@ -95,15 +95,16 @@ impl FormatAdapter for TomlAdapter {
         })
     }
 
-    fn template(&self, schema: &Schema) -> Result<String, FormatError> {
+    fn template(&self, shape: &Shape) -> Result<String, FormatError> {
         let mut out = String::new();
-        for line in &schema.doc {
+        let doc = shape.field_doc();
+        for line in doc {
             push_comment_line(&mut out, "", line);
         }
-        if !schema.doc.is_empty() {
+        if !doc.is_empty() {
             out.push('\n');
         }
-        walk_level(&mut TomlTemplate, schema, &String::new(), &mut out)?;
+        walk_root(&mut TomlTemplate, shape, &String::new(), &mut out)?;
         Ok(out)
     }
 
@@ -496,6 +497,27 @@ impl TemplateRenderer for TomlTemplate {
         push_commented_block(out, &buf);
         Ok(())
     }
+
+    fn root_map(
+        &mut self,
+        out: &mut String,
+        _prefix: &String,
+        item: &Shape,
+    ) -> Result<(), FormatError> {
+        use std::fmt::Write;
+
+        emit_object_doc(out, item);
+        let entry = "<key>";
+        let (header, inner) = match item {
+            Shape::Array(array) => (format!("#[[{entry}]]"), array.item.as_ref()),
+            other => (format!("#[{entry}]"), other),
+        };
+        let _ = writeln!(out, "{header}");
+        let mut buf = String::new();
+        emit_toml_item(self, &mut buf, entry, inner)?;
+        push_commented_block(out, &buf);
+        Ok(())
+    }
 }
 
 fn emit_object_doc(out: &mut String, item: &Shape) {
@@ -710,7 +732,12 @@ level = "info"
 pool_size = 5
 
 "#;
-        assert_eq!(TomlAdapter.template(&schema).unwrap(), golden);
+        assert_eq!(
+            TomlAdapter
+                .template(&Shape::Object(schema.clone()))
+                .unwrap(),
+            golden
+        );
     }
 
     #[test]
@@ -721,7 +748,9 @@ pool_size = 5
             .field("groups", Field::array_of_type(Field::map_of(item.clone())))
             .field("batches", Field::map_of(Field::array_of_type(item)))
             .build();
-        let text = TomlAdapter.template(&schema).unwrap();
+        let text = TomlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         assert!(
             text.contains("#[[groups]]"),
             "array-of-map emits array-of-tables header: {text}"
@@ -779,7 +808,9 @@ pool_size = 5
                 Field::map_of(Field::array_of_type(Field::array_of_type(item))),
             )
             .build();
-        let text = TomlAdapter.template(&schema).unwrap();
+        let text = TomlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         assert!(
             !text.contains("#[[matrix]]"),
             "must not flatten Array<Array<Object>> to one [[header]]: {text}"

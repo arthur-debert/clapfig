@@ -13,8 +13,8 @@
 //!
 //! Walkers take [`Shape`]. [`Clapfig::builder`](crate::Clapfig::builder)
 //! accepts `impl Into<Shape>` so object-root callers keep passing a
-//! [`Schema`]. Root Map and Tagged shapes construct; loading them is a
-//! loud stub (root-map load is SHP01-WS03; tagged walk is SHP01-WS04).
+//! [`Schema`]. Root Map loads; Tagged still constructs as a loud stub
+//! (tagged walk is SHP01-WS04).
 //!
 //! # Example
 //!
@@ -520,7 +520,7 @@ pub enum Shape {
     /// root.
     Object(Schema),
     /// Homogeneous unordered string-keyed map. Item is any shape. A legal
-    /// document root; load of a root map is SHP01-WS03.
+    /// document root.
     Map(MapShape),
     /// Homogeneous array. Item is any shape. Not a legal document root.
     Array(ArrayShape),
@@ -1505,13 +1505,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "root Map and Tagged")]
-    fn clapfig_builder_does_not_silently_load_root_map() {
+    fn clapfig_builder_accepts_root_map() {
         let _ = crate::Clapfig::builder(Shape::map("blocks", object("Block")).build());
     }
 
     #[test]
-    #[should_panic(expected = "root Map and Tagged")]
+    #[should_panic(expected = "tagged walk is SHP01-WS04")]
     fn clapfig_builder_does_not_silently_load_root_tagged() {
         let _ = crate::Clapfig::builder(
             Shape::tagged("Block", "kind")

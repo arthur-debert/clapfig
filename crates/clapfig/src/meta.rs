@@ -48,6 +48,35 @@ pub fn doc_for(schema: &Schema, key: &str) -> Option<Vec<String>> {
     walk_segments(schema, &segments)
 }
 
+/// [`doc_for`] against a document-root [`Shape`]. Root-map keys are user
+/// data, so lookup walks the item schema after the entry segment.
+pub fn doc_for_shape(shape: &Shape, key: &str) -> Option<Vec<String>> {
+    match shape {
+        Shape::Object(schema) => doc_for(schema, key),
+        Shape::Map(map) => {
+            let mut segments: Vec<&str> = key.split('.').collect();
+            if segments.is_empty() {
+                return None;
+            }
+            // Drop the user-supplied entry key; remaining segments are
+            // fields of the item shape.
+            segments.remove(0);
+            match map.item.as_ref() {
+                Shape::Object(item) => {
+                    if segments.is_empty() {
+                        Some(item.doc.clone())
+                    } else {
+                        walk_segments(item, &segments)
+                    }
+                }
+                other if segments.is_empty() => Some(other.field_doc().to_vec()),
+                _ => None,
+            }
+        }
+        Shape::Tagged(_) | Shape::Leaf(_) | Shape::Array(_) => None,
+    }
+}
+
 fn walk_segments(schema: &Schema, segments: &[&str]) -> Option<Vec<String>> {
     if segments.is_empty() {
         return None;
@@ -88,6 +117,15 @@ fn walk_segments(schema: &Schema, segments: &[&str]) -> Option<Vec<String>> {
 /// garbage doesn't "suggest" an unrelated short key); ties break to the
 /// lexicographically smallest candidate. Returns `None` when nothing is
 /// close enough.
+/// [`nearest_key`] against a document-root [`Shape`]. A root Map has no
+/// addressable keys, so there is never a suggestion.
+pub fn nearest_key_shape(shape: &Shape, key: &str, normalize_keys: bool) -> Option<String> {
+    match shape {
+        Shape::Object(schema) => nearest_key(schema, key, normalize_keys),
+        Shape::Map(_) | Shape::Tagged(_) | Shape::Leaf(_) | Shape::Array(_) => None,
+    }
+}
+
 pub fn nearest_key(schema: &Schema, key: &str, normalize_keys: bool) -> Option<String> {
     let needle = if normalize_keys {
         crate::normalize::normalize_key(key)

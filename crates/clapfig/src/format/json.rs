@@ -60,7 +60,7 @@ use crate::runtime::{Schema, Shape};
 use crate::value::{Map, Value};
 
 use super::template::{
-    TemplateRenderer, doc_lines, leaf_annotations, tagged_template_stub, walk_level,
+    TemplateRenderer, doc_lines, leaf_annotations, tagged_template_stub, walk_level, walk_root,
 };
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
@@ -127,9 +127,9 @@ impl FormatAdapter for JsonAdapter {
         Ok(render(&json))
     }
 
-    fn template(&self, schema: &Schema) -> Result<String, FormatError> {
+    fn template(&self, shape: &Shape) -> Result<String, FormatError> {
         let mut object = JsonMap::new();
-        walk_level(&mut JsonTemplate, schema, &(), &mut object)?;
+        walk_root(&mut JsonTemplate, shape, &(), &mut object)?;
         Ok(render(&Json::Object(object)))
     }
 
@@ -990,6 +990,20 @@ impl TemplateRenderer for JsonTemplate {
         out.insert(comment_key(name), comment_value(lines));
         Ok(())
     }
+
+    fn root_map(
+        &mut self,
+        out: &mut Self::Out,
+        _ctx: &(),
+        item: &Shape,
+    ) -> Result<(), FormatError> {
+        let mut lines = doc_lines(item.field_doc());
+        let mut example = JsonMap::new();
+        example.insert("<key>".to_string(), example_value(item, "<key>")?);
+        lines.push(assignment_snippet("<key>", compact(&Json::Object(example))));
+        out.insert(COMMENT_PREFIX.into(), comment_value(lines));
+        Ok(())
+    }
 }
 
 /// Example object for an array-of / map-of entry, shown inside a comment:
@@ -1788,7 +1802,9 @@ mod tests {
         let schema = RtSchema::object("App")
             .field("//weird", Field::string().default("x"))
             .build();
-        let err = JsonAdapter.template(&schema).unwrap_err();
+        let err = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap_err();
         assert!(err.detail().contains("reserved"), "{}", err.detail());
         assert!(err.detail().contains("//weird"), "{}", err.detail());
     }
@@ -1849,7 +1865,12 @@ mod tests {
   }
 }
 "#;
-        assert_eq!(JsonAdapter.template(&schema).unwrap(), golden);
+        assert_eq!(
+            JsonAdapter
+                .template(&Shape::Object(schema.clone()))
+                .unwrap(),
+            golden
+        );
     }
 
     #[test]
@@ -1868,7 +1889,9 @@ mod tests {
                 RtSchema::object("Server").field("host", Field::string().default("localhost")),
             )
             .build();
-        let text = JsonAdapter.template(&schema).unwrap();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let json: Json = serde_json::from_str(&text).unwrap();
         let obj = json.as_object().unwrap();
         // No real keys — absent array-of/map-of resolve to empty; the
@@ -1908,7 +1931,9 @@ mod tests {
                 ),
             )
             .build();
-        let text = JsonAdapter.template(&schema).unwrap();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let json: Json = serde_json::from_str(&text).unwrap();
         let obj = json.as_object().unwrap();
         assert_eq!(obj["//plugins"], r#""plugins": [{"tags":["builtin"]}]"#);
@@ -1926,7 +1951,9 @@ mod tests {
             .field("groups", Field::array_of_type(Field::map_of(item.clone())))
             .field("batches", Field::map_of(Field::array_of_type(item)))
             .build();
-        let text = JsonAdapter.template(&schema).unwrap();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let json: Json = serde_json::from_str(&text).unwrap();
         let obj = json.as_object().unwrap();
         assert_eq!(obj["//groups"], r#""groups": [{"<key>":{"timeout":30}}]"#);
@@ -1947,7 +1974,9 @@ mod tests {
                 Field::array_of_type(Field::array_of_type(Field::array_of_type(item))),
             )
             .build();
-        let text = JsonAdapter.template(&schema).unwrap();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let json: Json = serde_json::from_str(&text).unwrap();
         let obj = json.as_object().unwrap();
         let parse_snippet = |comment: &Json| {
@@ -1970,7 +1999,7 @@ mod tests {
         // gen → parse: every comment key is stripped, every real key is a
         // schema key with its default value.
         use crate::fixtures::test::test_schema;
-        let text = JsonAdapter.template(&test_schema()).unwrap();
+        let text = JsonAdapter.template(&Shape::Object(test_schema())).unwrap();
         let value = JsonAdapter.parse(&text).unwrap().value;
         let map = value.as_map().unwrap();
         assert_eq!(
@@ -2208,7 +2237,7 @@ mod tests {
         use crate::fixtures::test::test_schema;
         let out = crate::persist::set_in_document(
             &JsonAdapter,
-            &test_schema(),
+            &Shape::Object(test_schema()),
             None,
             "port",
             "9090",

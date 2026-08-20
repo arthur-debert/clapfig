@@ -17,8 +17,8 @@
 //!
 //! The layer order is configurable via [`ResolveInput::layer_order`]. Both
 //! entry points — `Clapfig::builder(schema)` and the derive-driven
-//! `Clapfig::typed::<C>()` — thread in the same [`Schema`]; the typed path
-//! deserializes the returned [`Map`] afterwards.
+//! `Clapfig::typed::<C>()` — thread in the same document-root [`Shape`];
+//! the typed path deserializes the returned [`Map`] afterwards.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,17 +30,17 @@ use crate::merge::deep_merge;
 use crate::normalize::{normalize_key, normalize_table_and_spans};
 use crate::origin::{Origin, OriginMap, origin_map_from_env, origin_map_from_file};
 use crate::overrides;
-use crate::runtime::Schema;
+use crate::runtime::Shape;
 use crate::schema_walk;
 use crate::strict::{CollectedUnknown, StrictnessOverrides, UnknownKeyHook};
 use crate::types::Layer;
-use crate::validate::{UnknownKeySource, ValidateContext, validate_unknown};
+use crate::validate::{UnknownKeySource, ValidateContext, validate_unknown_shape};
 use crate::value::{Map, Value};
 
 /// All pre-loaded data needed to resolve a config. No I/O happens here.
 pub(crate) struct ResolveInput<'a> {
-    /// The schema every layer is validated and finalized against.
-    pub schema: &'a Schema,
+    /// The document-root shape every layer is validated and finalized against.
+    pub shape: Shape,
     /// Enabled format adapters — the routing seam every file parse goes
     /// through. Per-file adapter selection is by extension; extensionless
     /// files (rc-style names) fall back to the preferred
@@ -226,9 +226,9 @@ pub(crate) fn resolve(
                     .map_err(|c| c.into_error(path))?;
             }
             if cascade_active {
-                let mut per_file = validate_unknown(
+                let mut per_file = validate_unknown_shape(
                     &table,
-                    input.schema,
+                    &input.shape,
                     &UnknownKeySource::File {
                         path,
                         source: content,
@@ -275,9 +275,9 @@ pub(crate) fn resolve(
     // "1.5" for an integer field) don't fail validation — that's
     // still the job of the final-merge type check inside `finalize`.
     if cascade_active && let Some((env_table_ref, sources, _)) = env_layer.as_ref() {
-        let mut env_filtered = validate_unknown(
+        let mut env_filtered = validate_unknown_shape(
             env_table_ref,
-            input.schema,
+            &input.shape,
             &UnknownKeySource::Env { sources },
             &validate_ctx,
         )?;
@@ -336,9 +336,9 @@ pub(crate) fn resolve(
     // Schema-driven default injection: populate the table from the schema's
     // declared defaults so `finalize` only has to check required fields.
     // Default origins fill in the same walk (ADR-0004).
-    schema_walk::fill_defaults_into(&mut merged, &mut origins, input.schema);
+    schema_walk::fill_defaults_into_shape(&mut merged, &mut origins, &input.shape);
 
-    let output = schema_walk::finalize(merged, &origins, input.schema, &input.discovery)?;
+    let output = schema_walk::finalize_shape(merged, &origins, &input.shape, &input.discovery)?;
     crate::trace::validation_complete();
     Ok((output, collected_unknowns))
 }
@@ -347,6 +347,7 @@ pub(crate) fn resolve(
 mod tests {
     use super::*;
     use crate::fixtures::test::test_schema;
+    use crate::runtime::Schema;
 
     fn test_spec() -> Schema {
         test_schema()
@@ -374,7 +375,7 @@ mod tests {
 
     fn empty_input(schema: &Schema) -> ResolveInput<'_> {
         ResolveInput {
-            schema,
+            shape: Shape::Object(schema.clone()),
             registry: toml_only_registry(),
             files: vec![],
             discovery: DiscoveryRecord::empty(),

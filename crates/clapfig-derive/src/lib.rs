@@ -286,6 +286,7 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
     // name (`Datetime` / `Value`); emitted alongside the schema statics.
     let mut claim_asserts: Vec<TokenStream2> = Vec::new();
 
+    let mut is_named_struct = false;
     let (fields_body, enum_variants_body) = match &input.data {
         Data::Struct(s) => match &s.fields {
             Fields::Named(named) => {
@@ -342,6 +343,7 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
                     claim_asserts.extend(expanded.claim_asserts);
                     field_entries.push(expanded.entry);
                 }
+                is_named_struct = true;
                 (quote! { &[ #(#field_entries),* ] }, quote! { &[] })
             }
             other => {
@@ -397,6 +399,12 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let static_ident = quote::format_ident!("__CLAPFIG_SCHEMA_{}", type_name);
     let cache_ident = quote::format_ident!("__CLAPFIG_RUNTIME_{}", type_name);
+    let shape_cache_ident = quote::format_ident!("__CLAPFIG_SHAPE_{}", type_name);
+    let document_root_impl = if is_named_struct {
+        quote! { impl ::clapfig::DocumentRoot for #type_name {} }
+    } else {
+        quote! {}
+    };
 
     let output = quote! {
         #(#claim_asserts)*
@@ -416,6 +424,11 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
             ::std::sync::Arc<::clapfig::runtime::Schema>,
         > = ::std::sync::OnceLock::new();
 
+        #[allow(non_upper_case_globals)]
+        static #shape_cache_ident: ::std::sync::OnceLock<
+            ::std::sync::Arc<::clapfig::runtime::Shape>,
+        > = ::std::sync::OnceLock::new();
+
         impl ::clapfig::Schema for #type_name {
             const STATIC: &'static ::clapfig::static_schema::SchemaStatic = &#static_ident;
 
@@ -432,7 +445,16 @@ fn expand_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
                     <Self as ::clapfig::Schema>::STATIC,
                 )
             }
+
+            fn shape_arc() -> ::std::sync::Arc<::clapfig::runtime::Shape> {
+                ::clapfig::static_schema::cached_runtime_shape_arc(
+                    &#shape_cache_ident,
+                    || <Self as ::clapfig::Schema>::shape(),
+                )
+            }
         }
+
+        #document_root_impl
     };
 
     Ok(output)

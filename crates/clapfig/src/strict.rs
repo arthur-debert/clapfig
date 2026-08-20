@@ -251,6 +251,29 @@ impl StrictnessOverrides {
         out
     }
 
+    /// Seed overrides from a document-root [`Shape`].
+    pub fn from_shape(shape: &crate::runtime::Shape) -> Self {
+        match shape {
+            crate::runtime::Shape::Object(schema) => Self::from_schema(schema),
+            crate::runtime::Shape::Map(map) => {
+                let mut out = Self::new();
+                if let Some(value) = map.strict {
+                    out.insert(String::new(), value);
+                }
+                walk_shape_strict(&map.item, "", &mut out);
+                out
+            }
+            crate::runtime::Shape::Tagged(tagged) => {
+                let mut out = Self::new();
+                if let Some(value) = tagged.strict {
+                    out.insert(String::new(), value);
+                }
+                out
+            }
+            crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => Self::new(),
+        }
+    }
+
     /// Resolve the effective strictness for an unknown key at `(path, leaf)`.
     ///
     /// `path` is the dotted form (full key, including the leaf); `leaf` is
@@ -397,6 +420,28 @@ fn strip_brackets(path: &str) -> String {
 /// Resolve a dotted path against a schema and return the kind of the node
 /// it lands on (`Nested`, `ArrayOf`, or `Leaf`). Used to validate
 /// `strict_at` paths at `build_resolver` time.
+pub(crate) fn resolve_path_kind_shape(shape: &crate::runtime::Shape, dotted: &str) -> PathKind {
+    match shape {
+        crate::runtime::Shape::Object(schema) => resolve_path_kind(schema, dotted),
+        crate::runtime::Shape::Map(_) => {
+            if dotted.is_empty() {
+                PathKind::Section
+            } else {
+                // Entry keys are user data, not schema fields.
+                PathKind::Unknown
+            }
+        }
+        crate::runtime::Shape::Tagged(_) => {
+            if dotted.is_empty() {
+                PathKind::Section
+            } else {
+                PathKind::Unknown
+            }
+        }
+        crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => PathKind::Unknown,
+    }
+}
+
 pub(crate) fn resolve_path_kind(schema: &Schema, dotted: &str) -> PathKind {
     if dotted.is_empty() {
         return PathKind::Section;
@@ -473,6 +518,42 @@ pub(crate) fn build_strict_overrides(
             raw_path.clone()
         };
         match resolve_path_kind(schema, &path) {
+            PathKind::Section => out.insert(path, *strict),
+            PathKind::Leaf => {
+                return Err(ClapfigError::InvalidStrictPath {
+                    path: raw_path.clone(),
+                    reason: "path resolves to a leaf field, but strict is a section property"
+                        .into(),
+                });
+            }
+            PathKind::Unknown => {
+                return Err(ClapfigError::InvalidStrictPath {
+                    path: raw_path.clone(),
+                    reason: "path does not resolve to any field in the config schema".into(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// [`build_strict_overrides`] against a document-root [`Shape`].
+pub(crate) fn build_strict_overrides_shape(
+    entries: &[(String, bool)],
+    normalize_keys: bool,
+    shape: &crate::runtime::Shape,
+) -> Result<StrictnessOverrides, ClapfigError> {
+    if let crate::runtime::Shape::Object(schema) = shape {
+        return build_strict_overrides(entries, normalize_keys, schema);
+    }
+    let mut out = StrictnessOverrides::from_shape(shape);
+    for (raw_path, strict) in entries {
+        let path = if normalize_keys {
+            crate::normalize::normalize_key(raw_path)
+        } else {
+            raw_path.clone()
+        };
+        match resolve_path_kind_shape(shape, &path) {
             PathKind::Section => out.insert(path, *strict),
             PathKind::Leaf => {
                 return Err(ClapfigError::InvalidStrictPath {

@@ -1,9 +1,11 @@
 //! Schema-driven walks of a value [`Map`] against a [`Shape`]: the
 //! resolve pipeline's validation stages as free functions.
 //!
-//! Object-root entry points still take [`Schema`] (the [`Shape::Object`]
-//! payload); every field's value is a [`Shape`]. Homogeneous maps and
-//! arrays of leaves or of objects share [`Shape::Map`] / [`Shape::Array`].
+//! Document-root entry points take [`Shape`]. Object-root callers still
+//! pass [`Schema`] (the [`Shape::Object`] payload); a root [`Shape::Map`]
+//! treats the document table as the map itself (keys are user data, not
+//! unknown). Homogeneous maps and arrays of leaves or of objects share
+//! [`Shape::Map`] / [`Shape::Array`]. Tagged walk is SHP01-WS04.
 //!
 //! Every function here recurses a parsed table and the schema tree side
 //! by side:
@@ -93,6 +95,41 @@ pub(crate) fn collect_unknown_paths(
     }
 }
 
+/// Walk `table` against a document-root [`Shape`].
+///
+/// Object roots use [`collect_unknown_paths`]. Map roots treat every
+/// top-level key as a user-supplied entry (not unknown) and recurse into
+/// each value against the item shape. Tagged is SHP01-WS04.
+pub(crate) fn collect_unknown_against_root(
+    table: &Map,
+    shape: &Shape,
+    unknown: &mut Vec<UnknownKey>,
+) {
+    match shape {
+        Shape::Object(schema) => {
+            collect_unknown_paths(table, schema, "", &ConfigPath::new(), unknown);
+        }
+        Shape::Map(map) => {
+            let path = ConfigPath::new();
+            for (entry_key, entry_value) in table {
+                collect_unknown_against_shape(
+                    entry_value,
+                    &map.item,
+                    entry_key,
+                    &path.clone().key(entry_key),
+                    unknown,
+                );
+            }
+        }
+        Shape::Tagged(_) => {
+            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+        }
+        Shape::Leaf(_) | Shape::Array(_) => {
+            unreachable!("illegal document roots are rejected by require_document_root")
+        }
+    }
+}
+
 /// Recurse unknown-key collection into a field's [`Shape`].
 fn collect_unknown_against_shape(
     value: &Value,
@@ -173,6 +210,52 @@ pub(crate) fn fill_defaults_into(table: &mut Map, origins: &mut OriginMap, schem
     let path = crate::trace::trace_event_enabled().then(ConfigPath::new);
     fill_defaults_at(table, origins, schema, "", path, &mut filled);
     crate::trace::defaults_filled(filled);
+}
+
+/// Fill defaults against a document-root [`Shape`].
+///
+/// Object roots use [`fill_defaults_into`]. Map roots never synthesize
+/// entries (keys are user data); they push item defaults into existing
+/// entries. An absent root map is the empty table already in `table`.
+pub(crate) fn fill_defaults_into_shape(table: &mut Map, origins: &mut OriginMap, shape: &Shape) {
+    match shape {
+        Shape::Object(schema) => fill_defaults_into(table, origins, schema),
+        Shape::Map(map) => {
+            let mut filled = 0usize;
+            let path = crate::trace::trace_event_enabled().then(ConfigPath::new);
+            fill_defaults_in_root_map(table, origins, map, path, &mut filled);
+            crate::trace::defaults_filled(filled);
+        }
+        Shape::Tagged(_) => {
+            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+        }
+        Shape::Leaf(_) | Shape::Array(_) => {
+            unreachable!("illegal document roots are rejected by require_document_root")
+        }
+    }
+}
+
+fn fill_defaults_in_root_map(
+    table: &mut Map,
+    origins: &mut OriginMap,
+    map: &crate::runtime::MapShape,
+    path: Option<ConfigPath>,
+    filled: &mut usize,
+) {
+    let keys: Vec<String> = table.keys().cloned().collect();
+    for key in keys {
+        let entry_cfg = path.as_ref().map(|p| p.clone().key(&key));
+        if let Some(entry) = table.get_mut(&key) {
+            if !origins.contains_key(&key) {
+                origins.insert(
+                    key.clone(),
+                    OriginNode::from_value(entry, Origin::default(&key)),
+                );
+            }
+            let node = origins.get_mut(&key).expect("just ensured origin node");
+            fill_defaults_in_value(entry, node, &map.item, &key, entry_cfg, filled);
+        }
+    }
 }
 
 fn fill_defaults_at(
@@ -474,6 +557,57 @@ pub(crate) fn finalize(
     coerce_leaf_values(&mut merged, schema);
     check_required_and_types(&merged, origins, schema, "", &ConfigPath::new(), discovery)?;
     Ok(merged)
+}
+
+/// Finalize a merged table against a document-root [`Shape`].
+///
+/// Object roots use [`finalize`]. Map roots coerce and type-check each
+/// entry against the item shape; they do not invent a parent field or
+/// require any particular key to exist (an absent map is empty).
+pub(crate) fn finalize_shape(
+    mut merged: Map,
+    origins: &OriginMap,
+    shape: &Shape,
+    discovery: &DiscoveryRecord,
+) -> Result<Map, ClapfigError> {
+    match shape {
+        Shape::Object(schema) => {
+            return finalize(merged, origins, schema, discovery);
+        }
+        Shape::Map(map) => {
+            coerce_root(&mut merged, shape);
+            let path = ConfigPath::new();
+            for (entry_key, entry_value) in &merged {
+                check_field(
+                    Some(entry_value),
+                    origins,
+                    &map.item,
+                    entry_key,
+                    &path.clone().key(entry_key),
+                    discovery,
+                )?;
+            }
+        }
+        Shape::Tagged(_) => {
+            todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
+        }
+        Shape::Leaf(_) | Shape::Array(_) => {
+            unreachable!("illegal document roots are rejected by require_document_root")
+        }
+    }
+    Ok(merged)
+}
+
+fn coerce_root(table: &mut Map, shape: &Shape) {
+    match shape {
+        Shape::Object(schema) => coerce_leaf_values(table, schema),
+        Shape::Map(map) => {
+            for entry in table.values_mut() {
+                coerce_value(entry, &map.item);
+            }
+        }
+        Shape::Tagged(_) | Shape::Leaf(_) | Shape::Array(_) => {}
+    }
 }
 
 /// Schema-driven value coercion: for every leaf the schema declares

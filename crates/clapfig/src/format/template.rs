@@ -99,6 +99,15 @@ pub(crate) trait TemplateRenderer: Sized {
         name: &str,
         item: &Shape,
     ) -> Result<(), FormatError>;
+
+    /// Emit a **document-root** map as a commented example entry, with no
+    /// invented parent table. `item` is the entry shape.
+    fn root_map(
+        &mut self,
+        out: &mut Self::Out,
+        ctx: &Self::Ctx,
+        item: &Shape,
+    ) -> Result<(), FormatError>;
 }
 
 /// Drive one schema level through `renderer`: the level's doc hook, then
@@ -145,6 +154,29 @@ pub(crate) fn walk_level<R: TemplateRenderer>(
         }
     }
     Ok(())
+}
+
+/// Drive a document-root [`Shape`] through `renderer`.
+///
+/// Object roots use [`walk_level`]. Map roots emit a commented example
+/// entry with no parent table. Tagged is SHP01-WS05. Leaf and Array are
+/// illegal document roots.
+pub(crate) fn walk_root<R: TemplateRenderer>(
+    renderer: &mut R,
+    shape: &Shape,
+    ctx: &R::Ctx,
+    out: &mut R::Out,
+) -> Result<(), FormatError> {
+    match shape {
+        Shape::Object(schema) => walk_level(renderer, schema, ctx, out),
+        Shape::Map(map) => renderer.root_map(out, ctx, &map.item),
+        Shape::Tagged(_) => {
+            tagged_template_stub();
+        }
+        Shape::Leaf(_) | Shape::Array(_) => panic!(
+            "clapfig: a Leaf or Array is not a legal document root (legal roots: Object, Map, Tagged)"
+        ),
+    }
 }
 
 /// A value-shaped field as the template leaf renderer sees it: a leaf,
