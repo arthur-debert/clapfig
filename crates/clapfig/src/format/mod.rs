@@ -14,10 +14,10 @@
 //! the single typed refusal, [`UnsupportedByFormat`] — never a silent
 //! lossy fallback.
 //!
-//! The trait also carries the seam the provenance epic consumes: adapters
-//! supply a path → span index ([`FormatAdapter::span_index`]) for their
-//! source text, so source-mapping attaches at this one seam instead of
-//! per-format branches.
+//! Parse returns `{value, spans}`: [`FormatAdapter::parse`] returns the
+//! value tree and a path → span index together ([`Parsed`], ADR-0005).
+//! Shipped adapters (TOML, YAML, JSON) fill the index so unknown-key
+//! and `InvalidValue` errors locate the token from byte spans.
 //!
 //! This module holds the contract and its pure data structures; the
 //! adapters themselves live in [`toml`], [`yaml`], and [`json`], and the
@@ -65,8 +65,6 @@ pub enum Operation {
     EditCreateFile,
     /// Edit: remove a key.
     EditUnset,
-    /// Supply a path → span index for source text (the provenance seam).
-    SpanIndex,
 }
 
 impl fmt::Display for Operation {
@@ -79,7 +77,6 @@ impl fmt::Display for Operation {
             Operation::EditCreateKey => "creating a missing key",
             Operation::EditCreateFile => "creating a missing file",
             Operation::EditUnset => "unsetting a key",
-            Operation::SpanIndex => "span indexing",
         })
     }
 }
@@ -167,16 +164,19 @@ impl FormatError {
     }
 }
 
-/// One step of a [`ConfigPath`]: a map key.
+/// One step of a [`ConfigPath`]: a map key or an array index.
 ///
-/// The public path vocabulary is key-only for now; the provenance epic
-/// adds an index segment when something can actually construct and
-/// consume one.
+/// One path type for the span index, the origin tree, and error
+/// rendering. A literal key containing `.` is one [`Key`](Self::Key)
+/// segment, never nesting; [`Index`](Self::Index) names an array element
+/// so a path can address `plugins[3].host`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PathSegment {
     /// A map key. The key is a literal string — a key containing `.` is
     /// one segment, never nesting.
     Key(String),
+    /// A zero-based array element index.
+    Index(usize),
 }
 
 /// Structured address of one node in a [`Value`] tree.
@@ -184,14 +184,16 @@ pub enum PathSegment {
 /// A path is a sequence of [`PathSegment`]s, so a literal key named
 /// `"database.port"` (one `Key` segment) is distinct from the nested keys
 /// `database` → `port` (two `Key` segments) — an unstructured dotted
-/// string cannot express that distinction. This is the path type the
-/// adapter contract traffics in ([`FormatAdapter::span_index`],
-/// [`FileEdit`]); every adapter builds and consumes the same
-/// representation.
+/// string cannot express that distinction. Index segments name array
+/// elements (`plugins[3].host`). This is the path type the adapter
+/// contract, the origin tree, and error rendering all use
+/// ([`Parsed::spans`], [`FileEdit`]); every adapter builds and consumes
+/// the same representation.
 ///
 /// [`Display`](fmt::Display) renders the familiar dotted notation for
-/// error messages (`database.port`), quoting key segments that are not
-/// bare (`"my.key".port`) — display only, never parsed back.
+/// error messages (`database.port`, `plugins[3].host`), quoting key
+/// segments that are not bare (`"my.key".port`) — display only, never
+/// parsed back.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConfigPath {
     segments: Vec<PathSegment>,
@@ -209,6 +211,12 @@ impl ConfigPath {
         self
     }
 
+    /// Append a zero-based array-index segment (builder style).
+    pub fn index(mut self, n: usize) -> Self {
+        self.segments.push(PathSegment::Index(n));
+        self
+    }
+
     /// The path's segments, root-first.
     pub fn segments(&self) -> &[PathSegment] {
         &self.segments
@@ -223,8 +231,17 @@ impl From<Vec<PathSegment>> for ConfigPath {
 
 impl fmt::Display for ConfigPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, PathSegment::Key(k)) in self.segments.iter().enumerate() {
-            write_key(f, i == 0, k)?;
+        let mut first = true;
+        for segment in &self.segments {
+            match segment {
+                PathSegment::Key(k) => {
+                    write_key(f, first, k)?;
+                }
+                PathSegment::Index(n) => {
+                    write!(f, "[{n}]")?;
+                }
+            }
+            first = false;
         }
         Ok(())
     }
@@ -248,42 +265,15 @@ fn write_key(out: &mut dyn fmt::Write, first: bool, key: &str) -> fmt::Result {
     }
 }
 
-/// One step of a document walker's internal path.
-///
-/// Unlike the public [`PathSegment`], this can address array elements:
-/// parse/serialize walkers descend into arrays and their error messages
-/// must name the element (`servers[0]`), while the public path vocabulary
-/// stays key-only until the provenance epic needs index segments.
-pub(crate) enum WalkSegment {
-    /// A map key.
-    Key(String),
-    /// A zero-based array element index.
-    Index(usize),
-}
-
 /// Human-readable location of a walker's path for error messages: the
 /// familiar dotted notation with array indexes (`'servers[0].host'`),
-/// quoted, or a prose fallback at the document root.
-pub(crate) fn walk_label(segments: &[WalkSegment]) -> String {
-    use fmt::Write as _;
+/// quoted, or a prose fallback at the document root. Uses the same
+/// [`PathSegment`] vocabulary as [`ConfigPath`].
+pub(crate) fn walk_label(segments: &[PathSegment]) -> String {
     if segments.is_empty() {
         return "the document root".to_string();
     }
-    let mut out = String::from("'");
-    let mut first = true;
-    for segment in segments {
-        match segment {
-            WalkSegment::Key(k) => {
-                let _ = write_key(&mut out, first, k);
-            }
-            WalkSegment::Index(n) => {
-                let _ = write!(out, "[{n}]");
-            }
-        }
-        first = false;
-    }
-    out.push('\'');
-    out
+    format!("'{}'", ConfigPath::from(segments.to_vec()))
 }
 
 /// A half-open byte range (`start..end`) into a format's source text.
@@ -293,6 +283,94 @@ pub struct Span {
     pub start: usize,
     /// Byte offset one past the range's last byte.
     pub end: usize,
+}
+
+impl Span {
+    /// Convert a parser byte range into a clapfig span.
+    pub(crate) fn from_range(range: std::ops::Range<usize>) -> Self {
+        Self {
+            start: range.start,
+            end: range.end,
+        }
+    }
+}
+
+/// 1-indexed line and character column of a byte offset in `src`.
+///
+/// Column counts Unicode scalar values, not bytes — renderers pad and
+/// draw carets in characters. Line and column are derived from byte
+/// spans at render time (provenance spec); validation stores the span
+/// and uses this to fill the public 1-indexed `line` field.
+pub(crate) fn byte_offset_to_line_col(src: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut col = 1;
+    for (i, c) in src.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if c == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// One span-index entry: the key token's range (if any) and the value's
+/// range (ADR-0006).
+///
+/// Two diagnostics caret two different ranges: unknown-key errors the
+/// key token, post-merge value errors the assigned value. A single span
+/// makes one of those carets a lie. `key` is `None` on array elements
+/// that exist in source — there is no key token for `[[servers]]`
+/// entries or JSON array items. YAML alias-expanded paths (ADR-0008)
+/// are the exception: a path that exists in [`Value`] only because an
+/// alias expanded carets the `*name` token for both `key` and `value`,
+/// including expanded sequence items. The origin retained on the shadow
+/// tree keeps the **value** span; unknown-key lookup uses the **key**
+/// span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpanEntry {
+    /// Byte range of the key token, if any. `None` on written array
+    /// elements. YAML alias-expanded paths (ADR-0008) use the `*name`
+    /// token for both sides, including expanded sequence items.
+    pub key: Option<Span>,
+    /// Byte range of the assigned value.
+    pub value: Span,
+}
+
+/// The value tree and path → span index produced by one
+/// [`FormatAdapter::parse`] (ADR-0005).
+///
+/// `spans` covers every path in `value` when an adapter fills it. TOML
+/// fills the index (ADR-0005), YAML fills it (ADR-0008), and JSON fills
+/// it (ADR-0007). An empty map is holding state for dummy/test adapters
+/// ([`Parsed::from_value`]), not a legal degradation of the finished
+/// contract. Callers that only want a [`Value`] (persist, some tests)
+/// use [`Parsed::value`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Parsed {
+    /// The document as a clapfig [`Value`] tree.
+    pub value: Value,
+    /// Path → [`SpanEntry`] index. TOML (ADR-0005), YAML (ADR-0008), and
+    /// JSON (ADR-0007) cover every path in [`value`](Self::value). Dummy
+    /// adapters and [`Parsed::from_value`] still return empty.
+    pub spans: BTreeMap<ConfigPath, SpanEntry>,
+}
+
+impl Parsed {
+    /// A value tree with an empty span index — dummy adapters, persist
+    /// callers, and tests that only need the tree. External
+    /// [`FormatAdapter`] implementations that do not fill spans use this
+    /// constructor rather than assembling the public fields by hand.
+    pub fn from_value(value: Value) -> Self {
+        Self {
+            value,
+            spans: BTreeMap::new(),
+        }
+    }
 }
 
 /// Which capability-matrix row a [`FileEdit::Set`] request falls under.
@@ -330,7 +408,9 @@ pub enum FileEdit<'a> {
     /// Set the value at a path, replacing an existing value or creating
     /// the path, per `target`.
     Set {
-        /// Structured path of the target node.
+        /// Structured path of the target node. File edits address map
+        /// keys; a path carrying [`PathSegment::Index`] is a typed
+        /// [`FormatError::Edit`].
         path: &'a ConfigPath,
         /// The value to write.
         value: &'a Value,
@@ -340,7 +420,9 @@ pub enum FileEdit<'a> {
     },
     /// Remove the key at a path.
     Unset {
-        /// Structured path of the target node.
+        /// Structured path of the target node. File edits address map
+        /// keys; a path carrying [`PathSegment::Index`] is a typed
+        /// [`FormatError::Edit`].
         path: &'a ConfigPath,
     },
 }
@@ -426,9 +508,16 @@ pub trait FormatAdapter: Send + Sync {
         format!("# {line}")
     }
 
-    /// Parse source text into a [`Value`] tree, applying the format's
-    /// baseline mapping rules (ADR-0002's table).
-    fn parse(&self, text: &str) -> Result<Value, FormatError>;
+    /// Parse source text into a [`Value`] tree and a path → span index,
+    /// applying the format's baseline mapping rules (ADR-0002's table).
+    ///
+    /// One parse produces both (ADR-0005): JSON strips `//` comment keys
+    /// and YAML resolves aliases in this same walk, so a second pass over
+    /// the text cannot stay in sync. Callers that only want the tree use
+    /// [`Parsed::value`]. TOML, YAML, and JSON fill the span index; dummy
+    /// adapters still return an empty map. The finished contract covers
+    /// every path in `value`.
+    fn parse(&self, text: &str) -> Result<Parsed, FormatError>;
 
     /// Serialize a [`Value`] tree to this format's source text.
     fn serialize(&self, value: &Value) -> Result<String, FormatError>;
@@ -443,12 +532,6 @@ pub trait FormatAdapter: Send + Sync {
     /// capabilities; declared-but-unsupported shapes refuse with the typed
     /// error.
     fn edit(&self, source: &str, edit: FileEdit<'_>) -> Result<String, FormatError>;
-
-    /// Build the path → span index for source text (the provenance seam):
-    /// each entry locates a value's bytes in the source the adapter
-    /// parsed. WS01 pins the signature; adapters stub the body until the
-    /// provenance epic lands.
-    fn span_index(&self, text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError>;
 }
 
 /// Ordered set of enabled format adapters — the single routing seam.
@@ -562,8 +645,8 @@ mod tests {
             &[Operation::Parse]
         }
 
-        fn parse(&self, _text: &str) -> Result<Value, FormatError> {
-            Ok(Value::Boolean(true))
+        fn parse(&self, _text: &str) -> Result<Parsed, FormatError> {
+            Ok(Parsed::from_value(Value::Boolean(true)))
         }
 
         fn serialize(&self, _value: &Value) -> Result<String, FormatError> {
@@ -576,10 +659,6 @@ mod tests {
 
         fn edit(&self, _source: &str, edit: FileEdit<'_>) -> Result<String, FormatError> {
             Err(self.require(edit.operation()).unwrap_err().into())
-        }
-
-        fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
-            Err(self.require(Operation::SpanIndex).unwrap_err().into())
         }
     }
 
@@ -632,10 +711,28 @@ mod tests {
         assert_ne!(nested, literal);
 
         let mut index = BTreeMap::new();
-        index.insert(nested.clone(), Span { start: 0, end: 1 });
-        index.insert(literal.clone(), Span { start: 2, end: 3 });
-        assert_eq!(index.get(&nested), Some(&Span { start: 0, end: 1 }));
-        assert_eq!(index.get(&literal), Some(&Span { start: 2, end: 3 }));
+        index.insert(
+            nested.clone(),
+            SpanEntry {
+                key: Some(Span { start: 0, end: 8 }),
+                value: Span { start: 11, end: 12 },
+            },
+        );
+        index.insert(
+            literal.clone(),
+            SpanEntry {
+                key: Some(Span { start: 2, end: 16 }),
+                value: Span { start: 19, end: 20 },
+            },
+        );
+        assert_eq!(
+            index.get(&nested).map(|e| e.value),
+            Some(Span { start: 11, end: 12 })
+        );
+        assert_eq!(
+            index.get(&literal).map(|e| e.value),
+            Some(Span { start: 19, end: 20 })
+        );
     }
 
     #[test]
@@ -653,18 +750,48 @@ mod tests {
     }
 
     #[test]
+    fn config_path_distinguishes_quoted_literal_from_nested_and_names_indexes() {
+        // `"a.b"` (one Key) vs `[a] b` (two Keys); Display quotes the
+        // non-bare literal and is one-way (never parsed back).
+        assert_eq!(ConfigPath::new().key("a.b").to_string(), "\"a.b\"");
+        assert_eq!(ConfigPath::new().key("a").key("b").to_string(), "a.b");
+        assert_eq!(
+            ConfigPath::new()
+                .key("plugins")
+                .index(3)
+                .key("host")
+                .to_string(),
+            "plugins[3].host"
+        );
+        assert_eq!(
+            ConfigPath::new().index(2).key("my.key").to_string(),
+            "[2].\"my.key\""
+        );
+    }
+
+    #[test]
+    fn span_entry_key_is_none_on_array_elements() {
+        let entry = SpanEntry {
+            key: None,
+            value: Span { start: 4, end: 12 },
+        };
+        assert!(entry.key.is_none());
+        assert_eq!(entry.value, Span { start: 4, end: 12 });
+    }
+
+    #[test]
     fn walk_label_renders_indexes_and_the_root() {
         assert_eq!(walk_label(&[]), "the document root");
         assert_eq!(
             walk_label(&[
-                WalkSegment::Key("servers".into()),
-                WalkSegment::Index(0),
-                WalkSegment::Key("host".into()),
+                PathSegment::Key("servers".into()),
+                PathSegment::Index(0),
+                PathSegment::Key("host".into()),
             ]),
             "'servers[0].host'"
         );
         assert_eq!(
-            walk_label(&[WalkSegment::Index(2), WalkSegment::Key("my.key".into())]),
+            walk_label(&[PathSegment::Index(2), PathSegment::Key("my.key".into())]),
             "'[2].\"my.key\"'"
         );
     }
@@ -709,7 +836,7 @@ mod tests {
         assert_send_sync::<Box<dyn FormatAdapter>>();
     }
 
-    const ALL_OPERATIONS: [Operation; 8] = [
+    const ALL_OPERATIONS: [Operation; 7] = [
         Operation::Parse,
         Operation::Template,
         Operation::Serialize,
@@ -717,49 +844,51 @@ mod tests {
         Operation::EditCreateKey,
         Operation::EditCreateFile,
         Operation::EditUnset,
-        Operation::SpanIndex,
     ];
 
     #[test]
     fn toml_adapter_declares_its_matrix_rows() {
         // The ADR-0002 matrix has no refusal rows for TOML, so the shipped
-        // adapter declares every implemented operation. SpanIndex stays
-        // undeclared (and refuses typed) until the provenance epic builds
-        // the index.
+        // adapter declares every implemented operation. Spans ride on
+        // parse (ADR-0005), not a separate operation.
         for operation in ALL_OPERATIONS {
-            if operation == Operation::SpanIndex {
-                assert!(!toml::TomlAdapter.supports(operation));
-                assert!(matches!(
-                    toml::TomlAdapter.span_index("").unwrap_err(),
-                    FormatError::Unsupported(_)
-                ));
-            } else {
-                assert!(
-                    toml::TomlAdapter.supports(operation),
-                    "toml should declare {operation}"
-                );
-            }
+            assert!(
+                toml::TomlAdapter.supports(operation),
+                "toml should declare {operation}"
+            );
         }
     }
 
     #[test]
     fn yaml_adapter_declares_its_matrix_rows() {
         // YAML's ADR-0002 matrix row declares every operation (its known
-        // refusals are shape-level, inside the declared edits). SpanIndex
-        // stays undeclared until the provenance epic builds the index.
+        // refusals are shape-level, inside the declared edits). Spans ride
+        // on parse (ADR-0005), not a separate operation.
         for operation in ALL_OPERATIONS {
-            if operation == Operation::SpanIndex {
-                assert!(!yaml::YamlAdapter.supports(operation));
-                assert!(matches!(
-                    yaml::YamlAdapter.span_index("").unwrap_err(),
-                    FormatError::Unsupported(_)
-                ));
-            } else {
-                assert!(
-                    yaml::YamlAdapter.supports(operation),
-                    "yaml should declare {operation}"
-                );
-            }
+            assert!(
+                yaml::YamlAdapter.supports(operation),
+                "yaml should declare {operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_returns_empty_span_index_as_holding_state() {
+        // Empty documents have no child paths, so every adapter's index
+        // is empty here. Non-empty documents are filled by TOML
+        // (ADR-0005), YAML (ADR-0008), and JSON (ADR-0007).
+        for (adapter, text) in [
+            (&toml::TomlAdapter as &dyn FormatAdapter, ""),
+            (&yaml::YamlAdapter, ""),
+            (&json::JsonAdapter, ""),
+        ] {
+            let parsed = adapter.parse(text).unwrap();
+            assert_eq!(parsed.value, Value::Map(Default::default()));
+            assert!(
+                parsed.spans.is_empty(),
+                "{} spans should be empty",
+                adapter.name()
+            );
         }
     }
 

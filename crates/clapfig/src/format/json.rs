@@ -1,17 +1,23 @@
-//! JSON format adapter — `serde_json` behind the adapter contract.
+//! JSON format adapter — owned parse walk; `serde_json` for serialize/edit.
 //!
 //! This file is the ONLY place in the crate that gives `serde_json` a
 //! *format* role (the crate also serves JSON Schema export, which is not a
-//! config format). It implements the full ADR-0002 matrix row set for
-//! JSON, with no known operation-level refusals:
+//! config format). Parse is a clapfig-owned walk (ADR-0007): `serde_json`
+//! has no byte offsets, and a second locate-keys pass is the desync
+//! ADR-0005 forbids. `serde_json` stays for serialize and edit
+//! (order-preserving pretty-print, comments-as-data). The file implements
+//! the full ADR-0002 matrix row set for JSON, with no known
+//! operation-level refusals:
 //!
-//! - [`parse`](JsonAdapter::parse): JSON text → owned [`Value`] tree, with
-//!   the `"//"` comment-key convention applied: every `//`-prefixed member
-//!   is format syntax owned by this adapter and is stripped at parse time,
-//!   before the core [`Value`] tree exists — exactly as TOML's `#`
-//!   comments never reach the tree. The stripped namespace is reserved at
-//!   any nesting depth; a `//`-prefixed member can never be a
-//!   configuration key.
+//! - [`parse`](JsonAdapter::parse): one walk over the source emits the
+//!   owned [`Value`] tree and the path → [`SpanEntry`](super::SpanEntry)
+//!   index (ADR-0005, ADR-0006). The `"//"` comment-key convention is
+//!   applied in that same walk: every `//`-prefixed member is format
+//!   syntax owned by this adapter and is stripped before the core
+//!   [`Value`] tree exists — exactly as TOML's `#` comments never reach
+//!   the tree — and is absent from the span index. The stripped
+//!   namespace is reserved at any nesting depth; a `//`-prefixed member
+//!   can never be a configuration key.
 //! - [`serialize`](JsonAdapter::serialize): [`Value`] tree → pretty JSON
 //!   text. Non-finite floats have no JSON literal and refuse with a typed
 //!   error naming the offending path; so does a map key in the reserved
@@ -39,23 +45,24 @@
 //! a typed error naming the key ("absence expresses unset"); an integer
 //! literal outside `i64` — on either side, above `i64::MAX` or below
 //! `i64::MIN` — is a typed error naming the key, never a silent float
-//! (`serde_json`'s `arbitrary_precision` keeps the lexical form that
-//! makes the two sides distinguishable from float literals). A float
-//! literal overflowing `f64` is likewise a typed error. Whitespace-only
-//! source parses as the empty map (an empty config file is "no config",
-//! matching TOML's empty document).
+//! (the owned walk classifies a number as an integer iff its lexeme has
+//! no fraction and no exponent). A float literal overflowing `f64` is
+//! likewise a typed error. Those mapping errors carry the offending
+//! token's byte span. Whitespace-only source parses as the empty map
+//! (an empty config file is "no config", matching TOML's empty
+//! document).
+
+use std::collections::BTreeMap;
 
 use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::runtime::{Field, Leaf, LeafType, Schema};
 use crate::value::{Map, Value};
 
-use std::collections::BTreeMap;
-
 use super::template::{TemplateRenderer, doc_lines, leaf_annotations, walk_level};
 use super::{
-    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
-    UnsupportedByFormat, WalkSegment, walk_label,
+    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
+    SpanEntry, walk_label,
 };
 
 /// The canonical format name used in error messages.
@@ -67,11 +74,11 @@ const COMMENT_PREFIX: &str = "//";
 
 /// The JSON format behind the adapter contract.
 ///
-/// Declares every ADR-0002 matrix row (JSON has no refusal rows). The one
-/// gap is [`span_index`](JsonAdapter::span_index) — undeclared and
-/// refused typed until the provenance epic builds the index. See the
-/// [module docs](self) for the comment-key convention and the baseline
-/// mapping rules this adapter applies.
+/// Declares every ADR-0002 matrix row (JSON has no refusal rows).
+/// [`parse`](JsonAdapter::parse) is the owned walk that fills the span
+/// index in the same pass as the [`Value`] tree (ADR-0005, ADR-0007).
+/// See the [module docs](self) for the comment-key convention and the
+/// baseline mapping rules this adapter applies.
 pub struct JsonAdapter;
 
 impl FormatAdapter for JsonAdapter {
@@ -84,8 +91,6 @@ impl FormatAdapter for JsonAdapter {
     }
 
     fn capabilities(&self) -> &'static [Operation] {
-        // The provenance epic adds Operation::SpanIndex when it
-        // implements span_index.
         &[
             Operation::Parse,
             Operation::Template,
@@ -110,15 +115,8 @@ impl FormatAdapter for JsonAdapter {
         format!("// {line}")
     }
 
-    fn parse(&self, text: &str) -> Result<Value, FormatError> {
-        // An empty (or whitespace-only) file is "no config", matching
-        // TOML's empty document — not a JSON syntax error.
-        if text.trim().is_empty() {
-            return Ok(Value::Map(Map::new()));
-        }
-        let json: Json = serde_json::from_str(text).map_err(|e| syntax_error(text, &e))?;
-        let mut path = Vec::new();
-        json_to_value(json, &mut path)
+    fn parse(&self, text: &str) -> Result<Parsed, FormatError> {
+        parse_document(text)
     }
 
     fn serialize(&self, value: &Value) -> Result<String, FormatError> {
@@ -145,11 +143,7 @@ impl FormatAdapter for JsonAdapter {
         match edit {
             FileEdit::Set { path, value, .. } => {
                 let keys = key_segments(path)?;
-                let mut value_path: Vec<WalkSegment> = path
-                    .segments()
-                    .iter()
-                    .map(|PathSegment::Key(k)| WalkSegment::Key(k.clone()))
-                    .collect();
+                let mut value_path: Vec<PathSegment> = path.segments().to_vec();
                 let json_value = value_to_json(value, &mut value_path)?;
                 super::edit::write_at_path(&mut doc, &keys, json_value)?;
             }
@@ -159,15 +153,6 @@ impl FormatAdapter for JsonAdapter {
             }
         }
         Ok(render(&doc))
-    }
-
-    fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
-        // Provenance epic: build the path → span index from parser spans.
-        Err(UnsupportedByFormat {
-            format: self.name(),
-            operation: Operation::SpanIndex,
-        }
-        .into())
     }
 }
 
@@ -226,94 +211,538 @@ fn span_at(text: &str, line: usize, column: usize) -> Option<Span> {
     None
 }
 
-/// Convert a parsed `serde_json::Value` into the owned model, applying the
-/// baseline mapping rules: `//`-prefixed members are stripped (before the
-/// [`Value`] tree exists), `null` and out-of-`i64` integers are typed
-/// errors naming the offending path.
-fn json_to_value(json: Json, path: &mut Vec<WalkSegment>) -> Result<Value, FormatError> {
-    Ok(match json {
-        Json::Null => {
-            return Err(FormatError::Parse {
-                format: FORMAT,
-                message: format!(
-                    "null at {} is not a configuration value: absence expresses unset — omit the key instead",
-                    walk_label(path)
-                ),
-                span: None,
-            });
+// --- owned parse walk (ADR-0007) -----------------------------------------
+
+/// Matches `serde_json`'s default recursion ceiling so a hostile nest
+/// is a typed parse error, not a stack overflow.
+const MAX_DEPTH: usize = 128;
+
+/// One-pass JSON parse: emit the [`Value`] tree and the span index
+/// together, applying the baseline mapping rules (strip `//` keys,
+/// refuse null, integer/float range) as the tokens are consumed.
+fn parse_document(text: &str) -> Result<Parsed, FormatError> {
+    // An empty (or whitespace-only) file is "no config", matching
+    // TOML's empty document — not a JSON syntax error. There is no
+    // source value to locate, so the index stays empty.
+    if text.trim().is_empty() {
+        return Ok(Parsed::from_value(Value::Map(Map::new())));
+    }
+    let mut parser = Parser::new(text);
+    let value = parser.parse_value(None)?;
+    parser.skip_ws();
+    if parser.pos < text.len() {
+        return parser.fail("unexpected trailing content after JSON value");
+    }
+    Ok(Parsed {
+        value,
+        spans: parser.spans,
+    })
+}
+
+/// Byte-offset walker over one JSON document.
+struct Parser<'a> {
+    text: &'a str,
+    pos: usize,
+    depth: usize,
+    path: Vec<PathSegment>,
+    spans: BTreeMap<ConfigPath, SpanEntry>,
+}
+
+impl<'a> Parser<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            pos: 0,
+            depth: 0,
+            path: Vec::new(),
+            spans: BTreeMap::new(),
         }
-        Json::Bool(b) => Value::Boolean(b),
-        Json::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Integer(i)
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.text.as_bytes().get(self.pos).copied()
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn here(&self) -> Span {
+        if self.pos >= self.text.len() {
+            return Span {
+                start: self.text.len(),
+                end: self.text.len(),
+            };
+        }
+        Span {
+            start: self.pos,
+            end: self.text.ceil_char_boundary(self.pos + 1),
+        }
+    }
+
+    fn parse_error(&self, message: String, span: Span) -> FormatError {
+        FormatError::Parse {
+            format: FORMAT,
+            message,
+            span: Some(span),
+        }
+    }
+
+    fn fail<T>(&self, message: impl Into<String>) -> Result<T, FormatError> {
+        Err(self.parse_error(message.into(), self.here()))
+    }
+
+    fn expect(&mut self, wanted: u8) -> Result<(), FormatError> {
+        match self.peek() {
+            Some(b) if b == wanted => {
+                self.pos += 1;
+                Ok(())
+            }
+            _ => self.fail(format!("expected '{}'", wanted as char)),
+        }
+    }
+
+    fn enter(&mut self) -> Result<(), FormatError> {
+        if self.depth >= MAX_DEPTH {
+            return self.fail("nesting exceeds the JSON parse limit");
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
+    fn record(&mut self, key: Option<Span>, value: Span) {
+        self.spans.insert(
+            ConfigPath::from(self.path.clone()),
+            SpanEntry { key, value },
+        );
+    }
+
+    /// Drop the current path and every descendant. Used when a later
+    /// duplicate key replaces an earlier member so the index cannot
+    /// retain paths the returned tree no longer has.
+    fn drop_current_prefix(&mut self) {
+        let prefix = self.path.as_slice();
+        self.spans.retain(|path, _| {
+            let segs = path.segments();
+            !(segs.len() >= prefix.len() && segs[..prefix.len()] == *prefix)
+        });
+    }
+
+    /// Parse one JSON value at the current path, apply baseline rules,
+    /// and record its span. `key` is the member-key token (quoted) or
+    /// `None` on the document root and on array elements (ADR-0006).
+    fn parse_value(&mut self, key: Option<Span>) -> Result<Value, FormatError> {
+        self.skip_ws();
+        let start = self.pos;
+        let value = match self.peek() {
+            Some(b'{') => self.parse_object()?,
+            Some(b'[') => self.parse_array()?,
+            Some(b'"') => Value::String(self.parse_string()?.0),
+            Some(b't') => {
+                self.expect_literal("true")?;
+                Value::Boolean(true)
+            }
+            Some(b'f') => {
+                self.expect_literal("false")?;
+                Value::Boolean(false)
+            }
+            Some(b'n') => {
+                let span = self.expect_literal("null")?;
+                return Err(self.parse_error(
+                    format!(
+                        "null at {} is not a configuration value: absence expresses unset — omit the key instead",
+                        walk_label(&self.path)
+                    ),
+                    span,
+                ));
+            }
+            Some(b'-' | b'0'..=b'9') => self.parse_number()?,
+            Some(_) => return self.fail("expected a JSON value"),
+            None => return self.fail("unexpected end of JSON input"),
+        };
+        self.record(
+            key,
+            Span {
+                start,
+                end: self.pos,
+            },
+        );
+        Ok(value)
+    }
+
+    fn parse_object(&mut self) -> Result<Value, FormatError> {
+        self.enter()?;
+        self.expect(b'{')?;
+        self.skip_ws();
+        let mut map = Map::new();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            self.leave();
+            return Ok(Value::Map(map));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return self.fail("expected a string key");
+            }
+            let (key, key_span) = self.parse_string()?;
+            self.skip_ws();
+            self.expect(b':')?;
+            if key.starts_with(COMMENT_PREFIX) {
+                // Comment syntax, not configuration: consume the value
+                // without baseline mapping and without indexing it.
+                self.skip_json()?;
             } else {
-                // `arbitrary_precision` keeps the number's lexical form, so
-                // an integer literal (no fraction, no exponent) that did
-                // not fit i64 is detectable on BOTH sides of the range —
-                // above i64::MAX and below i64::MIN alike — and is a typed
-                // error, never a silent float.
-                let lexeme = n.as_str();
-                if !lexeme.contains(['.', 'e', 'E']) {
-                    return Err(FormatError::Parse {
-                        format: FORMAT,
-                        message: format!(
-                            "integer {lexeme} at {} is out of range: the value model's integers are 64-bit signed (i64)",
-                            walk_label(path)
-                        ),
-                        span: None,
-                    });
+                self.path.push(PathSegment::Key(key.clone()));
+                if map.contains_key(&key) {
+                    self.drop_current_prefix();
                 }
-                match n.as_f64() {
-                    Some(f) if f.is_finite() => Value::Float(f),
-                    // A float literal whose magnitude overflows f64
-                    // (e.g. 1e999): out of range, not silently infinity.
-                    _ => {
-                        return Err(FormatError::Parse {
-                            format: FORMAT,
-                            message: format!(
-                                "float {lexeme} at {} is out of range: the value model's floats are 64-bit (f64)",
-                                walk_label(path)
-                            ),
-                            span: None,
-                        });
-                    }
-                }
-            }
-        }
-        Json::String(s) => Value::String(s),
-        Json::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for (i, item) in items.into_iter().enumerate() {
-                path.push(WalkSegment::Index(i));
-                let converted = json_to_value(item, path)?;
-                path.pop();
-                out.push(converted);
-            }
-            Value::Array(out)
-        }
-        Json::Object(entries) => {
-            let mut map = Map::new();
-            for (key, entry) in entries {
-                // The reserved comment namespace: stripped whole,
-                // whatever the member's value shape — even a null comment
-                // value is comment syntax, not a configuration value.
-                if key.starts_with(COMMENT_PREFIX) {
-                    continue;
-                }
-                path.push(WalkSegment::Key(key.clone()));
-                let converted = json_to_value(entry, path)?;
-                path.pop();
+                let converted = self.parse_value(Some(key_span))?;
+                self.path.pop();
                 map.insert(key, converted);
             }
-            Value::Map(map)
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => return self.fail("expected ',' or '}' after object member"),
+            }
         }
-    })
+        self.leave();
+        Ok(Value::Map(map))
+    }
+
+    fn parse_array(&mut self) -> Result<Value, FormatError> {
+        self.enter()?;
+        self.expect(b'[')?;
+        self.skip_ws();
+        let mut items = Vec::new();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            self.leave();
+            return Ok(Value::Array(items));
+        }
+        loop {
+            let index = items.len();
+            self.path.push(PathSegment::Index(index));
+            let item = self.parse_value(None)?;
+            self.path.pop();
+            items.push(item);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b']') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => return self.fail("expected ',' or ']' after array element"),
+            }
+        }
+        self.leave();
+        Ok(Value::Array(items))
+    }
+
+    /// Consume one JSON value without applying clapfig mapping rules.
+    /// Used for `//`-prefixed comment members, whose payload may be
+    /// null or an out-of-range integer and must not trip those errors.
+    fn skip_json(&mut self) -> Result<(), FormatError> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'{') => self.skip_object(),
+            Some(b'[') => self.skip_array(),
+            Some(b'"') => {
+                self.parse_string()?;
+                Ok(())
+            }
+            Some(b't') => {
+                self.expect_literal("true")?;
+                Ok(())
+            }
+            Some(b'f') => {
+                self.expect_literal("false")?;
+                Ok(())
+            }
+            Some(b'n') => {
+                self.expect_literal("null")?;
+                Ok(())
+            }
+            Some(b'-' | b'0'..=b'9') => {
+                self.lex_number()?;
+                Ok(())
+            }
+            Some(_) => self.fail("expected a JSON value"),
+            None => self.fail("unexpected end of JSON input"),
+        }
+    }
+
+    fn skip_object(&mut self) -> Result<(), FormatError> {
+        self.enter()?;
+        self.expect(b'{')?;
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            self.leave();
+            return Ok(());
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return self.fail("expected a string key");
+            }
+            self.parse_string()?;
+            self.skip_ws();
+            self.expect(b':')?;
+            self.skip_json()?;
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => return self.fail("expected ',' or '}' after object member"),
+            }
+        }
+        self.leave();
+        Ok(())
+    }
+
+    fn skip_array(&mut self) -> Result<(), FormatError> {
+        self.enter()?;
+        self.expect(b'[')?;
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            self.leave();
+            return Ok(());
+        }
+        loop {
+            self.skip_json()?;
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b']') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => return self.fail("expected ',' or ']' after array element"),
+            }
+        }
+        self.leave();
+        Ok(())
+    }
+
+    fn expect_literal(&mut self, literal: &str) -> Result<Span, FormatError> {
+        let start = self.pos;
+        if !self.text[self.pos..].starts_with(literal) {
+            return self.fail(format!("expected {literal}"));
+        }
+        self.pos += literal.len();
+        if self
+            .peek()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return self.fail(format!("expected {literal}"));
+        }
+        Ok(Span {
+            start,
+            end: self.pos,
+        })
+    }
+
+    fn parse_string(&mut self) -> Result<(String, Span), FormatError> {
+        let start = self.pos;
+        self.expect(b'"')?;
+        let mut out = String::new();
+        loop {
+            let Some(b) = self.peek() else {
+                return Err(self.parse_error(
+                    "unterminated string".into(),
+                    Span {
+                        start,
+                        end: self.text.len(),
+                    },
+                ));
+            };
+            match b {
+                b'"' => {
+                    self.pos += 1;
+                    return Ok((
+                        out,
+                        Span {
+                            start,
+                            end: self.pos,
+                        },
+                    ));
+                }
+                b'\\' => self.parse_escape(&mut out)?,
+                0x00..=0x1F => return self.fail("unescaped control character in string"),
+                _ => {
+                    let ch = self.text[self.pos..]
+                        .chars()
+                        .next()
+                        .expect("peeked a byte so a char remains");
+                    out.push(ch);
+                    self.pos += ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    fn parse_escape(&mut self, out: &mut String) -> Result<(), FormatError> {
+        self.pos += 1;
+        let Some(b) = self.peek() else {
+            return self.fail("unterminated string escape");
+        };
+        self.pos += 1;
+        match b {
+            b'"' => out.push('"'),
+            b'\\' => out.push('\\'),
+            b'/' => out.push('/'),
+            b'b' => out.push('\u{0008}'),
+            b'f' => out.push('\u{000c}'),
+            b'n' => out.push('\n'),
+            b'r' => out.push('\r'),
+            b't' => out.push('\t'),
+            b'u' => self.parse_unicode_escape(out)?,
+            _ => return self.fail("invalid escape sequence"),
+        }
+        Ok(())
+    }
+
+    fn parse_hex4(&mut self) -> Result<u16, FormatError> {
+        let Some(hex) = self.text.get(self.pos..self.pos + 4) else {
+            return self.fail("unterminated unicode escape");
+        };
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return self.fail("invalid unicode escape");
+        }
+        let unit = u16::from_str_radix(hex, 16).expect("four ASCII hex digits parse as a u16");
+        self.pos += 4;
+        Ok(unit)
+    }
+
+    fn parse_unicode_escape(&mut self, out: &mut String) -> Result<(), FormatError> {
+        let unit = self.parse_hex4()?;
+        if (0xD800..=0xDBFF).contains(&unit) {
+            if self.peek() != Some(b'\\') {
+                return self.fail("unpaired UTF-16 surrogate");
+            }
+            self.pos += 1;
+            if self.peek() != Some(b'u') {
+                return self.fail("unpaired UTF-16 surrogate");
+            }
+            self.pos += 1;
+            let low = self.parse_hex4()?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return self.fail("unpaired UTF-16 surrogate");
+            }
+            let cp = 0x10000 + (u32::from(unit - 0xD800) << 10) + u32::from(low - 0xDC00);
+            out.push(char::from_u32(cp).expect("surrogate pair decodes to a scalar"));
+        } else if (0xDC00..=0xDFFF).contains(&unit) {
+            return self.fail("unpaired UTF-16 surrogate");
+        } else {
+            out.push(char::from_u32(u32::from(unit)).expect("non-surrogate unit is a scalar"));
+        }
+        Ok(())
+    }
+
+    fn lex_number(&mut self) -> Result<(Span, bool), FormatError> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+                if self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                    return self.fail("leading zeros are not allowed in JSON numbers");
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                    self.pos += 1;
+                }
+            }
+            _ => return self.fail("expected a JSON number"),
+        }
+        let mut is_float = false;
+        if self.peek() == Some(b'.') {
+            is_float = true;
+            self.pos += 1;
+            if !self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                return self.fail("expected a digit after the decimal point");
+            }
+            while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            is_float = true;
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if !self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                return self.fail("expected a digit in the exponent");
+            }
+            while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        Ok((
+            Span {
+                start,
+                end: self.pos,
+            },
+            is_float,
+        ))
+    }
+
+    fn parse_number(&mut self) -> Result<Value, FormatError> {
+        let (span, is_float) = self.lex_number()?;
+        let lexeme = &self.text[span.start..span.end];
+        if is_float {
+            return match lexeme.parse::<f64>() {
+                Ok(f) if f.is_finite() => Ok(Value::Float(f)),
+                // Overflow (e.g. 1e999) becomes infinity; underflow to
+                // zero stays finite. Non-finite is a typed range error.
+                _ => Err(self.parse_error(
+                    format!(
+                        "float {lexeme} at {} is out of range: the value model's floats are 64-bit (f64)",
+                        walk_label(&self.path)
+                    ),
+                    span,
+                )),
+            };
+        }
+        match lexeme.parse::<i64>() {
+            Ok(i) => Ok(Value::Integer(i)),
+            Err(_) => Err(self.parse_error(
+                format!(
+                    "integer {lexeme} at {} is out of range: the value model's integers are 64-bit signed (i64)",
+                    walk_label(&self.path)
+                ),
+                span,
+            )),
+        }
+    }
 }
 
 /// Convert an owned [`Value`] into a `serde_json::Value`. The one
 /// unrepresentable shape is a non-finite float (JSON has no literal for
 /// it) — a typed error naming the offending path.
-fn value_to_json(value: &Value, path: &mut Vec<WalkSegment>) -> Result<Json, FormatError> {
+fn value_to_json(value: &Value, path: &mut Vec<PathSegment>) -> Result<Json, FormatError> {
     Ok(match value {
         Value::String(s) => Json::String(s.clone()),
         Value::Integer(i) => Json::Number((*i).into()),
@@ -338,7 +767,7 @@ fn value_to_json(value: &Value, path: &mut Vec<WalkSegment>) -> Result<Json, For
         Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
-                path.push(WalkSegment::Index(i));
+                path.push(PathSegment::Index(i));
                 let converted = value_to_json(item, path)?;
                 path.pop();
                 out.push(converted);
@@ -348,7 +777,7 @@ fn value_to_json(value: &Value, path: &mut Vec<WalkSegment>) -> Result<Json, For
         Value::Map(map) => {
             let mut out = JsonMap::new();
             for (key, entry) in map {
-                path.push(WalkSegment::Key(key.clone()));
+                path.push(PathSegment::Key(key.clone()));
                 // The reserved comment namespace cuts both ways: a
                 // `//`-prefixed key written here would be stripped as a
                 // comment at the next parse — refuse loudly instead of
@@ -372,21 +801,17 @@ fn value_to_json(value: &Value, path: &mut Vec<WalkSegment>) -> Result<Json, For
 
 /// Extract the key segments of a [`ConfigPath`], refusing `//`-prefixed
 /// segments, which live in the reserved comment namespace and can never
-/// address a configuration key.
+/// address a configuration key, and refusing index segments (file edits
+/// address map keys).
 fn key_segments(path: &ConfigPath) -> Result<Vec<&str>, FormatError> {
-    path.segments()
-        .iter()
-        .map(|PathSegment::Key(k)| {
-            if k.starts_with(COMMENT_PREFIX) {
-                Err(FormatError::Edit {
-                    format: FORMAT,
-                    message: reserved_key_message(&format!("'{k}'")),
-                })
-            } else {
-                Ok(k.as_str())
-            }
-        })
-        .collect()
+    let keys = super::edit::map_key_segments(path, FORMAT)?;
+    if let Some(k) = keys.iter().copied().find(|k| k.starts_with(COMMENT_PREFIX)) {
+        return Err(FormatError::Edit {
+            format: FORMAT,
+            message: reserved_key_message(&format!("'{k}'")),
+        });
+    }
+    Ok(keys)
 }
 
 /// The JSON document tree behind the shared edit walkers (`format::edit`)
@@ -499,7 +924,7 @@ impl TemplateRenderer for JsonTemplate {
                 if !lines.is_empty() {
                     out.insert(comment_key(name), comment_value(lines));
                 }
-                let mut path = vec![WalkSegment::Key(name.to_string())];
+                let mut path = vec![PathSegment::Key(name.to_string())];
                 out.insert(name.to_string(), value_to_json(default, &mut path)?);
             }
             None => {
@@ -588,7 +1013,7 @@ fn example_object(
         let value = match &nf.field {
             Field::Leaf(leaf) => match &leaf.default {
                 Some(default) => {
-                    let mut path = vec![WalkSegment::Key(context_key.to_string())];
+                    let mut path = vec![PathSegment::Key(context_key.to_string())];
                     value_to_json(default, &mut path)?
                 }
                 None => placeholder_value(&leaf.ty),
@@ -644,7 +1069,7 @@ fn compact(json: &Json) -> String {
 /// Render one owned value as inline JSON (for `Allowed:` enum listings),
 /// naming `key` in conversion errors.
 fn inline_json(value: &Value, key: &str) -> Result<String, FormatError> {
-    let mut path = vec![WalkSegment::Key(key.to_string())];
+    let mut path = vec![PathSegment::Key(key.to_string())];
     Ok(compact(&value_to_json(value, &mut path)?))
 }
 
@@ -694,8 +1119,8 @@ mod tests {
     #[test]
     fn json_adapter_declares_its_matrix_rows() {
         // The ADR-0002 matrix has no refusal rows for JSON, so the adapter
-        // declares every implemented operation. SpanIndex stays undeclared
-        // (and refuses typed) until the provenance epic builds the index.
+        // declares every implemented operation. Spans ride on parse
+        // (ADR-0005), not a separate operation.
         for operation in [
             Operation::Parse,
             Operation::Template,
@@ -710,11 +1135,6 @@ mod tests {
                 "json should declare {operation}"
             );
         }
-        assert!(!JsonAdapter.supports(Operation::SpanIndex));
-        assert!(matches!(
-            JsonAdapter.span_index("{}").unwrap_err(),
-            FormatError::Unsupported(_)
-        ));
     }
 
     // --- parse: direct rows ----------------------------------------------
@@ -723,7 +1143,8 @@ mod tests {
     fn parse_scalars_and_containers() {
         let value = JsonAdapter
             .parse(r#"{"s": "x", "i": 3, "f": 1.5, "b": true, "t": {"n": 1, "arr": [1, 2]}}"#)
-            .unwrap();
+            .unwrap()
+            .value;
         let map = value.as_map().unwrap();
         assert_eq!(map["s"], Value::String("x".into()));
         assert_eq!(map["i"], Value::Integer(3));
@@ -741,7 +1162,8 @@ mod tests {
     fn parse_number_forms() {
         let value = JsonAdapter
             .parse(r#"{"exp": 1e3, "neg": -7, "max": 9223372036854775807}"#)
-            .unwrap();
+            .unwrap()
+            .value;
         let map = value.as_map().unwrap();
         // An exponent literal is a float, an integer literal an integer.
         assert_eq!(map["exp"], Value::Float(1000.0));
@@ -750,9 +1172,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_string_escapes_and_surrogate_pairs() {
+        let value = JsonAdapter
+            .parse(r#"{"s": "a\"b\\c\/d\n\u0041\uD83D\uDE00"}"#)
+            .unwrap()
+            .value;
+        assert_eq!(
+            value.as_map().unwrap()["s"],
+            Value::String("a\"b\\c/d\nA😀".into())
+        );
+    }
+
+    #[test]
     fn parse_whitespace_only_is_empty_map() {
-        assert_eq!(JsonAdapter.parse("").unwrap(), Value::Map(Map::new()));
-        assert_eq!(JsonAdapter.parse("  \n\t").unwrap(), Value::Map(Map::new()));
+        assert_eq!(JsonAdapter.parse("").unwrap().value, Value::Map(Map::new()));
+        assert_eq!(
+            JsonAdapter.parse("  \n\t").unwrap().value,
+            Value::Map(Map::new())
+        );
     }
 
     #[test]
@@ -761,7 +1198,7 @@ mod tests {
         // non-map roots with one shared error); the adapter maps what the
         // text says.
         assert_eq!(
-            JsonAdapter.parse("[1, 2]").unwrap(),
+            JsonAdapter.parse("[1, 2]").unwrap().value,
             Value::Array(vec![Value::Integer(1), Value::Integer(2)])
         );
     }
@@ -784,7 +1221,8 @@ mod tests {
                     "servers": [{"//name": "docs in an array element", "name": "a"}]
                 }"#,
             )
-            .unwrap();
+            .unwrap()
+            .value;
         let map = value.as_map().unwrap();
         assert_eq!(
             map.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -806,7 +1244,8 @@ mod tests {
         // comment value must not trip the mapping-table errors.
         let value = JsonAdapter
             .parse(r#"{"//weird": null, "//huge": 18446744073709551615, "ok": 1}"#)
-            .unwrap();
+            .unwrap()
+            .value;
         assert_eq!(
             value
                 .as_map()
@@ -822,10 +1261,13 @@ mod tests {
 
     #[test]
     fn parse_null_is_typed_error_naming_key_and_advising_absence() {
-        let err = JsonAdapter.parse(r#"{"db": {"url": null}}"#).unwrap_err();
+        let source = r#"{"db": {"url": null}}"#;
+        let err = JsonAdapter.parse(source).unwrap_err();
         match err {
             FormatError::Parse {
-                format, message, ..
+                format,
+                message,
+                span,
             } => {
                 assert_eq!(format, "json");
                 assert!(message.contains("'db.url'"), "names the key: {message}");
@@ -833,6 +1275,8 @@ mod tests {
                     message.contains("absence expresses unset"),
                     "advises absence: {message}"
                 );
+                let span = span.expect("null carries the token span");
+                assert_eq!(&source[span.start..span.end], "null");
             }
             other => panic!("expected Parse, got {other:?}"),
         }
@@ -840,24 +1284,28 @@ mod tests {
 
     #[test]
     fn parse_null_in_array_names_indexed_path() {
-        let err = JsonAdapter.parse(r#"{"xs": [1, null]}"#).unwrap_err();
+        let source = r#"{"xs": [1, null]}"#;
+        let err = JsonAdapter.parse(source).unwrap_err();
         assert!(
             err.detail().contains("'xs[1]'"),
             "names the element: {}",
             err.detail()
         );
+        let span = err.parse_span().expect("null carries the token span");
+        assert_eq!(&source[span.start..span.end], "null");
     }
 
     #[test]
     fn parse_integer_outside_i64_is_typed_error_naming_key() {
         // i64::MAX + 1 — lexically an integer, outside the value model.
-        let err = JsonAdapter
-            .parse(r#"{"big": 9223372036854775808}"#)
-            .unwrap_err();
+        let source = r#"{"big": 9223372036854775808}"#;
+        let err = JsonAdapter.parse(source).unwrap_err();
         match err {
-            FormatError::Parse { message, .. } => {
+            FormatError::Parse { message, span, .. } => {
                 assert!(message.contains("'big'"), "names the key: {message}");
                 assert!(message.contains("out of range"), "{message}");
+                let span = span.expect("out-of-range integer carries its lexeme span");
+                assert_eq!(&source[span.start..span.end], "9223372036854775808");
             }
             other => panic!("expected Parse, got {other:?}"),
         }
@@ -867,14 +1315,15 @@ mod tests {
     fn parse_integer_below_i64_is_typed_error_naming_key() {
         // i64::MIN - 1 — the negative side of the range check. Without the
         // lexical form this would silently coerce to a float.
-        let err = JsonAdapter
-            .parse(r#"{"low": -9223372036854775809}"#)
-            .unwrap_err();
+        let source = r#"{"low": -9223372036854775809}"#;
+        let err = JsonAdapter.parse(source).unwrap_err();
         match err {
-            FormatError::Parse { message, .. } => {
+            FormatError::Parse { message, span, .. } => {
                 assert!(message.contains("'low'"), "names the key: {message}");
                 assert!(message.contains("out of range"), "{message}");
                 assert!(message.contains("-9223372036854775809"), "{message}");
+                let span = span.expect("out-of-range integer carries its lexeme span");
+                assert_eq!(&source[span.start..span.end], "-9223372036854775809");
             }
             other => panic!("expected Parse, got {other:?}"),
         }
@@ -884,19 +1333,23 @@ mod tests {
     fn parse_integer_above_u64_is_typed_error_naming_key() {
         // u64::MAX + 1 — beyond even serde_json's u64 fallback, still an
         // integer literal, still a typed error.
-        let err = JsonAdapter
-            .parse(r#"{"big": 18446744073709551616}"#)
-            .unwrap_err();
+        let source = r#"{"big": 18446744073709551616}"#;
+        let err = JsonAdapter.parse(source).unwrap_err();
         assert!(err.detail().contains("'big'"), "{}", err.detail());
         assert!(err.detail().contains("out of range"), "{}", err.detail());
+        let span = err.parse_span().expect("lexeme span");
+        assert_eq!(&source[span.start..span.end], "18446744073709551616");
     }
 
     #[test]
     fn parse_float_overflowing_f64_is_typed_error() {
         // A float literal too large for f64 must not become infinity.
-        let err = JsonAdapter.parse(r#"{"huge": 1e999}"#).unwrap_err();
+        let source = r#"{"huge": 1e999}"#;
+        let err = JsonAdapter.parse(source).unwrap_err();
         assert!(err.detail().contains("'huge'"), "{}", err.detail());
         assert!(err.detail().contains("out of range"), "{}", err.detail());
+        let span = err.parse_span().expect("lexeme span");
+        assert_eq!(&source[span.start..span.end], "1e999");
     }
 
     #[test]
@@ -944,9 +1397,9 @@ mod tests {
 
     #[test]
     fn parse_syntax_error_span_is_byte_accurate_after_multibyte_chars() {
-        // serde_json's column is a byte offset; with a multi-byte char
-        // earlier on the line the span must still land on the offending
-        // token, on valid char boundaries (slicing must not panic).
+        // The walker tracks byte offsets; with a multi-byte char earlier
+        // on the line the span must still land on the offending token,
+        // on valid char boundaries (slicing must not panic).
         let source = "{\"héllo\": }";
         let err = JsonAdapter.parse(source).unwrap_err();
         let FormatError::Parse { span, .. } = err else {
@@ -956,15 +1409,220 @@ mod tests {
         assert_eq!(&source[span.start..span.end], "}", "span: {span:?}");
     }
 
+    // --- parse: span index (ADR-0005 / ADR-0006 / ADR-0007) ---------------
+
+    /// Collect every path in `value`, root first — the set a successful
+    /// parse's span index must cover.
+    fn collect_paths(value: &Value) -> Vec<ConfigPath> {
+        fn walk(value: &Value, prefix: ConfigPath, out: &mut Vec<ConfigPath>) {
+            out.push(prefix.clone());
+            match value {
+                Value::Map(map) => {
+                    for (key, child) in map {
+                        walk(child, prefix.clone().key(key), out);
+                    }
+                }
+                Value::Array(items) => {
+                    for (i, child) in items.iter().enumerate() {
+                        walk(child, prefix.clone().index(i), out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(value, ConfigPath::new(), &mut out);
+        out
+    }
+
+    fn entry_at<'a>(
+        spans: &'a BTreeMap<ConfigPath, SpanEntry>,
+        path: &ConfigPath,
+    ) -> &'a SpanEntry {
+        spans
+            .get(path)
+            .unwrap_or_else(|| panic!("missing span for {path}"))
+    }
+
+    fn slice(source: &str, span: Span) -> &str {
+        &source[span.start..span.end]
+    }
+
+    #[test]
+    fn parse_span_index_covers_every_path_in_nested_objects_and_arrays() {
+        // Compact source so every token is unique and the slices lock
+        // exact ranges. The unknown-key demo case lives at servers[0].kind.
+        let source = r#"{"db":{"url":"pg://x"},"servers":[{"name":"a","kind":"rus"}]}"#;
+        let parsed = JsonAdapter.parse(source).unwrap();
+        let paths = collect_paths(&parsed.value);
+        assert_eq!(
+            parsed.spans.len(),
+            paths.len(),
+            "index paths: {:?}",
+            parsed
+                .spans
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+        for path in &paths {
+            assert!(parsed.spans.contains_key(path), "span index missing {path}");
+        }
+
+        let root = entry_at(&parsed.spans, &ConfigPath::new());
+        assert!(root.key.is_none(), "root has no key token");
+        assert_eq!(slice(source, root.value), source);
+
+        let db = entry_at(&parsed.spans, &ConfigPath::new().key("db"));
+        assert_eq!(slice(source, db.key.expect("map member")), r#""db""#);
+        assert_eq!(slice(source, db.value), r#"{"url":"pg://x"}"#);
+
+        let url = entry_at(&parsed.spans, &ConfigPath::new().key("db").key("url"));
+        assert_eq!(slice(source, url.key.expect("map member")), r#""url""#);
+        assert_eq!(slice(source, url.value), r#""pg://x""#);
+
+        let servers = entry_at(&parsed.spans, &ConfigPath::new().key("servers"));
+        assert_eq!(
+            slice(source, servers.key.expect("map member")),
+            r#""servers""#
+        );
+        assert_eq!(
+            slice(source, servers.value),
+            r#"[{"name":"a","kind":"rus"}]"#
+        );
+
+        let server0 = entry_at(&parsed.spans, &ConfigPath::new().key("servers").index(0));
+        assert!(
+            server0.key.is_none(),
+            "array elements have no key token (ADR-0006)"
+        );
+        assert_eq!(slice(source, server0.value), r#"{"name":"a","kind":"rus"}"#);
+
+        let name = entry_at(
+            &parsed.spans,
+            &ConfigPath::new().key("servers").index(0).key("name"),
+        );
+        assert_eq!(slice(source, name.key.expect("map member")), r#""name""#);
+        assert_eq!(slice(source, name.value), r#""a""#);
+    }
+
+    #[test]
+    fn parse_unknown_key_inside_array_of_objects_has_key_span() {
+        // Demo lock for WS04: a JSON unknown key inside an array of
+        // objects has a correct key span. The caret itself is WS02's
+        // unknown-key wiring; this branch locks the index.
+        let source = r#"{"servers":[{"name":"a","kind":"rus"}]}"#;
+        let parsed = JsonAdapter.parse(source).unwrap();
+        let kind = entry_at(
+            &parsed.spans,
+            &ConfigPath::new().key("servers").index(0).key("kind"),
+        );
+        let key = kind.key.expect("object member has a key span");
+        assert_eq!(slice(source, key), r#""kind""#);
+        assert_eq!(slice(source, kind.value), r#""rus""#);
+    }
+
+    #[test]
+    fn parse_comment_keys_are_absent_from_the_span_index() {
+        let source = r#"{
+            "//": "top",
+            "//host": "docs",
+            "host": "localhost",
+            "db": {"//url": "docs", "url": "pg://x"},
+            "servers": [{"//name": "docs", "name": "a"}]
+        }"#;
+        let parsed = JsonAdapter.parse(source).unwrap();
+        assert!(
+            parsed.spans.keys().all(|path| {
+                path.segments().iter().all(|seg| match seg {
+                    PathSegment::Key(k) => !k.starts_with(COMMENT_PREFIX),
+                    PathSegment::Index(_) => true,
+                })
+            }),
+            "comment keys leaked into the index: {:?}",
+            parsed
+                .spans
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+        for path in collect_paths(&parsed.value) {
+            assert!(
+                parsed.spans.contains_key(&path),
+                "span index missing {path}"
+            );
+        }
+        assert!(
+            parsed.spans.contains_key(&ConfigPath::new().key("host")),
+            "real keys stay in the index"
+        );
+        assert!(!parsed.spans.contains_key(&ConfigPath::new().key("//")));
+        assert!(!parsed.spans.contains_key(&ConfigPath::new().key("//host")));
+        assert!(
+            !parsed
+                .spans
+                .contains_key(&ConfigPath::new().key("db").key("//url"))
+        );
+    }
+
+    #[test]
+    fn parse_span_index_skips_whitespace_around_tokens() {
+        let source = "{ \"host\" : \"x\" }";
+        let parsed = JsonAdapter.parse(source).unwrap();
+        let host = entry_at(&parsed.spans, &ConfigPath::new().key("host"));
+        assert_eq!(slice(source, host.key.expect("map member")), r#""host""#);
+        assert_eq!(slice(source, host.value), r#""x""#);
+    }
+
+    #[test]
+    fn parse_literal_dotted_key_is_one_segment_in_the_span_index() {
+        let source = r#"{"a.b": 1}"#;
+        let parsed = JsonAdapter.parse(source).unwrap();
+        let literal = ConfigPath::new().key("a.b");
+        let nested = ConfigPath::new().key("a").key("b");
+        let entry = entry_at(&parsed.spans, &literal);
+        assert_eq!(slice(source, entry.key.expect("map member")), r#""a.b""#);
+        assert_eq!(slice(source, entry.value), "1");
+        assert!(!parsed.spans.contains_key(&nested));
+    }
+
+    #[test]
+    fn parse_duplicate_key_keeps_the_last_value_and_its_spans() {
+        let source = r#"{"a":{"x":1},"a":{"y":2}}"#;
+        let parsed = JsonAdapter.parse(source).unwrap();
+        assert_eq!(
+            parsed.value.as_map().unwrap()["a"]
+                .as_map()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["y"]
+        );
+        let a = entry_at(&parsed.spans, &ConfigPath::new().key("a"));
+        assert_eq!(slice(source, a.value), r#"{"y":2}"#);
+        assert!(
+            parsed
+                .spans
+                .contains_key(&ConfigPath::new().key("a").key("y"))
+        );
+        assert!(
+            !parsed
+                .spans
+                .contains_key(&ConfigPath::new().key("a").key("x")),
+            "replaced subtree must not linger in the index"
+        );
+    }
+
     // --- serialize --------------------------------------------------------
 
     #[test]
     fn serialize_round_trips_parse() {
         let source = r#"{"b": true, "i": 3, "s": "x", "t": {"n": 1}}"#;
-        let value = JsonAdapter.parse(source).unwrap();
+        let value = JsonAdapter.parse(source).unwrap().value;
         let text = JsonAdapter.serialize(&value).unwrap();
         assert!(text.ends_with('\n'));
-        let reparsed = JsonAdapter.parse(&text).unwrap();
+        let reparsed = JsonAdapter.parse(&text).unwrap().value;
         assert_eq!(value, reparsed);
     }
 
@@ -1221,7 +1879,7 @@ mod tests {
         // schema key with its default value.
         use crate::fixtures::test::test_schema;
         let text = JsonAdapter.template(&test_schema()).unwrap();
-        let value = JsonAdapter.parse(&text).unwrap();
+        let value = JsonAdapter.parse(&text).unwrap().value;
         let map = value.as_map().unwrap();
         assert_eq!(
             map.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -1290,7 +1948,7 @@ mod tests {
         assert!(edited.contains(r#""//": "file prose""#));
         assert!(edited.contains(r#""//port": "docs""#));
         // And parse still owns the namespace: comments never reach the tree.
-        let tree = JsonAdapter.parse(&edited).unwrap();
+        let tree = JsonAdapter.parse(&edited).unwrap().value;
         let map = tree.as_map().unwrap();
         assert_eq!(map.keys().map(String::as_str).collect::<Vec<_>>(), ["port"]);
         assert_eq!(map["port"], Value::Integer(2));
@@ -1365,7 +2023,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let reparsed = JsonAdapter.parse(&out).unwrap();
+        let reparsed = JsonAdapter.parse(&out).unwrap().value;
         assert_eq!(
             reparsed.as_map().unwrap()["database"].as_map().unwrap()["url"],
             Value::String("pg://x".into())
@@ -1388,6 +2046,28 @@ mod tests {
             .unwrap_err();
         match err {
             FormatError::Edit { message, .. } => assert!(message.contains("path conflict")),
+            other => panic!("expected Edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_indexed_path_is_typed_error() {
+        let path = ConfigPath::new().key("plugins").index(0).key("host");
+        let value = Value::from("x");
+        let err = JsonAdapter
+            .edit(
+                "{}",
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap_err();
+        match err {
+            FormatError::Edit { message, .. } => {
+                assert!(message.contains("[0]"), "{message}");
+            }
             other => panic!("expected Edit, got {other:?}"),
         }
     }
@@ -1447,7 +2127,7 @@ mod tests {
             out.contains(r#""//host": "The application host.""#),
             "{out}"
         );
-        let tree = JsonAdapter.parse(&out).unwrap();
+        let tree = JsonAdapter.parse(&out).unwrap().value;
         assert_eq!(tree.as_map().unwrap()["port"], Value::Integer(9090));
     }
 }

@@ -2,12 +2,18 @@
 //! config table.
 //!
 //! Operates on pre-loaded data (`ResolveInput`) with no I/O, making the full
-//! pipeline testable with synthetic inputs. Steps:
+//! pipeline testable with synthetic inputs (files, env, and the discovery
+//! probe record). Steps:
 //!
 //! 1. Build each layer independently (files, env, URL, CLI)
 //! 2. Merge layers in the configured order (default: files < env < URL < CLI)
 //! 3. Finalize the merged table against the schema (defaults +
 //!    required-field and type checks, via [`crate::schema_walk`])
+//!
+//! Each stage emits structured `tracing` events (target `"clapfig"`):
+//! discovery probes, parse, layer construction, overlay wins (origins and
+//! value types, never values), defaults filled, validation. `debug` is
+//! per-stage summaries; `info` and above stay silent on a healthy load.
 //!
 //! The layer order is configurable via [`ResolveInput::layer_order`]. Both
 //! entry points — `Clapfig::builder(schema)` and the derive-driven
@@ -18,10 +24,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::env;
-use crate::error::ClapfigError;
-use crate::format::{self, FormatRegistry};
+use crate::error::{ClapfigError, DiscoveryRecord};
+use crate::format::{self, ConfigPath, FormatRegistry};
 use crate::merge::deep_merge;
-use crate::normalize::{normalize_key, normalize_table};
+use crate::normalize::{normalize_key, normalize_table_and_spans};
+use crate::origin::{Origin, OriginMap, origin_map_from_env, origin_map_from_file};
 use crate::overrides;
 use crate::runtime::Schema;
 use crate::schema_walk;
@@ -43,7 +50,14 @@ pub(crate) struct ResolveInput<'a> {
     /// silent parse under another format.
     pub registry: &'a FormatRegistry,
     /// File contents in precedence order: first = lowest priority, last = highest.
+    /// Loaded files only — misses and unprobed candidates live on
+    /// [`discovery`](Self::discovery), not here.
     pub files: Vec<(PathBuf, String)>,
+    /// Every candidate probe (loaded / missing / error / not probed) plus
+    /// which non-file input types were consulted. Attached to
+    /// [`ClapfigError::MissingRequired`]. Injectable so this walk stays
+    /// I/O-free; production discovery fills it from the real search.
+    pub discovery: DiscoveryRecord,
     /// Raw environment variable pairs (pass `std::env::vars().collect()` or synthetic data).
     pub env_vars: Vec<(String, String)>,
     /// Env var prefix (e.g. `"MYAPP"`). `None` means env disabled.
@@ -76,17 +90,22 @@ pub(crate) struct ResolveInput<'a> {
 
 /// Rewrite the dotted-key half of each override pair, applying the same
 /// `-` → `_` rule as [`normalize_table`]. Used so CLI/URL-supplied keys land
-/// in the same shape as keys coming from normalized config files.
+/// in the same shape as keys coming from normalized config files. The
+/// original spelling is retained for origin facts.
 fn normalize_override_keys(
     entries: &[(String, Value)],
     normalize_keys: bool,
-) -> Vec<(String, Value)> {
-    if !normalize_keys {
-        return entries.to_vec();
-    }
+) -> Vec<(String, String, Value)> {
     entries
         .iter()
-        .map(|(k, v)| (normalize_key(k), v.clone()))
+        .map(|(k, v)| {
+            let merge_key = if normalize_keys {
+                normalize_key(k)
+            } else {
+                k.clone()
+            };
+            (merge_key, k.clone(), v.clone())
+        })
         .collect()
 }
 
@@ -119,7 +138,6 @@ pub(crate) fn resolve(
         overrides: &input.strict_overrides,
         default_strict: input.strict_default,
         callback: input.unknown_key_hook.as_ref(),
-        normalize_keys: input.normalize_keys,
     };
 
     // Skip validation entirely when no path through the cascade can ever
@@ -134,12 +152,26 @@ pub(crate) fn resolve(
     // strict outcomes never calls it.
     let cascade_active = input.strict_default || input.strict_overrides.has_any_strict();
 
+    // Default order: Files < Env < Url < Cli. Resolved before layer
+    // construction so omitting a layer excludes it entirely — including
+    // unknown-key validation. Building the env table first used to
+    // reject `APP__ROGUE` even when `Layer::Env` was not in the order;
+    // the files table had the same hole (parse + unknown-key still ran
+    // when `Layer::Files` was omitted).
+    let default_order = default_layer_order();
+    let order = input.layer_order.as_deref().unwrap_or(&default_order);
+
+    crate::trace::discovery_complete(&input.discovery);
+
     // Files layer: parse → (optionally) normalize → validate → merge.
     // Validation runs against the parsed Table — never the raw text — so
     // normalized keys are checked in the same form they will reach the merge.
+    // Origin trees are built after normalize so lookup keys match the
+    // value tree; span bytes still point at the user's original spelling.
     let mut collected_unknowns: Vec<CollectedUnknown> = Vec::new();
-    let files_table = {
+    let (files_table, files_origins) = if order.contains(&Layer::Files) {
         let mut t = Map::new();
+        let mut origins = OriginMap::new();
         for (path, content) in &input.files {
             // Extensionless (rc-style) names fall back to the preferred
             // adapter; an extension no enabled adapter claims is a hard
@@ -163,27 +195,35 @@ pub(crate) fn resolve(
                     })?
                 }
             };
+            let source: Arc<str> = Arc::from(content.as_str());
             let parsed = adapter
                 .parse(content)
                 .map_err(|e| ClapfigError::ParseError {
                     path: path.clone(),
                     source: Box::new(e),
-                    source_text: Some(Arc::from(content.as_str())),
+                    source_text: Some(Arc::clone(&source)),
                 })?;
-            let mut table = match parsed {
+            crate::trace::parsed_file(path, adapter.name());
+            let mut table = match parsed.value {
                 Value::Map(map) => map,
                 other => {
+                    let span = parsed.spans.get(&ConfigPath::new()).map(|e| e.value);
                     return Err(ClapfigError::InvalidValue {
                         key: path.display().to_string(),
                         reason: format!(
                             "config documents must be maps at the root, got {}",
                             other.type_str()
                         ),
+                        origin: Box::new(
+                            Origin::file_with_span(path.clone(), span, source).to_facts(),
+                        ),
                     });
                 }
             };
+            let mut spans = parsed.spans;
             if input.normalize_keys {
-                normalize_table(&mut table).map_err(|c| c.into_error(path))?;
+                normalize_table_and_spans(&mut table, &mut spans)
+                    .map_err(|c| c.into_error(path))?;
             }
             if cascade_active {
                 let mut per_file = validate_unknown(
@@ -192,22 +232,20 @@ pub(crate) fn resolve(
                     &UnknownKeySource::File {
                         path,
                         source: content,
+                        spans: &spans,
                     },
                     &validate_ctx,
                 )?;
                 collected_unknowns.append(&mut per_file);
             }
-            t = deep_merge(t, table);
+            let file_origins = origin_map_from_file(&table, &spans, path, &source);
+            (t, origins) = deep_merge(t, table, origins, file_origins);
         }
-        t
+        crate::trace::files_layer_constructed(input.files.len(), t.len());
+        (t, origins)
+    } else {
+        (Map::new(), OriginMap::new())
     };
-
-    // Default order: Files < Env < Url < Cli. Resolved before layer
-    // construction so omitting a layer excludes it entirely — including
-    // unknown-key validation. Building the env table first used to
-    // reject `APP__ROGUE` even when `Layer::Env` was not in the order.
-    let default_order = default_layer_order();
-    let order = input.layer_order.as_deref().unwrap_or(&default_order);
 
     // Env layer. Sources travel with the table so unknown-key errors
     // name the exact variable that produced each path, not a
@@ -236,7 +274,7 @@ pub(crate) fn resolve(
     // mismatches between env's heuristic value parsing (e.g. string
     // "1.5" for an integer field) don't fail validation — that's
     // still the job of the final-merge type check inside `finalize`.
-    if cascade_active && let Some((env_table_ref, sources)) = env_layer.as_ref() {
+    if cascade_active && let Some((env_table_ref, sources, _)) = env_layer.as_ref() {
         let mut env_filtered = validate_unknown(
             env_table_ref,
             input.schema,
@@ -245,49 +283,63 @@ pub(crate) fn resolve(
         )?;
         collected_unknowns.append(&mut env_filtered);
     }
-    let env_table = env_layer.map(|(table, _)| table);
+    let env_layer = env_layer.map(|(table, _, winners)| {
+        crate::trace::env_layer_constructed(table.len());
+        let origins = origin_map_from_env(&table, &winners);
+        (table, origins)
+    });
 
-    // URL layer
+    // URL / CLI layers. Construction and the `* layer constructed` summary
+    // both gate on membership, matching files and env: omitting a layer
+    // excludes it entirely, so a populated-but-omitted input must not
+    // narrate a layer that will never merge.
     #[cfg(feature = "url")]
-    let url_table = if input.url_overrides.is_empty() {
+    let url_layer = if !order.contains(&Layer::Url) || input.url_overrides.is_empty() {
         None
     } else {
-        Some(overrides::overrides_to_table(&normalize_override_keys(
-            &input.url_overrides,
-            input.normalize_keys,
-        )))
+        let layer = overrides::overrides_to_table_with_original_keys(
+            &normalize_override_keys(&input.url_overrides, input.normalize_keys),
+            |k| Origin::url(k),
+        );
+        crate::trace::url_layer_constructed(layer.0.len());
+        Some(layer)
     };
 
-    // CLI layer
-    let cli_table = if input.cli_overrides.is_empty() {
+    let cli_layer = if !order.contains(&Layer::Cli) || input.cli_overrides.is_empty() {
         None
     } else {
-        Some(overrides::overrides_to_table(&normalize_override_keys(
-            &input.cli_overrides,
-            input.normalize_keys,
-        )))
+        let layer = overrides::overrides_to_table_with_original_keys(
+            &normalize_override_keys(&input.cli_overrides, input.normalize_keys),
+            |k| Origin::r#override(k),
+        );
+        crate::trace::cli_layer_constructed(layer.0.len());
+        Some(layer)
     };
 
     // Merge layers in the specified order (first = lowest priority)
     let mut merged = Map::new();
+    let mut origins = OriginMap::new();
     for layer in order {
-        let table = match layer {
-            Layer::Files => Some(files_table.clone()),
-            Layer::Env => env_table.clone(),
+        let table_and_origins = match layer {
+            Layer::Files => Some((files_table.clone(), files_origins.clone())),
+            Layer::Env => env_layer.clone(),
             #[cfg(feature = "url")]
-            Layer::Url => url_table.clone(),
-            Layer::Cli => cli_table.clone(),
+            Layer::Url => url_layer.clone(),
+            Layer::Cli => cli_layer.clone(),
         };
-        if let Some(t) = table {
-            merged = deep_merge(merged, t);
+        if let Some((t, layer_origins)) = table_and_origins {
+            (merged, origins) = deep_merge(merged, t, origins, layer_origins);
         }
     }
+    crate::trace::merge_complete(merged.len());
 
     // Schema-driven default injection: populate the table from the schema's
     // declared defaults so `finalize` only has to check required fields.
-    schema_walk::fill_defaults_into(&mut merged, input.schema);
+    // Default origins fill in the same walk (ADR-0004).
+    schema_walk::fill_defaults_into(&mut merged, &mut origins, input.schema);
 
-    let output = schema_walk::finalize(merged, input.schema)?;
+    let output = schema_walk::finalize(merged, &origins, input.schema, &input.discovery)?;
+    crate::trace::validation_complete();
     Ok((output, collected_unknowns))
 }
 
@@ -310,11 +362,22 @@ mod tests {
         })
     }
 
+    fn yaml_registry() -> &'static FormatRegistry {
+        use std::sync::OnceLock;
+        static REGISTRY: OnceLock<FormatRegistry> = OnceLock::new();
+        REGISTRY.get_or_init(|| {
+            let mut r = FormatRegistry::new();
+            r.register(Box::new(crate::format::YamlAdapter));
+            r
+        })
+    }
+
     fn empty_input(schema: &Schema) -> ResolveInput<'_> {
         ResolveInput {
             schema,
             registry: toml_only_registry(),
             files: vec![],
+            discovery: DiscoveryRecord::empty(),
             env_vars: vec![],
             env_prefix: None,
             #[cfg(feature = "url")]
@@ -508,6 +571,55 @@ mod tests {
     }
 
     #[test]
+    fn toml_unknown_key_in_array_of_tables_carets_the_right_line() {
+        use crate::runtime::Field;
+        let schema = Schema::object("App")
+            .array_of(
+                "servers",
+                Schema::object("Server").field("host", Field::string().optional()),
+            )
+            .build();
+        let source = "[[servers]]\nhost = \"a\"\n[[servers]]\nrogue = 1\n";
+        let input = ResolveInput {
+            files: vec![("config.toml".into(), source.into())],
+            ..empty_input(&schema)
+        };
+        let err = resolve(input).unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].key, "servers[1].rogue");
+        assert_eq!(keys[0].line, 4);
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&source[span.start..span.end], "rogue");
+        let out = crate::render::render_plain(&err);
+        assert!(out.contains("rogue = 1"), "{out}");
+        assert!(out.contains(":4"), "{out}");
+    }
+
+    #[test]
+    fn toml_unknown_under_quoted_dotted_map_of_key_carets_the_key() {
+        use crate::runtime::Field;
+        let schema = Schema::object("App")
+            .map_of(
+                "plugins",
+                Schema::object("Plugin").field("host", Field::string().optional()),
+            )
+            .build();
+        let source = "[plugins.\"acme.prod\"]\nrogue = 1\n";
+        let input = ResolveInput {
+            files: vec![("config.toml".into(), source.into())],
+            ..empty_input(&schema)
+        };
+        let err = resolve(input).unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].line, 2);
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&source[span.start..span.end], "rogue");
+        let out = crate::render::render_plain(&err);
+        assert!(out.contains("rogue = 1"), "{out}");
+        assert!(out.contains(":2"), "{out}");
+    }
+
+    #[test]
     fn env_unknown_key_rejected_when_strict() {
         // Issue #54 item 3: env-derived unknown keys used to merge in
         // unnoticed. They now flow through the same cascade as file
@@ -587,6 +699,7 @@ mod tests {
             env_prefix: Some("MYAPP".into()),
             unknown_key_hook: Some(std::sync::Arc::new(move |ctx| {
                 if ctx.path == "rogue_key" {
+                    assert_eq!(ctx.env_var, Some("MYAPP__ROGUE_KEY"));
                     saw.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 crate::strict::UnknownKeyDecision::Accept
@@ -739,6 +852,25 @@ mod tests {
         let (table, _) = resolve(input).unwrap();
         // Env is not in layer_order, so the file value stands
         assert_eq!(get(&table, "port").unwrap().as_integer(), Some(3000));
+    }
+
+    #[test]
+    fn omitted_files_layer_ignores_unknown_file_keys() {
+        // Omitting Layer::Files excludes parse/unknown-key validation
+        // on supplied file contents — same "omit a layer to exclude it"
+        // rule as Env.
+        let spec = test_spec();
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\nrogue = 1\n".into())],
+            layer_order: Some(vec![Layer::Cli]),
+            cli_overrides: vec![("port".into(), Value::Integer(7777))],
+            ..empty_input(&spec)
+        };
+        let (table, collected) =
+            resolve(input).expect("omitted files must not fail on unknown file keys");
+        assert_eq!(get(&table, "port").unwrap().as_integer(), Some(7777));
+        assert!(collected.is_empty());
+        assert!(get(&table, "rogue").is_none());
     }
 
     #[test]
@@ -1011,5 +1143,387 @@ mod tests {
             get(&table, "database.url").unwrap().as_str(),
             Some("pg://y")
         );
+    }
+
+    fn required_name_schema() -> Schema {
+        Schema::object("Req")
+            .field("name", crate::runtime::Field::string())
+            .build()
+    }
+
+    #[test]
+    fn missing_required_uses_injected_discovery_record() {
+        // The core walk is I/O-free: probes on ResolveInput are the
+        // record MissingRequired reports, including FirstMatch's
+        // not-probed candidates. No filesystem is touched.
+        let schema = required_name_schema();
+        let discovery = DiscoveryRecord {
+            files: vec![
+                crate::error::FileProbe {
+                    path: "/etc/app.toml".into(),
+                    outcome: crate::error::ProbeOutcome::Missing,
+                },
+                crate::error::FileProbe {
+                    path: "/proj/app.toml".into(),
+                    outcome: crate::error::ProbeOutcome::NotProbed,
+                },
+            ],
+            env: true,
+            url: false,
+            overrides: true,
+        };
+        let input = ResolveInput {
+            discovery: discovery.clone(),
+            ..empty_input(&schema)
+        };
+        let err = resolve(input).unwrap_err();
+        match err {
+            ClapfigError::MissingRequired {
+                key,
+                discovery: got,
+            } => {
+                assert_eq!(key, "name");
+                assert_eq!(got, discovery);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_missing_leaf_is_missing_required_with_injected_discovery() {
+        // Parent map present from a file; required leaf absent. Same
+        // diagnostic as a top-level miss — no nearest-ancestor origin.
+        let schema = Schema::object("Req")
+            .nested(
+                "db",
+                Schema::object("Db").field("url", crate::runtime::Field::string()),
+            )
+            .build();
+        let discovery = DiscoveryRecord {
+            files: vec![crate::error::FileProbe {
+                path: "app.toml".into(),
+                outcome: crate::error::ProbeOutcome::Loaded,
+            }],
+            env: false,
+            url: false,
+            overrides: false,
+        };
+        let input = ResolveInput {
+            files: vec![("app.toml".into(), "[db]\n".into())],
+            discovery: discovery.clone(),
+            ..empty_input(&schema)
+        };
+        let err = resolve(input).unwrap_err();
+        let msg = err.to_string();
+        match err {
+            ClapfigError::MissingRequired {
+                key,
+                discovery: got,
+            } => {
+                assert_eq!(key, "db.url");
+                assert_eq!(got, discovery);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+        assert!(
+            !msg.contains("set by"),
+            "MissingRequired must not name a winning origin: {msg}"
+        );
+    }
+
+    fn assert_invalid_value<'a>(
+        err: &'a ClapfigError,
+        key: &str,
+        input_type: crate::types::InputType,
+    ) -> &'a crate::error::OriginFacts {
+        match err {
+            ClapfigError::InvalidValue {
+                key: got_key,
+                origin,
+                ..
+            } => {
+                assert_eq!(got_key, key);
+                assert_eq!(origin.input_type, Some(input_type));
+                origin.as_ref()
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_value_file_names_path_line_and_carets_the_value() {
+        let spec = test_spec();
+        let source = "port = \"not-a-number\"\n";
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), source.into())],
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "port", crate::types::InputType::File);
+        assert_eq!(
+            facts.file.as_deref(),
+            Some(std::path::Path::new("test.toml"))
+        );
+        let span = facts.span.expect("value span");
+        assert_eq!(&source[span.start..span.end], "\"not-a-number\"");
+        let msg = err.to_string();
+        assert!(msg.contains("test.toml:1"), "{msg}");
+        let out = crate::render::render_plain(&err);
+        assert!(out.contains("port = \"not-a-number\""), "{out}");
+        let caret = out.lines().find(|l| l.contains('^')).expect("{out}");
+        let caret_run = caret.chars().filter(|&c| c == '^').count();
+        assert_eq!(
+            caret_run,
+            source[span.start..span.end].chars().count(),
+            "caret should cover the value span, got: {out}"
+        );
+    }
+
+    fn assert_yaml_root_invalid(source: &str, expected_slice: &str) {
+        let spec = test_spec();
+        let input = ResolveInput {
+            registry: yaml_registry(),
+            files: vec![("app.yaml".into(), source.into())],
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "app.yaml", crate::types::InputType::File);
+        assert_eq!(
+            facts.file.as_deref(),
+            Some(std::path::Path::new("app.yaml"))
+        );
+        let span = facts.span.expect("root value span");
+        assert_eq!(&source[span.start..span.end], expected_slice);
+        let msg = err.to_string();
+        assert!(msg.contains("app.yaml:1"), "{msg}");
+        let out = crate::render::render_plain(&err);
+        let caret = out.lines().find(|l| l.contains('^')).expect("{out}");
+        let caret_run = caret.chars().filter(|&c| c == '^').count();
+        assert_eq!(
+            caret_run,
+            expected_slice.chars().count(),
+            "caret should cover the root value span, got: {out}"
+        );
+    }
+
+    #[test]
+    fn invalid_value_yaml_root_scalar_names_line_and_caret() {
+        assert_yaml_root_invalid("42\n", "42");
+    }
+
+    #[test]
+    fn invalid_value_yaml_root_array_names_line_and_caret() {
+        assert_yaml_root_invalid("[1, 2]\n", "[1, 2]");
+    }
+
+    #[test]
+    fn invalid_value_env_names_the_variable() {
+        let spec = test_spec();
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), "port = 3000\n".into())],
+            env_vars: vec![("MYAPP__PORT".into(), "not-a-number".into())],
+            env_prefix: Some("MYAPP".into()),
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "port", crate::types::InputType::Env);
+        assert_eq!(facts.env_var.as_deref(), Some("MYAPP__PORT"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("set by environment variable MYAPP__PORT"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn invalid_value_env_names_only_the_winning_variable() {
+        let spec = test_spec();
+        let input = ResolveInput {
+            env_vars: vec![
+                ("MYAPP__DATABASE__URL".into(), "postgres://ok".into()),
+                ("MYAPP__DATABASE".into(), "oops".into()),
+            ],
+            env_prefix: Some("MYAPP".into()),
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "database", crate::types::InputType::Env);
+        assert_eq!(facts.env_var.as_deref(), Some("MYAPP__DATABASE"));
+        let msg = err.to_string();
+        assert!(msg.contains("MYAPP__DATABASE"), "{msg}");
+        assert!(
+            !msg.contains("MYAPP__DATABASE__URL"),
+            "losing nested var must not appear on the origin: {msg}"
+        );
+    }
+
+    #[test]
+    fn invalid_value_env_nested_replaces_flat_origin() {
+        let spec = test_spec();
+        let input = ResolveInput {
+            env_vars: vec![
+                ("MYAPP__DATABASE".into(), "oops".into()),
+                ("MYAPP__DATABASE__POOL_SIZE".into(), "nope".into()),
+            ],
+            env_prefix: Some("MYAPP".into()),
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "database.pool_size", crate::types::InputType::Env);
+        assert_eq!(facts.env_var.as_deref(), Some("MYAPP__DATABASE__POOL_SIZE"));
+    }
+
+    #[test]
+    fn invalid_value_env_case_collision_names_last_writer() {
+        let spec = test_spec();
+        let input = ResolveInput {
+            env_vars: vec![
+                ("MYAPP__port".into(), "first".into()),
+                ("MYAPP__PORT".into(), "second".into()),
+            ],
+            env_prefix: Some("MYAPP".into()),
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "port", crate::types::InputType::Env);
+        assert_eq!(facts.env_var.as_deref(), Some("MYAPP__PORT"));
+        assert!(
+            !err.to_string().contains("MYAPP__port"),
+            "losing case variant must not appear on the origin: {}",
+            err
+        );
+    }
+
+    #[cfg(feature = "url")]
+    #[test]
+    fn invalid_value_url_names_the_query_key() {
+        let spec = test_spec();
+        let input = ResolveInput {
+            url_overrides: vec![("database.pool_size".into(), Value::String("big".into()))],
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "database.pool_size", crate::types::InputType::Url);
+        assert_eq!(facts.url_key.as_deref(), Some("database.pool_size"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("set by URL query parameter database.pool_size"),
+            "{msg}"
+        );
+    }
+
+    #[cfg(feature = "url")]
+    #[test]
+    fn invalid_value_url_keeps_percent_decoded_dotted_key() {
+        let spec = test_spec();
+        let pairs = crate::url::query_to_overrides("database.pool_size=big");
+        let input = ResolveInput {
+            url_overrides: pairs,
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "database.pool_size", crate::types::InputType::Url);
+        assert_eq!(facts.url_key.as_deref(), Some("database.pool_size"));
+    }
+
+    #[test]
+    fn invalid_value_override_names_the_override_key() {
+        let spec = test_spec();
+        let input = ResolveInput {
+            cli_overrides: vec![("port".into(), Value::String("nope".into()))],
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "port", crate::types::InputType::Override);
+        assert_eq!(facts.key.as_deref(), Some("port"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("set by a programmatic override for key port"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn invalid_value_default_names_the_schema_key() {
+        // Runtime schema whose declared default fails the leaf's enum check.
+        let schema = Schema::object("App")
+            .field(
+                "level",
+                crate::runtime::Field::enum_of(["debug", "info"]).default("verbose"),
+            )
+            .build();
+        let err = resolve(empty_input(&schema)).unwrap_err();
+        let facts = assert_invalid_value(&err, "level", crate::types::InputType::Default);
+        assert_eq!(facts.key.as_deref(), Some("level"));
+        let msg = err.to_string();
+        assert!(msg.contains("set by schema default for key level"), "{msg}");
+    }
+
+    #[test]
+    fn normalize_keys_origin_lookup_shows_user_spelling_in_snippet() {
+        let spec = test_spec();
+        let source = "[database]\npool-size = \"oops\"\n";
+        let input = ResolveInput {
+            files: vec![("test.toml".into(), source.into())],
+            normalize_keys: true,
+            ..empty_input(&spec)
+        };
+        let err = resolve(input).unwrap_err();
+        let facts = assert_invalid_value(&err, "database.pool_size", crate::types::InputType::File);
+        let span = facts.span.expect("value span");
+        assert_eq!(&source[span.start..span.end], "\"oops\"");
+        let out = crate::render::render_plain(&err);
+        assert!(out.contains("pool-size = \"oops\""), "{out}");
+        assert!(!out.contains("pool_size ="), "{out}");
+    }
+
+    #[test]
+    fn quoted_dotted_key_origin_is_not_nested_path() {
+        // Schema field names cannot contain `.` (dotted-path separator).
+        // A MapOf entry key `"a.b"` is one ConfigPath segment; nested
+        // `[a] b` is two. Origin lookup must not confuse them.
+        let quoted_schema = Schema::object("App")
+            .map_of(
+                "plugins",
+                Schema::object("Plugin").field("host", crate::runtime::Field::integer()),
+            )
+            .build();
+        let quoted = "[plugins.\"a.b\"]\nhost = \"oops\"\n";
+        let err = resolve(ResolveInput {
+            files: vec![("quoted.toml".into(), quoted.into())],
+            ..empty_input(&quoted_schema)
+        })
+        .unwrap_err();
+        let facts = assert_invalid_value(&err, "plugins.a.b.host", crate::types::InputType::File);
+        let span = facts.span.expect("value span");
+        assert_eq!(&quoted[span.start..span.end], "\"oops\"");
+        // The span lives on the quoted-key assignment, not a nested [a] b path.
+        assert!(quoted[..span.start].contains("\"a.b\""), "{quoted}");
+
+        let nested_schema = Schema::object("App")
+            .nested(
+                "a",
+                Schema::object("A").field("b", crate::runtime::Field::integer()),
+            )
+            .build();
+        let nested = "[a]\nb = \"oops\"\n";
+        let err = resolve(ResolveInput {
+            files: vec![("nested.toml".into(), nested.into())],
+            ..empty_input(&nested_schema)
+        })
+        .unwrap_err();
+        let facts = assert_invalid_value(&err, "a.b", crate::types::InputType::File);
+        let span = facts.span.expect("value span");
+        assert_eq!(&nested[span.start..span.end], "\"oops\"");
+        assert!(nested[..span.start].contains("[a]"), "{nested}");
+    }
+
+    #[test]
+    fn post_validation_failed_has_no_origin_line() {
+        let err = ClapfigError::PostValidationFailed("port too low".into());
+        let msg = err.to_string();
+        assert_eq!(msg, "Configuration validation failed: port too low");
+        assert!(!msg.contains("set by"), "{msg}");
+        assert!(!msg.contains("-->"), "{msg}");
     }
 }

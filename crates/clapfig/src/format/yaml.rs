@@ -1,10 +1,12 @@
 //! YAML format adapter — `serde_norway` parsing, `yamlpath`/`yamlpatch`
-//! editing (ADR-0003).
+//! editing (ADR-0003), `yamlpath` span index inside the same parse
+//! (ADR-0008).
 //!
 //! This file is the ONLY place in the crate (outside `Cargo.toml`) that
 //! touches the YAML crates: `serde_norway` (parse/serialize; the
 //! `yaml_serde` sibling exists solely because `yamlpatch`'s patch values
-//! are its type) and `yamlpath` + `yamlpatch` (targeted span-level edits).
+//! are its type) and `yamlpath` + `yamlpatch` (span index + targeted
+//! span-level edits).
 //!
 //! Baseline mapping (ADR-0002's table, YAML rows):
 //!
@@ -13,6 +15,13 @@
 //!   tests).
 //! - **Aliases** resolve at parse, invisible to the model; **custom tags**
 //!   and **merge keys** (`<<`) are typed errors naming the offending key.
+//!   A path that exists in source gets yamlpath's key and value ranges; a
+//!   path that exists in [`Value`] only because an alias expanded gets
+//!   the `*name` token's span for both `key` and `value` (ADR-0008),
+//!   including sequence items that exist only via expansion. Written
+//!   array elements still have `key: None` (ADR-0006). yamlpath can
+//!   follow aliases internally — this adapter does not use that, because
+//!   those spans sit on the anchor, not the alias site.
 //! - **`null`/`~`** is a typed error advising absence; an empty or
 //!   comments-only document — bare `---`/`...` document markers included —
 //!   is the empty map (absence, not null).
@@ -32,29 +41,28 @@
 //! typed [`UnsupportedByFormat`](super::UnsupportedByFormat) refusal
 //! instead of silent corruption.
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use crate::runtime::{Field, Leaf, Schema};
 use crate::value::{Map, Value};
-
-use std::collections::BTreeMap;
 
 use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
     walk_level,
 };
 use super::{
-    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
-    UnsupportedByFormat, WalkSegment, walk_label,
+    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
+    SpanEntry, UnsupportedByFormat, walk_label,
 };
 
 /// The YAML format behind the adapter contract.
 ///
-/// Declares every operation except [`Operation::SpanIndex`] (undeclared and
-/// refused typed until the provenance epic builds the index). The declared
-/// edit operations still refuse specific shapes at runtime — sequence-item
-/// edits and flow-style shapes the patch stack cannot rewrite honestly —
-/// per ADR-0002's known-refusals row; see the [module docs](self).
+/// Declares every ADR-0002 matrix row; known refusals are shape-level,
+/// inside the declared edits — sequence-item edits and flow-style shapes
+/// the patch stack cannot rewrite honestly. Span indexing rides on
+/// [`parse`](YamlAdapter::parse) (ADR-0005): the same call fills
+/// [`Parsed::spans`] via `yamlpath` (ADR-0008). See the [module docs](self).
 pub struct YamlAdapter;
 
 impl FormatAdapter for YamlAdapter {
@@ -67,8 +75,6 @@ impl FormatAdapter for YamlAdapter {
     }
 
     fn capabilities(&self) -> &'static [Operation] {
-        // The provenance epic adds Operation::SpanIndex when it
-        // implements span_index.
         &[
             Operation::Parse,
             Operation::Template,
@@ -91,17 +97,19 @@ impl FormatAdapter for YamlAdapter {
         format!("{}: {value}", inline_scalar(key))
     }
 
-    fn parse(&self, text: &str) -> Result<Value, FormatError> {
+    fn parse(&self, text: &str) -> Result<Parsed, FormatError> {
         // An empty or comments-only file (bare document markers included)
         // is an empty config: absence, not null. serde_norway would read
         // these as a root Null (or reject a lone `...`); only a document
         // with actual non-comment content gets the null error below.
         if is_blank_or_comments(text) {
-            return Ok(Value::Map(Map::new()));
+            return Ok(Parsed::from_value(Value::Map(Map::new())));
         }
         let raw: serde_norway::Value =
             serde_norway::from_str(text).map_err(|e| parse_error(&e, text))?;
-        norway_to_value(raw, &mut Vec::new())
+        let value = norway_to_value(raw, &mut Vec::new())?;
+        let spans = yaml_span_index(text, &value);
+        Ok(Parsed { value, spans })
     }
 
     fn serialize(&self, value: &Value) -> Result<String, FormatError> {
@@ -127,23 +135,14 @@ impl FormatAdapter for YamlAdapter {
         let operation = edit.operation();
         match edit {
             FileEdit::Set { path, value, .. } => {
-                let keys = key_segments(path);
+                let keys = key_segments(path)?;
                 set_in_source(source, &keys, value, operation)
             }
             FileEdit::Unset { path } => {
-                let keys = key_segments(path);
+                let keys = key_segments(path)?;
                 unset_in_source(source, &keys)
             }
         }
-    }
-
-    fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
-        // Provenance epic: build the path → span index from parser spans.
-        Err(UnsupportedByFormat {
-            format: self.name(),
-            operation: Operation::SpanIndex,
-        }
-        .into())
     }
 }
 
@@ -209,7 +208,7 @@ fn mapping_error(message: String) -> FormatError {
 /// error.
 fn norway_to_value(
     value: serde_norway::Value,
-    path: &mut Vec<WalkSegment>,
+    path: &mut Vec<PathSegment>,
 ) -> Result<Value, FormatError> {
     match value {
         serde_norway::Value::Null => Err(mapping_error(format!(
@@ -240,7 +239,7 @@ fn norway_to_value(
         serde_norway::Value::Sequence(items) => {
             let mut array = Vec::with_capacity(items.len());
             for (i, item) in items.into_iter().enumerate() {
-                path.push(WalkSegment::Index(i));
+                path.push(PathSegment::Index(i));
                 let converted = norway_to_value(item, path)?;
                 path.pop();
                 array.push(converted);
@@ -263,7 +262,7 @@ fn norway_to_value(
                         walk_label(path)
                     )));
                 }
-                path.push(WalkSegment::Key(key.clone()));
+                path.push(PathSegment::Key(key.clone()));
                 let converted = norway_to_value(entry, path)?;
                 path.pop();
                 map.insert(key, converted);
@@ -283,6 +282,194 @@ fn inline_norway(value: &serde_norway::Value) -> String {
     serde_norway::to_string(value)
         .map(|s| s.trim_end().to_string())
         .unwrap_or_else(|_| format!("{value:?}"))
+}
+
+/// Fill a path → [`SpanEntry`] index for every node in `value` (ADR-0005,
+/// ADR-0008), including the document root (`key: None`, exact value
+/// span) so a non-map root (`42`, `[1, 2]`) locates `InvalidValue`.
+/// Blank and comments-only documents skip this walk and yield an empty
+/// index — there is no source value to locate.
+///
+/// `yamlpath` is queried per written path. It can follow aliases; this
+/// walk does not. When a node's exact span sits outside its pretty span
+/// the value is an alias, and every descendant inherits the `*name`
+/// token for both `key` and `value` — including Index paths that exist
+/// only because an alias expanded into a sequence.
+fn yaml_span_index(text: &str, value: &Value) -> BTreeMap<ConfigPath, SpanEntry> {
+    let mut spans = BTreeMap::new();
+    match yamlpath::Document::new(text.to_string()) {
+        Ok(doc) => fill_spans(&doc, value, &mut Vec::new(), None, &mut spans),
+        // tree-sitter rejected something serde_norway accepted: still
+        // cover every path so the index is complete, with a coarse
+        // whole-document range rather than a silent hole.
+        Err(_) => fill_fallback(value, &mut Vec::new(), whole_document(text), &mut spans),
+    }
+    spans
+}
+
+fn whole_document(text: &str) -> Span {
+    Span {
+        start: 0,
+        end: text.len(),
+    }
+}
+
+fn fill_spans(
+    doc: &yamlpath::Document,
+    value: &Value,
+    path: &mut Vec<PathSegment>,
+    inherited_alias: Option<Span>,
+    spans: &mut BTreeMap<ConfigPath, SpanEntry>,
+) {
+    let child_alias = if let Some(alias) = inherited_alias {
+        // ADR-0008 exception to ADR-0006: expanded nested paths caret
+        // the `*name` token for both sides, including Index paths that
+        // exist only because an alias expanded into a sequence.
+        spans.insert(
+            ConfigPath::from(path.clone()),
+            SpanEntry {
+                key: Some(alias),
+                value: alias,
+            },
+        );
+        Some(alias)
+    } else {
+        let (entry, alias) = locate_span_entry(doc, path);
+        spans.insert(ConfigPath::from(path.clone()), entry);
+        alias
+    };
+
+    match value {
+        Value::Map(map) => {
+            for (key, child) in map {
+                path.push(PathSegment::Key(key.clone()));
+                fill_spans(doc, child, path, child_alias, spans);
+                path.pop();
+            }
+        }
+        Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                path.push(PathSegment::Index(i));
+                fill_spans(doc, child, path, child_alias, spans);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn fill_fallback(
+    value: &Value,
+    path: &mut Vec<PathSegment>,
+    fallback: Span,
+    spans: &mut BTreeMap<ConfigPath, SpanEntry>,
+) {
+    let key = match path.last() {
+        Some(PathSegment::Key(_)) => Some(fallback),
+        _ => None,
+    };
+    spans.insert(
+        ConfigPath::from(path.clone()),
+        SpanEntry {
+            key,
+            value: fallback,
+        },
+    );
+    match value {
+        Value::Map(map) => {
+            for (key, child) in map {
+                path.push(PathSegment::Key(key.clone()));
+                fill_fallback(child, path, fallback, spans);
+                path.pop();
+            }
+        }
+        Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                path.push(PathSegment::Index(i));
+                fill_fallback(child, path, fallback, spans);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn locate_span_entry(doc: &yamlpath::Document, path: &[PathSegment]) -> (SpanEntry, Option<Span>) {
+    let route = route_from_segments(path);
+    let key = match path.last() {
+        Some(PathSegment::Key(_)) => doc.query_key_only(&route).ok().map(|f| feature_span(&f)),
+        _ => None,
+    };
+    let pretty = doc.query_pretty(&route).ok().map(|f| feature_span(&f));
+    let exact = doc
+        .query_exact(&route)
+        .ok()
+        .flatten()
+        .map(|f| feature_span(&f));
+
+    // yamlpath's exact mode resolves aliases, so a jump off the pretty
+    // pair means this assignment is `*name`, not a written mapping.
+    let alias = match (pretty, exact) {
+        (Some(pretty), Some(exact)) if !span_contains(pretty, exact) => {
+            extract_alias_token(doc.source(), pretty, key).or(Some(pretty))
+        }
+        _ => None,
+    };
+    if let Some(alias) = alias {
+        return (SpanEntry { key, value: alias }, Some(alias));
+    }
+    let value = exact
+        .or(pretty)
+        .unwrap_or_else(|| whole_document(doc.source()));
+    (SpanEntry { key, value }, None)
+}
+
+fn route_from_segments(segments: &[PathSegment]) -> yamlpath::Route<'static> {
+    yamlpath::Route::from(
+        segments
+            .iter()
+            .map(|segment| match segment {
+                PathSegment::Key(key) => {
+                    yamlpath::Component::Key(std::borrow::Cow::Owned(key.clone()))
+                }
+                PathSegment::Index(i) => yamlpath::Component::Index(*i),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn feature_span(feature: &yamlpath::Feature<'_>) -> Span {
+    let (start, end) = feature.location.byte_span;
+    Span { start, end }
+}
+
+fn span_contains(outer: Span, inner: Span) -> bool {
+    inner.start >= outer.start && inner.end <= outer.end
+}
+
+/// The `*name` token inside a pretty pair (`db: *defaults`) or sequence
+/// item (`*defaults`). Search starts after the key token so a key that
+/// happens to contain `*` is not mistaken for the alias.
+fn extract_alias_token(source: &str, pretty: Span, key: Option<Span>) -> Option<Span> {
+    let start = key.map_or(pretty.start, |k| k.end.max(pretty.start));
+    let end = pretty.end.min(source.len());
+    if start >= end {
+        return None;
+    }
+    let region = &source[start..end];
+    let star = region.find('*')?;
+    let token_start = start + star;
+    let rest = &source[token_start + 1..end];
+    let name_len = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, ',' | ']' | '}' | '#' | ':'))
+        .unwrap_or(rest.len());
+    if name_len == 0 {
+        return None;
+    }
+    Some(Span {
+        start: token_start,
+        end: token_start + 1 + name_len,
+    })
 }
 
 /// Convert an owned [`Value`] into a `serde_norway::Value` for
@@ -312,12 +499,10 @@ fn value_to_norway(value: &Value) -> serde_norway::Value {
 
 // --- editing (yamlpath/yamlpatch span surgery) ---------------------------
 
-/// The key segments of a [`ConfigPath`], for the edit path below.
-fn key_segments(path: &ConfigPath) -> Vec<&str> {
-    path.segments()
-        .iter()
-        .map(|PathSegment::Key(k)| k.as_str())
-        .collect()
+/// The key segments of a [`ConfigPath`], for the edit path below. Index
+/// segments refuse rather than silently retargeting the edit.
+fn key_segments(path: &ConfigPath) -> Result<Vec<&str>, FormatError> {
+    super::edit::map_key_segments(path, "yaml")
 }
 
 /// Convert an owned [`Value`] into a `yaml_serde::Value` — the type
@@ -462,7 +647,7 @@ fn remove_from_tree(map: &mut Map, keys: &[&str]) -> bool {
 /// Parse the file under edit into its value tree. Empty and comments-only
 /// sources are the empty map (same rule as [`YamlAdapter::parse`]).
 fn parse_edit_source(source: &str) -> Result<Map, FormatError> {
-    match YamlAdapter.parse(source)? {
+    match YamlAdapter.parse(source)?.value {
         Value::Map(map) => Ok(map),
         other => Err(FormatError::Edit {
             format: "yaml",
@@ -953,7 +1138,7 @@ mod tests {
     }
 
     fn parse_map(text: &str) -> Map {
-        match YamlAdapter.parse(text).expect("fixture must parse") {
+        match YamlAdapter.parse(text).expect("fixture must parse").value {
             Value::Map(map) => map,
             other => panic!("expected map root, got {other:?}"),
         }
@@ -1038,9 +1223,9 @@ mod tests {
     fn empty_and_comments_only_documents_are_the_empty_map() {
         // Absence, not null: a blank or fully commented file is an empty
         // config — the case every all-commented generated template hits.
-        assert_eq!(YamlAdapter.parse("").unwrap(), Value::Map(Map::new()));
+        assert_eq!(YamlAdapter.parse("").unwrap().value, Value::Map(Map::new()));
         assert_eq!(
-            YamlAdapter.parse("# just\n\n# comments\n").unwrap(),
+            YamlAdapter.parse("# just\n\n# comments\n").unwrap().value,
             Value::Map(Map::new())
         );
     }
@@ -1051,7 +1236,7 @@ mod tests {
         // serde_norway; both are "no content" here — absence, not null.
         for source in ["---\n", "...\n", "---\n# note\n", "# note\n---\n"] {
             assert_eq!(
-                YamlAdapter.parse(source).unwrap(),
+                YamlAdapter.parse(source).unwrap().value,
                 Value::Map(Map::new()),
                 "source: {source:?}"
             );
@@ -1158,14 +1343,334 @@ mod tests {
         }
     }
 
+    // --- span index (ADR-0005 / ADR-0006 / ADR-0008) ---
+
+    fn snippet(source: &str, span: Span) -> &str {
+        &source[span.start..span.end]
+    }
+
+    fn assert_covers_tree(value: &Value, spans: &BTreeMap<ConfigPath, SpanEntry>) {
+        fn walk(value: &Value, path: ConfigPath, spans: &BTreeMap<ConfigPath, SpanEntry>) {
+            assert!(spans.contains_key(&path), "span index missing path {path}");
+            match value {
+                Value::Map(map) => {
+                    for (key, child) in map {
+                        walk(child, path.clone().key(key), spans);
+                    }
+                }
+                Value::Array(items) => {
+                    for (i, child) in items.iter().enumerate() {
+                        walk(child, path.clone().index(i), spans);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(value, ConfigPath::new(), spans);
+    }
+
+    #[test]
+    fn blank_document_span_index_is_empty() {
+        // No source value to locate — same as JSON's empty-file path.
+        assert!(YamlAdapter.parse("").unwrap().spans.is_empty());
+        assert!(
+            YamlAdapter
+                .parse("# just\n\n# comments\n")
+                .unwrap()
+                .spans
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn empty_mapping_records_root_span() {
+        let source = "{}\n";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        let root = parsed
+            .spans
+            .get(&ConfigPath::new())
+            .expect("root mapping is an index entry");
+        assert!(root.key.is_none(), "root has no key token");
+        assert_eq!(snippet(source, root.value).trim(), "{}");
+    }
+
+    #[test]
+    fn span_index_covers_root_scalar() {
+        let source = "42\n";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        assert_eq!(parsed.value, Value::Integer(42));
+        let root = parsed
+            .spans
+            .get(&ConfigPath::new())
+            .expect("root scalar is an index entry");
+        assert!(root.key.is_none(), "root has no key token");
+        assert_eq!(snippet(source, root.value).trim(), "42");
+    }
+
+    #[test]
+    fn span_index_covers_root_sequence() {
+        let source = "[1, 2]\n";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        assert!(matches!(parsed.value, Value::Array(_)));
+        assert_covers_tree(&parsed.value, &parsed.spans);
+        let root = parsed
+            .spans
+            .get(&ConfigPath::new())
+            .expect("root sequence is an index entry");
+        assert!(root.key.is_none(), "root has no key token");
+        assert_eq!(snippet(source, root.value).trim(), "[1, 2]");
+    }
+
+    #[test]
+    fn span_index_covers_nested_maps() {
+        let source = "outer:\n  inner:\n    extra: 1\n    keep: 2\n";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        assert_covers_tree(&parsed.value, &parsed.spans);
+
+        let extra = parsed
+            .spans
+            .get(&ConfigPath::new().key("outer").key("inner").key("extra"))
+            .expect("nested map key must be indexed");
+        assert_eq!(
+            snippet(source, extra.key.expect("map keys have a key span")),
+            "extra"
+        );
+        assert_eq!(snippet(source, extra.value), "1");
+
+        let outer = parsed
+            .spans
+            .get(&ConfigPath::new().key("outer"))
+            .expect("parent map must be indexed");
+        assert_eq!(
+            snippet(source, outer.key.expect("map keys have a key span")),
+            "outer"
+        );
+        assert!(
+            snippet(source, outer.value).contains("inner:"),
+            "parent value span covers the nested mapping, got {:?}",
+            snippet(source, outer.value)
+        );
+    }
+
+    #[test]
+    fn span_index_covers_unknown_key_in_inline_table() {
+        // Demoable: a YAML unknown key in an inline table has a correct
+        // key span. WS02 owns wiring this into unknown-key errors.
+        let source = "server: { host: localhost, extra: 1 }\n";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        assert_covers_tree(&parsed.value, &parsed.spans);
+
+        let extra = parsed
+            .spans
+            .get(&ConfigPath::new().key("server").key("extra"))
+            .expect("inline-table key must be indexed");
+        assert_eq!(
+            snippet(source, extra.key.expect("map keys have a key span")),
+            "extra"
+        );
+        assert_eq!(snippet(source, extra.value), "1");
+
+        let host = parsed
+            .spans
+            .get(&ConfigPath::new().key("server").key("host"))
+            .expect("inline-table sibling must be indexed");
+        assert_eq!(
+            snippet(source, host.key.expect("map keys have a key span")),
+            "host"
+        );
+        assert_eq!(snippet(source, host.value), "localhost");
+    }
+
+    #[test]
+    fn span_index_covers_arrays_and_array_of_maps() {
+        let source = "\
+items:
+  - name: a
+  - name: b
+arr: [1, 2]
+flow: [{ host: a }, { host: b, extra: 1 }]
+";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        assert_covers_tree(&parsed.value, &parsed.spans);
+
+        let first = parsed
+            .spans
+            .get(&ConfigPath::new().key("items").index(0))
+            .expect("array element must be indexed");
+        assert!(first.key.is_none(), "array elements have no key token");
+        assert!(
+            snippet(source, first.value).contains("name: a"),
+            "block sequence item value, got {:?}",
+            snippet(source, first.value)
+        );
+
+        let name = parsed
+            .spans
+            .get(&ConfigPath::new().key("items").index(0).key("name"))
+            .expect("array-of-maps key must be indexed");
+        assert_eq!(
+            snippet(source, name.key.expect("map keys have a key span")),
+            "name"
+        );
+        assert_eq!(snippet(source, name.value), "a");
+
+        let arr0 = parsed
+            .spans
+            .get(&ConfigPath::new().key("arr").index(0))
+            .expect("flow sequence item must be indexed");
+        assert!(arr0.key.is_none());
+        assert_eq!(snippet(source, arr0.value), "1");
+
+        let extra = parsed
+            .spans
+            .get(&ConfigPath::new().key("flow").index(1).key("extra"))
+            .expect("flow array-of-maps key must be indexed");
+        assert_eq!(
+            snippet(source, extra.key.expect("map keys have a key span")),
+            "extra"
+        );
+        assert_eq!(snippet(source, extra.value), "1");
+    }
+
+    #[test]
+    fn alias_expanded_paths_caret_the_alias_token() {
+        // ADR-0008: a path that exists in source keeps yamlpath's ranges;
+        // a path that exists in Value only because an alias expanded
+        // carets the `*name` token, not the anchor's nested keys.
+        let source = "\
+defaults: &defaults
+  host: localhost
+  port: 5432
+db: *defaults
+";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        assert_covers_tree(&parsed.value, &parsed.spans);
+
+        let written = parsed
+            .spans
+            .get(&ConfigPath::new().key("defaults").key("host"))
+            .expect("anchor-side path exists in source");
+        assert_eq!(
+            snippet(source, written.key.expect("map keys have a key span")),
+            "host"
+        );
+        assert_eq!(snippet(source, written.value), "localhost");
+
+        let db = parsed
+            .spans
+            .get(&ConfigPath::new().key("db"))
+            .expect("alias assignment exists in source");
+        assert_eq!(
+            snippet(source, db.key.expect("map keys have a key span")),
+            "db"
+        );
+        assert_eq!(snippet(source, db.value), "*defaults");
+
+        for key in ["host", "port"] {
+            let entry = parsed
+                .spans
+                .get(&ConfigPath::new().key("db").key(key))
+                .unwrap_or_else(|| panic!("expanded path db.{key} must be indexed"));
+            assert_eq!(
+                snippet(
+                    source,
+                    entry.key.expect("expanded path uses the alias as key")
+                ),
+                "*defaults",
+                "db.{key} key span"
+            );
+            assert_eq!(
+                snippet(source, entry.value),
+                "*defaults",
+                "db.{key} value span"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_array_item_and_its_expanded_children_caret_the_token() {
+        let source = "\
+tmpl: &t
+  host: x
+servers:
+  - *t
+";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        assert_covers_tree(&parsed.value, &parsed.spans);
+
+        let item = parsed
+            .spans
+            .get(&ConfigPath::new().key("servers").index(0))
+            .expect("alias sequence item must be indexed");
+        assert!(
+            item.key.is_none(),
+            "written array elements have no key token"
+        );
+        assert_eq!(snippet(source, item.value), "*t");
+
+        let host = parsed
+            .spans
+            .get(&ConfigPath::new().key("servers").index(0).key("host"))
+            .expect("expanded child of an alias item must be indexed");
+        assert_eq!(
+            snippet(
+                source,
+                host.key.expect("expanded path uses the alias as key")
+            ),
+            "*t"
+        );
+        assert_eq!(snippet(source, host.value), "*t");
+    }
+
+    #[test]
+    fn alias_expanded_sequence_items_caret_the_alias_token_on_both_sides() {
+        // ADR-0008 exception to ADR-0006: an Index path that exists only
+        // because an alias expanded still carets `*name` for `key` and
+        // `value`. Written array elements stay `key: None` (covered by
+        // `alias_array_item_and_its_expanded_children_caret_the_token`).
+        let source = "\
+tmpl: &t
+  - a
+  - b
+items: *t
+";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        assert_covers_tree(&parsed.value, &parsed.spans);
+
+        let items = parsed
+            .spans
+            .get(&ConfigPath::new().key("items"))
+            .expect("alias assignment exists in source");
+        assert_eq!(
+            snippet(source, items.key.expect("map keys have a key span")),
+            "items"
+        );
+        assert_eq!(snippet(source, items.value), "*t");
+
+        let first = parsed
+            .spans
+            .get(&ConfigPath::new().key("items").index(0))
+            .expect("expanded sequence item must be indexed");
+        assert_eq!(
+            snippet(
+                source,
+                first
+                    .key
+                    .expect("expanded index path uses the alias as key")
+            ),
+            "*t"
+        );
+        assert_eq!(snippet(source, first.value), "*t");
+    }
+
     // --- serialization ---
 
     #[test]
     fn serialize_round_trips_parse() {
         let source = "b: true\ni: 3\ns: x\nt:\n  n: 1\n";
-        let value = YamlAdapter.parse(source).unwrap();
+        let value = YamlAdapter.parse(source).unwrap().value;
         let text = YamlAdapter.serialize(&value).unwrap();
-        let reparsed = YamlAdapter.parse(&text).unwrap();
+        let reparsed = YamlAdapter.parse(&text).unwrap().value;
         assert_eq!(value, reparsed);
     }
 
@@ -1175,7 +1680,7 @@ mod tests {
         map.insert("port_str".into(), Value::String("8080".into()));
         map.insert("country".into(), Value::String("no".into()));
         let text = YamlAdapter.serialize(&Value::Map(map.clone())).unwrap();
-        assert_eq!(YamlAdapter.parse(&text).unwrap(), Value::Map(map));
+        assert_eq!(YamlAdapter.parse(&text).unwrap().value, Value::Map(map));
     }
 
     #[test]
@@ -1620,6 +2125,21 @@ db:
     }
 
     #[test]
+    fn edit_indexed_path_is_typed_error() {
+        let path = ConfigPath::new().key("plugins").index(0).key("host");
+        let value = Value::from("x");
+        let err = YamlAdapter
+            .edit("", set_edit(&path, &value, SetTarget::MissingKey))
+            .unwrap_err();
+        match err {
+            FormatError::Edit { message, .. } => {
+                assert!(message.contains("[0]"), "{message}");
+            }
+            other => panic!("expected Edit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn edit_unset_removes_key_and_missing_is_noop() {
         let source = "# keep me\nport: 8080\nhost: x\n";
         let path = ConfigPath::new().key("port");
@@ -1679,7 +2199,10 @@ db:
             .edit("# note\nonly: 1\n", FileEdit::Unset { path: &path })
             .unwrap();
         assert!(out.contains("# note"), "out: {out}");
-        assert_eq!(YamlAdapter.parse(&out).unwrap(), Value::Map(Map::new()));
+        assert_eq!(
+            YamlAdapter.parse(&out).unwrap().value,
+            Value::Map(Map::new())
+        );
     }
 
     #[test]

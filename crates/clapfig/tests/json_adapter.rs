@@ -6,9 +6,10 @@
 //! strings, and the exported schema validating the generated template
 //! (comment keys allowlisted per ADR-0002).
 
+use clapfig::error::ClapfigError;
 use clapfig::runtime::{Field, Schema};
 use clapfig::value::Value;
-use clapfig::{Clapfig, ConfigAction, SearchPath};
+use clapfig::{Clapfig, ConfigAction, InputType, SearchPath};
 use tempfile::TempDir;
 
 /// The shared logical schema for the parity slice. Every required field
@@ -178,7 +179,28 @@ fn same_mistake_produces_identical_validation_error() {
         .load()
         .unwrap_err();
 
-    assert_eq!(toml_err.to_string(), json_err.to_string());
+    match (toml_err, json_err) {
+        (
+            ClapfigError::InvalidValue {
+                key: tk,
+                reason: tr,
+                origin: to,
+            },
+            ClapfigError::InvalidValue {
+                key: jk,
+                reason: jr,
+                origin: jo,
+            },
+        ) => {
+            assert_eq!(tk, jk);
+            assert_eq!(tr, jr);
+            assert_eq!(to.input_type, jo.input_type);
+            assert_eq!(to.input_type, Some(InputType::File));
+            assert!(to.span.is_some(), "TOML value span");
+            assert!(jo.span.is_some(), "JSON value span");
+        }
+        (t, j) => panic!("expected matching InvalidValue, got {t:?} vs {j:?}"),
+    }
 }
 
 #[test]

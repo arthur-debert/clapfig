@@ -34,13 +34,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::ClapfigError;
+use crate::format::Span;
 use crate::runtime::{Field, Schema};
+use crate::types::InputType;
 use crate::value::Value;
 
 /// Context handed to an [`on_unknown_key`](crate::Builder::on_unknown_key)
 /// callback. Carries every signal the callback needs to make a per-key
 /// decision: where the key lives in the merged tree, what it was, what
-/// file produced it, and — for TOML sources — which line.
+/// file produced it, and which line (from the file's span index).
 #[derive(Debug)]
 pub struct UnknownKeyContext<'a> {
     /// Full dotted path with every segment unquoted, e.g.
@@ -82,11 +84,25 @@ pub struct UnknownKeyContext<'a> {
     pub file: Option<&'a Path>,
 
     /// 1-indexed line number in `file` where the key appears. `None` when
-    /// the `find_key_line` heuristic could not locate it. The heuristic
-    /// only recognizes TOML `key = value` / `[section]` syntax, so this is
-    /// always `None` for YAML/JSON and non-file sources, and `None` in
-    /// rare TOML cases (quoted keys, inline tables).
+    /// the file's span index has no entry for the key, or the origin is
+    /// not a file. Derived from [`span`](Self::span).
     pub line: Option<usize>,
+
+    /// Byte span of the **key** token (ADR-0006). Set from the file's
+    /// span index when that path has a key token; `None` when the index
+    /// has no entry or the origin is not a file.
+    pub span: Option<Span>,
+
+    /// Environment variable that supplied this key, when it came from
+    /// the env layer.
+    pub env_var: Option<&'a str>,
+
+    /// URL query-parameter key that supplied this key, when it came from
+    /// the URL layer.
+    pub url_key: Option<&'a str>,
+
+    /// Which input type produced the key. `None` when unset.
+    pub input_type: Option<InputType>,
 }
 
 /// Decision returned by an [`on_unknown_key`](crate::Builder::on_unknown_key)
@@ -129,9 +145,21 @@ pub struct CollectedUnknown {
     pub value: Option<Value>,
     /// File the key came from, when sourced from a config file.
     pub file: Option<std::path::PathBuf>,
-    /// 1-indexed line number in `file`, if the `find_key_line` heuristic
-    /// located the key. TOML-only — see [`UnknownKeyContext::line`].
+    /// 1-indexed line number in `file`, if the span index located the
+    /// key. See [`UnknownKeyContext::line`].
     pub line: Option<usize>,
+    /// Byte span of the **key** token (ADR-0006). Set from the file's
+    /// span index when that path has a key token; `None` when the index
+    /// has no entry or the origin is not a file.
+    pub span: Option<Span>,
+    /// Environment variable that supplied this key, when it came from
+    /// the env layer.
+    pub env_var: Option<String>,
+    /// URL query-parameter key that supplied this key, when it came from
+    /// the URL layer.
+    pub url_key: Option<String>,
+    /// Which input type produced the key. `None` when unset.
+    pub input_type: Option<InputType>,
 }
 
 /// Internal type-alias for the boxed callback. `Send + Sync` is required so
@@ -316,11 +344,12 @@ fn parent_path(path: &str) -> &str {
 /// Section path of `(path, leaf)`: `path` with the trailing leaf stripped
 /// (plus the `.` separator if any). Returns `""` for a top-level key.
 ///
-/// Shared with `validate::lookup_value` and `validate::find_key_line` —
+/// Shared with the strictness cascade —
 /// dot-splitting `path` would miscount segments when the leaf is a
 /// quoted TOML key containing literal dots (e.g.
 /// `"acme.task-due-date-missing"`). Stripping the known leaf off the
-/// end is the only way to recover the correct section path.
+/// end is the only way to recover the correct section path. Value and
+/// span lookup walk the structured [`crate::format::ConfigPath`] instead.
 pub(crate) fn section_path_of<'a>(path: &'a str, leaf: &str) -> &'a str {
     path.strip_suffix(leaf)
         .map(|p| p.strip_suffix('.').unwrap_or(p))
@@ -543,5 +572,45 @@ mod tests {
         assert!(!overrides.has_any_strict());
         overrides.insert("b", true);
         assert!(overrides.has_any_strict());
+    }
+
+    #[test]
+    fn unknown_key_context_origin_facts_construct() {
+        let value = Value::Integer(1);
+        let ctx = UnknownKeyContext {
+            path: "plugins[3].host",
+            leaf: "host",
+            value: Some(&value),
+            file: Some(Path::new("/tmp/app.toml")),
+            line: Some(4),
+            span: Some(Span { start: 10, end: 14 }),
+            env_var: None,
+            url_key: None,
+            input_type: Some(InputType::File),
+        };
+        assert_eq!(ctx.path, "plugins[3].host");
+        assert_eq!(ctx.span, Some(Span { start: 10, end: 14 }));
+        assert_eq!(ctx.input_type, Some(InputType::File));
+        assert!(ctx.env_var.is_none());
+        assert!(ctx.url_key.is_none());
+    }
+
+    #[test]
+    fn collected_unknown_mirrors_context_origin_facts() {
+        let collected = CollectedUnknown {
+            path: "rogue".into(),
+            leaf: "rogue".into(),
+            value: Some(Value::Boolean(true)),
+            file: None,
+            line: None,
+            span: None,
+            env_var: Some("MYAPP__ROGUE".into()),
+            url_key: None,
+            input_type: Some(InputType::Env),
+        };
+        assert_eq!(collected.env_var.as_deref(), Some("MYAPP__ROGUE"));
+        assert_eq!(collected.input_type, Some(InputType::Env));
+        assert!(collected.span.is_none());
+        assert!(collected.url_key.is_none());
     }
 }

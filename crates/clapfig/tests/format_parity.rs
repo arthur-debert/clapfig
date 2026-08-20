@@ -114,10 +114,12 @@ fn type_mismatch_produces_the_identical_error() {
             ClapfigError::InvalidValue {
                 key: tk,
                 reason: tr,
+                ..
             },
             ClapfigError::InvalidValue {
                 key: yk,
                 reason: yr,
+                ..
             },
         ) => {
             assert_eq!(tk, yk);
@@ -136,10 +138,12 @@ fn enum_violation_produces_the_identical_error() {
             ClapfigError::InvalidValue {
                 key: tk,
                 reason: tr,
+                ..
             },
             ClapfigError::InvalidValue {
                 key: yk,
                 reason: yr,
+                ..
             },
         ) => {
             assert_eq!(tk, yk);

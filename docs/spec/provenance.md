@@ -5,13 +5,13 @@
 Clapfig resolves a value through discovery, parsing, layered merge, defaults,
 and validation. After the value-model epic (`docs/spec/value-model.md`), that
 pipeline speaks clapfig `Value`, and file input goes through format adapters
-(TOML, YAML, JSON). What it still does not do is retain **where** a value came
-from, or narrate the work.
+(TOML, YAML, JSON). This Spec is the feature definition for retaining **where**
+a value came from and narrating the work.
 
-This Spec is the feature definition for that gap. It supersedes the accepted
-proposal (`docs/proposals/provenance-and-observability.md`) as the *what and
-why*. The proposal remains historical; where the two disagree, this file wins.
-Two decisions already landed ahead of this work and are constraints, not
+It supersedes the accepted proposal
+(`docs/proposals/provenance-and-observability.md`) as the *what and why*. The
+proposal remains historical; where the two disagree, this file wins. Two
+decisions already landed ahead of this work and are constraints, not
 reopened questions:
 
 - Origins key the clapfig-owned `Value` model, not a format type
@@ -20,11 +20,11 @@ reopened questions:
   not as annotations on `Value` nodes
   ([ADR-0004](../adr/0004-origin-data-travels-as-a-shadow-tree.md)).
 
-The adapter contract already reserves the seam
-(`FormatAdapter::span_index`, `Operation::SpanIndex`, `Span`, `ConfigPath`).
-The value-model audit trimmed the speculative half of that seam
-(`PathSegment::Index` was removed; every shipped adapter currently *refuses*
-span indexing). This epic fills the seam for real.
+Parse returns `{ value, spans }`
+([ADR-0005](../adr/0005-parse-returns-value-and-spans.md)); there is no
+separate `span_index` / `Operation::SpanIndex` entry point.
+`PathSegment::Index` is part of `ConfigPath`. Every shipped adapter fills
+the index.
 
 Glossary: **Origin** is the provenance vocabulary (where a resolved value came
 from). **Input type** is where values come from (files, env, overrides, URL).
@@ -47,12 +47,13 @@ supplied the value. Given three config files, an env prefix, and programmatic
 overrides, `invalid value for key 'database.pool_size'` leaves the user to
 search every input by hand.
 
-The only located schema-driven errors today are unknown-key errors, and their
-line numbers come from `find_key_line` in `validate.rs` — a TOML text-scan
-heuristic that cannot handle arrays-of-tables or inline tables, and that
-silently degrades to line 0 (no snippet) for YAML and JSON. Parse errors are
-already located: they carry parser spans. The crate docs already name YAML/JSON
-line numbers as this epic's job.
+Before this work, the only located schema-driven errors were unknown-key
+errors, and their line numbers came from `find_key_line` in `validate.rs` — a
+TOML text-scan heuristic that could not handle arrays-of-tables or inline
+tables, and that silently degraded to line 0 (no snippet) for YAML and JSON.
+Parse errors were already located: they carry parser spans. That heuristic is
+gone: unknown-key and `InvalidValue` locations come from adapter span indexes
+across TOML, YAML, and JSON.
 
 This is the gap recorded as a qualification on #100, #101, and #102: those
 features are not honestly complete while the errors they produce cannot name
@@ -207,8 +208,10 @@ empty or partial index is not a legal result. Per adapter:
   stays for serialize and edit.
 - **YAML** — `serde_norway` still builds `Value`; the same `parse` fills
   spans with `yamlpath`. A path that exists only because an alias
-  expanded gets the `*name` token's span
+  expanded gets the `*name` token's span for both `key` and `value`,
+  including expanded sequence items
   ([ADR-0008](../adr/0008-yaml-spans-via-yamlpath-inside-parse.md)).
+  Written array elements still have `key: None` (ADR-0006).
 
 Unknown-key validation stays **per-file, pre-merge**. It consults that
 file's span index, not the merged origin tree (an unknown key in a
@@ -217,9 +220,9 @@ checks consult the merged origin tree (the winner).
 
 ### Discovery record
 
-Discovery today returns only loaded files (`load_files_cached` →
-`ResolveInput.files`). Missing files are dropped; under `FirstMatch`,
-lower-priority directories are never visited. This epic retains every
+Before this work, discovery returned only loaded files (`load_files_cached` →
+`ResolveInput.files`). Missing files were dropped; under `FirstMatch`,
+lower-priority directories were never visited. This epic retains every
 candidate probe with its outcome: `loaded`, `missing`, `error`, or `not
 probed`. That record feeds `MissingRequired` diagnostics and `trace`
 discovery events. Stem-based discovery probes every enabled extension in a

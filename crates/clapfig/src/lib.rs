@@ -97,9 +97,9 @@
 //!   keys, ordered maps) do not get to, and formats that express less map into
 //!   the baseline by explicit adapter rules. A config file means the same
 //!   thing in every format: identical schema validation and strict-mode
-//!   accept/reject decisions. (Unknown-key line numbers and source
-//!   snippets are TOML-only today — YAML/JSON strict errors name the key
-//!   and file but carry no source line.)
+//!   accept/reject decisions. Unknown-key and `InvalidValue` errors
+//!   locate the offending token from the adapter's byte-span index in
+//!   TOML, YAML, and JSON (line/column at render time).
 //! - **Datetimes cross formats by schema, not by sniffing.** TOML has
 //!   first-class datetimes; in YAML and JSON they are written as strings
 //!   in TOML's four datetime spellings (offset date-time, local
@@ -121,6 +121,32 @@
 //!   inferred from cargo features); the first entry is the preferred
 //!   format `config gen` renders and file seeding uses. The Discovery
 //!   section below spells out the full file-name contract.
+//!
+//! # Design: clapfig traces itself
+//!
+//! Clapfig traces liberally. Every stage of resolution — discovery,
+//! parsing, layer construction, merge, validation, persistence — emits
+//! structured [tracing](https://docs.rs/tracing) events, so that when
+//! behavior does not match a user's expectation, the answer is in the
+//! logs, not in a debugger attached to a fork.
+//!
+//! `tracing` is an unconditional dependency. Events are no-ops when no
+//! subscriber is installed. With a subscriber that honors `RUST_LOG`,
+//! enable the full story with `RUST_LOG=clapfig=trace`.
+//!
+//! Level discipline:
+//!
+//! - **`trace`** — the full story: every discovery probe (hits and
+//!   misses), every merge overlay win with both origins and value
+//!   *types*, defaults filled.
+//! - **`debug`** — per-stage summaries.
+//! - **`info` and above** — silent on a healthy load.
+//!
+//! **Values never appear in events**, at any level. Config values
+//! routinely include tokens and passwords, and clapfig has no sensitivity
+//! metadata. Logs carry key paths, origins, value types, and precedence
+//! decisions only. User-facing errors may still quote the offending
+//! value; that is a different contract.
 //!
 //! # Core library — no CLI framework required
 //!
@@ -341,7 +367,7 @@
 //!
 //! Strict mode is **on by default**. When a config file contains a key that
 //! doesn't match any field in your schema, loading fails with the file path,
-//! key name, and — for TOML sources — the line number:
+//! key name, and the line number when the span index locates the key:
 //!
 //! ```text
 //! Unknown key 'typo_key' in /home/user/.config/myapp/myapp.toml (line 5)
@@ -426,8 +452,8 @@
 //! value as `Option<&value::Value>` (`None` in the rare case lookup can't
 //! resolve — out-of-bounds array index, path through a non-map
 //! intermediate), the source file, and the 1-indexed line number
-//! (`Some` on a best-effort match in TOML sources; always `None` for
-//! YAML/JSON and non-file sources).
+//! (`Some` when the file's span index locates the key; `None` when
+//! the origin is not a file, or when lookup cannot resolve the key).
 //!
 //! # Runtime-defined schemas
 //!
@@ -754,8 +780,9 @@
 //! # Error handling
 //!
 //! All fallible operations return [`ClapfigError`]. Errors are designed to
-//! be user-facing: unknown keys include file paths (and, for TOML sources,
-//! line numbers), unknown scopes list the available ones, and missing
+//! be user-facing: unknown keys include file paths and, when the span
+//! index locates the key, line numbers (TOML, YAML, and JSON), unknown
+//! scopes list the available ones, and missing
 //! prerequisites reference the builder method to call. See the [`error`]
 //! module for the full set.
 
@@ -778,11 +805,13 @@ mod flatten;
 pub(crate) mod merge;
 mod normalize;
 mod ops;
+mod origin;
 mod overrides;
 mod persist;
 mod resolve;
 mod schema_walk;
 mod strict;
+mod trace;
 mod typed_builder;
 #[cfg(feature = "url")]
 mod url;
@@ -796,12 +825,14 @@ pub use builder::{Builder, Resolver};
 pub use clapfig_derive::Schema;
 #[cfg(feature = "clap")]
 pub use cli::{ConfigArgs, ConfigCommand, ConfigSubcommand};
-pub use error::{ClapfigError, UnknownKeyInfo};
+pub use error::{
+    ClapfigError, DiscoveryRecord, FileProbe, OriginFacts, ProbeOutcome, UnknownKeyInfo,
+};
 pub use ops::ConfigResult;
 pub use static_schema::Schema;
 pub use strict::{CollectedUnknown, UnknownKeyContext, UnknownKeyDecision};
 pub use typed_builder::{TypedBuilder, TypedResolver};
-pub use types::{Boundary, ConfigAction, Layer, SearchMode, SearchPath};
+pub use types::{Boundary, ConfigAction, InputType, Layer, SearchMode, SearchPath};
 
 /// Entry point for building a clapfig configuration.
 ///

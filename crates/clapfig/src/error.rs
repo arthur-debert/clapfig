@@ -2,8 +2,8 @@
 //!
 //! All errors are designed to be shown directly to end users. Each variant
 //! includes enough context to diagnose the problem without reaching for a
-//! debugger: file paths (and, for TOML sources, line numbers) for unknown
-//! keys, the list of
+//! debugger: file paths and, when the span index locates the key, line
+//! numbers (TOML, YAML, and JSON) for unknown keys, the list of
 //! available scopes when a scope name is wrong, and references to the
 //! builder method that needs to be called when a prerequisite is missing.
 //!
@@ -26,9 +26,13 @@
 //! module's [`FormatError`](crate::format::FormatError)) rather than
 //! re-invented, so you still get their full detail.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
+
+use crate::format::Span;
+use crate::types::InputType;
 
 /// A single unknown-key violation discovered during strict-mode validation.
 ///
@@ -51,10 +55,11 @@ pub struct UnknownKeyInfo {
     /// instead.
     pub path: PathBuf,
     /// 1-indexed line number where the key was found, or `0` if the line
-    /// could not be located. The `find_key_line` heuristic only recognizes
-    /// TOML syntax, so keys from YAML/JSON sources are always `0` (and
-    /// renderers suppress the line entirely rather than print a bogus
-    /// `line 0`); env-derived keys have no line either.
+    /// could not be located. Derived from [`span`](Self::span) (the key
+    /// token) when the file's span index has an entry; `0` when the
+    /// index has no entry for the path or the origin is not a file.
+    /// Renderers suppress the line entirely rather than print a bogus
+    /// `line 0`.
     pub line: usize,
     /// Full contents of the config file, shared across all infos from the
     /// same file. Used by renderers for source snippets. `None` for
@@ -65,6 +70,126 @@ pub struct UnknownKeyInfo {
     /// this to describe the error as an env problem — naming the variable
     /// to unset — instead of dressing it in config-file clothing.
     pub env_var: Option<String>,
+    /// Byte span of the **key** token in `source` (ADR-0006). Set from
+    /// the file's span index when that path has a key token; `None` when
+    /// the index has no entry or the origin is not a file.
+    pub span: Option<Span>,
+    /// URL query-parameter key that supplied this unknown key, when it
+    /// came from the URL layer.
+    pub url_key: Option<String>,
+    /// Which input type produced the key. `None` when unset; env-derived
+    /// keys already name [`env_var`](Self::env_var).
+    pub input_type: Option<InputType>,
+}
+
+/// Outcome of one discovery probe of a candidate config file.
+///
+/// Under [`SearchMode::FirstMatch`](crate::SearchMode::FirstMatch),
+/// candidates the search never reached are [`NotProbed`](Self::NotProbed),
+/// never [`Missing`](Self::Missing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// The file existed and was loaded.
+    Loaded,
+    /// The file was probed and does not exist.
+    Missing,
+    /// Probe-time failure on an injected record (`error: …` in
+    /// [`ClapfigError::MissingRequired`] rendering).
+    ///
+    /// Production discovery does not produce this variant: a
+    /// non-NotFound read error aborts the whole resolve as
+    /// [`ClapfigError::IoError`] (an unreadable config file is not a
+    /// missing-key search). Parse failures after a successful read are
+    /// [`ClapfigError::ParseError`] on a [`Loaded`](Self::Loaded) probe.
+    Error {
+        /// Human-readable failure detail.
+        message: String,
+    },
+    /// The search never reached this candidate (FirstMatch stopped
+    /// earlier).
+    NotProbed,
+}
+
+impl fmt::Display for ProbeOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Loaded => f.write_str("loaded"),
+            Self::Missing => f.write_str("missing"),
+            Self::Error { message } => write!(f, "error: {message}"),
+            Self::NotProbed => f.write_str("not probed"),
+        }
+    }
+}
+
+/// One discovery probe of a candidate config file, with its outcome.
+///
+/// The record names paths actually probed (stem-mode included), not the
+/// format registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileProbe {
+    /// Path that discovery considered.
+    pub path: PathBuf,
+    /// What happened at that path.
+    pub outcome: ProbeOutcome,
+}
+
+/// Files discovery looked at, plus which non-file input types were
+/// consulted — the facts [`ClapfigError::MissingRequired`] reports
+/// instead of a winning origin (an absent key has none).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiscoveryRecord {
+    /// Candidate file probes, in search order, with outcomes.
+    /// Empty when `Layer::Files` was omitted from `layer_order` (the
+    /// files layer was not consulted).
+    pub files: Vec<FileProbe>,
+    /// Whether the environment layer was consulted (`false` when
+    /// `.no_env()` or `Layer::Env` is omitted from `layer_order`).
+    pub env: bool,
+    /// Whether the URL query layer was consulted (`false` when no query
+    /// was supplied or `Layer::Url` is omitted).
+    pub url: bool,
+    /// Whether programmatic overrides were consulted (`false` when none
+    /// were supplied or `Layer::Cli` is omitted).
+    pub overrides: bool,
+}
+
+impl DiscoveryRecord {
+    /// Empty record: no probes, no non-file layers consulted.
+    ///
+    /// Production resolution fills this from the real search; the
+    /// synthetic resolve path injects it so tests do not touch the
+    /// filesystem.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+/// Origin facts of a value that exists: file, span, env var, URL query
+/// key, input type.
+///
+/// Flattened onto [`UnknownKeyInfo`] / [`UnknownKeyContext`] /
+/// [`CollectedUnknown`] (those types already carried some of these).
+/// Boxed on [`ClapfigError::InvalidValue`] so the error enum stays
+/// small (`clippy::result_large_err`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OriginFacts {
+    /// File that supplied the value, when it came from a file.
+    pub file: Option<PathBuf>,
+    /// Byte span of the assigned **value** in that file (ADR-0006).
+    pub span: Option<Span>,
+    /// Full file text, shared across origins from the same parse.
+    /// Renderers use it with [`span`](Self::span) to draw a caret over
+    /// the assigned value.
+    pub source: Option<Arc<str>>,
+    /// Environment variable that supplied the value.
+    pub env_var: Option<String>,
+    /// URL query-parameter key that supplied the value.
+    pub url_key: Option<String>,
+    /// Override key (`InputType::Override`) or schema key
+    /// (`InputType::Default`).
+    pub key: Option<String>,
+    /// Which input type produced the value.
+    pub input_type: Option<InputType>,
 }
 
 impl UnknownKeyInfo {
@@ -133,8 +258,16 @@ pub enum ClapfigError {
         kind: &'static str,
     },
 
-    #[error("Invalid value for '{key}': {reason}")]
-    InvalidValue { key: String, reason: String },
+    #[error("{}", format_invalid_value(.key, .reason, .origin))]
+    InvalidValue {
+        key: String,
+        reason: String,
+        /// Origin of the winning value (file, span, env var, URL key,
+        /// input type). Boxed so [`ClapfigError`] stays a small `Result`
+        /// error. [`ClapfigError::MissingRequired`] does not carry this —
+        /// an absent key has no origin, it has a [`DiscoveryRecord`].
+        origin: Box<OriginFacts>,
+    },
 
     #[error("No persist scopes configured — call .persist_scope() on the builder")]
     NoPersistPath,
@@ -193,8 +326,19 @@ pub enum ClapfigError {
 
     /// A required field declared by the [`Schema`](crate::runtime::Schema)
     /// was not supplied by any layer and has no default.
-    #[error("Missing required key: {key}")]
-    MissingRequired { key: String },
+    ///
+    /// An absent key has no winning origin — including a nested leaf
+    /// whose parent map exists from some input type. The message lists
+    /// file probes and consulted non-file input types, never an origin
+    /// line.
+    #[error("{}", format_missing_required(.key, .discovery))]
+    MissingRequired {
+        key: String,
+        /// Files probed (with outcomes) and non-file input types
+        /// consulted. An absent key has no winning origin — this is the
+        /// search, not an origin.
+        discovery: DiscoveryRecord,
+    },
 
     /// A `strict_at` builder override targets a path that does not resolve
     /// to a nested-section node in the config schema. Either the path does
@@ -272,6 +416,106 @@ impl ClapfigError {
     pub fn is_strict_violation(&self) -> bool {
         matches!(self, ClapfigError::UnknownKeys(_))
     }
+
+    /// Schema/type-validation error with origin facts left unset.
+    ///
+    /// Persist-path and other non-merge checks have no origin tree;
+    /// post-merge `finalize` uses [`Self::invalid_value_at`].
+    pub(crate) fn invalid_value(key: impl Into<String>, reason: impl Into<String>) -> Self {
+        ClapfigError::InvalidValue {
+            key: key.into(),
+            reason: reason.into(),
+            origin: Box::new(OriginFacts::default()),
+        }
+    }
+
+    /// Schema/type-validation error naming the winning origin at `path`.
+    pub(crate) fn invalid_value_at(
+        key: impl Into<String>,
+        reason: impl Into<String>,
+        origins: &crate::origin::OriginMap,
+        path: &crate::format::ConfigPath,
+    ) -> Self {
+        let facts = crate::origin::lookup(origins, path)
+            .map(crate::origin::Origin::to_facts)
+            .unwrap_or_default();
+        ClapfigError::InvalidValue {
+            key: key.into(),
+            reason: reason.into(),
+            origin: Box::new(facts),
+        }
+    }
+
+    /// Required-key absence carrying the discovery record of the search
+    /// that did not find `key`.
+    pub(crate) fn missing_required(key: impl Into<String>, discovery: DiscoveryRecord) -> Self {
+        ClapfigError::MissingRequired {
+            key: key.into(),
+            discovery,
+        }
+    }
+}
+
+fn format_invalid_value(key: &str, reason: &str, origin: &OriginFacts) -> String {
+    use std::fmt::Write;
+    let mut out = format!("Invalid value for '{key}': {reason}");
+    match origin.input_type {
+        Some(InputType::File) => {
+            if let Some(file) = &origin.file {
+                if let (Some(span), Some(src)) = (origin.span, origin.source.as_deref()) {
+                    let (line, _) = crate::format::byte_offset_to_line_col(src, span.start);
+                    let _ = write!(out, "\n  --> {}:{line}", file.display());
+                } else {
+                    let _ = write!(out, "\n  --> {}", file.display());
+                }
+            }
+        }
+        Some(InputType::Env) => {
+            if let Some(var) = &origin.env_var {
+                let _ = write!(out, "\n  set by environment variable {var}");
+            }
+        }
+        Some(InputType::Url) => {
+            if let Some(url_key) = &origin.url_key {
+                let _ = write!(out, "\n  set by URL query parameter {url_key}");
+            }
+        }
+        Some(InputType::Override) => {
+            let override_key = origin.key.as_deref().unwrap_or(key);
+            let _ = write!(
+                out,
+                "\n  set by a programmatic override for key {override_key}"
+            );
+        }
+        Some(InputType::Default) => {
+            let schema_key = origin.key.as_deref().unwrap_or(key);
+            let _ = write!(out, "\n  set by schema default for key {schema_key}");
+        }
+        None => {}
+    }
+    out
+}
+
+fn format_missing_required(key: &str, discovery: &DiscoveryRecord) -> String {
+    use std::fmt::Write;
+    let mut out = format!("Missing required key: {key}");
+    for probe in &discovery.files {
+        let _ = write!(out, "\n  {} ({})", probe.path.display(), probe.outcome);
+    }
+    let mut consulted = Vec::new();
+    if discovery.env {
+        consulted.push("env");
+    }
+    if discovery.url {
+        consulted.push("url");
+    }
+    if discovery.overrides {
+        consulted.push("overrides");
+    }
+    if !consulted.is_empty() {
+        let _ = write!(out, "\n  consulted: {}", consulted.join(", "));
+    }
+    out
 }
 
 fn format_unknown_keys(infos: &[UnknownKeyInfo]) -> String {
@@ -287,9 +531,9 @@ fn format_unknown_keys(infos: &[UnknownKeyInfo]) -> String {
             (Some(var), _) => {
                 let _ = write!(out, "\n  - '{}' from environment variable {var}", info.key);
             }
-            // Line 0 means "could not be located" (YAML/JSON sources have
-            // no TOML line heuristic) — omit it rather than render a
-            // bogus `(line 0)`.
+            // Line 0 means "could not be located" (no span-index entry
+            // for the path) — omit it rather than render a bogus
+            // `(line 0)`.
             (None, 0) => {
                 let _ = write!(out, "\n  - '{}' in {}", info.key, info.path.display());
             }
@@ -317,6 +561,9 @@ mod tests {
             line,
             source: None,
             env_var: None,
+            span: None,
+            url_key: None,
+            input_type: None,
         }
     }
 
@@ -378,7 +625,7 @@ mod tests {
 
     #[test]
     fn unknown_key_line_zero_is_suppressed() {
-        // YAML/JSON sources have no line heuristic; never print `(line 0)`.
+        // Line 0 means "could not be located"; never print `(line 0)`.
         let msg = ClapfigError::UnknownKeys(vec![info("typo", 0)]).to_string();
         assert!(msg.contains("'typo' in"), "{msg}");
         assert!(!msg.contains("line"), "{msg}");
@@ -420,5 +667,195 @@ mod tests {
     fn leaf_returns_last_segment() {
         assert_eq!(info("a.b.c", 0).leaf(), "c");
         assert_eq!(info("toplevel", 0).leaf(), "toplevel");
+    }
+
+    #[test]
+    fn discovery_record_constructs_probe_outcomes() {
+        let record = DiscoveryRecord {
+            files: vec![
+                FileProbe {
+                    path: "/etc/myapp.toml".into(),
+                    outcome: ProbeOutcome::Loaded,
+                },
+                FileProbe {
+                    path: "/home/me/.myapp.toml".into(),
+                    outcome: ProbeOutcome::Missing,
+                },
+                FileProbe {
+                    path: "/proj/.myapp.toml".into(),
+                    outcome: ProbeOutcome::Error {
+                        message: "permission denied".into(),
+                    },
+                },
+                FileProbe {
+                    path: "/unreached/.myapp.toml".into(),
+                    outcome: ProbeOutcome::NotProbed,
+                },
+            ],
+            env: true,
+            url: false,
+            overrides: true,
+        };
+        assert_eq!(record.files.len(), 4);
+        assert!(record.env);
+        assert!(!record.url);
+        assert!(record.overrides);
+        assert_eq!(record.files[3].outcome, ProbeOutcome::NotProbed);
+    }
+
+    #[test]
+    fn missing_required_carries_discovery_not_an_origin() {
+        let discovery = DiscoveryRecord {
+            files: vec![
+                FileProbe {
+                    path: "/etc/myapp.toml".into(),
+                    outcome: ProbeOutcome::Missing,
+                },
+                FileProbe {
+                    path: "/proj/.myapp.toml".into(),
+                    outcome: ProbeOutcome::NotProbed,
+                },
+            ],
+            env: true,
+            url: false,
+            overrides: true,
+        };
+        let err = ClapfigError::missing_required("database.url", discovery.clone());
+        match err {
+            ClapfigError::MissingRequired {
+                key,
+                discovery: got,
+            } => {
+                assert_eq!(key, "database.url");
+                assert_eq!(got, discovery);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_display_lists_probes_and_consulted_types_not_an_origin() {
+        let err = ClapfigError::missing_required(
+            "database.url",
+            DiscoveryRecord {
+                files: vec![
+                    FileProbe {
+                        path: "/etc/myapp.toml".into(),
+                        outcome: ProbeOutcome::Missing,
+                    },
+                    FileProbe {
+                        path: "/home/me/.myapp.toml".into(),
+                        outcome: ProbeOutcome::Loaded,
+                    },
+                    FileProbe {
+                        path: "/proj/.myapp.toml".into(),
+                        outcome: ProbeOutcome::NotProbed,
+                    },
+                ],
+                env: true,
+                url: false,
+                overrides: true,
+            },
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("Missing required key: database.url"),
+            "{msg}"
+        );
+        assert!(msg.contains("/etc/myapp.toml (missing)"), "{msg}");
+        assert!(msg.contains("/home/me/.myapp.toml (loaded)"), "{msg}");
+        assert!(msg.contains("/proj/.myapp.toml (not probed)"), "{msg}");
+        assert!(msg.contains("consulted: env, overrides"), "{msg}");
+        assert!(
+            !msg.contains("consulted: env, url"),
+            "url was not consulted: {msg}"
+        );
+        assert!(
+            !msg.contains("set by"),
+            "MissingRequired must not name a winning origin: {msg}"
+        );
+        assert!(
+            !msg.contains("origin"),
+            "MissingRequired must not name a winning origin: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_required_empty_discovery_is_the_key_line_only() {
+        let msg = ClapfigError::missing_required("name", DiscoveryRecord::empty()).to_string();
+        assert_eq!(msg, "Missing required key: name");
+    }
+
+    #[test]
+    fn probe_outcome_display_uses_spec_vocabulary() {
+        assert_eq!(ProbeOutcome::Loaded.to_string(), "loaded");
+        assert_eq!(ProbeOutcome::Missing.to_string(), "missing");
+        assert_eq!(ProbeOutcome::NotProbed.to_string(), "not probed");
+        assert_eq!(
+            ProbeOutcome::Error {
+                message: "permission denied".into(),
+            }
+            .to_string(),
+            "error: permission denied"
+        );
+    }
+
+    #[test]
+    fn invalid_value_origin_facts_start_unset() {
+        let err = ClapfigError::invalid_value("port", "expected integer");
+        match err {
+            ClapfigError::InvalidValue {
+                key,
+                reason,
+                origin,
+            } => {
+                assert_eq!(key, "port");
+                assert_eq!(reason, "expected integer");
+                assert_eq!(*origin, OriginFacts::default());
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+        assert_eq!(
+            ClapfigError::invalid_value("port", "expected integer").to_string(),
+            "Invalid value for 'port': expected integer"
+        );
+    }
+
+    #[test]
+    fn invalid_value_display_names_each_origin_kind() {
+        let mut file = OriginFacts {
+            file: Some("app.toml".into()),
+            span: Some(crate::format::Span { start: 7, end: 11 }),
+            source: Some(Arc::from("port = 8080\n")),
+            input_type: Some(InputType::File),
+            ..OriginFacts::default()
+        };
+        let msg = ClapfigError::InvalidValue {
+            key: "port".into(),
+            reason: "expected integer".into(),
+            origin: Box::new(file.clone()),
+        }
+        .to_string();
+        assert!(msg.contains("--> app.toml:1"), "{msg}");
+
+        file.input_type = Some(InputType::Env);
+        file.env_var = Some("MYAPP__PORT".into());
+        file.file = None;
+        file.span = None;
+        file.source = None;
+        let msg = ClapfigError::InvalidValue {
+            key: "port".into(),
+            reason: "expected integer".into(),
+            origin: Box::new(file.clone()),
+        }
+        .to_string();
+        assert!(
+            msg.contains("set by environment variable MYAPP__PORT"),
+            "{msg}"
+        );
+
+        let msg = ClapfigError::PostValidationFailed("nope".into()).to_string();
+        assert!(!msg.contains("set by"), "{msg}");
+        assert!(!msg.contains("-->"), "{msg}");
     }
 }

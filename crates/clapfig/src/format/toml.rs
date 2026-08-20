@@ -4,7 +4,8 @@
 //! touches the `toml` and `toml_edit` crates. It carries the behavior the
 //! pipeline had before the value-model refactor, byte-identically:
 //!
-//! - [`parse`](TomlAdapter::parse): `toml` text → owned [`Value`] tree.
+//! - [`parse`](TomlAdapter::parse): one `toml_edit` document → owned
+//!   [`Value`] tree **and** the path → span index (ADR-0005).
 //! - [`serialize`](TomlAdapter::serialize): [`Value`] tree → TOML text.
 //! - [`template`](TomlAdapter::template): the commented config template
 //!   (doc comments, `# Allowed:` enum lines, commented placeholders for
@@ -12,27 +13,25 @@
 //! - [`edit`](TomlAdapter::edit): comment-preserving `toml_edit` set/unset
 //!   against existing source text.
 
+use std::collections::BTreeMap;
+
 use crate::runtime::{Leaf, Schema};
 use crate::value::{Map, Value};
-
-use std::collections::BTreeMap;
 
 use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
     walk_level,
 };
-use super::{
-    ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, PathSegment, Span,
-    UnsupportedByFormat,
-};
+use super::{ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, Span, SpanEntry};
 
 /// The TOML format behind the adapter contract.
 ///
 /// TOML is the baseline format: per ADR-0002's capability matrix it
 /// declares every implemented operation with no known refusals, including
-/// lossless comment-preserving edits. The one gap is
-/// [`span_index`](TomlAdapter::span_index) — undeclared and refused typed
-/// until the provenance epic builds the index.
+/// lossless comment-preserving edits. [`parse`](TomlAdapter::parse) walks
+/// one `toml_edit` document (ImDocument, so spans survive) and returns
+/// the value tree together with a complete path → span index (ADR-0005,
+/// ADR-0006).
 pub struct TomlAdapter;
 
 impl FormatAdapter for TomlAdapter {
@@ -45,8 +44,6 @@ impl FormatAdapter for TomlAdapter {
     }
 
     fn capabilities(&self) -> &'static [Operation] {
-        // The provenance epic adds Operation::SpanIndex when it
-        // implements span_index.
         &[
             Operation::Parse,
             Operation::Template,
@@ -58,8 +55,11 @@ impl FormatAdapter for TomlAdapter {
         ]
     }
 
-    fn parse(&self, text: &str) -> Result<Value, FormatError> {
-        let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+    fn parse(&self, text: &str) -> Result<Parsed, FormatError> {
+        // `ImDocument` retains byte spans; `DocumentMut` (used by edit)
+        // clears them on construction. One walk produces both the Value
+        // tree and the span index (ADR-0005).
+        let doc = toml_edit::ImDocument::parse(text).map_err(|e: toml_edit::TomlError| {
             // `message()` is the bare description; some parser errors
             // express themselves through the span alone, so fall back to
             // the full rendering rather than an empty message.
@@ -70,13 +70,12 @@ impl FormatAdapter for TomlAdapter {
             FormatError::Parse {
                 format: "toml",
                 message,
-                span: e.span().map(|r| Span {
-                    start: r.start,
-                    end: r.end,
-                }),
+                span: e.span().map(Span::from_range),
             }
         })?;
-        Ok(toml_to_value(toml::Value::Table(table)))
+        let mut spans = BTreeMap::new();
+        let value = Value::Map(table_to_map(doc.as_table(), &ConfigPath::new(), &mut spans));
+        Ok(Parsed { value, spans })
     }
 
     fn serialize(&self, value: &Value) -> Result<String, FormatError> {
@@ -115,32 +114,20 @@ impl FormatAdapter for TomlAdapter {
                 .map_err(|e: toml_edit::TomlError| FormatError::Parse {
                     format: "toml",
                     message: e.message().to_string(),
-                    span: e.span().map(|r| Span {
-                        start: r.start,
-                        end: r.end,
-                    }),
+                    span: e.span().map(Span::from_range),
                 })?;
         match edit {
             FileEdit::Set { path, value, .. } => {
                 check_datetime_offsets(value)?;
-                let keys = key_segments(path);
+                let keys = key_segments(path)?;
                 super::edit::write_at_path(doc.as_item_mut(), &keys, value_to_toml_edit(value))?;
             }
             FileEdit::Unset { path } => {
-                let keys = key_segments(path);
+                let keys = key_segments(path)?;
                 super::edit::unset_at_path(doc.as_item_mut(), &keys);
             }
         }
         Ok(doc.to_string())
-    }
-
-    fn span_index(&self, _text: &str) -> Result<BTreeMap<ConfigPath, Span>, FormatError> {
-        // Provenance epic: build the path → span index from parser spans.
-        Err(UnsupportedByFormat {
-            format: self.name(),
-            operation: Operation::SpanIndex,
-        }
-        .into())
     }
 }
 
@@ -167,26 +154,130 @@ fn check_datetime_offsets(value: &Value) -> Result<(), FormatError> {
     }
 }
 
-/// Convert a parsed `toml::Value` into the owned model. Infallible: every
-/// TOML construct maps directly onto the baseline (TOML *is* the baseline).
-fn toml_to_value(value: toml::Value) -> Value {
-    match value {
-        toml::Value::String(s) => Value::String(s),
-        toml::Value::Integer(i) => Value::Integer(i),
-        toml::Value::Float(f) => Value::Float(f),
-        toml::Value::Boolean(b) => Value::Boolean(b),
-        // Identity: `toml::value::Datetime` IS the owned model's `Datetime`
-        // (both are `toml_datetime`'s, same pinned version).
-        toml::Value::Datetime(d) => Value::Datetime(d),
-        toml::Value::Array(items) => Value::Array(items.into_iter().map(toml_to_value).collect()),
-        toml::Value::Table(entries) => {
-            let mut map = Map::new();
-            for (k, v) in entries {
-                map.insert(k, toml_to_value(v));
-            }
-            Value::Map(map)
+/// Walk a `toml_edit` table into the owned model, recording a span-index
+/// entry for every path. Infallible: every TOML construct maps directly
+/// onto the baseline (TOML *is* the baseline).
+fn table_to_map(
+    table: &toml_edit::Table,
+    path: &ConfigPath,
+    spans: &mut BTreeMap<ConfigPath, SpanEntry>,
+) -> Map {
+    table_like_to_map(table, path, spans)
+}
+
+fn table_like_to_map(
+    table: &impl toml_edit::TableLike,
+    path: &ConfigPath,
+    spans: &mut BTreeMap<ConfigPath, SpanEntry>,
+) -> Map {
+    let mut map = Map::new();
+    for (k, item) in table.iter() {
+        let Some(key) = table.key(k) else {
+            unreachable!("iter() key must exist in the table");
+        };
+        let child = path.clone().key(k);
+        let key_span = key.span().map(Span::from_range);
+        let value = item_to_value(item, &child, key_span, spans);
+        map.insert(k.to_string(), value);
+    }
+    map
+}
+
+fn item_to_value(
+    item: &toml_edit::Item,
+    path: &ConfigPath,
+    key_span: Option<Span>,
+    spans: &mut BTreeMap<ConfigPath, SpanEntry>,
+) -> Value {
+    match item {
+        toml_edit::Item::None => {
+            record_span(spans, path.clone(), key_span, None);
+            Value::Map(Map::new())
+        }
+        toml_edit::Item::Value(v) => {
+            record_span(spans, path.clone(), key_span, v.span());
+            edit_value_to_value(v, path, spans)
+        }
+        toml_edit::Item::Table(t) => {
+            record_span(spans, path.clone(), key_span, t.span());
+            Value::Map(table_to_map(t, path, spans))
+        }
+        toml_edit::Item::ArrayOfTables(a) => {
+            record_span(spans, path.clone(), key_span, a.span());
+            Value::Array(array_of_tables_to_values(a, path, spans))
         }
     }
+}
+
+fn edit_value_to_value(
+    value: &toml_edit::Value,
+    path: &ConfigPath,
+    spans: &mut BTreeMap<ConfigPath, SpanEntry>,
+) -> Value {
+    match value {
+        toml_edit::Value::String(s) => Value::String(s.value().clone()),
+        toml_edit::Value::Integer(i) => Value::Integer(*i.value()),
+        toml_edit::Value::Float(f) => Value::Float(*f.value()),
+        toml_edit::Value::Boolean(b) => Value::Boolean(*b.value()),
+        // Identity: `toml_edit::Datetime` IS the owned model's `Datetime`
+        // (both are `toml_datetime`'s, same pinned version).
+        toml_edit::Value::Datetime(d) => Value::Datetime(*d.value()),
+        toml_edit::Value::Array(a) => Value::Array(array_to_values(a, path, spans)),
+        toml_edit::Value::InlineTable(t) => Value::Map(table_like_to_map(t, path, spans)),
+    }
+}
+
+fn array_to_values(
+    array: &toml_edit::Array,
+    path: &ConfigPath,
+    spans: &mut BTreeMap<ConfigPath, SpanEntry>,
+) -> Vec<Value> {
+    array
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let child = path.clone().index(i);
+            record_span(spans, child.clone(), None, v.span());
+            edit_value_to_value(v, &child, spans)
+        })
+        .collect()
+}
+
+fn array_of_tables_to_values(
+    array: &toml_edit::ArrayOfTables,
+    path: &ConfigPath,
+    spans: &mut BTreeMap<ConfigPath, SpanEntry>,
+) -> Vec<Value> {
+    array
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let child = path.clone().index(i);
+            record_span(spans, child.clone(), None, t.span());
+            Value::Map(table_to_map(t, &child, spans))
+        })
+        .collect()
+}
+
+fn record_span(
+    spans: &mut BTreeMap<ConfigPath, SpanEntry>,
+    path: ConfigPath,
+    key: Option<Span>,
+    value: Option<std::ops::Range<usize>>,
+) {
+    spans.insert(
+        path,
+        SpanEntry {
+            key,
+            // Implicit dotted/header parent tables may lack a value span;
+            // fall back to the key token so every path in the tree has an
+            // entry (ADR-0005: empty/partial indexes are not legal).
+            value: value
+                .map(Span::from_range)
+                .or(key)
+                .unwrap_or(Span { start: 0, end: 0 }),
+        },
+    );
 }
 
 /// Convert an owned [`Value`] into a `toml::Value` for serialization.
@@ -213,12 +304,10 @@ fn value_to_toml(value: &Value) -> toml::Value {
 }
 
 /// The key segments of a [`ConfigPath`](super::ConfigPath), for the edit
-/// walkers below.
-fn key_segments(path: &super::ConfigPath) -> Vec<&str> {
-    path.segments()
-        .iter()
-        .map(|PathSegment::Key(k)| k.as_str())
-        .collect()
+/// walkers below. Index segments refuse rather than silently retargeting
+/// the edit.
+fn key_segments(path: &super::ConfigPath) -> Result<Vec<&str>, FormatError> {
+    super::edit::map_key_segments(path, "toml")
 }
 
 /// The TOML document tree behind the shared edit walkers
@@ -413,8 +502,32 @@ fn format_inline_toml(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ConfigPath, SetTarget};
+    use super::super::SetTarget;
     use super::*;
+
+    fn collect_value_paths(value: &Value, path: ConfigPath, out: &mut Vec<ConfigPath>) {
+        match value {
+            Value::Map(map) => {
+                for (k, v) in map {
+                    let child = path.clone().key(k.clone());
+                    out.push(child.clone());
+                    collect_value_paths(v, child, out);
+                }
+            }
+            Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    let child = path.clone().index(i);
+                    out.push(child.clone());
+                    collect_value_paths(v, child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn source_slice(source: &str, span: Span) -> &str {
+        &source[span.start..span.end]
+    }
 
     #[test]
     fn template_matches_byte_identical_golden() {
@@ -477,7 +590,8 @@ pool_size = 5
     fn parse_scalars_and_containers() {
         let value = TomlAdapter
             .parse("s = \"x\"\ni = 3\nf = 1.5\nb = true\n[t]\nn = 1\narr = [1, 2]\n")
-            .unwrap();
+            .unwrap()
+            .value;
         let map = value.as_map().unwrap();
         assert_eq!(map["s"], Value::String("x".into()));
         assert_eq!(map["i"], Value::Integer(3));
@@ -492,8 +606,124 @@ pool_size = 5
     }
 
     #[test]
+    fn parse_fills_span_index_for_every_path() {
+        let source = r#"s = "x"
+i = 3
+arr = [1, 2]
+
+[t]
+n = 1
+"#;
+        let parsed = TomlAdapter.parse(source).unwrap();
+        let mut paths = Vec::new();
+        collect_value_paths(&parsed.value, ConfigPath::new(), &mut paths);
+        for path in &paths {
+            assert!(
+                parsed.spans.contains_key(path),
+                "missing span for path {path}"
+            );
+        }
+        assert_eq!(parsed.spans.len(), paths.len());
+    }
+
+    #[test]
+    fn parse_span_index_key_none_on_array_elements() {
+        let source = "arr = [1, { x = 2 }]\n";
+        let parsed = TomlAdapter.parse(source).unwrap();
+        let first = parsed
+            .spans
+            .get(&ConfigPath::new().key("arr").index(0))
+            .expect("arr[0]");
+        assert!(first.key.is_none(), "array elements have no key token");
+        assert_eq!(source_slice(source, first.value), "1");
+        let inline = parsed
+            .spans
+            .get(&ConfigPath::new().key("arr").index(1))
+            .expect("arr[1]");
+        assert!(inline.key.is_none());
+        let x = parsed
+            .spans
+            .get(&ConfigPath::new().key("arr").index(1).key("x"))
+            .expect("arr[1].x");
+        assert_eq!(source_slice(source, x.key.expect("map key")), "x");
+        assert_eq!(source_slice(source, x.value), "2");
+    }
+
+    #[test]
+    fn parse_span_index_array_of_tables_entries_have_no_key() {
+        let source = "[[servers]]\nhost = \"a\"\n[[servers]]\nhost = \"b\"\n";
+        let parsed = TomlAdapter.parse(source).unwrap();
+        let entry = parsed
+            .spans
+            .get(&ConfigPath::new().key("servers").index(1))
+            .expect("servers[1]");
+        assert!(
+            entry.key.is_none(),
+            "[[servers]] entries have no key token (ADR-0006)"
+        );
+        let host = parsed
+            .spans
+            .get(&ConfigPath::new().key("servers").index(1).key("host"))
+            .expect("servers[1].host");
+        assert_eq!(source_slice(source, host.key.expect("host key")), "host");
+        assert_eq!(source_slice(source, host.value), "\"b\"");
+    }
+
+    #[test]
+    fn parse_span_index_covers_inline_tables() {
+        let source = "point = { x = 1, y = 2 }\n";
+        let parsed = TomlAdapter.parse(source).unwrap();
+        let x = parsed
+            .spans
+            .get(&ConfigPath::new().key("point").key("x"))
+            .expect("point.x");
+        assert_eq!(source_slice(source, x.key.expect("x key")), "x");
+        assert_eq!(source_slice(source, x.value), "1");
+    }
+
+    #[test]
+    fn parse_span_index_quoted_dotted_key_is_one_segment() {
+        let source = "\"a.b\" = 1\n[a]\nb = 2\n";
+        let parsed = TomlAdapter.parse(source).unwrap();
+        let literal = parsed
+            .spans
+            .get(&ConfigPath::new().key("a.b"))
+            .expect("literal a.b");
+        assert_eq!(
+            source_slice(source, literal.key.expect("quoted key")),
+            "\"a.b\""
+        );
+        assert_eq!(source_slice(source, literal.value), "1");
+        let nested = parsed
+            .spans
+            .get(&ConfigPath::new().key("a").key("b"))
+            .expect("nested a.b");
+        assert_eq!(source_slice(source, nested.key.expect("b key")), "b");
+        assert_eq!(source_slice(source, nested.value), "2");
+        assert_ne!(literal.key, nested.key);
+    }
+
+    #[test]
+    fn parse_span_index_key_span_is_original_spelling() {
+        let source = "pool-size = 5\n";
+        let parsed = TomlAdapter.parse(source).unwrap();
+        let entry = parsed
+            .spans
+            .get(&ConfigPath::new().key("pool-size"))
+            .expect("pool-size");
+        assert_eq!(
+            source_slice(source, entry.key.expect("key span")),
+            "pool-size"
+        );
+        assert_eq!(source_slice(source, entry.value), "5");
+    }
+
+    #[test]
     fn parse_datetime_lands_in_owned_variant() {
-        let value = TomlAdapter.parse("dt = 1979-05-27T07:32:00Z\n").unwrap();
+        let value = TomlAdapter
+            .parse("dt = 1979-05-27T07:32:00Z\n")
+            .unwrap()
+            .value;
         let dt = value.as_map().unwrap()["dt"].as_datetime().unwrap();
         assert_eq!(dt.to_string(), "1979-05-27T07:32:00Z");
     }
@@ -646,9 +876,9 @@ pool_size = 5
     #[test]
     fn serialize_round_trips_parse() {
         let source = "b = true\ni = 3\ns = \"x\"\n\n[t]\nn = 1\n";
-        let value = TomlAdapter.parse(source).unwrap();
+        let value = TomlAdapter.parse(source).unwrap().value;
         let text = TomlAdapter.serialize(&value).unwrap();
-        let reparsed = TomlAdapter.parse(&text).unwrap();
+        let reparsed = TomlAdapter.parse(&text).unwrap().value;
         assert_eq!(value, reparsed);
     }
 
@@ -691,7 +921,7 @@ pool_size = 5
                 },
             )
             .unwrap();
-        let reparsed = TomlAdapter.parse(&out).unwrap();
+        let reparsed = TomlAdapter.parse(&out).unwrap().value;
         assert_eq!(
             reparsed.as_map().unwrap()["database"].as_map().unwrap()["url"],
             Value::String("pg://x".into())
@@ -714,6 +944,28 @@ pool_size = 5
             .unwrap_err();
         match err {
             FormatError::Edit { message, .. } => assert!(message.contains("path conflict")),
+            other => panic!("expected Edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_indexed_path_is_typed_error() {
+        let path = ConfigPath::new().key("plugins").index(0).key("host");
+        let value = Value::from("x");
+        let err = TomlAdapter
+            .edit(
+                "port = 1\n",
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap_err();
+        match err {
+            FormatError::Edit { message, .. } => {
+                assert!(message.contains("[0]"), "{message}");
+            }
             other => panic!("expected Edit, got {other:?}"),
         }
     }

@@ -94,6 +94,32 @@ pub enum Layer {
     Cli,
 }
 
+/// Where a resolved value came from, as reported on errors.
+///
+/// Distinct from [`Layer`], which is **merge-order** (`Files` / `Env` /
+/// `Url` / `Cli`) and must not grow a `Default` variant. This enum is
+/// **provenance identity**: `File` (singular — one winning file),
+/// `Override` rather than `Cli` (clapfig cannot know whether a CLI flag,
+/// GUI field, or HTTP header produced a programmatic override), and
+/// `Default` for schema-filled values.
+///
+/// The pipeline's crate-private origin payload uses the same variants
+/// under the name `OriginLayer`. There is no public `Origin` type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InputType {
+    /// A config file that discovery loaded.
+    File,
+    /// An environment variable with the configured prefix.
+    Env,
+    /// A URL query parameter (requires the `url` feature to be consulted).
+    Url,
+    /// A programmatic override (`cli_override` / `cli_overrides_from`).
+    Override,
+    /// A schema-filled default (`fill_defaults_into`) or schema-shaped
+    /// absence (empty map/array materialization).
+    Default,
+}
+
 /// Where to search for config files.
 ///
 /// Each variant represents a source of candidate directories. The builder

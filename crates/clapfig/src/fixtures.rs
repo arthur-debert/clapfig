@@ -11,6 +11,7 @@ pub mod test {
         match crate::format::TomlAdapter
             .parse(text)
             .expect("test fixture TOML must parse")
+            .value
         {
             Value::Map(map) => map,
             _ => unreachable!("TOML documents are maps at the root"),
@@ -83,8 +84,18 @@ pub mod test {
     fn test_schema_loads_defaults() {
         let schema = test_schema();
         let mut table = Map::new();
-        crate::schema_walk::fill_defaults_into(&mut table, &schema);
-        let table = crate::schema_walk::finalize(table, &schema).unwrap();
+        crate::schema_walk::fill_defaults_into(
+            &mut table,
+            &mut crate::origin::OriginMap::new(),
+            &schema,
+        );
+        let table = crate::schema_walk::finalize(
+            table,
+            &crate::origin::OriginMap::new(),
+            &schema,
+            &crate::error::DiscoveryRecord::empty(),
+        )
+        .unwrap();
         assert_eq!(table["host"].as_str(), Some("localhost"));
         assert_eq!(table["port"].as_integer(), Some(8080));
         assert_eq!(table["debug"].as_bool(), Some(false));
