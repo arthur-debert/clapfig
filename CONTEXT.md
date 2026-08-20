@@ -41,3 +41,12 @@ are `File`, `Env`, `Url`, `Override`, `Default` — not **Layer**
 `Cli` in merge-order and `Override` here).
 _Avoid_: source (already means the retained file text in error types, and
 the cause chain in Rust's `Error::source()`), source map, Layer
+
+**Shape**:
+A schema node: leaf, object, homogeneous map, homogeneous array, or
+tagged union. Every walker walks Shape. Legal document roots are the
+object-shaped constructors (Object, Map, internally tagged object) —
+not Leaf or Array. A tagged-union variant is an object (`Schema`), not
+an arbitrary Shape. Today's named-field object is one constructor, not
+the node.
+_Avoid_: schema type, field kind
