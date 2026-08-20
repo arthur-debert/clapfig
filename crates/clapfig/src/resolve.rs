@@ -342,11 +342,19 @@ pub(crate) fn resolve(
     if cascade_active {
         let mut exclusive = Vec::new();
         schema_walk::collect_branch_exclusive_root(&merged, input.schema, &mut exclusive);
+        let phase2_overrides = input
+            .strict_overrides
+            .for_selected_branch(input.schema, &merged);
+        let phase2_ctx = ValidateContext {
+            overrides: &phase2_overrides,
+            default_strict: input.strict_default,
+            callback: input.unknown_key_hook.as_ref(),
+        };
         let mut phase2 = crate::validate::filter_through_cascade(
             &merged,
             &UnknownKeySource::Merged { origins: &origins },
             exclusive,
-            &validate_ctx,
+            &phase2_ctx,
         )?;
         collected_unknowns.append(&mut phase2);
     }

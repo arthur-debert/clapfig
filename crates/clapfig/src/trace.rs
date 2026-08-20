@@ -702,4 +702,41 @@ mod tests {
             "trace must not contain the discriminator string or variant name:\n{logs}"
         );
     }
+
+    #[test]
+    fn invalid_discriminator_does_not_emit_tagged_branch_selected() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.toml"),
+            "kind = \"rus\"\nmount = \".\"\n",
+        )
+        .unwrap();
+        let shape = Shape::from(
+            Shape::tagged("Block", "kind")
+                .variant(
+                    "rust",
+                    Schema::object("Rust").field("mount", RtField::string()),
+                )
+                .variant(
+                    "payload",
+                    Schema::object("Payload").field("artifact", RtField::string()),
+                )
+                .build(),
+        );
+        let (events, result) = capture(|| {
+            Clapfig::builder(shape)
+                .app_name("app")
+                .file_name("app.toml")
+                .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+                .no_env()
+                .load()
+        });
+        assert!(result.is_err(), "unknown discriminator must fail");
+        let selected = named(&events, "tagged branch selected");
+        assert!(
+            selected.is_empty(),
+            "selection event records that selection happened; invalid tags must not emit it:\n{}",
+            blob(&events)
+        );
+    }
 }

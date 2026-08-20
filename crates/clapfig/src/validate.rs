@@ -222,6 +222,7 @@ pub(crate) fn filter_through_cascade(
                 span: located.span,
                 env_var: located.env_var.as_deref(),
                 url_key: located.url_key.as_deref(),
+                override_key: located.override_key.as_deref(),
                 input_type: located.input_type,
             };
             match callback(&context) {
@@ -240,6 +241,7 @@ pub(crate) fn filter_through_cascade(
                         span: located.span,
                         env_var: located.env_var,
                         url_key: located.url_key,
+                        override_key: located.override_key,
                         input_type: located.input_type,
                     });
                     continue;
@@ -250,15 +252,13 @@ pub(crate) fn filter_through_cascade(
 
         rejected.push(UnknownKeyInfo {
             key,
-            path: located
-                .file
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| std::path::PathBuf::from("<env>")),
+            path: unknown_key_source_path(&located),
             line: located.line,
             source: located.source,
             env_var: located.env_var,
             span: located.span,
             url_key: located.url_key,
+            override_key: located.override_key,
             input_type: located.input_type,
         });
     }
@@ -275,8 +275,20 @@ struct LocatedUnknown<'a> {
     env_var: Option<String>,
     span: Option<Span>,
     url_key: Option<String>,
+    override_key: Option<String>,
     input_type: Option<InputType>,
     source: Option<Arc<str>>,
+}
+
+fn unknown_key_source_path(located: &LocatedUnknown<'_>) -> std::path::PathBuf {
+    if let Some(file) = located.file {
+        return file.to_path_buf();
+    }
+    match located.input_type {
+        Some(InputType::Url) => std::path::PathBuf::from("<url>"),
+        Some(InputType::Override) => std::path::PathBuf::from("<override>"),
+        _ => std::path::PathBuf::from("<env>"),
+    }
 }
 
 fn locate_unknown_key<'a>(
@@ -300,6 +312,7 @@ fn locate_unknown_key<'a>(
                 env_var: None,
                 span: key_span,
                 url_key: None,
+                override_key: None,
                 input_type: None,
                 source: file_source.cloned(),
             }
@@ -310,6 +323,7 @@ fn locate_unknown_key<'a>(
             env_var: crate::env::env_source_names(sources, config_path),
             span: None,
             url_key: None,
+            override_key: None,
             input_type: None,
             source: None,
         },
@@ -321,11 +335,13 @@ fn locate_unknown_key<'a>(
                     env_var: None,
                     span: None,
                     url_key: None,
+                    override_key: None,
                     input_type: None,
                     source: None,
                 };
             };
-            let line = match (found.span, found.source.as_deref()) {
+            let key_span = found.key_span;
+            let line = match (key_span, found.source.as_deref()) {
                 (Some(span), Some(src)) => byte_offset_to_line_col(src, span.start).0,
                 _ => 0,
             };
@@ -337,8 +353,13 @@ fn locate_unknown_key<'a>(
                 } else {
                     Some(found.env_vars.join(", "))
                 },
-                span: found.span,
+                span: key_span,
                 url_key: found.url_key.clone(),
+                override_key: if found.layer == InputType::Override {
+                    found.key.clone()
+                } else {
+                    None
+                },
                 input_type: Some(found.layer),
                 source: found.source.clone(),
             }

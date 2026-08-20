@@ -355,3 +355,129 @@ fn surviving_true_unknown_is_not_a_phase2_candidate() {
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].key, "artifact");
 }
+
+#[test]
+fn phase2_file_unknown_key_span_covers_the_key_token() {
+    let err = load_file(
+        block_shape(),
+        "kind = \"rust\"\nmount = \".\"\nartifact = \"x\"\n",
+    )
+    .unwrap_err();
+    let keys = err.unknown_keys().expect("UnknownKeys");
+    assert_eq!(keys[0].key, "artifact");
+    let span = keys[0]
+        .span
+        .expect("phase-2 file winner must carry key span");
+    let src = keys[0].source.as_deref().expect("retained source");
+    assert_eq!(
+        src.get(span.start..span.end),
+        Some("artifact"),
+        "caret must cover the key token, not the value"
+    );
+}
+
+#[test]
+fn nested_tagged_cli_overrides_from_matches_tag_and_variant_leaves() {
+    #[derive(serde::Serialize)]
+    struct Block {
+        kind: String,
+        mount: String,
+    }
+    #[derive(serde::Serialize)]
+    struct Args {
+        block: Block,
+    }
+    let schema = Schema::object("App").field("block", block_shape()).build();
+    let dir = TempDir::new().unwrap();
+    let args = Args {
+        block: Block {
+            kind: "rust".into(),
+            mount: ".".into(),
+        },
+    };
+    let table = Clapfig::builder(schema)
+        .app_name("app")
+        .file_name("app.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .cli_overrides_from(&args)
+        .load()
+        .expect("nested tagged leaves must be auto-matched");
+    let block = table["block"].as_map().unwrap();
+    assert_eq!(block["kind"], Value::String("rust".into()));
+    assert_eq!(block["mount"], Value::String(".".into()));
+}
+
+#[test]
+fn nested_tagged_strict_at_is_a_valid_section() {
+    let schema = Schema::object("App").field("block", block_shape()).build();
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("app.toml"),
+        "[block]\nkind = \"rust\"\nmount = \".\"\nartifact = \"x\"\n",
+    )
+    .unwrap();
+    let table = Clapfig::builder(schema)
+        .app_name("app")
+        .file_name("app.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .strict_at("block", false)
+        .load()
+        .expect("strict_at on a nested tagged section must be accepted");
+    let block = table["block"].as_map().unwrap();
+    assert_eq!(block["kind"], Value::String("rust".into()));
+}
+
+#[test]
+fn cli_won_branch_exclusive_key_names_override_origin() {
+    let dir = TempDir::new().unwrap();
+    let err = Clapfig::builder(block_shape())
+        .app_name("app")
+        .file_name("app.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .cli_override("kind", Some("rust"))
+        .cli_override("mount", Some("."))
+        .cli_override("artifact", Some("x"))
+        .load()
+        .unwrap_err();
+    let keys = err.unknown_keys().expect("UnknownKeys");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].key, "artifact");
+    assert_eq!(keys[0].input_type, Some(InputType::Override));
+    assert_eq!(keys[0].override_key.as_deref(), Some("artifact"));
+    assert_ne!(keys[0].path.as_os_str(), "<env>");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("programmatic override"),
+        "Display must not classify an override winner as <env>: {msg}"
+    );
+    assert!(!msg.contains("<env>"), "{msg}");
+}
+
+#[cfg(feature = "url")]
+#[test]
+fn url_won_branch_exclusive_key_names_url_origin() {
+    let dir = TempDir::new().unwrap();
+    let err = Clapfig::builder(block_shape())
+        .app_name("app")
+        .file_name("app.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .url_query("kind=rust&mount=.&artifact=x")
+        .load()
+        .unwrap_err();
+    let keys = err.unknown_keys().expect("UnknownKeys");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].key, "artifact");
+    assert_eq!(keys[0].input_type, Some(InputType::Url));
+    assert_eq!(keys[0].url_key.as_deref(), Some("artifact"));
+    assert_ne!(keys[0].path.as_os_str(), "<env>");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("URL query"),
+        "Display must not classify a URL winner as <env>: {msg}"
+    );
+    assert!(!msg.contains("<env>"), "{msg}");
+}

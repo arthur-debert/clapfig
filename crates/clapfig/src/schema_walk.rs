@@ -214,7 +214,9 @@ fn collect_unknown_tagged_phase1(
 
 /// Recurse unknown-key collection through every shape a name is declared
 /// as across variants, so a nested key valid for any variant is known at
-/// phase 1.
+/// phase 1. Mixed constructors on the same field (Object in one variant,
+/// Map / Tagged / `Value` in another) combine: a key is unknown only if
+/// every alternative treats it as unknown.
 fn collect_unknown_against_shapes_union(
     value: &Value,
     shapes: &[&Shape],
@@ -222,84 +224,38 @@ fn collect_unknown_against_shapes_union(
     path: &ConfigPath,
     unknown: &mut Vec<UnknownKey>,
 ) {
-    let objects: Vec<&Schema> = shapes
-        .iter()
-        .filter_map(|s| match s {
-            Shape::Object(schema) => Some(schema),
-            _ => None,
-        })
-        .collect();
-    if !objects.is_empty() {
-        if let Value::Map(inner) = value {
-            collect_unknown_union_objects(inner, &objects, prefix, path, unknown);
+    match value {
+        Value::Map(inner) => {
+            collect_unknown_union_map(inner, shapes, prefix, path, unknown);
         }
-        return;
-    }
-    let tagged: Vec<&TaggedShape> = shapes
-        .iter()
-        .filter_map(|s| match s {
-            Shape::Tagged(t) => Some(t),
-            _ => None,
-        })
-        .collect();
-    if let Some(inner_tagged) = tagged.first()
-        && let Value::Map(inner) = value
-    {
-        collect_unknown_tagged_phase1(inner, inner_tagged, prefix, path, unknown);
-        return;
-    }
-    let map_items: Vec<&Shape> = shapes
-        .iter()
-        .filter_map(|s| match s {
-            Shape::Map(map) => Some(map.item.as_ref()),
-            _ => None,
-        })
-        .collect();
-    if !map_items.is_empty()
-        && let Value::Map(entries) = value
-    {
-        for (entry_key, entry_value) in entries {
-            let entry_path = format!("{prefix}.{entry_key}");
-            collect_unknown_against_shapes_union(
-                entry_value,
-                &map_items,
-                &entry_path,
-                &path.clone().key(entry_key),
-                unknown,
-            );
+        Value::Array(items) => {
+            let array_items: Vec<&Shape> = shapes
+                .iter()
+                .filter_map(|s| match s {
+                    Shape::Array(array) => Some(array.item.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            if array_items.is_empty() {
+                return;
+            }
+            for (i, item) in items.iter().enumerate() {
+                collect_unknown_against_shapes_union(
+                    item,
+                    &array_items,
+                    &format!("{prefix}[{i}]"),
+                    &path.clone().index(i),
+                    unknown,
+                );
+            }
         }
-        return;
-    }
-    let array_items: Vec<&Shape> = shapes
-        .iter()
-        .filter_map(|s| match s {
-            Shape::Array(array) => Some(array.item.as_ref()),
-            _ => None,
-        })
-        .collect();
-    if !array_items.is_empty()
-        && let Value::Array(items) = value
-    {
-        for (i, item) in items.iter().enumerate() {
-            let indexed = format!("{prefix}[{i}]");
-            collect_unknown_against_shapes_union(
-                item,
-                &array_items,
-                &indexed,
-                &path.clone().index(i),
-                unknown,
-            );
-        }
-        return;
-    }
-    if let Some(shape) = shapes.first() {
-        collect_unknown_against_shape(value, shape, prefix, path, unknown);
+        _ => {}
     }
 }
 
-fn collect_unknown_union_objects(
+fn collect_unknown_union_map(
     table: &Map,
-    schemas: &[&Schema],
+    shapes: &[&Shape],
     prefix: &str,
     path: &ConfigPath,
     unknown: &mut Vec<UnknownKey>,
@@ -307,18 +263,43 @@ fn collect_unknown_union_objects(
     for (key, value) in table {
         let full = join_prefix(prefix, key);
         let child = path.clone().key(key);
-        let field_shapes: Vec<&Shape> = schemas
-            .iter()
-            .filter_map(|schema| find_field(schema, key).map(|nf| &nf.field))
-            .collect();
-        if field_shapes.is_empty() {
+        let mut nested: Vec<&Shape> = Vec::new();
+        let mut known = false;
+        for shape in shapes {
+            match shape {
+                Shape::Leaf(_) => known = true,
+                Shape::Map(map) => {
+                    known = true;
+                    nested.push(map.item.as_ref());
+                }
+                Shape::Object(schema) => {
+                    if let Some(nf) = find_field(schema, key) {
+                        known = true;
+                        nested.push(&nf.field);
+                    }
+                }
+                Shape::Tagged(tagged) => {
+                    if key == tagged.tag.as_str() {
+                        known = true;
+                    } else {
+                        let field_shapes = tagged.field_shapes(key);
+                        if !field_shapes.is_empty() {
+                            known = true;
+                            nested.extend(field_shapes);
+                        }
+                    }
+                }
+                Shape::Array(_) => {}
+            }
+        }
+        if !known {
             unknown.push(UnknownKey {
                 path: full,
                 leaf: key.clone(),
                 config_path: child,
             });
-        } else {
-            collect_unknown_against_shapes_union(value, &field_shapes, &full, &child, unknown);
+        } else if !nested.is_empty() {
+            collect_unknown_against_shapes_union(value, &nested, &full, &child, unknown);
         }
     }
 }
@@ -485,64 +466,23 @@ fn collect_exclusive_against_shape(
 ) {
     match selected {
         Shape::Leaf(_) => {}
-        Shape::Object(schema) => {
-            let other_objects: Vec<&Schema> = others
-                .iter()
-                .filter_map(|s| match s {
-                    Shape::Object(o) => Some(o),
-                    _ => None,
-                })
-                .collect();
-            if let Value::Map(inner) = value {
-                for (key, nested) in inner {
-                    let full = join_prefix(prefix, key);
-                    let child = path.clone().key(key);
-                    if let Some(nf) = find_field(schema, key) {
-                        let nested_others: Vec<&Shape> = other_objects
-                            .iter()
-                            .filter_map(|o| find_field(o, key).map(|f| &f.field))
-                            .collect();
-                        collect_exclusive_against_shape(
-                            nested,
-                            &nf.field,
-                            &nested_others,
-                            &full,
-                            &child,
-                            unknown,
-                        );
-                    } else if other_objects.iter().any(|o| find_field(o, key).is_some()) {
-                        unknown.push(UnknownKey {
-                            path: full,
-                            leaf: key.clone(),
-                            config_path: child,
-                        });
-                    }
-                }
-            }
-        }
         Shape::Tagged(tagged) => {
             if let Value::Map(inner) = value {
                 collect_branch_exclusive_tagged(inner, tagged, prefix, path, unknown);
-            }
-        }
-        Shape::Map(map) => {
-            let other_items: Vec<&Shape> = others
-                .iter()
-                .filter_map(|s| match s {
-                    Shape::Map(m) => Some(m.item.as_ref()),
-                    _ => None,
-                })
-                .collect();
-            if let Value::Map(entries) = value {
-                for (entry_key, entry_value) in entries {
-                    collect_exclusive_against_shape(
-                        entry_value,
-                        &map.item,
-                        &other_items,
-                        &format!("{prefix}.{entry_key}"),
-                        &path.clone().key(entry_key),
-                        unknown,
-                    );
+                for key in inner.keys() {
+                    if key == tagged.tag.as_str() || !tagged.field_shapes(key).is_empty() {
+                        continue;
+                    }
+                    if others
+                        .iter()
+                        .any(|s| nested_shapes_for_key(s, key).is_some())
+                    {
+                        unknown.push(UnknownKey {
+                            path: join_prefix(prefix, key),
+                            leaf: key.clone(),
+                            config_path: path.clone().key(key),
+                        });
+                    }
                 }
             }
         }
@@ -567,6 +507,73 @@ fn collect_exclusive_against_shape(
                 }
             }
         }
+        Shape::Object(_) | Shape::Map(_) => {
+            let Value::Map(inner) = value else {
+                return;
+            };
+            for (key, nested) in inner {
+                let full = join_prefix(prefix, key);
+                let child = path.clone().key(key);
+                match nested_shapes_for_key(selected, key) {
+                    Some(sel_nested) if sel_nested.is_empty() => {}
+                    Some(sel_nested) => {
+                        let mut other_nested = Vec::new();
+                        for other in others {
+                            if let Some(ns) = nested_shapes_for_key(other, key) {
+                                other_nested.extend(ns);
+                            }
+                        }
+                        for sel in sel_nested {
+                            collect_exclusive_against_shape(
+                                nested,
+                                sel,
+                                &other_nested,
+                                &full,
+                                &child,
+                                unknown,
+                            );
+                        }
+                    }
+                    None if others
+                        .iter()
+                        .any(|s| nested_shapes_for_key(s, key).is_some()) =>
+                    {
+                        unknown.push(UnknownKey {
+                            path: full,
+                            leaf: key.clone(),
+                            config_path: child,
+                        });
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+}
+
+/// Nested shapes `shape` imposes on map key `key`.
+///
+/// `None` — this constructor does not know the key (candidate exclusive
+/// against another variant). `Some([])` — known as a leaf (tag, `Value`,
+/// scalar); no further unknown-key walk. `Some(shapes)` — known, recurse.
+fn nested_shapes_for_key<'a>(shape: &'a Shape, key: &str) -> Option<Vec<&'a Shape>> {
+    match shape {
+        Shape::Object(schema) => find_field(schema, key).map(|nf| vec![&nf.field]),
+        Shape::Tagged(tagged) => {
+            if key == tagged.tag.as_str() {
+                Some(Vec::new())
+            } else {
+                let field_shapes = tagged.field_shapes(key);
+                if field_shapes.is_empty() {
+                    None
+                } else {
+                    Some(field_shapes)
+                }
+            }
+        }
+        Shape::Map(map) => Some(vec![map.item.as_ref()]),
+        Shape::Leaf(_) => Some(Vec::new()),
+        Shape::Array(_) => None,
     }
 }
 
@@ -1243,11 +1250,6 @@ fn check_tagged(
     match table.get(&tagged.tag) {
         None => Err(ClapfigError::missing_required(tag_key, discovery.clone())),
         Some(value) => {
-            if let Some(origin) = crate::origin::lookup(origins, &tag_path) {
-                crate::trace::tagged_branch_selected(&tag_path, &origin.label(), value.type_str());
-            } else {
-                crate::trace::tagged_branch_selected(&tag_path, "unknown", value.type_str());
-            }
             tagged
                 .discriminator_leaf_type()
                 .check(value)
@@ -1260,6 +1262,11 @@ fn check_tagged(
             let variant = tagged
                 .variant(disc)
                 .expect("enum check passed: discriminator names a variant");
+            if let Some(origin) = crate::origin::lookup(origins, &tag_path) {
+                crate::trace::tagged_branch_selected(&tag_path, &origin.label(), value.type_str());
+            } else {
+                crate::trace::tagged_branch_selected(&tag_path, "unknown", value.type_str());
+            }
             check_required_and_types(
                 table,
                 origins,
@@ -2082,5 +2089,103 @@ mod tests {
         fill_defaults_into_root(&mut table, &mut origins, DocumentRoot::Tagged(&tagged));
         assert_eq!(table.get("mount"), Some(&Value::String(".".into())));
         assert!(!table.contains_key("artifact"));
+    }
+
+    fn mixed_params_tagged() -> crate::runtime::TaggedShape {
+        crate::runtime::Shape::tagged("Block", "kind")
+            .variant(
+                "typed",
+                Schema::object("Typed")
+                    .nested(
+                        "params",
+                        Schema::object("P").field("shape", RtField::string().optional()),
+                    )
+                    .build(),
+            )
+            .variant(
+                "open",
+                Schema::object("Open")
+                    .field("params", RtField::value().optional())
+                    .build(),
+            )
+            .build()
+    }
+
+    #[test]
+    fn phase1_union_keeps_keys_valid_for_a_value_alternative() {
+        let tagged = mixed_params_tagged();
+        let table = parse("kind = \"open\"\n[params]\nanything = 1\n");
+        let mut unknown = Vec::new();
+        collect_unknown_paths_root(
+            &table,
+            DocumentRoot::Tagged(&tagged),
+            "",
+            &ConfigPath::new(),
+            &mut unknown,
+        );
+        assert!(
+            unknown.is_empty(),
+            "params.anything is known via the Value alternative: {:?}",
+            unknown.iter().map(|u| u.path.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn phase1_union_still_flags_true_unknowns_outside_every_alternative() {
+        let tagged = mixed_params_tagged();
+        let table = parse("kind = \"open\"\nrogue = 1\n");
+        let mut unknown = Vec::new();
+        collect_unknown_paths_root(
+            &table,
+            DocumentRoot::Tagged(&tagged),
+            "",
+            &ConfigPath::new(),
+            &mut unknown,
+        );
+        assert_eq!(
+            unknown.iter().map(|u| u.path.as_str()).collect::<Vec<_>>(),
+            ["rogue"]
+        );
+    }
+
+    #[test]
+    fn phase2_reports_exclusive_keys_from_a_tagged_alternative_of_an_object_field() {
+        let tagged = crate::runtime::Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .nested(
+                        "params",
+                        Schema::object("P").field("shape", RtField::string().optional()),
+                    )
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .field(
+                        "params",
+                        crate::runtime::Shape::from(
+                            crate::runtime::Shape::tagged("Params", "kind")
+                                .variant(
+                                    "artifact",
+                                    Schema::object("A")
+                                        .field("entry", RtField::string().optional())
+                                        .build(),
+                                )
+                                .build(),
+                        ),
+                    )
+                    .build(),
+            )
+            .build();
+        let table = parse("kind = \"rust\"\n[params]\nkind = \"artifact\"\nentry = \"x\"\n");
+        let mut exclusive = Vec::new();
+        collect_branch_exclusive_root(&table, DocumentRoot::Tagged(&tagged), &mut exclusive);
+        let paths: Vec<&str> = exclusive.iter().map(|u| u.path.as_str()).collect();
+        assert!(
+            paths.contains(&"params.kind") || paths.contains(&"params.entry"),
+            "branch-exclusive keys from the other constructor must be reported: {paths:?}"
+        );
     }
 }

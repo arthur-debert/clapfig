@@ -49,10 +49,10 @@ pub struct UnknownKeyInfo {
     /// Dotted key path that was not recognized by the config schema
     /// (e.g. `"database.typo"`).
     pub key: String,
-    /// Path to the config file that contained the unknown key. For an
-    /// env-derived key (see [`env_var`](Self::env_var)) this is the
-    /// synthesized `<env>` placeholder — renderers name the variable
-    /// instead.
+    /// Path to the config file that contained the unknown key. Non-file
+    /// winners use a synthesized placeholder (`<env>`, `<url>`,
+    /// `<override>`) — renderers name the variable, query key, or
+    /// override key instead of dressing those sources as a config file.
     pub path: PathBuf,
     /// 1-indexed line number where the key was found, or `0` if the line
     /// could not be located. Derived from [`span`](Self::span) (the key
@@ -77,6 +77,9 @@ pub struct UnknownKeyInfo {
     /// URL query-parameter key that supplied this unknown key, when it
     /// came from the URL layer.
     pub url_key: Option<String>,
+    /// Override key that supplied this unknown key, when it came from a
+    /// programmatic override (`cli_override` / `cli_overrides_from`).
+    pub override_key: Option<String>,
     /// Which input type produced the key. `None` when unset; env-derived
     /// keys already name [`env_var`](Self::env_var).
     pub input_type: Option<InputType>,
@@ -520,34 +523,56 @@ fn format_missing_required(key: &str, discovery: &DiscoveryRecord) -> String {
 
 fn format_unknown_keys(infos: &[UnknownKeyInfo]) -> String {
     use std::fmt::Write;
-    let header = if infos.iter().all(|i| i.env_var.is_some()) {
-        "Unknown keys in environment:"
-    } else {
-        "Unknown keys in config file:"
-    };
+    let header = unknown_keys_header(infos);
     let mut out = String::from(header);
     for info in infos {
-        match (&info.env_var, info.line) {
-            (Some(var), _) => {
-                let _ = write!(out, "\n  - '{}' from environment variable {var}", info.key);
-            }
+        if let Some(var) = &info.env_var {
+            let _ = write!(out, "\n  - '{}' from environment variable {var}", info.key);
+        } else if let Some(url_key) = &info.url_key {
+            let _ = write!(
+                out,
+                "\n  - '{}' from URL query parameter {url_key}",
+                info.key
+            );
+        } else if let Some(override_key) = &info.override_key {
+            let _ = write!(
+                out,
+                "\n  - '{}' from programmatic override {override_key}",
+                info.key
+            );
+        } else if info.line == 0 {
             // Line 0 means "could not be located" (no span-index entry
             // for the path) — omit it rather than render a bogus
             // `(line 0)`.
-            (None, 0) => {
-                let _ = write!(out, "\n  - '{}' in {}", info.key, info.path.display());
-            }
-            (None, line) => {
-                let _ = write!(
-                    out,
-                    "\n  - '{}' in {} (line {line})",
-                    info.key,
-                    info.path.display(),
-                );
-            }
+            let _ = write!(out, "\n  - '{}' in {}", info.key, info.path.display());
+        } else {
+            let _ = write!(
+                out,
+                "\n  - '{}' in {} (line {})",
+                info.key,
+                info.path.display(),
+                info.line,
+            );
         }
     }
     out
+}
+
+fn unknown_keys_header(infos: &[UnknownKeyInfo]) -> &'static str {
+    if infos.iter().all(|i| i.env_var.is_some()) {
+        "Unknown keys in environment:"
+    } else if infos.iter().all(|i| i.url_key.is_some()) {
+        "Unknown keys in URL query:"
+    } else if infos.iter().all(|i| i.override_key.is_some()) {
+        "Unknown keys in programmatic overrides:"
+    } else if infos
+        .iter()
+        .all(|i| i.env_var.is_none() && i.url_key.is_none() && i.override_key.is_none())
+    {
+        "Unknown keys in config file:"
+    } else {
+        "Unknown keys:"
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +588,7 @@ mod tests {
             env_var: None,
             span: None,
             url_key: None,
+            override_key: None,
             input_type: None,
         }
     }
@@ -644,6 +670,41 @@ mod tests {
         );
         assert!(!msg.contains("config file"), "{msg}");
         assert!(!msg.contains("<env>"), "{msg}");
+    }
+
+    #[test]
+    fn url_derived_unknown_key_names_the_query_parameter() {
+        let mut i = info("artifact", 0);
+        i.path = "<url>".into();
+        i.url_key = Some("artifact".into());
+        i.input_type = Some(InputType::Url);
+        let msg = ClapfigError::UnknownKeys(vec![i]).to_string();
+        assert!(msg.contains("Unknown keys in URL query:"), "{msg}");
+        assert!(
+            msg.contains("'artifact' from URL query parameter artifact"),
+            "{msg}"
+        );
+        assert!(!msg.contains("<env>"), "{msg}");
+        assert!(!msg.contains("config file"), "{msg}");
+    }
+
+    #[test]
+    fn override_derived_unknown_key_names_the_override_key() {
+        let mut i = info("artifact", 0);
+        i.path = "<override>".into();
+        i.override_key = Some("artifact".into());
+        i.input_type = Some(InputType::Override);
+        let msg = ClapfigError::UnknownKeys(vec![i]).to_string();
+        assert!(
+            msg.contains("Unknown keys in programmatic overrides:"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("'artifact' from programmatic override artifact"),
+            "{msg}"
+        );
+        assert!(!msg.contains("<env>"), "{msg}");
+        assert!(!msg.contains("config file"), "{msg}");
     }
 
     #[test]

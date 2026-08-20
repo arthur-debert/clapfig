@@ -153,7 +153,18 @@ fn collect_keys(schema: &Schema, prefix: &str, keys: &mut HashSet<String>) {
                 // user-supplied key) or "set the `audit` leaf inside a
                 // known schema field."
             }
-            crate::runtime::Shape::Tagged(_) => {}
+            crate::runtime::Shape::Tagged(tagged) => {
+                // Addressable nested tagged: the tag leaf and every
+                // variant's leaf paths under this prefix. The tagged
+                // object itself is a section, not a leaf. Tagged values
+                // behind unaddressable map/array entry syntax never
+                // reach here — those containers skip their subtrees
+                // above.
+                keys.insert(format!("{dotted}.{}", tagged.tag));
+                for variant in &tagged.variants {
+                    collect_keys(&variant.schema, &dotted, keys);
+                }
+            }
         }
     }
 }
@@ -236,5 +247,39 @@ mod tests {
         let schema = crate::fixtures::test::test_schema();
         let keys = valid_keys(&schema);
         assert!(!keys.contains("database"));
+    }
+
+    #[test]
+    fn valid_keys_collects_nested_tagged_tag_and_variant_leaves() {
+        use crate::runtime::{Field, Schema, Shape};
+        let schema = Schema::object("App")
+            .field(
+                "block",
+                Shape::from(
+                    Shape::tagged("Block", "kind")
+                        .variant(
+                            "rust",
+                            Schema::object("Rust")
+                                .field("mount", Field::string())
+                                .field("crate_path", Field::string().optional())
+                                .build(),
+                        )
+                        .variant(
+                            "payload",
+                            Schema::object("Payload")
+                                .field("mount", Field::string())
+                                .field("artifact", Field::string())
+                                .build(),
+                        )
+                        .build(),
+                ),
+            )
+            .build();
+        let keys = valid_keys(&schema);
+        assert!(keys.contains("block.kind"), "{keys:?}");
+        assert!(keys.contains("block.mount"), "{keys:?}");
+        assert!(keys.contains("block.crate_path"), "{keys:?}");
+        assert!(keys.contains("block.artifact"), "{keys:?}");
+        assert!(!keys.contains("block"), "{keys:?}");
     }
 }
