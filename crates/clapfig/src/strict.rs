@@ -35,9 +35,9 @@ use std::sync::Arc;
 
 use crate::error::ClapfigError;
 use crate::format::Span;
-use crate::runtime::Schema;
+use crate::runtime::{DocumentRoot, Schema, Shape, TaggedShape};
 use crate::types::InputType;
-use crate::value::Value;
+use crate::value::{Map, Value};
 
 /// Context handed to an [`on_unknown_key`](crate::Builder::on_unknown_key)
 /// callback. Carries every signal the callback needs to make a per-key
@@ -101,6 +101,10 @@ pub struct UnknownKeyContext<'a> {
     /// the URL layer.
     pub url_key: Option<&'a str>,
 
+    /// Override key that supplied this key, when it came from a
+    /// programmatic override (`cli_override` / `cli_overrides_from`).
+    pub override_key: Option<&'a str>,
+
     /// Which input type produced the key. `None` when unset.
     pub input_type: Option<InputType>,
 }
@@ -158,6 +162,9 @@ pub struct CollectedUnknown {
     /// URL query-parameter key that supplied this key, when it came from
     /// the URL layer.
     pub url_key: Option<String>,
+    /// Override key that supplied this key, when it came from a
+    /// programmatic override.
+    pub override_key: Option<String>,
     /// Which input type produced the key. `None` when unset.
     pub input_type: Option<InputType>,
 }
@@ -223,9 +230,12 @@ pub(crate) struct StrictnessOverrides {
     /// When the document root is a homogeneous Map, item-schema `strict`
     /// annotations are stored root-relative (`db`), while runtime paths
     /// include the dynamic entry key (`core.db.rogue`). Cascade lookup
-    /// probes only the path with that first segment stripped — never the
-    /// physical cursor, so an entry named `db` cannot steal `db.strict`.
+    /// probes only the path with that first segment stripped.
     skip_root_entry: bool,
+    /// Builder `strict_at` pairs, recorded so phase 2 can rebuild
+    /// schema-derived entries from the selected variant and replay these
+    /// overlays on top (builder wins at the same path).
+    builder_overlay: Vec<(String, bool)>,
 }
 
 impl StrictnessOverrides {
@@ -233,11 +243,66 @@ impl StrictnessOverrides {
         Self {
             entries: HashMap::new(),
             skip_root_entry: false,
+            builder_overlay: Vec::new(),
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn insert(&mut self, path: impl Into<String>, strict: bool) {
         self.entries.insert(path.into(), strict);
+    }
+
+    /// Schema-derived insert: conflicting values at the same path from
+    /// sibling variants union to `true` (any-strict-wins, declaration
+    /// order independent). Never used for builder `strict_at`.
+    fn insert_schema(&mut self, path: impl Into<String>, strict: bool) {
+        let path = path.into();
+        match self.entries.get(&path) {
+            None => {
+                self.entries.insert(path, strict);
+            }
+            Some(&existing) if existing == strict => {}
+            Some(_) => {
+                self.entries.insert(path, true);
+            }
+        }
+    }
+
+    /// Builder `strict_at` overlay: overwrites schema-derived entries at
+    /// the same path and is replayed after phase-2 selected-variant rebuild.
+    fn overlay(&mut self, path: impl Into<String>, strict: bool) {
+        let path = path.into();
+        self.entries.insert(path.clone(), strict);
+        self.builder_overlay.push((path, strict));
+    }
+
+    /// Phase-2 map: schema-derived strictness from the selected tagged
+    /// branch, including tagged items inside arrays and maps (recorded at
+    /// indexed/keyed runtime paths), then builder overlays.
+    pub(crate) fn for_selected_branch(&self, root: DocumentRoot<'_>, merged: &Map) -> Self {
+        let mut out = Self::new();
+        out.skip_root_entry = self.skip_root_entry;
+        match root {
+            DocumentRoot::Object(schema) => {
+                walk_selected_object(schema, Some(merged), "", &mut out);
+            }
+            DocumentRoot::Map(map) => {
+                out.skip_root_entry = true;
+                if let Some(value) = map.strict {
+                    out.insert_schema(String::new(), value);
+                }
+                for (key, value) in merged {
+                    walk_selected_shape(&map.item, Some(value), key, &mut out);
+                }
+            }
+            DocumentRoot::Tagged(tagged) => {
+                walk_selected_tagged(tagged, Some(merged), "", &mut out);
+            }
+        }
+        for (path, strict) in &self.builder_overlay {
+            out.entries.insert(path.clone(), *strict);
+        }
+        out
     }
 
     /// `true` when at least one override could promote some key to strict.
@@ -258,11 +323,10 @@ impl StrictnessOverrides {
         out
     }
 
-    /// Seed overrides from a document-root [`Shape`].
-    pub fn from_shape(shape: &crate::runtime::Shape) -> Self {
-        match shape {
-            crate::runtime::Shape::Object(schema) => Self::from_schema(schema),
-            crate::runtime::Shape::Map(map) => {
+    pub(crate) fn from_root(root: DocumentRoot<'_>) -> Self {
+        match root {
+            DocumentRoot::Object(schema) => Self::from_schema(schema),
+            DocumentRoot::Map(map) => {
                 let mut out = Self::new();
                 out.skip_root_entry = true;
                 if let Some(value) = map.strict {
@@ -271,14 +335,11 @@ impl StrictnessOverrides {
                 walk_shape_strict(&map.item, "", &mut out);
                 out
             }
-            crate::runtime::Shape::Tagged(tagged) => {
+            DocumentRoot::Tagged(tagged) => {
                 let mut out = Self::new();
-                if let Some(value) = tagged.strict {
-                    out.insert(String::new(), value);
-                }
+                walk_tagged_strict(tagged, "", &mut out);
                 out
             }
-            crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => Self::new(),
         }
     }
 
@@ -297,13 +358,6 @@ impl StrictnessOverrides {
     ///   probes both the physical form (`plugins[0]`) and the
     ///   bracket-stripped schema form (`plugins`) at each step, so an
     ///   override set on the item schema applies to any entry.
-    /// - **Root-map paths** (`core.db.rogue`): item-schema overrides are
-    ///   stored without the dynamic entry key (`db`). When the document
-    ///   root is a Map, lookup never matches the physical cursor (an
-    ///   entry named `db` must not steal `db.strict(...)`); it probes
-    ///   only the path after stripping that first segment, so
-    ///   `db.strict(false)` governs `<entry>.db.*` and `entries[""]`
-    ///   remains the root-map override.
     ///
     /// The cascade walks from the leaf's section path upward, returning
     /// the first explicit override found. With no override on any
@@ -325,15 +379,8 @@ impl StrictnessOverrides {
         }
     }
 
-    /// Direct match, then the array-index and root-map schema forms of
-    /// `cursor` when those probes apply.
     fn probe(&self, cursor: &str) -> Option<bool> {
         if self.skip_root_entry {
-            // The physical cursor starts with a user-supplied entry key.
-            // Matching it against item-relative entries would let an
-            // entry named `db` steal `db.strict(...)`. Empty cursor is
-            // the root-map override; every other cursor is looked up
-            // only after stripping that first segment.
             if cursor.is_empty() {
                 return self.entries.get("").copied();
             }
@@ -348,11 +395,6 @@ impl StrictnessOverrides {
         if let Some(v) = self.entries.get(cursor) {
             return Some(*v);
         }
-        // Also probe the bracket-stripped form so an override set on a
-        // runtime ArrayOf schema (e.g. `plugins.audit`) is consulted
-        // when the unknown key sits inside an array entry
-        // (`plugins[0].audit.rogue`). Allocation-free fast path when
-        // there are no brackets in the cursor.
         if cursor.contains('[') {
             let schema_form = strip_brackets(cursor);
             if let Some(v) = self.entries.get(&schema_form) {
@@ -367,7 +409,7 @@ impl StrictnessOverrides {
 /// `strict` is explicitly set.
 fn walk_schema_strict(schema: &Schema, prefix: &str, out: &mut StrictnessOverrides) {
     if let Some(value) = schema.strict {
-        out.insert(prefix.to_string(), value);
+        out.insert_schema(prefix.to_string(), value);
     }
     for field in &schema.fields {
         let dotted = if prefix.is_empty() {
@@ -379,42 +421,145 @@ fn walk_schema_strict(schema: &Schema, prefix: &str, out: &mut StrictnessOverrid
     }
 }
 
-fn walk_shape_strict(shape: &crate::runtime::Shape, dotted: &str, out: &mut StrictnessOverrides) {
-    use crate::runtime::Shape;
+fn walk_shape_strict(shape: &Shape, dotted: &str, out: &mut StrictnessOverrides) {
     match shape {
         Shape::Leaf(_) => {}
         Shape::Object(nested) => walk_schema_strict(nested, dotted, out),
         Shape::Array(array) => {
             if let Some(value) = array.strict {
-                out.insert(dotted.to_string(), value);
+                out.insert_schema(dotted.to_string(), value);
             }
             walk_shape_strict(&array.item, dotted, out);
         }
         Shape::Map(map) => {
             if let Some(value) = map.strict {
-                out.insert(dotted.to_string(), value);
+                out.insert_schema(dotted.to_string(), value);
             }
             walk_shape_strict(&map.item, dotted, out);
         }
-        Shape::Tagged(tagged) => {
-            if let Some(value) = tagged.strict {
-                out.insert(dotted.to_string(), value);
-            }
-            for variant in &tagged.variants {
-                walk_schema_strict(&variant.schema, dotted, out);
-            }
+        Shape::Tagged(tagged) => walk_tagged_strict(tagged, dotted, out),
+    }
+}
+
+/// Phase-1 tagged walk: the tagged node owns `dotted` (spec: the tagged
+/// object is the cascade parent). Variant root `schema.strict` does not
+/// write that path. Nested fields of every variant union with
+/// any-strict-wins so declaration order does not change behavior.
+fn walk_tagged_strict(tagged: &TaggedShape, dotted: &str, out: &mut StrictnessOverrides) {
+    if let Some(value) = tagged.strict {
+        out.insert_schema(dotted.to_string(), value);
+    }
+    for variant in &tagged.variants {
+        for field in &variant.schema.fields {
+            let child = if dotted.is_empty() {
+                field.name.clone()
+            } else {
+                format!("{dotted}.{}", field.name)
+            };
+            walk_shape_strict(&field.field, &child, out);
         }
     }
 }
 
-/// Drop the first dotted path segment: `core.db` → `db`, `core[0].db` →
-/// `db` (the `[0]` stays in the first segment, the remainder starts after
-/// the first `.`), `core` → `""`. Used so a root-map item override stored
-/// at `db` matches the runtime path `core.db.rogue`.
-fn strip_first_segment(path: &str) -> &str {
-    match path.find('.') {
-        Some(i) => &path[i + 1..],
-        None => "",
+fn walk_selected_object(
+    schema: &Schema,
+    table: Option<&Map>,
+    prefix: &str,
+    out: &mut StrictnessOverrides,
+) {
+    if let Some(value) = schema.strict {
+        out.insert_schema(prefix.to_string(), value);
+    }
+    for field in &schema.fields {
+        let dotted = if prefix.is_empty() {
+            field.name.to_string()
+        } else {
+            format!("{prefix}.{}", field.name)
+        };
+        walk_selected_shape(
+            &field.field,
+            table.and_then(|t| t.get(&field.name)),
+            &dotted,
+            out,
+        );
+    }
+}
+
+fn walk_selected_tagged(
+    tagged: &TaggedShape,
+    table: Option<&Map>,
+    dotted: &str,
+    out: &mut StrictnessOverrides,
+) {
+    if let Some(value) = tagged.strict {
+        out.insert_schema(dotted.to_string(), value);
+    }
+    let Some(table) = table else {
+        return;
+    };
+    let Some(selected) = tagged.selected(table) else {
+        return;
+    };
+    for field in &selected.schema.fields {
+        let child = if dotted.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{dotted}.{}", field.name)
+        };
+        walk_selected_shape(&field.field, table.get(&field.name), &child, out);
+    }
+}
+
+fn walk_selected_shape(
+    shape: &Shape,
+    value: Option<&Value>,
+    dotted: &str,
+    out: &mut StrictnessOverrides,
+) {
+    match shape {
+        Shape::Leaf(_) => {}
+        Shape::Object(nested) => {
+            walk_selected_object(nested, value.and_then(Value::as_map), dotted, out);
+        }
+        Shape::Array(array) => {
+            if let Some(v) = array.strict {
+                out.insert_schema(dotted.to_string(), v);
+            }
+            match value {
+                Some(Value::Array(items)) => {
+                    for (i, item) in items.iter().enumerate() {
+                        walk_selected_shape(
+                            &array.item,
+                            Some(item),
+                            &format!("{dotted}[{i}]"),
+                            out,
+                        );
+                    }
+                }
+                _ => walk_shape_strict(&array.item, dotted, out),
+            }
+        }
+        Shape::Map(map) => {
+            if let Some(v) = map.strict {
+                out.insert_schema(dotted.to_string(), v);
+            }
+            match value {
+                Some(Value::Map(entries)) => {
+                    for (key, entry) in entries {
+                        walk_selected_shape(
+                            &map.item,
+                            Some(entry),
+                            &format!("{dotted}.{key}"),
+                            out,
+                        );
+                    }
+                }
+                _ => walk_shape_strict(&map.item, dotted, out),
+            }
+        }
+        Shape::Tagged(tagged) => {
+            walk_selected_tagged(tagged, value.and_then(Value::as_map), dotted, out);
+        }
     }
 }
 
@@ -472,25 +617,63 @@ fn strip_brackets(path: &str) -> String {
 /// Resolve a dotted path against a schema and return the kind of the node
 /// it lands on (`Nested`, `ArrayOf`, or `Leaf`). Used to validate
 /// `strict_at` paths at `build_resolver` time.
-pub(crate) fn resolve_path_kind_shape(shape: &crate::runtime::Shape, dotted: &str) -> PathKind {
-    match shape {
-        crate::runtime::Shape::Object(schema) => resolve_path_kind(schema, dotted),
-        crate::runtime::Shape::Map(_) => {
+fn strip_first_segment(path: &str) -> &str {
+    match path.find('.') {
+        Some(i) => &path[i + 1..],
+        None => "",
+    }
+}
+
+fn resolve_path_kind_root(root: DocumentRoot<'_>, dotted: &str) -> PathKind {
+    match root {
+        DocumentRoot::Object(schema) => resolve_path_kind(schema, dotted),
+        DocumentRoot::Map(_) => {
             if dotted.is_empty() {
                 PathKind::Section
             } else {
-                // Entry keys are user data, not schema fields.
                 PathKind::Unknown
             }
         }
-        crate::runtime::Shape::Tagged(_) => {
-            if dotted.is_empty() {
-                PathKind::Section
-            } else {
-                PathKind::Unknown
-            }
+        DocumentRoot::Tagged(tagged) => resolve_tagged_kind(tagged, dotted),
+    }
+}
+
+fn resolve_tagged_kind(tagged: &TaggedShape, rest: &str) -> PathKind {
+    if rest.is_empty() {
+        return PathKind::Section;
+    }
+    if rest == tagged.tag {
+        return PathKind::Leaf;
+    }
+    if rest.starts_with(&format!("{}.", tagged.tag)) {
+        return PathKind::Unknown;
+    }
+    union_path_kind(
+        tagged
+            .variants
+            .iter()
+            .map(|v| resolve_path_kind(&v.schema, rest)),
+    )
+}
+
+/// Section in any variant wins (valid `strict_at` target). Leaf only
+/// when every variant that knows the path treats it as a leaf.
+fn union_path_kind(kinds: impl IntoIterator<Item = PathKind>) -> PathKind {
+    let mut saw_section = false;
+    let mut saw_leaf = false;
+    for kind in kinds {
+        match kind {
+            PathKind::Section => saw_section = true,
+            PathKind::Leaf => saw_leaf = true,
+            PathKind::Unknown => {}
         }
-        crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => PathKind::Unknown,
+    }
+    if saw_section {
+        PathKind::Section
+    } else if saw_leaf {
+        PathKind::Leaf
+    } else {
+        PathKind::Unknown
     }
 }
 
@@ -529,19 +712,30 @@ pub(crate) fn resolve_path_kind(schema: &Schema, dotted: &str) -> PathKind {
                 if segments.peek().is_none() {
                     return PathKind::Section;
                 }
-                match field.field.peel_containers() {
-                    crate::runtime::Shape::Object(nested) => current = nested,
-                    crate::runtime::Shape::Tagged(_) => return PathKind::Unknown,
-                    crate::runtime::Shape::Leaf(_) => return PathKind::Unknown,
+                let rest = remaining_dotted(segments);
+                return match field.field.peel_containers() {
+                    crate::runtime::Shape::Object(nested) => resolve_path_kind(nested, &rest),
+                    crate::runtime::Shape::Tagged(tagged) => resolve_tagged_kind(tagged, &rest),
+                    crate::runtime::Shape::Leaf(_) => PathKind::Unknown,
                     crate::runtime::Shape::Array(_) | crate::runtime::Shape::Map(_) => {
                         unreachable!("peel_containers strips Array/Map")
                     }
-                }
+                };
             }
-            crate::runtime::Shape::Tagged(_) => return PathKind::Unknown,
+            crate::runtime::Shape::Tagged(tagged) => {
+                if segments.peek().is_none() {
+                    return PathKind::Section;
+                }
+                return resolve_tagged_kind(tagged, &remaining_dotted(segments));
+            }
         }
     }
     PathKind::Section
+}
+
+fn remaining_dotted<'a>(segments: impl Iterator<Item = &'a str>) -> String {
+    let parts: Vec<&str> = segments.collect();
+    parts.join(".")
 }
 
 /// Validate a list of `(path, strict)` overrides against a schema and
@@ -557,56 +751,20 @@ pub(crate) fn resolve_path_kind(schema: &Schema, dotted: &str) -> PathKind {
 /// When `normalize_keys` is `true`, each path is rewritten through
 /// `normalize::normalize_key` before lookup so the override accepts the
 /// same kebab/snake spellings the rest of the pipeline does.
-pub(crate) fn build_strict_overrides(
+pub(crate) fn build_strict_overrides_root(
     entries: &[(String, bool)],
     normalize_keys: bool,
-    schema: &Schema,
+    root: DocumentRoot<'_>,
 ) -> Result<StrictnessOverrides, ClapfigError> {
-    let mut out = StrictnessOverrides::from_schema(schema);
+    let mut out = StrictnessOverrides::from_root(root);
     for (raw_path, strict) in entries {
         let path = if normalize_keys {
             crate::normalize::normalize_key(raw_path)
         } else {
             raw_path.clone()
         };
-        match resolve_path_kind(schema, &path) {
-            PathKind::Section => out.insert(path, *strict),
-            PathKind::Leaf => {
-                return Err(ClapfigError::InvalidStrictPath {
-                    path: raw_path.clone(),
-                    reason: "path resolves to a leaf field, but strict is a section property"
-                        .into(),
-                });
-            }
-            PathKind::Unknown => {
-                return Err(ClapfigError::InvalidStrictPath {
-                    path: raw_path.clone(),
-                    reason: "path does not resolve to any field in the config schema".into(),
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// [`build_strict_overrides`] against a document-root [`Shape`].
-pub(crate) fn build_strict_overrides_shape(
-    entries: &[(String, bool)],
-    normalize_keys: bool,
-    shape: &crate::runtime::Shape,
-) -> Result<StrictnessOverrides, ClapfigError> {
-    if let crate::runtime::Shape::Object(schema) = shape {
-        return build_strict_overrides(entries, normalize_keys, schema);
-    }
-    let mut out = StrictnessOverrides::from_shape(shape);
-    for (raw_path, strict) in entries {
-        let path = if normalize_keys {
-            crate::normalize::normalize_key(raw_path)
-        } else {
-            raw_path.clone()
-        };
-        match resolve_path_kind_shape(shape, &path) {
-            PathKind::Section => out.insert(path, *strict),
+        match resolve_path_kind_root(root, &path) {
+            PathKind::Section => out.overlay(path, *strict),
             PathKind::Leaf => {
                 return Err(ClapfigError::InvalidStrictPath {
                     path: raw_path.clone(),
@@ -640,6 +798,7 @@ pub(crate) enum PathKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::Field;
 
     #[test]
     fn parent_path_works() {
@@ -732,67 +891,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_first_segment_drops_the_dynamic_root_entry() {
-        assert_eq!(strip_first_segment("core.db"), "db");
-        assert_eq!(strip_first_segment("core[0].db"), "db");
-        assert_eq!(strip_first_segment("core"), "");
-        assert_eq!(strip_first_segment(""), "");
-    }
-
-    #[test]
-    fn from_shape_root_map_item_strict_matches_every_entry() {
-        use crate::runtime::{Field, Schema as RtSchema, Shape};
-        let item = RtSchema::object("Site")
-            .field("host", Field::string().optional())
-            .nested(
-                "db",
-                RtSchema::object("Db")
-                    .strict(false)
-                    .field("url", Field::string().optional()),
-            )
-            .nested(
-                "audit",
-                RtSchema::object("Audit")
-                    .strict(true)
-                    .field("level", Field::string().optional()),
-            );
-        let shape = Shape::from(Shape::map("sites", item));
-        let overrides = StrictnessOverrides::from_shape(&shape);
-        // Nested `db.strict(false)` is stored as `db`; runtime paths are
-        // `core.db.rogue` / `site.db.rogue` — the root-entry skip must
-        // make both match, not only a path that never occurs.
-        assert!(
-            !overrides.effective_strict("core.db.rogue", "rogue", true),
-            "item db.strict(false) must govern unknown keys under every entry"
-        );
-        assert!(
-            !overrides.effective_strict("site.db.rogue", "rogue", true),
-            "item db.strict(false) must govern a second map entry"
-        );
-        assert!(
-            overrides.effective_strict("core.audit.rogue", "rogue", false),
-            "item audit.strict(true) must re-tighten under every entry"
-        );
-        assert!(
-            overrides.effective_strict("site.audit.rogue", "rogue", false),
-            "item audit.strict(true) must re-tighten a second map entry"
-        );
-        // Unknown at the item top-level still uses the builder default
-        // (no item-root strict here).
-        assert!(overrides.effective_strict("core.rogue", "rogue", true));
-        // An entry whose key equals a nested override path must not
-        // inherit that override at the entry's own top level.
-        assert!(
-            overrides.effective_strict("db.rogue", "rogue", true),
-            "entry named db must not steal item db.strict(false) for db.rogue"
-        );
-        assert!(
-            !overrides.effective_strict("db.db.rogue", "rogue", true),
-            "the nested db section under an entry named db still matches"
-        );
-    }
-
-    #[test]
     fn strip_brackets_removes_array_indices() {
         assert_eq!(strip_brackets("plugins[0].audit"), "plugins.audit");
         assert_eq!(strip_brackets("a[10].b[2].c"), "a.b.c");
@@ -802,9 +900,9 @@ mod tests {
 
     #[test]
     fn from_schema_records_array_and_map_node_strict() {
-        use crate::runtime::{Field, Schema as RtSchema, Shape};
-        let plugin = RtSchema::object("Plugin").field("name", Field::string().optional());
-        let schema = RtSchema::object("App")
+        use crate::runtime::Shape;
+        let plugin = Schema::object("Plugin").field("name", Field::string().optional());
+        let schema = Schema::object("App")
             .field(
                 "plugins",
                 Shape::array("plugins", plugin.clone()).strict(false),
@@ -824,19 +922,18 @@ mod tests {
 
     #[test]
     fn resolve_path_kind_walks_through_nested_containers() {
-        use crate::runtime::{Field, Schema as RtSchema};
-        let schema = RtSchema::object("App")
+        let schema = Schema::object("App")
             .field(
                 "containers",
-                Field::array_of_type(Field::array_of_type(RtSchema::object("Item").nested(
+                Field::array_of_type(Field::array_of_type(Schema::object("Item").nested(
                     "policy",
-                    RtSchema::object("Policy").field("name", Field::string().optional()),
+                    Schema::object("Policy").field("name", Field::string().optional()),
                 ))),
             )
             .field(
                 "groups",
                 Field::map_of(Field::array_of_type(
-                    RtSchema::object("Item").field("timeout", Field::integer().optional()),
+                    Schema::object("Item").field("timeout", Field::integer().optional()),
                 )),
             )
             .build();
@@ -875,6 +972,7 @@ mod tests {
             span: Some(Span { start: 10, end: 14 }),
             env_var: None,
             url_key: None,
+            override_key: None,
             input_type: Some(InputType::File),
         };
         assert_eq!(ctx.path, "plugins[3].host");
@@ -895,11 +993,210 @@ mod tests {
             span: None,
             env_var: Some("MYAPP__ROGUE".into()),
             url_key: None,
+            override_key: None,
             input_type: Some(InputType::Env),
         };
         assert_eq!(collected.env_var.as_deref(), Some("MYAPP__ROGUE"));
         assert_eq!(collected.input_type, Some(InputType::Env));
         assert!(collected.span.is_none());
         assert!(collected.url_key.is_none());
+    }
+
+    #[test]
+    fn tagged_root_strict_is_not_overwritten_by_variant_schema_strict() {
+        let tagged = Shape::tagged("Block", "kind")
+            .strict(false)
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .strict(true)
+                    .field("mount", Field::string())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .strict(true)
+                    .field("artifact", Field::string())
+                    .build(),
+            )
+            .build();
+        let overrides = StrictnessOverrides::from_root(DocumentRoot::Tagged(&tagged));
+        assert!(
+            !overrides.effective_strict("crate_path", "crate_path", true),
+            "tagged.strict(false) must govern keys at the tagged object"
+        );
+    }
+
+    #[test]
+    fn sibling_variant_nested_strict_union_is_declaration_order_independent() {
+        let rust_lenient_params = Schema::object("Rust")
+            .nested(
+                "params",
+                Schema::object("P")
+                    .strict(false)
+                    .field("shape", Field::string().optional()),
+            )
+            .build();
+        let payload_strict_params = Schema::object("Payload")
+            .nested(
+                "params",
+                Schema::object("Q")
+                    .strict(true)
+                    .field("artifact", Field::string().optional()),
+            )
+            .build();
+        let a = Shape::tagged("Block", "kind")
+            .variant("rust", rust_lenient_params.clone())
+            .variant("payload", payload_strict_params.clone())
+            .build();
+        let b = Shape::tagged("Block", "kind")
+            .variant("payload", payload_strict_params)
+            .variant("rust", rust_lenient_params)
+            .build();
+        let first = StrictnessOverrides::from_root(DocumentRoot::Tagged(&a));
+        let reversed = StrictnessOverrides::from_root(DocumentRoot::Tagged(&b));
+        assert_eq!(
+            first.effective_strict("params.rogue", "rogue", false),
+            reversed.effective_strict("params.rogue", "rogue", false),
+        );
+        assert!(
+            first.effective_strict("params.rogue", "rogue", false),
+            "any-strict-wins: one variant's params.strict(true) makes phase 1 strict"
+        );
+    }
+
+    #[test]
+    fn resolve_path_kind_walks_nested_tagged_as_section() {
+        let schema = Schema::object("App")
+            .field(
+                "block",
+                Shape::from(
+                    Shape::tagged("Block", "kind")
+                        .variant(
+                            "rust",
+                            Schema::object("Rust")
+                                .field("mount", Field::string())
+                                .build(),
+                        )
+                        .variant(
+                            "payload",
+                            Schema::object("Payload")
+                                .field("artifact", Field::string())
+                                .build(),
+                        )
+                        .build(),
+                ),
+            )
+            .build();
+        assert_eq!(resolve_path_kind(&schema, "block"), PathKind::Section);
+        assert_eq!(resolve_path_kind(&schema, "block.kind"), PathKind::Leaf);
+        assert_eq!(resolve_path_kind(&schema, "block.mount"), PathKind::Leaf);
+        assert_eq!(resolve_path_kind(&schema, "block.artifact"), PathKind::Leaf);
+    }
+
+    #[test]
+    fn resolve_path_kind_section_wins_when_any_variant_is_a_section() {
+        let tagged = Shape::tagged("Block", "kind")
+            .variant(
+                "a",
+                Schema::object("A").field("params", Field::string()).build(),
+            )
+            .variant(
+                "b",
+                Schema::object("B")
+                    .nested(
+                        "params",
+                        Schema::object("P").field("x", Field::string().optional()),
+                    )
+                    .build(),
+            )
+            .build();
+        assert_eq!(
+            resolve_path_kind_root(DocumentRoot::Tagged(&tagged), "params"),
+            PathKind::Section
+        );
+    }
+
+    fn opposing_meta_tagged() -> crate::runtime::TaggedShape {
+        Shape::tagged("Plugin", "kind")
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .nested(
+                        "meta",
+                        Schema::object("RM")
+                            .strict(false)
+                            .field("crate_path", Field::string().optional()),
+                    )
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .nested(
+                        "meta",
+                        Schema::object("PM")
+                            .strict(true)
+                            .field("artifact", Field::string().optional()),
+                    )
+                    .build(),
+            )
+            .build()
+    }
+
+    fn tagged_item_table(kind: &str) -> Map {
+        let mut item = Map::new();
+        item.insert("kind".into(), Value::String(kind.into()));
+        item
+    }
+
+    #[test]
+    fn selected_branch_strictness_follows_each_array_item_variant() {
+        let tagged = opposing_meta_tagged();
+        let schema = Schema::object("App")
+            .field("plugins", Shape::array("plugins", Shape::from(tagged)))
+            .build();
+        let mut table = Map::new();
+        table.insert(
+            "plugins".into(),
+            Value::Array(vec![
+                Value::Map(tagged_item_table("rust")),
+                Value::Map(tagged_item_table("payload")),
+            ]),
+        );
+        let overrides = StrictnessOverrides::from_root(DocumentRoot::Object(&schema))
+            .for_selected_branch(DocumentRoot::Object(&schema), &table);
+        assert!(
+            !overrides.effective_strict("plugins[0].meta.artifact", "artifact", true),
+            "rust item's meta.strict(false) must govern that occurrence"
+        );
+        assert!(
+            overrides.effective_strict("plugins[1].meta.crate_path", "crate_path", false),
+            "payload item's meta.strict(true) must govern that occurrence"
+        );
+    }
+
+    #[test]
+    fn selected_branch_strictness_follows_each_map_entry_variant() {
+        let tagged = opposing_meta_tagged();
+        let schema = Schema::object("App")
+            .field("plugins", Shape::map("plugins", Shape::from(tagged)))
+            .build();
+        let mut entries = Map::new();
+        entries.insert("core".into(), Value::Map(tagged_item_table("rust")));
+        entries.insert("edge".into(), Value::Map(tagged_item_table("payload")));
+        let mut table = Map::new();
+        table.insert("plugins".into(), Value::Map(entries));
+        let overrides = StrictnessOverrides::from_root(DocumentRoot::Object(&schema))
+            .for_selected_branch(DocumentRoot::Object(&schema), &table);
+        assert!(
+            !overrides.effective_strict("plugins.core.meta.artifact", "artifact", true),
+            "rust entry's meta.strict(false) must govern that occurrence"
+        );
+        assert!(
+            overrides.effective_strict("plugins.edge.meta.crate_path", "crate_path", false),
+            "payload entry's meta.strict(true) must govern that occurrence"
+        );
     }
 }

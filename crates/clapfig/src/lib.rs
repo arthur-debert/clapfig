@@ -845,8 +845,8 @@ pub use types::{Boundary, ConfigAction, InputType, Layer, SearchMode, SearchPath
 ///   the schema is `impl Into<runtime::Shape>` (a
 ///   [`runtime::Schema`](crate::runtime::Schema) converts as
 ///   [`Shape::Object`](crate::runtime::Shape::Object)), and `load()`
-///   returns a value [`Map`](crate::value::Map). Object-root and root-Map
-///   load are in; tagged walk is SHP01-WS04.
+///   returns a value [`Map`](crate::value::Map). Object-root, root-Map,
+///   and tagged object-root load are in.
 ///
 /// Both produce builders with the same surface — `app_name`,
 /// `search_paths`, `env_prefix`, `cli_override`, `post_validate`, `load`,
@@ -866,7 +866,7 @@ impl Clapfig {
     ///
     /// Walkers take [`Shape`](crate::runtime::Shape). A root Map loads as
     /// a homogeneous map of the item shape (no synthetic parent field).
-    /// A root Tagged still `todo!()`s here — tagged walk is SHP01-WS04.
+    /// Tagged object-root load is the two-phase walk (SHP01-WS04).
     /// Object-root `load()` is unchanged.
     ///
     /// Returns a [`Builder`] with the same surface as
@@ -893,12 +893,8 @@ impl Clapfig {
         shape.require_document_root();
         match shape {
             crate::runtime::Shape::Object(schema) => Builder::new(schema),
-            crate::runtime::Shape::Map(map) => {
-                Builder::from_shape(std::sync::Arc::new(crate::runtime::Shape::Map(map)))
-            }
-            crate::runtime::Shape::Tagged(_) => {
-                todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
-            }
+            crate::runtime::Shape::Tagged(tagged) => Builder::from_tagged(tagged),
+            crate::runtime::Shape::Map(map) => Builder::from_map(map),
             crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => {
                 unreachable!("illegal document roots are rejected by require_document_root")
             }
@@ -907,8 +903,7 @@ impl Clapfig {
 
     /// Entry point for the typed path: build a config pipeline from a
     /// struct whose schema was emitted by the `#[derive(clapfig::Schema)]`
-    /// macro, or a `BTreeMap<String, T>` / `HashMap<String, T>` whose
-    /// value type derives `Schema` (a root map).
+    /// macro.
     ///
     /// Same builder surface as [`Self::builder`], but `load()` returns the
     /// typed `C`. The schema metadata available to JSON Schema, template,

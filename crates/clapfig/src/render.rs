@@ -78,11 +78,22 @@ fn render_unknown_keys_plain(infos: &[crate::error::UnknownKeyInfo]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let n = infos.len();
-    // Env-derived keys are env problems, not file problems — name the
-    // variable to unset instead of dressing them in config-file clothing.
+    // Non-file winners are not file problems — name the variable, query
+    // key, or override key instead of dressing them in config-file clothing.
     let all_env = infos.iter().all(|i| i.env_var.is_some());
+    let all_url = infos.iter().all(|i| i.url_key.is_some());
+    let all_override = infos.iter().all(|i| i.override_key.is_some());
     let source_noun = if all_env {
         "environment"
+    } else if all_url {
+        "URL query"
+    } else if all_override {
+        "programmatic overrides"
+    } else if infos
+        .iter()
+        .any(|i| i.env_var.is_some() || i.url_key.is_some() || i.override_key.is_some())
+    {
+        "config"
     } else {
         "config file"
     };
@@ -99,6 +110,24 @@ fn render_unknown_keys_plain(infos: &[crate::error::UnknownKeyInfo]) -> String {
             let _ = write!(
                 out,
                 "\n  --> environment variable {var}\n     key: {}",
+                info.key,
+            );
+            out.push('\n');
+            continue;
+        }
+        if let Some(url_key) = &info.url_key {
+            let _ = write!(
+                out,
+                "\n  --> URL query parameter {url_key}\n     key: {}",
+                info.key,
+            );
+            out.push('\n');
+            continue;
+        }
+        if let Some(override_key) = &info.override_key {
+            let _ = write!(
+                out,
+                "\n  --> programmatic override {override_key}\n     key: {}",
                 info.key,
             );
             out.push('\n');
@@ -135,6 +164,10 @@ fn render_unknown_keys_plain(infos: &[crate::error::UnknownKeyInfo]) -> String {
 
     if all_env {
         out.push_str("\nhint: check for typos, or unset the unrecognized environment variables.");
+    } else if all_url {
+        out.push_str("\nhint: check for typos, or drop the unrecognized URL query parameters.");
+    } else if all_override {
+        out.push_str("\nhint: check for typos, or drop the unrecognized programmatic overrides.");
     } else {
         out.push_str("\nhint: check for typos, or remove the unrecognized keys.");
     }
@@ -435,6 +468,7 @@ mod tests {
             env_var: None,
             span: None,
             url_key: None,
+            override_key: None,
             input_type: None,
         }]
     }
@@ -469,6 +503,7 @@ mod tests {
                 env_var: None,
                 span: None,
                 url_key: None,
+                override_key: None,
                 input_type: None,
             },
             UnknownKeyInfo {
@@ -479,6 +514,7 @@ mod tests {
                 env_var: None,
                 span: None,
                 url_key: None,
+                override_key: None,
                 input_type: None,
             },
         ];
@@ -496,6 +532,7 @@ mod tests {
             env_var: None,
             span: None,
             url_key: None,
+            override_key: None,
             input_type: None,
         }];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
@@ -515,6 +552,7 @@ mod tests {
             env_var: None,
             span: Some(Span { start: 0, end: 8 }),
             url_key: None,
+            override_key: None,
             input_type: None,
         }];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
@@ -540,6 +578,7 @@ mod tests {
             env_var: None,
             span: Some(Span { start: 0, end: 6 }),
             url_key: None,
+            override_key: None,
             input_type: None,
         }];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
@@ -571,6 +610,7 @@ mod tests {
             env_var: None,
             span: None,
             url_key: None,
+            override_key: None,
             input_type: None,
         }];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
@@ -599,6 +639,7 @@ mod tests {
             env_var: None,
             span: None,
             url_key: None,
+            override_key: None,
             input_type: None,
         }];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
@@ -616,6 +657,7 @@ mod tests {
             env_var: Some("MYAPP__ROGUE_KEY".into()),
             span: None,
             url_key: None,
+            override_key: None,
             input_type: None,
         }];
         let out = render_plain(&ClapfigError::UnknownKeys(infos));
@@ -625,6 +667,49 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("unset the unrecognized environment"), "{out}");
+        assert!(!out.contains("<env>"), "{out}");
+        assert!(!out.contains("config file"), "{out}");
+    }
+
+    #[test]
+    fn plain_url_key_renders_as_url_error_naming_query_parameter() {
+        let infos = vec![UnknownKeyInfo {
+            key: "artifact".into(),
+            path: "<url>".into(),
+            line: 0,
+            source: None,
+            env_var: None,
+            span: None,
+            url_key: Some("artifact".into()),
+            override_key: None,
+            input_type: Some(crate::types::InputType::Url),
+        }];
+        let out = render_plain(&ClapfigError::UnknownKeys(infos));
+        assert!(out.contains("unknown key in URL query"), "{out}");
+        assert!(out.contains("--> URL query parameter artifact"), "{out}");
+        assert!(!out.contains("<env>"), "{out}");
+        assert!(!out.contains("config file"), "{out}");
+    }
+
+    #[test]
+    fn plain_override_key_renders_as_override_error() {
+        let infos = vec![UnknownKeyInfo {
+            key: "artifact".into(),
+            path: "<override>".into(),
+            line: 0,
+            source: None,
+            env_var: None,
+            span: None,
+            url_key: None,
+            override_key: Some("artifact".into()),
+            input_type: Some(crate::types::InputType::Override),
+        }];
+        let out = render_plain(&ClapfigError::UnknownKeys(infos));
+        assert!(
+            out.contains("unknown key in programmatic overrides"),
+            "{out}"
+        );
+        assert!(out.contains("--> programmatic override artifact"), "{out}");
         assert!(!out.contains("<env>"), "{out}");
         assert!(!out.contains("config file"), "{out}");
     }
@@ -705,6 +790,7 @@ mod tests {
             env_var: None,
             span: None,
             url_key: None,
+            override_key: None,
             input_type: None,
         }];
         let out = render_rich(&ClapfigError::UnknownKeys(infos));

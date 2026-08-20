@@ -34,10 +34,11 @@ pub(crate) type OriginLayer = InputType;
 
 /// Origin of one resolved value: layer plus whatever that layer knows.
 ///
-/// File origins carry path, the **value** byte span (unknown-key lookup
-/// uses the span-index **key** span, ADR-0006), and the file's full text
-/// (`Arc<str>`, one per parsed file). Non-file origins leave file / span
-/// / text as `None` and fill the field that layer owns.
+/// File origins carry path, the **value** byte span, the **key** token
+/// span (ADR-0006: unknown-key diagnostics use the key span; value
+/// errors use the value span), and the file's full text (`Arc<str>`, one
+/// per parsed file). Non-file origins leave file / span / text as `None`
+/// and fill the field that layer owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Origin {
     /// Which provenance layer produced the value.
@@ -46,6 +47,10 @@ pub(crate) struct Origin {
     pub file: Option<PathBuf>,
     /// Byte span of the assigned value in `source`, when from a file.
     pub span: Option<Span>,
+    /// Byte span of the **key** token in `source` (ADR-0006), when from a
+    /// file. Unknown-key diagnostics use this; [`span`](Self::span) is
+    /// the assigned value.
+    pub key_span: Option<Span>,
     /// Full file text, shared across origins from the same parse.
     pub source: Option<Arc<str>>,
     /// Winning original environment variable name, when `layer` is
@@ -62,8 +67,9 @@ pub(crate) struct Origin {
 
 impl Origin {
     /// A file origin: path, value span, and retained source text.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn file(path: PathBuf, span: Span, source: Arc<str>) -> Self {
-        Self::file_with_span(path, Some(span), source)
+        Self::file_with_spans(path, None, Some(span), source)
     }
 
     /// A file origin whose span-index lookup missed this path.
@@ -71,10 +77,21 @@ impl Origin {
     /// Still a file origin (path + source); renderers omit the line
     /// rather than inventing one.
     pub(crate) fn file_with_span(path: PathBuf, span: Option<Span>, source: Arc<str>) -> Self {
+        Self::file_with_spans(path, None, span, source)
+    }
+
+    /// A file origin with separate key and value spans (ADR-0006).
+    pub(crate) fn file_with_spans(
+        path: PathBuf,
+        key_span: Option<Span>,
+        value_span: Option<Span>,
+        source: Arc<str>,
+    ) -> Self {
         Self {
             layer: OriginLayer::File,
             file: Some(path),
-            span,
+            span: value_span,
+            key_span,
             source: Some(source),
             env_vars: Vec::new(),
             url_key: None,
@@ -88,6 +105,7 @@ impl Origin {
             layer: OriginLayer::Env,
             file: None,
             span: None,
+            key_span: None,
             source: None,
             env_vars: vars.into(),
             url_key: None,
@@ -102,6 +120,7 @@ impl Origin {
             layer: OriginLayer::Url,
             file: None,
             span: None,
+            key_span: None,
             source: None,
             env_vars: Vec::new(),
             url_key: Some(query_key.into()),
@@ -116,6 +135,7 @@ impl Origin {
             layer: OriginLayer::Override,
             file: None,
             span: None,
+            key_span: None,
             source: None,
             env_vars: Vec::new(),
             url_key: None,
@@ -129,6 +149,7 @@ impl Origin {
             layer: OriginLayer::Default,
             file: None,
             span: None,
+            key_span: None,
             source: None,
             env_vars: Vec::new(),
             url_key: None,
@@ -288,8 +309,9 @@ pub(crate) fn lookup<'a>(map: &'a OriginMap, path: &ConfigPath) -> Option<&'a Or
 
 /// Build an origin map from a parsed file table and its span index.
 ///
-/// Each node's origin keeps the **value** span (ADR-0006). Missing
-/// index entries still produce a file origin (path + source, no span).
+/// Each node's origin keeps the **value** span and the **key** token
+/// span (ADR-0006). Missing index entries still produce a file origin
+/// (path + source, no span).
 pub(crate) fn origin_map_from_file(
     table: &Map,
     spans: &BTreeMap<ConfigPath, SpanEntry>,
@@ -326,7 +348,12 @@ fn walk_file_value(
     source: &Arc<str>,
 ) -> OriginNode {
     let origin = match spans.get(&path) {
-        Some(entry) => Origin::file(file.to_path_buf(), entry.value, Arc::clone(source)),
+        Some(entry) => Origin::file_with_spans(
+            file.to_path_buf(),
+            entry.key,
+            Some(entry.value),
+            Arc::clone(source),
+        ),
         None => Origin::file_with_span(file.to_path_buf(), None, Arc::clone(source)),
     };
     match value {
@@ -447,6 +474,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/app.toml"))
         );
         assert_eq!(origin.span, Some(Span { start: 7, end: 11 }));
+        assert!(origin.key_span.is_none());
         assert_eq!(origin.source.as_deref(), Some("port = 8080\n"));
         assert!(origin.env_vars.is_empty());
         assert!(origin.url_key.is_none());
