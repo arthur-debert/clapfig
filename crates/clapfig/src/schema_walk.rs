@@ -350,7 +350,7 @@ pub(crate) fn collect_branch_exclusive_root(
             }
         }
         DocumentRoot::Tagged(tagged) => {
-            collect_branch_exclusive_tagged(table, tagged, "", &ConfigPath::new(), unknown)
+            collect_branch_exclusive_tagged(table, tagged, "", &ConfigPath::new(), unknown, &[])
         }
     }
 }
@@ -417,18 +417,24 @@ fn collect_branch_exclusive_in_shape(
         }
         Shape::Tagged(tagged) => {
             if let Value::Map(inner) = value {
-                collect_branch_exclusive_tagged(inner, tagged, prefix, path, unknown);
+                collect_branch_exclusive_tagged(inner, tagged, prefix, path, unknown, &[]);
             }
         }
     }
 }
 
+/// Phase-2 exclusive keys for a tagged object. `others` are sibling
+/// constructors for the same field from a parent union (empty at a
+/// tagged document root). Intra-union other-variant fields and those
+/// sibling constructors are combined in one walk so nested exclusive
+/// keys are reported once.
 fn collect_branch_exclusive_tagged(
     table: &Map,
     tagged: &TaggedShape,
     prefix: &str,
     path: &ConfigPath,
     unknown: &mut Vec<UnknownKey>,
+    others: &[&Shape],
 ) {
     let Some(selected) = tagged.selected(table) else {
         return;
@@ -446,11 +452,16 @@ fn collect_branch_exclusive_tagged(
         let full = join_prefix(prefix, key);
         let child = path.clone().key(key);
         if let Some(nf) = find_field(&selected.schema, key) {
-            let nested_others: Vec<&Shape> = other_fields
+            let mut nested_others: Vec<&Shape> = other_fields
                 .iter()
                 .filter(|(name, _)| *name == key.as_str())
                 .map(|(_, shape)| *shape)
                 .collect();
+            for other in others {
+                if let Some(ns) = nested_shapes_for_key(other, key) {
+                    nested_others.extend(ns);
+                }
+            }
             collect_exclusive_against_shape(
                 value,
                 &nf.field,
@@ -459,7 +470,11 @@ fn collect_branch_exclusive_tagged(
                 &child,
                 unknown,
             );
-        } else if other_fields.iter().any(|(name, _)| *name == key.as_str()) {
+        } else if other_fields.iter().any(|(name, _)| *name == key.as_str())
+            || others
+                .iter()
+                .any(|s| nested_shapes_for_key(s, key).is_some())
+        {
             unknown.push(UnknownKey {
                 path: full,
                 leaf: key.clone(),
@@ -480,52 +495,8 @@ fn collect_exclusive_against_shape(
     match selected {
         Shape::Leaf(_) => {}
         Shape::Tagged(tagged) => {
-            let Value::Map(inner) = value else {
-                return;
-            };
-            collect_branch_exclusive_tagged(inner, tagged, prefix, path, unknown);
-            let Some(selected_var) = tagged.selected(inner) else {
-                return;
-            };
-            for (key, nested) in inner {
-                if key == tagged.tag.as_str() {
-                    continue;
-                }
-                let full = join_prefix(prefix, key);
-                let child = path.clone().key(key);
-                match find_field(&selected_var.schema, key) {
-                    Some(nf) => {
-                        let mut other_nested = Vec::new();
-                        for other in others {
-                            if let Some(ns) = nested_shapes_for_key(other, key) {
-                                other_nested.extend(ns);
-                            }
-                        }
-                        if other_nested.is_empty() {
-                            continue;
-                        }
-                        collect_exclusive_against_shape(
-                            nested,
-                            &nf.field,
-                            &other_nested,
-                            &full,
-                            &child,
-                            unknown,
-                        );
-                    }
-                    None if tagged.field_shapes(key).is_empty()
-                        && others
-                            .iter()
-                            .any(|s| nested_shapes_for_key(s, key).is_some()) =>
-                    {
-                        unknown.push(UnknownKey {
-                            path: full,
-                            leaf: key.clone(),
-                            config_path: child,
-                        });
-                    }
-                    None => {}
-                }
+            if let Value::Map(inner) = value {
+                collect_branch_exclusive_tagged(inner, tagged, prefix, path, unknown, others);
             }
         }
         Shape::Array(array) => {
@@ -2356,6 +2327,14 @@ mod tests {
                                         .field("crate_path", RtField::string().optional()),
                                 ),
                             )
+                            .variant(
+                                "y",
+                                Schema::object("Y").nested(
+                                    "meta",
+                                    Schema::object("YM")
+                                        .field("artifact", RtField::string().optional()),
+                                ),
+                            )
                             .build(),
                     ),
                 ),
@@ -2377,9 +2356,13 @@ mod tests {
         let mut exclusive = Vec::new();
         collect_branch_exclusive_root(&table, DocumentRoot::Tagged(&tagged), &mut exclusive);
         let paths: Vec<&str> = exclusive.iter().map(|u| u.path.as_str()).collect();
-        assert!(
-            paths.contains(&"params.meta.artifact"),
-            "nested exclusive keys under a selected tagged field vs another constructor: {paths:?}"
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|p| **p == "params.meta.artifact")
+                .count(),
+            1,
+            "intra-shape and inter-shape exclusive keys must be reported once: {paths:?}"
         );
     }
 }
