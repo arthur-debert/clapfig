@@ -171,18 +171,24 @@ impl DiscoveryRecord {
 /// Flattened onto [`UnknownKeyInfo`] / [`UnknownKeyContext`] /
 /// [`CollectedUnknown`] (those types already carried some of these).
 /// Boxed on [`ClapfigError::InvalidValue`] so the error enum stays
-/// small (`clippy::result_large_err`). Empty until later provenance
-/// slices fill the origin tree.
+/// small (`clippy::result_large_err`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OriginFacts {
     /// File that supplied the value, when it came from a file.
     pub file: Option<PathBuf>,
     /// Byte span of the assigned **value** in that file (ADR-0006).
     pub span: Option<Span>,
+    /// Full file text, shared across origins from the same parse.
+    /// Renderers use it with [`span`](Self::span) to draw a caret over
+    /// the assigned value.
+    pub source: Option<Arc<str>>,
     /// Environment variable that supplied the value.
     pub env_var: Option<String>,
     /// URL query-parameter key that supplied the value.
     pub url_key: Option<String>,
+    /// Override key (`InputType::Override`) or schema key
+    /// (`InputType::Default`).
+    pub key: Option<String>,
     /// Which input type produced the value.
     pub input_type: Option<InputType>,
 }
@@ -253,14 +259,13 @@ pub enum ClapfigError {
         kind: &'static str,
     },
 
-    #[error("Invalid value for '{key}': {reason}")]
+    #[error("{}", format_invalid_value(.key, .reason, .origin))]
     InvalidValue {
         key: String,
         reason: String,
         /// Origin of the winning value (file, span, env var, URL key,
         /// input type). Boxed so [`ClapfigError`] stays a small `Result`
-        /// error; fields are unset until later provenance slices fill
-        /// them. [`ClapfigError::MissingRequired`] does not carry this —
+        /// error. [`ClapfigError::MissingRequired`] does not carry this —
         /// an absent key has no origin, it has a [`DiscoveryRecord`].
         origin: Box<OriginFacts>,
     },
@@ -415,13 +420,30 @@ impl ClapfigError {
 
     /// Schema/type-validation error with origin facts left unset.
     ///
-    /// WS01 holding state: later slices fill file/span/env/url/input type
-    /// from the origin tree.
+    /// Persist-path and other non-merge checks have no origin tree;
+    /// post-merge `finalize` uses [`Self::invalid_value_at`].
     pub(crate) fn invalid_value(key: impl Into<String>, reason: impl Into<String>) -> Self {
         ClapfigError::InvalidValue {
             key: key.into(),
             reason: reason.into(),
             origin: Box::new(OriginFacts::default()),
+        }
+    }
+
+    /// Schema/type-validation error naming the winning origin at `path`.
+    pub(crate) fn invalid_value_at(
+        key: impl Into<String>,
+        reason: impl Into<String>,
+        origins: &crate::origin::OriginMap,
+        path: &crate::format::ConfigPath,
+    ) -> Self {
+        let facts = crate::origin::lookup(origins, path)
+            .map(crate::origin::Origin::to_facts)
+            .unwrap_or_default();
+        ClapfigError::InvalidValue {
+            key: key.into(),
+            reason: reason.into(),
+            origin: Box::new(facts),
         }
     }
 
@@ -433,6 +455,46 @@ impl ClapfigError {
             discovery,
         }
     }
+}
+
+fn format_invalid_value(key: &str, reason: &str, origin: &OriginFacts) -> String {
+    use std::fmt::Write;
+    let mut out = format!("Invalid value for '{key}': {reason}");
+    match origin.input_type {
+        Some(InputType::File) => {
+            if let Some(file) = &origin.file {
+                if let (Some(span), Some(src)) = (origin.span, origin.source.as_deref()) {
+                    let (line, _) = crate::format::byte_offset_to_line_col(src, span.start);
+                    let _ = write!(out, "\n  --> {}:{line}", file.display());
+                } else {
+                    let _ = write!(out, "\n  --> {}", file.display());
+                }
+            }
+        }
+        Some(InputType::Env) => {
+            if let Some(var) = &origin.env_var {
+                let _ = write!(out, "\n  set by environment variable {var}");
+            }
+        }
+        Some(InputType::Url) => {
+            if let Some(url_key) = &origin.url_key {
+                let _ = write!(out, "\n  set by URL query parameter {url_key}");
+            }
+        }
+        Some(InputType::Override) => {
+            let override_key = origin.key.as_deref().unwrap_or(key);
+            let _ = write!(
+                out,
+                "\n  set by a programmatic override for key {override_key}"
+            );
+        }
+        Some(InputType::Default) => {
+            let schema_key = origin.key.as_deref().unwrap_or(key);
+            let _ = write!(out, "\n  set by schema default for key {schema_key}");
+        }
+        None => {}
+    }
+    out
 }
 
 fn format_missing_required(key: &str, discovery: &DiscoveryRecord) -> String {
@@ -754,5 +816,47 @@ mod tests {
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+        assert_eq!(
+            ClapfigError::invalid_value("port", "expected integer").to_string(),
+            "Invalid value for 'port': expected integer"
+        );
+    }
+
+    #[test]
+    fn invalid_value_display_names_each_origin_kind() {
+        let mut file = OriginFacts {
+            file: Some("app.toml".into()),
+            span: Some(crate::format::Span { start: 7, end: 11 }),
+            source: Some(Arc::from("port = 8080\n")),
+            input_type: Some(InputType::File),
+            ..OriginFacts::default()
+        };
+        let msg = ClapfigError::InvalidValue {
+            key: "port".into(),
+            reason: "expected integer".into(),
+            origin: Box::new(file.clone()),
+        }
+        .to_string();
+        assert!(msg.contains("--> app.toml:1"), "{msg}");
+
+        file.input_type = Some(InputType::Env);
+        file.env_var = Some("MYAPP__PORT".into());
+        file.file = None;
+        file.span = None;
+        file.source = None;
+        let msg = ClapfigError::InvalidValue {
+            key: "port".into(),
+            reason: "expected integer".into(),
+            origin: Box::new(file.clone()),
+        }
+        .to_string();
+        assert!(
+            msg.contains("set by environment variable MYAPP__PORT"),
+            "{msg}"
+        );
+
+        let msg = ClapfigError::PostValidationFailed("nope".into()).to_string();
+        assert!(!msg.contains("set by"), "{msg}");
+        assert!(!msg.contains("-->"), "{msg}");
     }
 }

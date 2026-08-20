@@ -14,6 +14,10 @@
 //! source names collapse onto one path, the table last-wins (matching
 //! insert order) and every source name is retained so the error can
 //! list them all.
+//!
+//! Provenance is a separate last-writer map ([`EnvWinners`]): when a
+//! value wins, only that variable is the origin. Unknown-key aggregation
+//! on [`EnvSources`] must not leak losing writers into `InvalidValue`.
 
 use std::collections::BTreeMap;
 
@@ -25,6 +29,14 @@ use crate::value::{Map, Value};
 /// table last-wins, and this map keeps every spelling so unknown-key
 /// reporting can name each variable to unset.
 pub(crate) type EnvSources = BTreeMap<String, Vec<String>>;
+
+/// Dotted table path → the original environment variable that produced
+/// the **winning** node at that path.
+///
+/// Last-writer, same as the value table: a later var that replaces a
+/// subtree drops the losing descendants. Unknown-key reporting stays on
+/// [`EnvSources`].
+pub(crate) type EnvWinners = BTreeMap<String, String>;
 
 /// Build a config value [`Map`] from environment variables matching `{PREFIX}__*`.
 ///
@@ -44,16 +56,17 @@ pub(crate) type EnvSources = BTreeMap<String, Vec<String>>;
 /// shapes for one key.
 ///
 /// Takes an iterator so tests can pass synthetic data instead of
-/// `std::env::vars()`. Also returns the original variable name for
-/// each dotted path so unknown-key errors can name the exact variable
-/// to unset.
+/// `std::env::vars()`. Also returns the original variable names for
+/// each dotted path ([`EnvSources`], every spelling for unknown-key
+/// errors) and the last-writer map ([`EnvWinners`], provenance).
 pub(crate) fn env_to_table_with_sources(
     prefix: &str,
     vars: impl IntoIterator<Item = (String, String)>,
-) -> (Map, EnvSources) {
+) -> (Map, EnvSources, EnvWinners) {
     let needle = format!("{prefix}__");
     let mut table = Map::new();
     let mut sources = EnvSources::new();
+    let mut winners = EnvWinners::new();
 
     for (key, value) in vars {
         let Some(rest) = key.strip_prefix(&needle) else {
@@ -67,6 +80,7 @@ pub(crate) fn env_to_table_with_sources(
         insert_nested(
             &mut table,
             &mut sources,
+            &mut winners,
             &segments,
             parse_env_value(&value),
             &mut String::new(),
@@ -74,7 +88,7 @@ pub(crate) fn env_to_table_with_sources(
         );
     }
 
-    (table, sources)
+    (table, sources, winners)
 }
 
 /// Original variable names that produced `path` or any descendant of it.
@@ -86,6 +100,17 @@ pub(crate) fn env_to_table_with_sources(
 /// in first-seen (path-sorted, then recorded) order so the error can
 /// still name every variable to unset.
 pub(crate) fn env_source_names(sources: &EnvSources, path: &str) -> Option<String> {
+    let names = env_source_vars(sources, path);
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join(", "))
+    }
+}
+
+/// Original variable names that produced `path` or any descendant, in
+/// first-seen order. Empty when nothing under `path` was set.
+pub(crate) fn env_source_vars(sources: &EnvSources, path: &str) -> Vec<String> {
     let prefix = format!("{path}.");
     let mut names = Vec::new();
     for (key, vars) in sources {
@@ -97,16 +122,13 @@ pub(crate) fn env_source_names(sources: &EnvSources, path: &str) -> Option<Strin
             }
         }
     }
-    if names.is_empty() {
-        None
-    } else {
-        Some(names.join(", "))
-    }
+    names
 }
 
 fn insert_nested(
     table: &mut Map,
     sources: &mut EnvSources,
+    winners: &mut EnvWinners,
     segments: &[&str],
     value: Value,
     dotted: &mut String,
@@ -123,22 +145,43 @@ fn insert_nested(
 
     if segments.len() == 1 {
         table.insert(key, value);
+        prune_descendant_winners(winners, dotted);
+        winners.insert(dotted.clone(), original.to_string());
         let entry = sources.entry(dotted.clone()).or_default();
         if !entry.iter().any(|name| name == original) {
             entry.push(original.to_string());
         }
     } else {
+        let existed_as_map = matches!(table.get(&key), Some(Value::Map(_)));
         let sub = table.entry(key).or_insert_with(|| Value::Map(Map::new()));
         // If a flat var (e.g. MYAPP__DATABASE=x) already set this key to a
         // non-map, replace it — the more specific nested key wins.
         if !matches!(sub, Value::Map(_)) {
             *sub = Value::Map(Map::new());
+            prune_descendant_winners(winners, dotted);
+            winners.insert(dotted.clone(), original.to_string());
+        } else if !existed_as_map {
+            winners.insert(dotted.clone(), original.to_string());
         }
         if let Value::Map(sub_map) = sub {
-            insert_nested(sub_map, sources, &segments[1..], value, dotted, original);
+            insert_nested(
+                sub_map,
+                sources,
+                winners,
+                &segments[1..],
+                value,
+                dotted,
+                original,
+            );
         }
     }
     dotted.truncate(restore);
+}
+
+/// Drop last-writer names under `dotted` when that node is replaced.
+fn prune_descendant_winners(winners: &mut EnvWinners, dotted: &str) {
+    let prefix = format!("{dotted}.");
+    winners.retain(|key, _| !key.starts_with(&prefix));
 }
 
 /// Parse a string value into a typed config value.
@@ -176,6 +219,10 @@ mod tests {
 
     fn env_to_table(prefix: &str, vars: impl IntoIterator<Item = (String, String)>) -> Map {
         env_to_table_with_sources(prefix, vars).0
+    }
+
+    fn env_winner<'a>(winners: &'a EnvWinners, path: &str) -> Option<&'a str> {
+        winners.get(path).map(String::as_str)
     }
 
     #[test]
@@ -304,7 +351,7 @@ mod tests {
     fn mixed_case_suffix_keeps_original_variable_name() {
         // The suffix is lowercased for the table path; the recorded
         // source name is the spelling that produced the value.
-        let (table, sources) = env_to_table_with_sources(
+        let (table, sources, _) = env_to_table_with_sources(
             "MYAPP",
             vars(&[("MYAPP__rogue_key", "1"), ("MYAPP__Database__Rogue", "x")]),
         );
@@ -326,7 +373,7 @@ mod tests {
         // Stored under the leaf path; validation reports the unknown
         // ancestor. Both the exact path and its descendants must name
         // the variable.
-        let (_, sources) =
+        let (_, sources, _) =
             env_to_table_with_sources("MYAPP", vars(&[("MYAPP__DATABASE__ROGUE", "1")]));
         assert_eq!(
             env_source_names(&sources, "database.rogue").as_deref(),
@@ -346,7 +393,7 @@ mod tests {
         // Two names collapse onto `host`. The later value wins; both
         // spellings stay on the source list so an unknown-key error
         // can name every variable to unset.
-        let (table, sources) = env_to_table_with_sources(
+        let (table, sources, winners) = env_to_table_with_sources(
             "MYAPP",
             vars(&[("MYAPP__host", "first"), ("MYAPP__HOST", "second")]),
         );
@@ -354,6 +401,36 @@ mod tests {
         assert_eq!(
             sources.get("host"),
             Some(&vec!["MYAPP__host".to_string(), "MYAPP__HOST".to_string()])
+        );
+        assert_eq!(env_winner(&winners, "host"), Some("MYAPP__HOST"));
+    }
+
+    #[test]
+    fn winners_drop_losing_nested_var_when_flat_replaces_table() {
+        let (_, sources, winners) = env_to_table_with_sources(
+            "APP",
+            vars(&[("APP__DATABASE__URL", "x"), ("APP__DATABASE", "oops")]),
+        );
+        assert_eq!(env_winner(&winners, "database"), Some("APP__DATABASE"));
+        assert_eq!(env_winner(&winners, "database.url"), None);
+        assert!(
+            env_source_names(&sources, "database")
+                .as_deref()
+                .is_some_and(|s| s.contains("APP__DATABASE__URL")),
+            "unknown-key aggregation still lists the losing nested var"
+        );
+    }
+
+    #[test]
+    fn winners_drop_losing_flat_var_when_nested_replaces_scalar() {
+        let (_, _, winners) = env_to_table_with_sources(
+            "APP",
+            vars(&[("APP__DATABASE", "oops"), ("APP__DATABASE__URL", "x")]),
+        );
+        assert_eq!(env_winner(&winners, "database"), Some("APP__DATABASE__URL"));
+        assert_eq!(
+            env_winner(&winners, "database.url"),
+            Some("APP__DATABASE__URL")
         );
     }
 }

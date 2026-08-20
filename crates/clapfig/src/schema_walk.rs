@@ -14,23 +14,28 @@
 //!   sections, map-of nodes, and non-optional map leaves materialize as
 //!   empty tables (an absent map is the empty map), and absent array-of
 //!   nodes and non-optional array leaves without a default materialize as
-//!   empty arrays (an absent array is the empty array).
+//!   empty arrays (an absent array is the empty array). Default origins
+//!   are filled in the same walk (ADR-0004).
 //! - **[`finalize`]**: applies schema-driven coercions (string values in
 //!   TOML's four datetime lexical forms become [`Value::Datetime`] on
 //!   datetime leaves per ADR-0001; integer values become [`Value::Float`]
 //!   on float leaves, matching what serde accepts), then recursively
 //!   type-checks every value against its `LeafType`, enum-checks
-//!   `LeafType::Enum`, and enforces required fields. A required miss
-//!   becomes [`ClapfigError::MissingRequired`] carrying the injected
-//!   discovery record (an absent key has no origin). Returns the merged
-//!   value [`Map`] (the typed [`TypedBuilder`](crate::TypedBuilder)
-//!   deserializes that map into `C` afterwards).
+//!   `LeafType::Enum`, and enforces required fields. Coercion does **not**
+//!   change origin. A required miss becomes
+//!   [`ClapfigError::MissingRequired`] carrying the injected discovery
+//!   record (an absent key has no origin). A type/enum/shape error on a
+//!   value that exists becomes [`ClapfigError::InvalidValue`] naming the
+//!   winning origin. Returns the merged value [`Map`] (the typed
+//!   [`TypedBuilder`](crate::TypedBuilder) deserializes that map into `C`
+//!   afterwards).
 //!
 //! [`Schema`]: crate::runtime::Schema
 //! [`UnknownKey`]: crate::validate::UnknownKey
 
 use crate::error::{ClapfigError, DiscoveryRecord};
 use crate::format::ConfigPath;
+use crate::origin::{Origin, OriginMap, OriginNode};
 use crate::runtime::{Field, NamedField, Schema};
 use crate::validate::UnknownKey;
 use crate::value::{Map, Value};
@@ -151,13 +156,26 @@ fn find_field<'a>(schema: &'a Schema, name: &str) -> Option<&'a NamedField> {
 /// array-typed leaves without a declared default materialize as empty
 /// arrays by the same rule (an absent array is the empty array). Existing
 /// values are never overwritten.
-pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
+///
+/// Default origins are filled in the same walk (ADR-0004): a newly
+/// inserted default, empty map, or empty array gets [`Origin::default`]
+/// naming the schema key; existing origin nodes are left in place.
+pub(crate) fn fill_defaults_into(table: &mut Map, origins: &mut OriginMap, schema: &Schema) {
+    fill_defaults_at(table, origins, schema, "");
+}
+
+fn fill_defaults_at(table: &mut Map, origins: &mut OriginMap, schema: &Schema, prefix: &str) {
     for nf in &schema.fields {
+        let schema_key = if prefix.is_empty() {
+            nf.name.clone()
+        } else {
+            format!("{prefix}.{}", nf.name)
+        };
         match &nf.field {
             Field::Leaf(leaf) => {
                 if !table.contains_key(&nf.name) {
                     if let Some(default) = &leaf.default {
-                        table.insert(nf.name.clone(), default.clone());
+                        insert_default(table, origins, &nf.name, default.clone(), &schema_key);
                     } else if !leaf.optional && matches!(leaf.ty, crate::runtime::LeafType::Map(_))
                     {
                         // A non-optional map leaf (bare `HashMap<String,
@@ -169,7 +187,13 @@ pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
                         // empty map instead of a missing-field error.
                         // Optional (`Option<Map<..>>`) leaves stay absent
                         // and deserialize to `None`.
-                        table.insert(nf.name.clone(), Value::Map(Map::new()));
+                        insert_default(
+                            table,
+                            origins,
+                            &nf.name,
+                            Value::Map(Map::new()),
+                            &schema_key,
+                        );
                     } else if !leaf.optional
                         && matches!(leaf.ty, crate::runtime::LeafType::Array(_))
                     {
@@ -182,16 +206,29 @@ pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
                         // (`Option<Vec<..>>`) leaves stay absent and
                         // deserialize to `None`; a declared
                         // `#[clapfig(default = [...])]` wins (branch above).
-                        table.insert(nf.name.clone(), Value::Array(Vec::new()));
+                        insert_default(
+                            table,
+                            origins,
+                            &nf.name,
+                            Value::Array(Vec::new()),
+                            &schema_key,
+                        );
                     }
                 }
             }
             Field::Nested(nested) => {
+                let created = !table.contains_key(&nf.name);
                 let entry = table
                     .entry(nf.name.clone())
                     .or_insert_with(|| Value::Map(Map::new()));
+                if created {
+                    origins.entry(nf.name.clone()).or_insert_with(|| {
+                        OriginNode::map(Origin::default(&schema_key), OriginMap::new())
+                    });
+                }
                 if let Value::Map(t) = entry {
-                    fill_defaults_into(t, nested);
+                    let child_origins = child_map_origins(origins, &nf.name, &schema_key);
+                    fill_defaults_at(t, child_origins, nested, &schema_key);
                 }
             }
             Field::ArrayOf(item_schema) => {
@@ -202,13 +239,28 @@ pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
                 // entries", and the typed path's serde deserialize needs
                 // the `[]` to produce an empty `Vec` instead of a
                 // missing-field error.
+                let created = !table.contains_key(&nf.name);
                 let entry = table
                     .entry(nf.name.clone())
                     .or_insert_with(|| Value::Array(Vec::new()));
+                if created {
+                    origins.entry(nf.name.clone()).or_insert_with(|| {
+                        OriginNode::array(Origin::default(&schema_key), Vec::new())
+                    });
+                }
                 if let Value::Array(items) = entry {
-                    for item in items {
+                    let child_origins = child_array_origins(origins, &nf.name, &schema_key);
+                    for (i, item) in items.iter_mut().enumerate() {
                         if let Value::Map(t) = item {
-                            fill_defaults_into(t, item_schema);
+                            let indexed = format!("{schema_key}[{i}]");
+                            while child_origins.len() <= i {
+                                child_origins.push(OriginNode::map(
+                                    Origin::default(&indexed),
+                                    OriginMap::new(),
+                                ));
+                            }
+                            let entry_origins = child_origins[i].map_children_mut();
+                            fill_defaults_at(t, entry_origins, item_schema, &indexed);
                         }
                     }
                 }
@@ -221,13 +273,23 @@ pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
                 // and the typed path's serde deserialize needs the `{}` to
                 // produce an empty `HashMap` instead of a missing-field
                 // error.
+                let created = !table.contains_key(&nf.name);
                 let entry = table
                     .entry(nf.name.clone())
                     .or_insert_with(|| Value::Map(Map::new()));
+                if created {
+                    origins.entry(nf.name.clone()).or_insert_with(|| {
+                        OriginNode::map(Origin::default(&schema_key), OriginMap::new())
+                    });
+                }
                 if let Value::Map(entries) = entry {
-                    for (_entry_key, entry_value) in entries.iter_mut() {
+                    let child_origins = child_map_origins(origins, &nf.name, &schema_key);
+                    for (entry_key, entry_value) in entries.iter_mut() {
                         if let Value::Map(t) = entry_value {
-                            fill_defaults_into(t, item_schema);
+                            let entry_path = format!("{schema_key}.{entry_key}");
+                            let entry_origins =
+                                child_map_entry_origins(child_origins, entry_key, &entry_path);
+                            fill_defaults_at(t, entry_origins, item_schema, &entry_path);
                         }
                     }
                 }
@@ -236,21 +298,75 @@ pub(crate) fn fill_defaults_into(table: &mut Map, schema: &Schema) {
     }
 }
 
+fn insert_default(
+    table: &mut Map,
+    origins: &mut OriginMap,
+    name: &str,
+    value: Value,
+    schema_key: &str,
+) {
+    origins.insert(
+        name.to_string(),
+        OriginNode::from_value(&value, Origin::default(schema_key)),
+    );
+    table.insert(name.to_string(), value);
+}
+
+fn child_map_origins<'a>(
+    origins: &'a mut OriginMap,
+    name: &str,
+    schema_key: &str,
+) -> &'a mut OriginMap {
+    let node = origins
+        .entry(name.to_string())
+        .or_insert_with(|| OriginNode::map(Origin::default(schema_key), OriginMap::new()));
+    node.map_children_mut()
+}
+
+fn child_array_origins<'a>(
+    origins: &'a mut OriginMap,
+    name: &str,
+    schema_key: &str,
+) -> &'a mut Vec<OriginNode> {
+    let node = origins
+        .entry(name.to_string())
+        .or_insert_with(|| OriginNode::array(Origin::default(schema_key), Vec::new()));
+    node.array_children_mut()
+}
+
+fn child_map_entry_origins<'a>(
+    origins: &'a mut OriginMap,
+    entry_key: &str,
+    schema_key: &str,
+) -> &'a mut OriginMap {
+    let node = origins
+        .entry(entry_key.to_string())
+        .or_insert_with(|| OriginNode::map(Origin::default(schema_key), OriginMap::new()));
+    node.map_children_mut()
+}
+
 /// Finalize a merged table: apply schema-driven coercions
 /// (datetime strings, integer-for-float), then enforce required fields
 /// and per-leaf types. Returns the merged map on success.
 ///
+/// Coercion changes a value's type (datetime strings, integer-for-float)
+/// and does **not** change origin: the winning input still owns the
+/// value.
+///
+/// `origins` is the lockstep shadow tree; type/enum/shape errors on a
+/// value that exists name the origin at that path.
 /// `discovery` is attached to [`ClapfigError::MissingRequired`] — an
 /// absent key has no origin, it has the search that did not find it.
 /// Callers without a probe record (schema-only unit tests) pass
 /// [`DiscoveryRecord::empty`].
 pub(crate) fn finalize(
     mut merged: Map,
+    origins: &OriginMap,
     schema: &Schema,
     discovery: &DiscoveryRecord,
 ) -> Result<Map, ClapfigError> {
     coerce_leaf_values(&mut merged, schema);
-    check_required_and_types(&merged, schema, "", discovery)?;
+    check_required_and_types(&merged, origins, schema, "", &ConfigPath::new(), discovery)?;
     Ok(merged)
 }
 
@@ -345,27 +461,30 @@ pub(crate) fn coerce_value(value: &mut Value, ty: &crate::runtime::LeafType) {
 /// Recursively validate required-field presence and per-leaf types.
 fn check_required_and_types(
     table: &Map,
+    origins: &OriginMap,
     schema: &Schema,
     prefix: &str,
+    path: &ConfigPath,
     discovery: &DiscoveryRecord,
 ) -> Result<(), ClapfigError> {
     for nf in &schema.fields {
-        let path = if prefix.is_empty() {
+        let display = if prefix.is_empty() {
             nf.name.clone()
         } else {
             format!("{prefix}.{}", nf.name)
         };
+        let child = path.clone().key(&nf.name);
         match &nf.field {
             Field::Leaf(leaf) => match table.get(&nf.name) {
                 None => {
                     if !leaf.optional {
-                        return Err(ClapfigError::missing_required(path, discovery.clone()));
+                        return Err(ClapfigError::missing_required(display, discovery.clone()));
                     }
                 }
                 Some(value) => {
-                    leaf.ty
-                        .check(value)
-                        .map_err(|reason| ClapfigError::invalid_value(path.clone(), reason))?;
+                    leaf.ty.check(value).map_err(|reason| {
+                        ClapfigError::invalid_value_at(display.clone(), reason, origins, &child)
+                    })?;
                 }
             },
             Field::Nested(nested) => match table.get(&nf.name) {
@@ -374,15 +493,24 @@ fn check_required_and_types(
                     // required. Recurse with an empty table so the missing-
                     // required check below fires for inner leaves.
                     let empty = Map::new();
-                    check_required_and_types(&empty, nested, &path, discovery)?;
+                    check_required_and_types(
+                        &empty,
+                        &OriginMap::new(),
+                        nested,
+                        &display,
+                        &child,
+                        discovery,
+                    )?;
                 }
                 Some(Value::Map(inner)) => {
-                    check_required_and_types(inner, nested, &path, discovery)?;
+                    check_required_and_types(inner, origins, nested, &display, &child, discovery)?;
                 }
                 Some(other) => {
-                    return Err(ClapfigError::invalid_value(
-                        path,
+                    return Err(ClapfigError::invalid_value_at(
+                        display,
                         format!("expected map, got {}", value_type_name(other)),
+                        origins,
+                        &child,
                     ));
                 }
             },
@@ -394,24 +522,36 @@ fn check_required_and_types(
                 }
                 Some(Value::Array(items)) => {
                     for (i, item) in items.iter().enumerate() {
-                        let indexed = format!("{path}[{i}]");
+                        let indexed = format!("{display}[{i}]");
+                        let indexed_path = child.clone().index(i);
                         match item {
                             Value::Map(inner) => {
-                                check_required_and_types(inner, item_schema, &indexed, discovery)?;
+                                check_required_and_types(
+                                    inner,
+                                    origins,
+                                    item_schema,
+                                    &indexed,
+                                    &indexed_path,
+                                    discovery,
+                                )?;
                             }
                             other => {
-                                return Err(ClapfigError::invalid_value(
+                                return Err(ClapfigError::invalid_value_at(
                                     indexed,
                                     format!("expected map, got {}", value_type_name(other)),
+                                    origins,
+                                    &indexed_path,
                                 ));
                             }
                         }
                     }
                 }
                 Some(other) => {
-                    return Err(ClapfigError::invalid_value(
-                        path,
+                    return Err(ClapfigError::invalid_value_at(
+                        display,
                         format!("expected array, got {}", value_type_name(other)),
+                        origins,
+                        &child,
                     ));
                 }
             },
@@ -423,29 +563,36 @@ fn check_required_and_types(
                 }
                 Some(Value::Map(entries)) => {
                     for (entry_key, entry_value) in entries {
-                        let entry_path = format!("{path}.{entry_key}");
+                        let entry_path = format!("{display}.{entry_key}");
+                        let entry_cfg = child.clone().key(entry_key);
                         match entry_value {
                             Value::Map(inner) => {
                                 check_required_and_types(
                                     inner,
+                                    origins,
                                     item_schema,
                                     &entry_path,
+                                    &entry_cfg,
                                     discovery,
                                 )?;
                             }
                             other => {
-                                return Err(ClapfigError::invalid_value(
+                                return Err(ClapfigError::invalid_value_at(
                                     entry_path,
                                     format!("expected map, got {}", value_type_name(other)),
+                                    origins,
+                                    &entry_cfg,
                                 ));
                             }
                         }
                     }
                 }
                 Some(other) => {
-                    return Err(ClapfigError::invalid_value(
-                        path,
+                    return Err(ClapfigError::invalid_value_at(
+                        display,
                         format!("expected map, got {}", value_type_name(other)),
+                        origins,
+                        &child,
                     ));
                 }
             },
@@ -498,10 +645,15 @@ mod tests {
         crate::fixtures::test::parse_toml(toml_text)
     }
 
-    /// Schema-only finalize: no probe record. Production resolve injects
-    /// the real discovery via the three-argument [`super::finalize`].
+    /// Schema-only finalize: empty origins, no probe record. Production
+    /// resolve injects the merged origin tree and discovery via
+    /// [`super::finalize`].
     fn finalize(merged: Map, schema: &Schema) -> Result<Map, ClapfigError> {
-        super::finalize(merged, schema, &DiscoveryRecord::empty())
+        super::finalize(merged, &OriginMap::new(), schema, &DiscoveryRecord::empty())
+    }
+
+    fn fill(table: &mut Map, schema: &Schema) {
+        fill_defaults_into(table, &mut OriginMap::new(), schema);
     }
 
     fn unknown_paths(table: &Map, schema: &Schema) -> Vec<String> {
@@ -585,7 +737,7 @@ mod tests {
     #[test]
     fn fill_defaults_populates_missing_top_level() {
         let mut table = parse("name = \"x\"\n");
-        fill_defaults_into(&mut table, &test_schema());
+        fill(&mut table, &test_schema());
         assert_eq!(table.get("port"), Some(&Value::Integer(8080)));
         assert_eq!(table.get("host"), Some(&Value::String("localhost".into())));
         assert_eq!(table.get("level"), Some(&Value::String("info".into())));
@@ -594,14 +746,14 @@ mod tests {
     #[test]
     fn fill_defaults_does_not_overwrite() {
         let mut table = parse("name = \"x\"\nport = 9999\n");
-        fill_defaults_into(&mut table, &test_schema());
+        fill(&mut table, &test_schema());
         assert_eq!(table.get("port"), Some(&Value::Integer(9999)));
     }
 
     #[test]
     fn fill_defaults_creates_nested_section_when_missing() {
         let mut table = parse("name = \"x\"\n");
-        fill_defaults_into(&mut table, &test_schema());
+        fill(&mut table, &test_schema());
         let db = table.get("db").and_then(Value::as_map).unwrap();
         assert_eq!(db.get("pool_size"), Some(&Value::Integer(5)));
         // `url` is optional; should stay absent.
@@ -620,7 +772,7 @@ mod tests {
             )
             .build();
         let mut table = parse("");
-        fill_defaults_into(&mut table, &schema);
+        fill(&mut table, &schema);
         assert_eq!(table.get("plugins"), Some(&Value::Array(Vec::new())));
     }
 
@@ -633,7 +785,7 @@ mod tests {
             )
             .build();
         let mut table = parse("[[plugins]]\n");
-        fill_defaults_into(&mut table, &schema);
+        fill(&mut table, &schema);
         let items = table.get("plugins").and_then(Value::as_array).unwrap();
         let entry = items[0].as_map().unwrap();
         assert_eq!(entry.get("priority"), Some(&Value::Integer(10)));
@@ -651,7 +803,7 @@ mod tests {
             )
             .build();
         let mut table = parse("");
-        fill_defaults_into(&mut table, &schema);
+        fill(&mut table, &schema);
         assert_eq!(table.get("tags"), Some(&Value::Array(Vec::new())));
     }
 
@@ -665,7 +817,7 @@ mod tests {
             )
             .build();
         let mut table = parse("");
-        fill_defaults_into(&mut table, &schema);
+        fill(&mut table, &schema);
         assert!(!table.contains_key("tags"));
     }
 
@@ -675,7 +827,7 @@ mod tests {
     fn finalize_errors_on_missing_required() {
         let schema = test_schema();
         let mut table = parse("port = 1\n");
-        fill_defaults_into(&mut table, &schema);
+        fill(&mut table, &schema);
         let err = finalize(table, &schema).unwrap_err();
         match err {
             ClapfigError::MissingRequired { key, .. } => assert_eq!(key, "name"),
@@ -687,7 +839,7 @@ mod tests {
     fn finalize_accepts_when_required_present() {
         let schema = test_schema();
         let mut table = parse("name = \"x\"\n");
-        fill_defaults_into(&mut table, &schema);
+        fill(&mut table, &schema);
         let out = finalize(table, &schema).unwrap();
         assert_eq!(out.get("name"), Some(&Value::String("x".into())));
         assert_eq!(out.get("port"), Some(&Value::Integer(8080)));
@@ -699,7 +851,7 @@ mod tests {
     fn finalize_rejects_wrong_leaf_type() {
         let schema = test_schema();
         let mut table = parse("name = \"x\"\nport = \"oops\"\n");
-        fill_defaults_into(&mut table, &schema);
+        fill(&mut table, &schema);
         let err = finalize(table, &schema).unwrap_err();
         match err {
             ClapfigError::InvalidValue { key, reason, .. } => {
@@ -714,7 +866,7 @@ mod tests {
     fn finalize_rejects_out_of_set_enum_value() {
         let schema = test_schema();
         let mut table = parse("name = \"x\"\nlevel = \"garbage\"\n");
-        fill_defaults_into(&mut table, &schema);
+        fill(&mut table, &schema);
         let err = finalize(table, &schema).unwrap_err();
         match err {
             ClapfigError::InvalidValue { key, reason, .. } => {
@@ -901,7 +1053,7 @@ mod tests {
             url: false,
             overrides: false,
         };
-        let err = super::finalize(table, &schema, &discovery).unwrap_err();
+        let err = super::finalize(table, &OriginMap::new(), &schema, &discovery).unwrap_err();
         match err {
             ClapfigError::MissingRequired {
                 key,
@@ -916,6 +1068,55 @@ mod tests {
         assert!(
             !msg.contains("set by"),
             "MissingRequired must not name a winning origin: {msg}"
+        );
+    }
+
+    #[test]
+    fn fill_defaults_writes_default_origins_in_the_same_walk() {
+        let mut table = parse("name = \"x\"\n");
+        let mut origins = OriginMap::new();
+        fill_defaults_into(&mut table, &mut origins, &test_schema());
+        let port = crate::origin::lookup(&origins, &ConfigPath::new().key("port")).unwrap();
+        assert_eq!(port.layer, crate::types::InputType::Default);
+        assert_eq!(port.key.as_deref(), Some("port"));
+        let pool =
+            crate::origin::lookup(&origins, &ConfigPath::new().key("db").key("pool_size")).unwrap();
+        assert_eq!(pool.layer, crate::types::InputType::Default);
+        assert_eq!(pool.key.as_deref(), Some("db.pool_size"));
+    }
+
+    #[test]
+    fn fill_defaults_does_not_overwrite_existing_origins() {
+        let mut table = parse("name = \"x\"\nport = 9999\n");
+        let mut origins = OriginMap::new();
+        origins.insert("port".into(), OriginNode::leaf(Origin::r#override("port")));
+        fill_defaults_into(&mut table, &mut origins, &test_schema());
+        let port = crate::origin::lookup(&origins, &ConfigPath::new().key("port")).unwrap();
+        assert_eq!(port.layer, crate::types::InputType::Override);
+        assert_eq!(table.get("port"), Some(&Value::Integer(9999)));
+    }
+
+    #[test]
+    fn coerce_does_not_change_origin() {
+        let schema = Schema::object("T")
+            .field("timeout", RtField::float().optional())
+            .build();
+        let mut table = Map::new();
+        table.insert("timeout".into(), Value::Integer(5));
+        let mut origins = OriginMap::new();
+        origins.insert(
+            "timeout".into(),
+            OriginNode::leaf(Origin::env(vec!["APP__TIMEOUT".into()])),
+        );
+        let before = origins.clone();
+        coerce_leaf_values(&mut table, &schema);
+        assert_eq!(table["timeout"], Value::Float(5.0));
+        assert_eq!(origins, before);
+        assert_eq!(
+            crate::origin::lookup(&origins, &ConfigPath::new().key("timeout"))
+                .unwrap()
+                .layer,
+            crate::types::InputType::Env
         );
     }
 }
