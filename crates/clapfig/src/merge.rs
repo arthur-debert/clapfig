@@ -19,23 +19,20 @@ use crate::value::{Map, Value};
 /// If both sides have a Map for the same key, recurse. Otherwise
 /// `overlay`'s value **and** origin win. Arrays are not merged element-wise.
 /// Replacing an existing value fires [`crate::trace::overlay_win`].
+/// Path tracking for those events is skipped when TRACE is disabled, so
+/// unused tracing does not allocate per key (ADR-0009).
 pub(crate) fn deep_merge(
     base: Map,
     overlay: Map,
     base_origins: OriginMap,
     overlay_origins: OriginMap,
 ) -> (Map, OriginMap) {
-    deep_merge_at(
-        ConfigPath::new(),
-        base,
-        overlay,
-        base_origins,
-        overlay_origins,
-    )
+    let path = crate::trace::trace_event_enabled().then(ConfigPath::new);
+    deep_merge_at(path, base, overlay, base_origins, overlay_origins)
 }
 
 fn deep_merge_at(
-    path: ConfigPath,
+    path: Option<ConfigPath>,
     mut base: Map,
     overlay: Map,
     mut base_origins: OriginMap,
@@ -44,7 +41,7 @@ fn deep_merge_at(
     for (key, overlay_val) in overlay {
         match (base.remove(&key), overlay_val) {
             (Some(Value::Map(base_map)), Value::Map(overlay_map)) => {
-                let child = path.clone().key(&key);
+                let child = path.as_ref().map(|p| p.clone().key(&key));
                 let (base_origin, base_om) = take_map_children(base_origins.remove(&key));
                 let (overlay_origin, overlay_om) = take_map_children(overlay_origins.remove(&key));
                 let (merged, merged_o) =
@@ -56,7 +53,7 @@ fn deep_merge_at(
                 base_origins.insert(key, OriginNode::map(origin, merged_o));
             }
             (base_val, overlay_val) => {
-                if let Some(ref loser) = base_val {
+                if let (Some(loser), Some(path)) = (&base_val, &path) {
                     crate::trace::overlay_win(
                         &path.clone().key(&key),
                         &origin_node_label(overlay_origins.get(&key)),

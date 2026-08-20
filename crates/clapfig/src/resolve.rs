@@ -289,9 +289,12 @@ pub(crate) fn resolve(
         (table, origins)
     });
 
-    // URL layer
+    // URL / CLI layers. Construction and the `* layer constructed` summary
+    // both gate on membership, matching files and env: omitting a layer
+    // excludes it entirely, so a populated-but-omitted input must not
+    // narrate a layer that will never merge.
     #[cfg(feature = "url")]
-    let url_layer = if input.url_overrides.is_empty() {
+    let url_layer = if !order.contains(&Layer::Url) || input.url_overrides.is_empty() {
         None
     } else {
         let layer = overrides::overrides_to_table_with_original_keys(
@@ -302,8 +305,7 @@ pub(crate) fn resolve(
         Some(layer)
     };
 
-    // CLI layer
-    let cli_layer = if input.cli_overrides.is_empty() {
+    let cli_layer = if !order.contains(&Layer::Cli) || input.cli_overrides.is_empty() {
         None
     } else {
         let layer = overrides::overrides_to_table_with_original_keys(

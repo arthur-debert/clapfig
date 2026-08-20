@@ -83,6 +83,14 @@ pub(crate) fn cli_layer_constructed(keys: usize) {
     tracing::debug!(target: TARGET, keys, "cli layer constructed");
 }
 
+/// True when a clapfig `trace` event would be recorded.
+///
+/// Callers skip per-key path/label allocation for overlay and default
+/// events when this is false, so unused tracing stays free (ADR-0009).
+pub(crate) fn trace_event_enabled() -> bool {
+    tracing::event_enabled!(target: TARGET, tracing::Level::TRACE)
+}
+
 /// Overlay replaced an existing value. Both origins and both value
 /// **types** are named; values themselves are not.
 pub(crate) fn overlay_win(
@@ -109,8 +117,11 @@ pub(crate) fn merge_complete(keys: usize) {
 }
 
 /// One schema default (or materialized empty container) was filled.
-pub(crate) fn default_filled(key: &str, value_type: &str) {
-    tracing::trace!(target: TARGET, key, value_type, "default filled");
+///
+/// `key` is a [`ConfigPath`] so a quoted dotted MapOf entry stays one
+/// segment (`plugins."a.b".enabled`), not a flattened display string.
+pub(crate) fn default_filled(key: &ConfigPath, value_type: &str) {
+    tracing::trace!(target: TARGET, key = %key, value_type, "default filled");
 }
 
 /// Per-stage summary of defaults injection.
@@ -148,6 +159,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fmt;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use tempfile::TempDir;
@@ -161,7 +173,7 @@ mod tests {
     use crate::format::TomlAdapter;
     use crate::persist;
     use crate::runtime::{Field as RtField, Schema};
-    use crate::types::SearchPath;
+    use crate::types::{Layer, SearchPath};
     use crate::value::Value;
 
     /// Sentinel that must never appear in any clapfig event field.
@@ -200,6 +212,7 @@ mod tests {
 
     struct CapturingSubscriber {
         inner: Arc<CaptureInner>,
+        next_span: AtomicU64,
     }
 
     struct FieldVisitor<'a> {
@@ -257,7 +270,8 @@ mod tests {
         }
 
         fn new_span(&self, _span: &Attributes<'_>) -> Id {
-            Id::from_u64(1)
+            // Span IDs must be unique and non-zero (`Id::from_u64(0)` panics).
+            Id::from_u64(self.next_span.fetch_add(1, Ordering::Relaxed))
         }
 
         fn record(&self, _span: &Id, _values: &Record<'_>) {}
@@ -295,6 +309,7 @@ mod tests {
         });
         let subscriber = CapturingSubscriber {
             inner: Arc::clone(&inner),
+            next_span: AtomicU64::new(1),
         };
         let result = tracing::subscriber::with_default(subscriber, f);
         let events = inner.events.lock().expect("capture mutex").clone();
@@ -444,6 +459,88 @@ mod tests {
         );
         assert_eq!(host.field("winner_type"), Some("string"));
         assert_eq!(host.field("loser_type"), Some("string"));
+    }
+
+    #[test]
+    fn omitted_cli_and_url_inputs_do_not_emit_layer_constructed() {
+        let (events, result) = capture(|| {
+            let builder = Clapfig::builder(tracing_schema())
+                .app_name("app")
+                .no_env()
+                .cli_override("port", Some(9999i64))
+                .layer_order(Vec::<Layer>::new());
+            #[cfg(feature = "url")]
+            let builder = builder.url_query("host=from-url");
+            builder.load()
+        });
+
+        let table = result.expect("omitted layers still fill schema defaults");
+        assert_eq!(table.get("port"), Some(&Value::Integer(8080)));
+        assert_eq!(table.get("host"), Some(&Value::String("localhost".into())));
+
+        let logs = blob(&events);
+        let discovery = named(&events, "discovery complete");
+        assert_eq!(
+            discovery.len(),
+            1,
+            "expected one discovery complete:\n{logs}"
+        );
+        assert_eq!(discovery[0].field("overrides"), Some("false"));
+        #[cfg(feature = "url")]
+        assert_eq!(discovery[0].field("url"), Some("false"));
+        assert!(
+            named(&events, "cli layer constructed").is_empty(),
+            "omitted CLI must not narrate construction:\n{logs}"
+        );
+        #[cfg(feature = "url")]
+        assert!(
+            named(&events, "url layer constructed").is_empty(),
+            "omitted URL must not narrate construction:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn default_filled_quotes_dotted_map_of_entry_key() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("app.toml"), "[plugins.\"a.b\"]\n").unwrap();
+
+        let schema = Schema::object("TraceConfig")
+            .map_of(
+                "plugins",
+                Schema::object("Plugin").field("enabled", RtField::boolean().default(true)),
+            )
+            .build();
+
+        let (events, result) = capture(|| {
+            Clapfig::builder(schema)
+                .app_name("app")
+                .file_name("app.toml")
+                .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+                .no_env()
+                .load()
+        });
+
+        let table = result.expect("map-of default fill");
+        let enabled = table["plugins"].as_map().unwrap()["a.b"]
+            .as_map()
+            .unwrap()
+            .get("enabled");
+        assert_eq!(enabled, Some(&Value::Boolean(true)));
+
+        let logs = blob(&events);
+        let filled = named(&events, "default filled");
+        let key = filled
+            .iter()
+            .find_map(|e| e.field("key"))
+            .unwrap_or_else(|| panic!("expected a default filled event:\n{logs}"));
+        assert_eq!(
+            key, r#"plugins."a.b".enabled"#,
+            "MapOf entry keys must keep ConfigPath identity:\n{logs}"
+        );
+        assert!(
+            !logs.contains("plugins.a.b.enabled"),
+            "flattened dotted display must not appear:\n{logs}"
+        );
     }
 
     #[test]
