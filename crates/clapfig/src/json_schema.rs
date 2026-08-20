@@ -1,13 +1,10 @@
 //! JSON Schema generation from a config schema.
 //!
-//! Entry point is [`generate_schema`]: it walks a
-//! [`runtime::Schema`](crate::runtime::Schema) — built by the runtime
-//! builder or emitted by `#[derive(clapfig::Schema)]` — and produces a JSON
-//! Schema document. Useful for auto-generating UI editors, external
+//! Entry point is [`generate_schema`] (object root) or
+//! [`generate_from_shape`] (any document-root [`Shape`](crate::runtime::Shape)).
+//! A root map is `type: object` plus `additionalProperties` of the item
+//! at the document root. Useful for auto-generating UI editors, external
 //! validation tools, or IDE integrations.
-//!
-//! The walker consumes `&runtime::Schema` directly — the crate's one
-//! schema model — so the same generator serves both entry points.
 //!
 //! # What is in the schema
 //!
@@ -131,11 +128,47 @@ fn comment_key_allowlist() -> Value {
 /// Returns a `serde_json::Value` — the caller serializes it to a string,
 /// writes it to a file, or embeds it wherever needed.
 pub fn generate_schema(schema: &Schema) -> Value {
-    let mut root = schema_to_object(schema);
-    if let Value::Object(map) = &mut root {
-        map.insert("$schema".into(), Value::String(SCHEMA_DIALECT.into()));
+    generate_from_shape(&Shape::Object(schema.clone()))
+}
+
+/// Generate a JSON Schema document from a document-root [`Shape`].
+///
+/// A root [`Shape::Map`] is `type: object` with `additionalProperties` of
+/// the item schema at the document root (no synthetic parent property).
+/// Object roots match [`generate_schema`].
+pub fn generate_from_shape(shape: &Shape) -> Value {
+    let mut root = match shape {
+        Shape::Object(schema) => schema_to_object(schema),
+        Shape::Map(map) => map_root_to_object(map),
+        Shape::Tagged(_) => panic!(
+            "clapfig: tagged JSON Schema is SHP01-WS05; do not export a tagged shape this slice"
+        ),
+        Shape::Leaf(_) | Shape::Array(_) => panic!(
+            "clapfig: a Leaf or Array is not a legal document root (legal roots: Object, Map, Tagged)"
+        ),
+    };
+    if let Value::Object(obj) = &mut root {
+        obj.insert("$schema".into(), Value::String(SCHEMA_DIALECT.into()));
     }
     root
+}
+
+/// JSON Schema for a root homogeneous map: `type: object` plus
+/// `additionalProperties` of the item, at the document root.
+fn map_root_to_object(map: &crate::runtime::MapShape) -> Value {
+    let mut obj = Map::new();
+    obj.insert("type".into(), Value::String("object".into()));
+    if !map.name.is_empty() {
+        obj.insert("title".into(), Value::String(map.name.clone()));
+    }
+    if !map.doc.is_empty() {
+        obj.insert("description".into(), Value::String(join_doc(&map.doc)));
+    }
+    obj.insert("patternProperties".into(), comment_key_allowlist());
+    if let Some(entry) = shape_to_schema(&map.item) {
+        obj.insert("additionalProperties".into(), entry);
+    }
+    Value::Object(obj)
 }
 
 /// Convert a schema node into a JSON Schema object.

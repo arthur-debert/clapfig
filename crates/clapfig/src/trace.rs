@@ -570,8 +570,16 @@ mod tests {
         let schema = tracing_schema();
         let adapter = TomlAdapter;
 
-        let (events, result) =
-            capture(|| persist::persist_value(&adapter, &schema, &path, "token", SENTINEL, false));
+        let (events, result) = capture(|| {
+            persist::persist_value(
+                &adapter,
+                &crate::runtime::Shape::Object(schema.clone()),
+                &path,
+                "token",
+                SENTINEL,
+                false,
+            )
+        });
         result.expect("persist set");
 
         let logs = blob(&events);
@@ -611,8 +619,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("app.toml");
         let schema = tracing_schema();
-        let (events, result) =
-            capture(|| persist::persist_value(&TomlAdapter, &schema, &path, "nope", "1", false));
+        let (events, result) = capture(|| {
+            persist::persist_value(
+                &TomlAdapter,
+                &crate::runtime::Shape::Object(schema.clone()),
+                &path,
+                "nope",
+                "1",
+                false,
+            )
+        });
         assert!(matches!(result, Err(ClapfigError::KeyNotFound { .. })));
         assert!(
             named(&events, "persist set").is_empty(),

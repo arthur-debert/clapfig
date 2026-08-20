@@ -98,6 +98,26 @@ pub(crate) fn validate_unknown(
     filter_through_cascade(table, origin, unknown, ctx)
 }
 
+/// Unknown-key walk against a document-root [`Shape`].
+///
+/// Object roots use [`validate_unknown`]. Map roots collect unknown keys
+/// inside entries (root keys are user data, not unknown).
+pub(crate) fn validate_unknown_shape(
+    table: &Map,
+    shape: &crate::runtime::Shape,
+    origin: &UnknownKeySource<'_>,
+    ctx: &ValidateContext<'_>,
+) -> Result<Vec<CollectedUnknown>, ClapfigError> {
+    match shape {
+        crate::runtime::Shape::Object(schema) => validate_unknown(table, schema, origin, ctx),
+        _ => {
+            let mut unknown: Vec<UnknownKey> = Vec::new();
+            crate::schema_walk::collect_unknown_against_root(table, shape, &mut unknown);
+            filter_through_cascade(table, origin, unknown, ctx)
+        }
+    }
+}
+
 /// Resolve an already-collected list of unknown paths against the cascade
 /// and the optional `on_unknown_key` callback. Shared between the per-file
 /// walker and the env-layer walker so both have identical strictness

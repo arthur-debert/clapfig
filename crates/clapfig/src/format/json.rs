@@ -60,7 +60,7 @@ use crate::runtime::{Schema, Shape};
 use crate::value::{Map, Value};
 
 use super::template::{
-    TemplateRenderer, doc_lines, leaf_annotations, tagged_template_stub, walk_level,
+    TemplateRenderer, doc_lines, leaf_annotations, tagged_template_stub, walk_level, walk_root,
 };
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
@@ -127,9 +127,9 @@ impl FormatAdapter for JsonAdapter {
         Ok(render(&json))
     }
 
-    fn template(&self, schema: &Schema) -> Result<String, FormatError> {
+    fn template(&self, shape: &Shape) -> Result<String, FormatError> {
         let mut object = JsonMap::new();
-        walk_level(&mut JsonTemplate, schema, &(), &mut object)?;
+        walk_root(&mut JsonTemplate, shape, &(), &mut object)?;
         Ok(render(&Json::Object(object)))
     }
 
@@ -990,6 +990,27 @@ impl TemplateRenderer for JsonTemplate {
         out.insert(comment_key(name), comment_value(lines));
         Ok(())
     }
+
+    fn root_map(
+        &mut self,
+        out: &mut Self::Out,
+        _ctx: &(),
+        item: &Shape,
+        doc: &[String],
+    ) -> Result<(), FormatError> {
+        // Root-map docs live on the MapShape (`doc`); item docs are the
+        // entry example's own prose. The assignment value is the item
+        // example directly — wrapping it in a second `<key>` object
+        // would advertise a map level the schema does not accept.
+        let mut lines = doc_lines(doc);
+        lines.extend(doc_lines(item.field_doc()));
+        lines.push(assignment_snippet(
+            "<key>",
+            compact(&example_value(item, "<key>")?),
+        ));
+        out.insert(COMMENT_PREFIX.into(), comment_value(lines));
+        Ok(())
+    }
 }
 
 /// Example object for an array-of / map-of entry, shown inside a comment:
@@ -1788,7 +1809,9 @@ mod tests {
         let schema = RtSchema::object("App")
             .field("//weird", Field::string().default("x"))
             .build();
-        let err = JsonAdapter.template(&schema).unwrap_err();
+        let err = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap_err();
         assert!(err.detail().contains("reserved"), "{}", err.detail());
         assert!(err.detail().contains("//weird"), "{}", err.detail());
     }
@@ -1849,7 +1872,12 @@ mod tests {
   }
 }
 "#;
-        assert_eq!(JsonAdapter.template(&schema).unwrap(), golden);
+        assert_eq!(
+            JsonAdapter
+                .template(&Shape::Object(schema.clone()))
+                .unwrap(),
+            golden
+        );
     }
 
     #[test]
@@ -1868,7 +1896,9 @@ mod tests {
                 RtSchema::object("Server").field("host", Field::string().default("localhost")),
             )
             .build();
-        let text = JsonAdapter.template(&schema).unwrap();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let json: Json = serde_json::from_str(&text).unwrap();
         let obj = json.as_object().unwrap();
         // No real keys — absent array-of/map-of resolve to empty; the
@@ -1908,7 +1938,9 @@ mod tests {
                 ),
             )
             .build();
-        let text = JsonAdapter.template(&schema).unwrap();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let json: Json = serde_json::from_str(&text).unwrap();
         let obj = json.as_object().unwrap();
         assert_eq!(obj["//plugins"], r#""plugins": [{"tags":["builtin"]}]"#);
@@ -1926,7 +1958,9 @@ mod tests {
             .field("groups", Field::array_of_type(Field::map_of(item.clone())))
             .field("batches", Field::map_of(Field::array_of_type(item)))
             .build();
-        let text = JsonAdapter.template(&schema).unwrap();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let json: Json = serde_json::from_str(&text).unwrap();
         let obj = json.as_object().unwrap();
         assert_eq!(obj["//groups"], r#""groups": [{"<key>":{"timeout":30}}]"#);
@@ -1947,7 +1981,9 @@ mod tests {
                 Field::array_of_type(Field::array_of_type(Field::array_of_type(item))),
             )
             .build();
-        let text = JsonAdapter.template(&schema).unwrap();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let json: Json = serde_json::from_str(&text).unwrap();
         let obj = json.as_object().unwrap();
         let parse_snippet = |comment: &Json| {
@@ -1966,11 +2002,75 @@ mod tests {
     }
 
     #[test]
+    fn template_root_map_snippet_is_one_entry_not_an_extra_key_level() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Site")
+            .doc("One named site.")
+            .field("host", Field::string().default("localhost"))
+            .field("port", Field::integer().default(8080i64));
+        let shape = Shape::from(Shape::map("sites", item).doc("Named sites by key."));
+        let text = JsonAdapter.template(&shape).unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let comment = json
+            .as_object()
+            .unwrap()
+            .get("//")
+            .expect("root-map example rides the object comment");
+        let lines: Vec<&str> = match comment {
+            Json::String(s) => vec![s.as_str()],
+            Json::Array(items) => items.iter().filter_map(Json::as_str).collect(),
+            other => panic!("comment payload must be a string or array: {other}"),
+        };
+        assert!(
+            lines.iter().any(|l| l.contains("Named sites by key.")),
+            "root MapShape docs must appear in the JSON template: {text}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("One named site.")),
+            "item object docs must still appear: {text}"
+        );
+        let snippet = lines
+            .iter()
+            .find(|l| l.contains("\"<key>\""))
+            .expect("assignment snippet");
+        let parsed: Json = serde_json::from_str(&format!("{{{snippet}}}")).unwrap_or_else(|e| {
+            panic!("root-map snippet must parse as a JSON object: {e}: {snippet}")
+        });
+        let entry = parsed
+            .get("<key>")
+            .unwrap_or_else(|| panic!("snippet assigns <key>: {parsed}"));
+        assert!(
+            entry.get("<key>").is_none(),
+            "must not wrap the item in a second <key> object: {parsed}"
+        );
+        assert_eq!(entry["host"], "localhost");
+        assert_eq!(entry["port"], 8080);
+
+        let leaf = JsonAdapter
+            .template(&Shape::from(Shape::map("values", Field::string())))
+            .unwrap();
+        let leaf_json: Json = serde_json::from_str(&leaf).unwrap();
+        let leaf_comment = &leaf_json["//"];
+        let leaf_lines: Vec<&str> = match leaf_comment {
+            Json::String(s) => vec![s.as_str()],
+            Json::Array(items) => items.iter().filter_map(Json::as_str).collect(),
+            other => panic!("leaf comment payload must be a string or array: {other}"),
+        };
+        let leaf_snippet = leaf_lines
+            .iter()
+            .find(|l| l.contains("\"<key>\""))
+            .expect("leaf assignment snippet");
+        let leaf_parsed: Json = serde_json::from_str(&format!("{{{leaf_snippet}}}"))
+            .unwrap_or_else(|e| panic!("leaf snippet must parse: {e}: {leaf_snippet}"));
+        assert_eq!(leaf_parsed["<key>"], "");
+    }
+
+    #[test]
     fn template_parses_clean_through_own_adapter() {
         // gen → parse: every comment key is stripped, every real key is a
         // schema key with its default value.
         use crate::fixtures::test::test_schema;
-        let text = JsonAdapter.template(&test_schema()).unwrap();
+        let text = JsonAdapter.template(&Shape::Object(test_schema())).unwrap();
         let value = JsonAdapter.parse(&text).unwrap().value;
         let map = value.as_map().unwrap();
         assert_eq!(
@@ -2208,7 +2308,7 @@ mod tests {
         use crate::fixtures::test::test_schema;
         let out = crate::persist::set_in_document(
             &JsonAdapter,
-            &test_schema(),
+            &Shape::Object(test_schema()),
             None,
             "port",
             "9090",

@@ -1,0 +1,45 @@
+error[E0277]: `Vec<u8>` is not a legal clapfig document root
+ --> tests/ui/derive/vec_document_root_rejected.rs:2:39
+  |
+2 |     let _ = clapfig::Clapfig::typed::<Vec<u8>>();
+  |                                       ^^^^^^^ illegal document root
+  |
+  = help: the trait `DocumentRoot` is not implemented for `Vec<u8>`
+  = note: legal roots: a named-field struct deriving Schema, or BTreeMap<String, T> / HashMap<String, T> where T: Schema
+  = note: Leaf and Array (scalars, Vec<T>, unit-only enums as the document type) are not legal document roots
+help: the following other types implement trait `DocumentRoot`
+ --> src/static_schema.rs
+  |
+  | impl<V: Schema> DocumentRoot for std::collections::HashMap<String, V> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `HashMap<std::string::String, V>`
+...
+  | impl<V: Schema> DocumentRoot for std::collections::BTreeMap<String, V> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `BTreeMap<std::string::String, V>`
+note: required by a bound in `Clapfig::typed`
+ --> src/lib.rs
+  |
+  |     pub fn typed<C: crate::static_schema::DocumentRoot>() -> TypedBuilder<C> {
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Clapfig::typed`
+
+error[E0277]: `Vec<u8>` is not a legal clapfig document root
+ --> tests/ui/derive/vec_document_root_rejected.rs:2:13
+  |
+2 |     let _ = clapfig::Clapfig::typed::<Vec<u8>>();
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ illegal document root
+  |
+  = help: the trait `DocumentRoot` is not implemented for `Vec<u8>`
+  = note: legal roots: a named-field struct deriving Schema, or BTreeMap<String, T> / HashMap<String, T> where T: Schema
+  = note: Leaf and Array (scalars, Vec<T>, unit-only enums as the document type) are not legal document roots
+help: the following other types implement trait `DocumentRoot`
+ --> src/static_schema.rs
+  |
+  | impl<V: Schema> DocumentRoot for std::collections::HashMap<String, V> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `HashMap<std::string::String, V>`
+...
+  | impl<V: Schema> DocumentRoot for std::collections::BTreeMap<String, V> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `BTreeMap<std::string::String, V>`
+note: required by a bound in `TypedBuilder`
+ --> src/typed_builder.rs
+  |
+  | pub struct TypedBuilder<C: DocumentRoot> {
+  |                            ^^^^^^^^^^^^ required by this bound in `TypedBuilder`

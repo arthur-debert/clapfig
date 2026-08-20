@@ -800,10 +800,10 @@ pub trait Schema {
     /// with [`LeafType::Enum`](crate::runtime::LeafType::Enum), preserving
     /// the closed post-rename variant set from [`STATIC`](Self::STATIC).
     /// Named-field structs wrap [`schema`](Self::schema) as
-    /// [`Shape::Object`](crate::runtime::Shape::Object). Root Map and
-    /// Tagged typed loads (later workstreams) override this. Walkers
-    /// take [`Shape`](crate::runtime::Shape); object-root load walks
-    /// [`schema`](Self::schema) as `Shape::Object`.
+    /// [`Shape::Object`](crate::runtime::Shape::Object). Root-map typed
+    /// loads (`HashMap`/`BTreeMap`) override this as
+    /// [`Shape::Map`](crate::runtime::Shape::Map). Walkers take
+    /// [`Shape`](crate::runtime::Shape).
     fn shape() -> crate::runtime::Shape {
         if Self::STATIC.is_enum() {
             crate::runtime::Shape::Leaf(unit_enum_leaf(Self::STATIC))
@@ -812,12 +812,20 @@ pub trait Schema {
         }
     }
 
+    /// `Arc`-flavored document-root [`shape`](Self::shape). The inner
+    /// [`crate::Builder`] stores an `Arc<Shape>`; object-root derive
+    /// impls cache this the same way [`schema_arc`](Self::schema_arc)
+    /// caches the object. Default allocates a fresh `Arc` per call.
+    fn shape_arc() -> Arc<crate::runtime::Shape> {
+        Arc::new(Self::shape())
+    }
+
     /// `Arc`-flavored access to the same cached runtime view. Used by the
     /// macro-driven builder ([`crate::TypedBuilder`]) to avoid
     /// cloning the schema tree per builder construction — the inner
-    /// [`crate::Builder`] stores an `Arc<Schema>` and the cache hands out
-    /// cheap reference-counted handles to it. Cost: one `Arc::clone` per
-    /// call (atomic increment, no allocation).
+    /// [`crate::Builder`] stores an `Arc<Shape>` built from this object
+    /// for named-field roots. Cost: one `Arc::clone` per call (atomic
+    /// increment, no allocation).
     fn schema_arc() -> Arc<RuntimeSchema>;
 
     /// Flat list of every dotted path the schema knows about: leaf
@@ -842,6 +850,79 @@ pub trait Schema {
         out
     }
 }
+
+/// Marker: `{Self}` is a legal clapfig **document root**.
+///
+/// [`Clapfig::typed`](crate::Clapfig::typed) is generic over this, not
+/// over [`Schema`] alone: a named-field struct deriving `Schema`, or
+/// `BTreeMap<String, T>` / `HashMap<String, T>` where `T: Schema`. Leaf
+/// and Array (scalars, `Vec<T>`, a unit-only enum as the document type)
+/// are not legal document roots — they remain valid nested shapes.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a legal clapfig document root",
+    label = "illegal document root",
+    note = "legal roots: a named-field struct deriving Schema, or BTreeMap<String, T> / \
+            HashMap<String, T> where T: Schema",
+    note = "Leaf and Array (scalars, Vec<T>, unit-only enums as the document type) are not \
+            legal document roots"
+)]
+pub trait DocumentRoot: Schema {}
+
+fn root_map_shape(item: crate::runtime::Shape) -> crate::runtime::Shape {
+    crate::runtime::Shape::Map(crate::runtime::MapShape {
+        name: String::new(),
+        doc: Vec::new(),
+        strict: None,
+        item: Box::new(item),
+        default: None,
+        optional: false,
+        env: None,
+    })
+}
+
+impl<V: Schema> Schema for std::collections::HashMap<String, V> {
+    const STATIC: &'static SchemaStatic = V::STATIC;
+
+    fn schema() -> &'static RuntimeSchema {
+        V::schema()
+    }
+
+    fn schema_arc() -> Arc<RuntimeSchema> {
+        V::schema_arc()
+    }
+
+    fn shape() -> crate::runtime::Shape {
+        root_map_shape(V::shape())
+    }
+
+    fn field_paths() -> Vec<String> {
+        Vec::new()
+    }
+}
+
+impl<V: Schema> DocumentRoot for std::collections::HashMap<String, V> {}
+
+impl<V: Schema> Schema for std::collections::BTreeMap<String, V> {
+    const STATIC: &'static SchemaStatic = V::STATIC;
+
+    fn schema() -> &'static RuntimeSchema {
+        V::schema()
+    }
+
+    fn schema_arc() -> Arc<RuntimeSchema> {
+        V::schema_arc()
+    }
+
+    fn shape() -> crate::runtime::Shape {
+        root_map_shape(V::shape())
+    }
+
+    fn field_paths() -> Vec<String> {
+        Vec::new()
+    }
+}
+
+impl<V: Schema> DocumentRoot for std::collections::BTreeMap<String, V> {}
 
 /// Derive-support marker: asserts a field type the macro claimed as a
 /// datetime leaf really is [`clapfig::value::Datetime`](crate::value::Datetime).
@@ -948,6 +1029,17 @@ pub fn cached_runtime_schema_arc(
 ) -> Arc<RuntimeSchema> {
     cell.get_or_init(|| Arc::new(static_schema.to_runtime()))
         .clone()
+}
+
+/// `Arc`-returning cache for a document-root [`runtime::Shape`](crate::runtime::Shape).
+///
+/// The init closure typically calls [`Schema::shape`](Schema::shape) so
+/// unit-enum vs object is decided the same way as the uncached accessor.
+pub fn cached_runtime_shape_arc(
+    cell: &'static OnceLock<Arc<RuntimeShape>>,
+    init: impl FnOnce() -> RuntimeShape,
+) -> Arc<RuntimeShape> {
+    cell.get_or_init(|| Arc::new(init())).clone()
 }
 
 #[cfg(test)]

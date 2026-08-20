@@ -84,6 +84,20 @@ pub fn valid_keys(schema: &Schema) -> HashSet<String> {
     keys
 }
 
+/// Addressable dotted keys for a document-root [`Shape`].
+///
+/// Object roots use [`valid_keys`]. A root Map has no addressable keys
+/// (every segment is user data).
+pub fn valid_keys_shape(shape: &crate::runtime::Shape) -> HashSet<String> {
+    match shape {
+        crate::runtime::Shape::Object(schema) => valid_keys(schema),
+        crate::runtime::Shape::Map(_)
+        | crate::runtime::Shape::Tagged(_)
+        | crate::runtime::Shape::Leaf(_)
+        | crate::runtime::Shape::Array(_) => HashSet::new(),
+    }
+}
+
 fn collect_keys(schema: &Schema, prefix: &str, keys: &mut HashSet<String>) {
     for field in &schema.fields {
         let dotted = if prefix.is_empty() {

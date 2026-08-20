@@ -829,7 +829,7 @@ pub use error::{
     ClapfigError, DiscoveryRecord, FileProbe, OriginFacts, ProbeOutcome, UnknownKeyInfo,
 };
 pub use ops::ConfigResult;
-pub use static_schema::Schema;
+pub use static_schema::{DocumentRoot, Schema};
 pub use strict::{CollectedUnknown, UnknownKeyContext, UnknownKeyDecision};
 pub use typed_builder::{TypedBuilder, TypedResolver};
 pub use types::{Boundary, ConfigAction, InputType, Layer, SearchMode, SearchPath};
@@ -845,9 +845,8 @@ pub use types::{Boundary, ConfigAction, InputType, Layer, SearchMode, SearchPath
 ///   the schema is `impl Into<runtime::Shape>` (a
 ///   [`runtime::Schema`](crate::runtime::Schema) converts as
 ///   [`Shape::Object`](crate::runtime::Shape::Object)), and `load()`
-///   returns a value [`Map`](crate::value::Map). Object-root load is
-///   unchanged; root Map / Tagged construction is in, resolve of those
-///   roots is a later workstream.
+///   returns a value [`Map`](crate::value::Map). Object-root and root-Map
+///   load are in; tagged walk is SHP01-WS04.
 ///
 /// Both produce builders with the same surface — `app_name`,
 /// `search_paths`, `env_prefix`, `cli_override`, `post_validate`, `load`,
@@ -865,9 +864,9 @@ impl Clapfig {
     /// document roots are Object, Map, and Tagged; Leaf and Array are
     /// valid nested shapes and panic when used as the document root.
     ///
-    /// Walkers take [`Shape`](crate::runtime::Shape). A root Map or Tagged
-    /// therefore `todo!()` here — it must not load as if it were an
-    /// object (root-map load is SHP01-WS03; tagged walk is SHP01-WS04).
+    /// Walkers take [`Shape`](crate::runtime::Shape). A root Map loads as
+    /// a homogeneous map of the item shape (no synthetic parent field).
+    /// A root Tagged still `todo!()`s here — tagged walk is SHP01-WS04.
     /// Object-root `load()` is unchanged.
     ///
     /// Returns a [`Builder`] with the same surface as
@@ -894,12 +893,11 @@ impl Clapfig {
         shape.require_document_root();
         match shape {
             crate::runtime::Shape::Object(schema) => Builder::new(schema),
-            crate::runtime::Shape::Map(_) | crate::runtime::Shape::Tagged(_) => {
-                todo!(
-                    "clapfig: root Map and Tagged shapes are constructible \
-                     but must not load as an object; root-map load is SHP01-WS03 \
-                     and tagged walk is SHP01-WS04"
-                )
+            crate::runtime::Shape::Map(map) => {
+                Builder::from_shape(std::sync::Arc::new(crate::runtime::Shape::Map(map)))
+            }
+            crate::runtime::Shape::Tagged(_) => {
+                todo!("clapfig: tagged walk is SHP01-WS04; do not load a tagged shape this slice")
             }
             crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => {
                 unreachable!("illegal document roots are rejected by require_document_root")
@@ -909,7 +907,8 @@ impl Clapfig {
 
     /// Entry point for the typed path: build a config pipeline from a
     /// struct whose schema was emitted by the `#[derive(clapfig::Schema)]`
-    /// macro.
+    /// macro, or a `BTreeMap<String, T>` / `HashMap<String, T>` whose
+    /// value type derives `Schema` (a root map).
     ///
     /// Same builder surface as [`Self::builder`], but `load()` returns the
     /// typed `C`. The schema metadata available to JSON Schema, template,
@@ -937,7 +936,7 @@ impl Clapfig {
     ///     .app_name("myapp")
     ///     .load()?;
     /// ```
-    pub fn typed<C: crate::static_schema::Schema>() -> TypedBuilder<C> {
+    pub fn typed<C: crate::static_schema::DocumentRoot>() -> TypedBuilder<C> {
         TypedBuilder::new()
     }
 }

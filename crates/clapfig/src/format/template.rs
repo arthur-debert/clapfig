@@ -99,6 +99,21 @@ pub(crate) trait TemplateRenderer: Sized {
         name: &str,
         item: &Shape,
     ) -> Result<(), FormatError>;
+
+    /// Emit a **document-root** map as a commented example entry, with no
+    /// invented parent table. `item` is the entry shape — value-shaped
+    /// items (leaf, array/map of leaves) render as a commented assignment;
+    /// object and nested-container items keep their format's table /
+    /// mapping syntax. `doc` is the root [`MapShape`](crate::runtime::MapShape)'s
+    /// own prose (JSON parks it on the `"//"` comment with the example;
+    /// TOML/YAML already emit it in `template` before the walk).
+    fn root_map(
+        &mut self,
+        out: &mut Self::Out,
+        ctx: &Self::Ctx,
+        item: &Shape,
+        doc: &[String],
+    ) -> Result<(), FormatError>;
 }
 
 /// Drive one schema level through `renderer`: the level's doc hook, then
@@ -147,6 +162,29 @@ pub(crate) fn walk_level<R: TemplateRenderer>(
     Ok(())
 }
 
+/// Drive a document-root [`Shape`] through `renderer`.
+///
+/// Object roots use [`walk_level`]. Map roots emit a commented example
+/// entry with no parent table. Tagged is SHP01-WS05. Leaf and Array are
+/// illegal document roots.
+pub(crate) fn walk_root<R: TemplateRenderer>(
+    renderer: &mut R,
+    shape: &Shape,
+    ctx: &R::Ctx,
+    out: &mut R::Out,
+) -> Result<(), FormatError> {
+    match shape {
+        Shape::Object(schema) => walk_level(renderer, schema, ctx, out),
+        Shape::Map(map) => renderer.root_map(out, ctx, &map.item, &map.doc),
+        Shape::Tagged(_) => {
+            tagged_template_stub();
+        }
+        Shape::Leaf(_) | Shape::Array(_) => panic!(
+            "clapfig: a Leaf or Array is not a legal document root (legal roots: Object, Map, Tagged)"
+        ),
+    }
+}
+
 /// A value-shaped field as the template leaf renderer sees it: a leaf,
 /// or a homogeneous array/map of leaves.
 #[derive(Clone, Copy)]
@@ -158,7 +196,7 @@ pub(crate) struct ValueView<'a> {
 }
 
 impl<'a> ValueView<'a> {
-    fn from_shape(shape: &'a Shape) -> Self {
+    pub(crate) fn from_shape(shape: &'a Shape) -> Self {
         match shape {
             Shape::Leaf(leaf) => Self {
                 doc: &leaf.doc,

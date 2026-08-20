@@ -49,7 +49,7 @@ use crate::value::{Map, Value};
 
 use super::template::{
     TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
-    tagged_template_stub, walk_level,
+    tagged_template_stub, walk_level, walk_root,
 };
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
@@ -119,15 +119,16 @@ impl FormatAdapter for YamlAdapter {
         })
     }
 
-    fn template(&self, schema: &Schema) -> Result<String, FormatError> {
+    fn template(&self, shape: &Shape) -> Result<String, FormatError> {
         let mut out = String::new();
-        for line in &schema.doc {
+        let doc = shape.field_doc();
+        for line in doc {
             push_comment_line(&mut out, "", line);
         }
-        if !schema.doc.is_empty() {
+        if !doc.is_empty() {
             out.push('\n');
         }
-        walk_level(&mut YamlTemplate, schema, &0, &mut out)?;
+        walk_root(&mut YamlTemplate, shape, &0, &mut out)?;
         Ok(out)
     }
 
@@ -1009,6 +1010,38 @@ impl TemplateRenderer for YamlTemplate {
         push_commented_block(out, &buf);
         Ok(())
     }
+
+    fn root_map(
+        &mut self,
+        out: &mut String,
+        depth: &usize,
+        item: &Shape,
+        _doc: &[String],
+    ) -> Result<(), FormatError> {
+        let indent = "  ".repeat(*depth);
+        // Value-shaped items are assignments, not mappings: a leaf or
+        // array/map of leaves has no `<key>:` + nested-block spelling,
+        // and routing them through `emit_yaml_item` hits its leaf
+        // `unreachable!`.
+        if item.is_value_field() {
+            let field = super::template::ValueView::from_shape(item);
+            for line in leaf_annotations(field, "YAML", &mut |v| Ok(format_inline_yaml(v)))? {
+                push_comment_line(out, &indent, &line);
+            }
+            let example = match field.default {
+                Some(value) => format_inline_yaml(value),
+                None => placeholder(field.shape, "''", "1970-01-01T00:00:00Z").to_string(),
+            };
+            let _ = writeln!(out, "{indent}#<key>: {example}");
+            return Ok(());
+        }
+        emit_object_doc(out, &indent, item);
+        let mut buf = String::new();
+        let _ = writeln!(buf, "{indent}<key>:");
+        emit_yaml_item(self, &mut buf, &(depth + 1), item)?;
+        push_commented_block(out, &buf);
+        Ok(())
+    }
 }
 
 fn emit_object_doc(out: &mut String, indent: &str, item: &Shape) {
@@ -1845,7 +1878,12 @@ db:
   pool_size: 5
 
 "#;
-        assert_eq!(YamlAdapter.template(&schema).unwrap(), golden);
+        assert_eq!(
+            YamlAdapter
+                .template(&Shape::Object(schema.clone()))
+                .unwrap(),
+            golden
+        );
     }
 
     #[test]
@@ -1853,7 +1891,9 @@ db:
         // A generated template must be a valid config document: defaults
         // present, commented placeholders absent — never a null.
         let schema = crate::fixtures::test::test_schema();
-        let text = YamlAdapter.template(&schema).unwrap();
+        let text = YamlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let map = parse_map(&text);
         assert_eq!(map["host"], Value::String("localhost".into()));
         assert_eq!(map["port"], Value::Integer(8080));
@@ -1880,7 +1920,9 @@ db:
                     .field("token", Field::string().optional()),
             )
             .build();
-        let text = YamlAdapter.template(&schema).unwrap();
+        let text = YamlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         assert!(text.contains("#auth:"), "text: {text}");
         assert!(text.contains("#  #token: ''"), "text: {text}");
         let map = parse_map(&text);
@@ -1904,7 +1946,9 @@ db:
                 RtSchema::object("Limit").field("burst", Field::integer().default(2i64)),
             )
             .build();
-        let text = YamlAdapter.template(&schema).unwrap();
+        let text = YamlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         assert!(text.contains("#plugins:"), "text: {text}");
         assert!(
             text.contains("#  - path: /usr/lib"),
@@ -1929,7 +1973,9 @@ db:
             .field("groups", Field::array_of_type(Field::map_of(item.clone())))
             .field("batches", Field::map_of(Field::array_of_type(item)))
             .build();
-        let text = YamlAdapter.template(&schema).unwrap();
+        let text = YamlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         assert!(text.contains("#groups:"), "text: {text}");
         assert!(
             text.contains("#  - <key>:"),
@@ -1960,7 +2006,9 @@ db:
                 Field::array_of_type(Field::array_of_type(Field::array_of_type(item))),
             )
             .build();
-        let text = YamlAdapter.template(&schema).unwrap();
+        let text = YamlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let uncommented: String = text
             .lines()
             .map(|line| line.strip_prefix('#').unwrap_or(line))
@@ -1987,6 +2035,64 @@ db:
     }
 
     #[test]
+    fn template_root_map_covers_leaf_array_and_nested_map_items() {
+        use crate::runtime::{Field, LeafType, Schema as RtSchema};
+        let object = RtSchema::object("Site")
+            .field("host", Field::string().default("localhost"))
+            .field("port", Field::integer().default(8080i64));
+
+        let leaf = YamlAdapter
+            .template(&Shape::from(Shape::map("values", Field::string())))
+            .unwrap();
+        assert!(
+            leaf.contains("#<key>: ''"),
+            "root map of leaves is a commented assignment, not a mapping block: {leaf}"
+        );
+
+        let array_of_leaves = YamlAdapter
+            .template(&Shape::from(Shape::map(
+                "values",
+                Field::array_of_type(LeafType::String),
+            )))
+            .unwrap();
+        assert!(
+            array_of_leaves.contains("#<key>: []"),
+            "root map of scalar arrays is a commented assignment: {array_of_leaves}"
+        );
+
+        let array_of_objects = YamlAdapter
+            .template(&Shape::from(Shape::map(
+                "sites",
+                Shape::array("sites", object.clone()),
+            )))
+            .unwrap();
+        assert!(
+            array_of_objects.contains("#<key>:"),
+            "root map of object arrays keeps a mapping key: {array_of_objects}"
+        );
+        assert!(
+            array_of_objects.contains("- host: localhost")
+                || array_of_objects.contains("#  - host: localhost"),
+            "object-array item is a sequence example: {array_of_objects}"
+        );
+
+        let nested_map = YamlAdapter
+            .template(&Shape::from(Shape::map(
+                "groups",
+                Shape::map("inner", object),
+            )))
+            .unwrap();
+        assert!(
+            nested_map.contains("#<key>:"),
+            "root map of maps keeps a mapping key: {nested_map}"
+        );
+        assert!(
+            nested_map.contains("<key>:"),
+            "nested map item adds an inner placeholder key: {nested_map}"
+        );
+    }
+
+    #[test]
     fn template_escapes_keys_the_parser_would_misread() {
         // Schema names only forbid empty, `.`, `[`, `]` — a template must
         // quote names the parser would otherwise read as comments,
@@ -2001,7 +2107,9 @@ db:
                 RtSchema::object("Db").field("pool", Field::integer().default(5i64)),
             )
             .build();
-        let text = YamlAdapter.template(&schema).unwrap();
+        let text = YamlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let map = parse_map(&text);
         assert_eq!(map["#token"], Value::String("x".into()));
         assert_eq!(map["a: b"], Value::Integer(1));
