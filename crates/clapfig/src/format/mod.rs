@@ -290,13 +290,19 @@ pub struct Span {
 ///
 /// Two diagnostics caret two different ranges: unknown-key errors the
 /// key token, post-merge value errors the assigned value. A single span
-/// makes one of those carets a lie. `key` is `None` on array elements —
-/// there is no key token in source for `[[servers]]` entries or JSON
-/// array items. The origin retained on the shadow tree keeps the
-/// **value** span; unknown-key lookup uses the **key** span.
+/// makes one of those carets a lie. `key` is `None` on array elements
+/// that exist in source — there is no key token for `[[servers]]`
+/// entries or JSON array items. YAML alias-expanded paths (ADR-0008)
+/// are the exception: a path that exists in [`Value`] only because an
+/// alias expanded carets the `*name` token for both `key` and `value`,
+/// including expanded sequence items. The origin retained on the shadow
+/// tree keeps the **value** span; unknown-key lookup uses the **key**
+/// span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpanEntry {
-    /// Byte range of the key token, if any. `None` on array elements.
+    /// Byte range of the key token, if any. `None` on written array
+    /// elements. YAML alias-expanded paths (ADR-0008) use the `*name`
+    /// token for both sides, including expanded sequence items.
     pub key: Option<Span>,
     /// Byte range of the assigned value.
     pub value: Span,

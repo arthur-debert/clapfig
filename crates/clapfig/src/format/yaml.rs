@@ -17,9 +17,11 @@
 //!   and **merge keys** (`<<`) are typed errors naming the offending key.
 //!   A path that exists in source gets yamlpath's key and value ranges; a
 //!   path that exists in [`Value`] only because an alias expanded gets
-//!   the `*name` token's span for both `key` and `value` (ADR-0008).
-//!   yamlpath can follow aliases internally — this adapter does not use
-//!   that, because those spans sit on the anchor, not the alias site.
+//!   the `*name` token's span for both `key` and `value` (ADR-0008),
+//!   including sequence items that exist only via expansion. Written
+//!   array elements still have `key: None` (ADR-0006). yamlpath can
+//!   follow aliases internally — this adapter does not use that, because
+//!   those spans sit on the anchor, not the alias site.
 //! - **`null`/`~`** is a typed error advising absence; an empty or
 //!   comments-only document — bare `---`/`...` document markers included —
 //!   is the empty map (absence, not null).
@@ -290,7 +292,8 @@ fn inline_norway(value: &serde_norway::Value) -> String {
 /// `yamlpath` is queried per written path. It can follow aliases; this
 /// walk does not. When a node's exact span sits outside its pretty span
 /// the value is an alias, and every descendant inherits the `*name`
-/// token for both `key` and `value`.
+/// token for both `key` and `value` — including Index paths that exist
+/// only because an alias expanded into a sequence.
 fn yaml_span_index(text: &str, value: &Value) -> BTreeMap<ConfigPath, SpanEntry> {
     let mut spans = BTreeMap::new();
     match yamlpath::Document::new(text.to_string()) {
@@ -320,8 +323,9 @@ fn fill_spans(
     let child_alias = if path.is_empty() {
         None
     } else if let Some(alias) = inherited_alias {
-        // ADR-0008: expanded nested paths caret the `*name` token for
-        // both sides, including array elements that have no key in source.
+        // ADR-0008 exception to ADR-0006: expanded nested paths caret
+        // the `*name` token for both sides, including Index paths that
+        // exist only because an alias expanded into a sequence.
         spans.insert(
             ConfigPath::from(path.clone()),
             SpanEntry {
@@ -1583,6 +1587,47 @@ servers:
             "*t"
         );
         assert_eq!(snippet(source, host.value), "*t");
+    }
+
+    #[test]
+    fn alias_expanded_sequence_items_caret_the_alias_token_on_both_sides() {
+        // ADR-0008 exception to ADR-0006: an Index path that exists only
+        // because an alias expanded still carets `*name` for `key` and
+        // `value`. Written array elements stay `key: None` (covered by
+        // `alias_array_item_and_its_expanded_children_caret_the_token`).
+        let source = "\
+tmpl: &t
+  - a
+  - b
+items: *t
+";
+        let parsed = YamlAdapter.parse(source).unwrap();
+        assert_covers_tree(&parsed.value, &parsed.spans);
+
+        let items = parsed
+            .spans
+            .get(&ConfigPath::new().key("items"))
+            .expect("alias assignment exists in source");
+        assert_eq!(
+            snippet(source, items.key.expect("map keys have a key span")),
+            "items"
+        );
+        assert_eq!(snippet(source, items.value), "*t");
+
+        let first = parsed
+            .spans
+            .get(&ConfigPath::new().key("items").index(0))
+            .expect("expanded sequence item must be indexed");
+        assert_eq!(
+            snippet(
+                source,
+                first
+                    .key
+                    .expect("expanded index path uses the alias as key")
+            ),
+            "*t"
+        );
+        assert_eq!(snippet(source, first.value), "*t");
     }
 
     // --- serialization ---
