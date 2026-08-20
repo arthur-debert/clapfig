@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{ClapfigError, UnknownKeyInfo};
-use crate::format::{ConfigPath, SpanEntry, byte_offset_to_line_col};
+use crate::format::{ConfigPath, PathSegment, SpanEntry, byte_offset_to_line_col};
 use crate::runtime::Schema;
 use crate::strict::{
     CollectedUnknown, StrictnessOverrides, UnknownKeyContext, UnknownKeyDecision, UnknownKeyHook,
@@ -55,16 +55,18 @@ pub(crate) enum UnknownKeySource<'a> {
 
 /// Single unknown-key entry passed to `filter_through_cascade`.
 ///
-/// `path` is the dotted form (suitable for the cascade lookup, the
-/// line-number heuristic, and error rendering). `leaf` is the raw TOML
-/// key the parser saw at the leaf position — distinct from the trailing
-/// dot-split segment when the key was quoted with `.` inside it (a
-/// literal TOML quoted key like `"acme.task-due-date-missing"`). The
-/// schema walk captures the raw key so quoted-key semantics survive to
-/// the `on_unknown_key` callback.
+/// `path` is the dotted display form (cascade lookup, error rendering,
+/// `on_unknown_key`). `leaf` is the raw map key at the leaf — distinct
+/// from the trailing dot-split segment when that key was quoted with
+/// `.` inside it (a literal `"acme.task-due-date-missing"`).
+/// `config_path` is the structured address the parser indexed; span
+/// lookup and value lookup use it rather than reconstructing from
+/// `path`, so a quoted dotted ancestor (`[plugins."acme.prod"]`) stays
+/// one segment.
 pub(crate) struct UnknownKey {
     pub path: String,
     pub leaf: String,
+    pub config_path: ConfigPath,
 }
 
 /// Detect unknown keys in a parsed config table: walk `table` against
@@ -92,7 +94,7 @@ pub(crate) fn validate_unknown(
     ctx: &ValidateContext<'_>,
 ) -> Result<Vec<CollectedUnknown>, ClapfigError> {
     let mut unknown: Vec<UnknownKey> = Vec::new();
-    crate::schema_walk::collect_unknown_paths(table, schema, "", &mut unknown);
+    crate::schema_walk::collect_unknown_paths(table, schema, "", &ConfigPath::new(), &mut unknown);
     filter_through_cascade(table, origin, unknown, ctx)
 }
 
@@ -130,7 +132,11 @@ pub(crate) fn filter_through_cascade(
     let mut rejected: Vec<UnknownKeyInfo> = Vec::new();
     let mut collected: Vec<CollectedUnknown> = Vec::new();
     for entry in unknown_keys {
-        let UnknownKey { path: key, leaf } = entry;
+        let UnknownKey {
+            path: key,
+            leaf,
+            config_path,
+        } = entry;
         let strict = ctx
             .overrides
             .effective_strict(&key, &leaf, ctx.default_strict);
@@ -152,7 +158,6 @@ pub(crate) fn filter_through_cascade(
                 source,
                 spans,
             } => {
-                let config_path = config_path_of(&key, &leaf);
                 let key_span = spans.get(&config_path).and_then(|e| e.key);
                 let line = key_span
                     .map(|s| byte_offset_to_line_col(source, s.start).0)
@@ -163,18 +168,17 @@ pub(crate) fn filter_through_cascade(
                 (None, 0, crate::env::env_source_names(sources, &key), None)
             }
         };
-        let value_ref = lookup_value(table, &key, &leaf);
+        let value_ref = lookup_value(table, &config_path);
 
         if let Some(callback) = ctx.callback {
-            // Callback runs only on cascade-strict keys. Look the value up
-            // by `(path, leaf)` so quoted keys containing dots (literal
-            // TOML keys like `"acme.task-due-date-missing"`) resolve
-            // correctly. `lookup_value` also walks `[N]` array-index
-            // segments, so callbacks on array-internal keys see the real
-            // entry value. `value` is `None` when the lookup genuinely
-            // can't resolve (out-of-bounds index, path through a
-            // non-table) — the callback still runs and can decide based
-            // on path/leaf/file/line alone. Env-derived keys arrive with
+            // Callback runs only on cascade-strict keys. Look the value
+            // up by the structured path so quoted keys containing dots
+            // (literal `"acme.prod"` ancestors, `"a.b"` leaves) and
+            // `[N]` array indexes resolve to the real entry. `value` is
+            // `None` when the lookup genuinely can't resolve
+            // (out-of-bounds index, path through a non-table) — the
+            // callback still runs and can decide based on
+            // path/leaf/file/line alone. Env-derived keys arrive with
             // `file: None`.
             let context = UnknownKeyContext {
                 path: &key,
@@ -227,82 +231,52 @@ pub(crate) fn filter_through_cascade(
     }
 }
 
-/// Look up a value in a parsed table by its full dotted `path` plus the
-/// raw `leaf` key the parser saw at the end.
+/// Look up a value in a parsed table by the structured path the walker
+/// recorded (the same [`ConfigPath`] the adapter indexed).
 ///
-/// Splitting `path` on `.` doesn't work when the leaf is a quoted TOML
-/// key containing dots (e.g. `"acme.task-due-date-missing"` parses as a
-/// single key; my dotted-path encoding flattens it into segments that
-/// dot-split can't recover). The fix: strip the leaf — plus the
-/// preceding `.` if any — off the end of the path, walk what remains as
-/// nested-table segments (descending into `Value::Array` entries when a
-/// segment carries a `[N]` index suffix), then fetch `leaf` directly.
-///
-/// Returns `None` when the lookup genuinely fails: a non-table
-/// intermediate, a missing key, or an out-of-bounds array index. The
-/// callback receives this `Option` directly through
-/// [`UnknownKeyContext::value`](crate::UnknownKeyContext::value) and can
-/// decide based on path/leaf/file/line when the value is unavailable.
-fn lookup_value<'a>(table: &'a Map, path: &str, leaf: &str) -> Option<&'a Value> {
-    let section = crate::strict::section_path_of(path, leaf);
-    if section.is_empty() {
-        return table.get(leaf);
+/// Display of a [`ConfigPath`] is one-way; this walks the segments, so a
+/// quoted dotted ancestor (`plugins` → `acme.prod` → `rogue`) and an
+/// array index (`plugins` → `[1]` → `rogue`) both resolve. Returns
+/// `None` when the lookup genuinely fails: a non-table intermediate, a
+/// missing key, or an out-of-bounds array index. The callback receives
+/// this `Option` through
+/// [`UnknownKeyContext::value`](crate::UnknownKeyContext::value).
+fn lookup_value<'a>(table: &'a Map, path: &ConfigPath) -> Option<&'a Value> {
+    enum Cursor<'a> {
+        Map(&'a Map),
+        Array(&'a [Value]),
     }
-    let mut segments = section.split('.');
-    let first = segments.next().unwrap();
-    let (first_name, first_idx) = parse_segment(first);
-    let mut cursor: &Value = table.get(first_name)?;
-    if let Some(i) = first_idx {
-        cursor = cursor.as_array()?.get(i)?;
-    }
-    for seg in segments {
-        let (name, idx) = parse_segment(seg);
-        cursor = cursor.as_map()?.get(name)?;
-        if let Some(i) = idx {
-            cursor = cursor.as_array()?.get(i)?;
-        }
-    }
-    cursor.as_map()?.get(leaf)
-}
-
-/// Split a path segment into `(name, optional index)`.
-///
-/// `plugins[3]` → `("plugins", Some(3))`; `name` → `("name", None)`.
-/// Garbage indices (`plugins[foo]`, `plugins[]`) parse as `(name, None)`,
-/// which falls through to the next non-array lookup and naturally fails.
-fn parse_segment(seg: &str) -> (&str, Option<usize>) {
-    if let Some(open) = seg.find('[')
-        && let Some(close) = seg[open..].find(']')
-    {
-        let name = &seg[..open];
-        let idx_str = &seg[open + 1..open + close];
-        if let Ok(i) = idx_str.parse::<usize>() {
-            return (name, Some(i));
-        }
-    }
-    (seg, None)
-}
-
-/// Reconstruct the [`ConfigPath`] of an unknown key from the dotted
-/// `path` plus the raw `leaf` the walker captured.
-///
-/// Mirrors [`lookup_value`]: strip the leaf (so a quoted `"a.b"` stays
-/// one segment) and walk remaining `[N]`-suffixed section segments.
-/// Display of a [`ConfigPath`] is one-way; this is not parsing Display
-/// back, it is the same encoding `collect_unknown_paths` wrote.
-fn config_path_of(path: &str, leaf: &str) -> ConfigPath {
-    let section = crate::strict::section_path_of(path, leaf);
-    let mut out = ConfigPath::new();
-    if !section.is_empty() {
-        for seg in section.split('.') {
-            let (name, idx) = parse_segment(seg);
-            out = out.key(name);
-            if let Some(i) = idx {
-                out = out.index(i);
+    let mut current = Cursor::Map(table);
+    let segs = path.segments();
+    for (i, seg) in segs.iter().enumerate() {
+        let is_last = i + 1 == segs.len();
+        current = match (current, seg) {
+            (Cursor::Map(m), PathSegment::Key(k)) => {
+                let v = m.get(k)?;
+                if is_last {
+                    return Some(v);
+                }
+                match v {
+                    Value::Map(next) => Cursor::Map(next),
+                    Value::Array(next) => Cursor::Array(next),
+                    _ => return None,
+                }
             }
-        }
+            (Cursor::Array(a), PathSegment::Index(idx)) => {
+                let v = a.get(*idx)?;
+                if is_last {
+                    return Some(v);
+                }
+                match v {
+                    Value::Map(next) => Cursor::Map(next),
+                    Value::Array(next) => Cursor::Array(next),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
     }
-    out.key(leaf)
+    None
 }
 
 #[cfg(test)]
@@ -902,5 +876,88 @@ pool_size = 10
         let caret = out.lines().find(|l| l.contains('^')).expect("{out}");
         let caret_run = caret.chars().filter(|&c| c == '^').count();
         assert_eq!(caret_run, 3, "caret should be character-width, got: {out}");
+    }
+
+    fn map_of_plugin_schema() -> crate::runtime::Schema {
+        use crate::runtime::{Field, Schema};
+        Schema::object("App")
+            .map_of(
+                "plugins",
+                Schema::object("Plugin").field("host", Field::string().optional()),
+            )
+            .build()
+    }
+
+    fn unknown_in(
+        content: &str,
+        adapter: &dyn FormatAdapter,
+        file: &str,
+    ) -> crate::error::ClapfigError {
+        let parsed = adapter.parse(content).unwrap();
+        let table = match parsed.value {
+            crate::value::Value::Map(map) => map,
+            _ => unreachable!(),
+        };
+        validate_unknown(
+            &table,
+            &map_of_plugin_schema(),
+            &UnknownKeySource::File {
+                path: Path::new(file),
+                source: content,
+                spans: &parsed.spans,
+            },
+            &test_ctx(),
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn unknown_under_quoted_dotted_map_of_key_keeps_the_span() {
+        let content = "[plugins.\"acme.prod\"]\nrogue = 1\n";
+        let err = unknown_in(content, &crate::format::TomlAdapter, "/p.toml");
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].line, 2);
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&content[span.start..span.end], "rogue");
+        let out = crate::render::render_plain(&err);
+        assert!(out.contains("rogue = 1"), "{out}");
+        assert!(out.contains(":2"), "{out}");
+    }
+
+    #[test]
+    fn unknown_under_inline_quoted_dotted_map_of_key_keeps_the_span() {
+        let content = "plugins = { \"acme.prod\" = { rogue = 1 } }\n";
+        let err = unknown_in(content, &crate::format::TomlAdapter, "/p.toml");
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].line, 1);
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&content[span.start..span.end], "rogue");
+    }
+
+    #[test]
+    fn unknown_under_bracket_bearing_map_of_key_keeps_the_span() {
+        // `parse_segment` used to treat `x[0]` as name `x` + index 0.
+        let content = "[plugins.\"x[0]\"]\nrogue = 1\n";
+        let err = unknown_in(content, &crate::format::TomlAdapter, "/p.toml");
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].line, 2);
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&content[span.start..span.end], "rogue");
+    }
+
+    #[test]
+    fn yaml_and_json_quoted_dotted_map_of_key_keeps_the_span() {
+        let yaml = "plugins:\n  \"acme.prod\":\n    rogue: 1\n";
+        let err = unknown_in(yaml, &crate::format::YamlAdapter, "/p.yaml");
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].line, 3);
+        let span = keys[0].span.expect("YAML key span");
+        assert_eq!(&yaml[span.start..span.end], "rogue");
+
+        let json = "{\"plugins\":{\"acme.prod\":{\"rogue\":1}}}\n";
+        let err = unknown_in(json, &crate::format::JsonAdapter, "/p.json");
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        let span = keys[0].span.expect("JSON key span");
+        assert_eq!(&json[span.start..span.end], "\"rogue\"");
     }
 }

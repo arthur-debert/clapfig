@@ -548,6 +548,30 @@ mod tests {
     }
 
     #[test]
+    fn toml_unknown_under_quoted_dotted_map_of_key_carets_the_key() {
+        use crate::runtime::Field;
+        let schema = Schema::object("App")
+            .map_of(
+                "plugins",
+                Schema::object("Plugin").field("host", Field::string().optional()),
+            )
+            .build();
+        let source = "[plugins.\"acme.prod\"]\nrogue = 1\n";
+        let input = ResolveInput {
+            files: vec![("config.toml".into(), source.into())],
+            ..empty_input(&schema)
+        };
+        let err = resolve(input).unwrap_err();
+        let keys = err.unknown_keys().expect("expected UnknownKeys");
+        assert_eq!(keys[0].line, 2);
+        let span = keys[0].span.expect("key span");
+        assert_eq!(&source[span.start..span.end], "rogue");
+        let out = crate::render::render_plain(&err);
+        assert!(out.contains("rogue = 1"), "{out}");
+        assert!(out.contains(":2"), "{out}");
+    }
+
+    #[test]
     fn env_unknown_key_rejected_when_strict() {
         // Issue #54 item 3: env-derived unknown keys used to merge in
         // unnoticed. They now flow through the same cascade as file

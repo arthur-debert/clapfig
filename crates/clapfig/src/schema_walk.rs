@@ -30,12 +30,17 @@
 //! [`UnknownKey`]: crate::validate::UnknownKey
 
 use crate::error::{ClapfigError, DiscoveryRecord};
+use crate::format::ConfigPath;
 use crate::runtime::{Field, NamedField, Schema};
 use crate::validate::UnknownKey;
 use crate::value::{Map, Value};
 
-/// Recursively walk `table` against `schema`, collecting dotted paths of
-/// any keys not declared in the schema.
+/// Recursively walk `table` against `schema`, collecting unknown keys.
+///
+/// `prefix` is the dotted display form (cascade / error rendering).
+/// `path` is the structured address of `table` — the same [`ConfigPath`]
+/// the adapter indexed — so span lookup does not reconstruct from the
+/// display string (a quoted dotted MapOf key stays one segment).
 ///
 /// For nested objects (`Field::Nested`) the recursion descends into the
 /// sub-table; for `Field::ArrayOf`, each entry is validated against the
@@ -50,6 +55,7 @@ pub(crate) fn collect_unknown_paths(
     table: &Map,
     schema: &Schema,
     prefix: &str,
+    path: &ConfigPath,
     unknown: &mut Vec<UnknownKey>,
 ) {
     for (key, value) in table {
@@ -58,9 +64,10 @@ pub(crate) fn collect_unknown_paths(
         } else {
             format!("{prefix}.{key}")
         };
+        let child = path.clone().key(key);
         match find_field(schema, key) {
             None => {
-                // Capture the raw TOML key as the leaf — preserves quoted-
+                // Capture the raw map key as the leaf — preserves quoted-
                 // key semantics (`"acme.task-due-date-missing"` stays as a
                 // single literal) so an `on_unknown_key` callback can
                 // pattern-match on it (e.g. lex-fmt's "leaf contains a `.`
@@ -68,6 +75,7 @@ pub(crate) fn collect_unknown_paths(
                 unknown.push(UnknownKey {
                     path: full,
                     leaf: key.clone(),
+                    config_path: child,
                 });
             }
             Some(NamedField {
@@ -81,7 +89,7 @@ pub(crate) fn collect_unknown_paths(
                 ..
             }) => {
                 if let Value::Map(t) = value {
-                    collect_unknown_paths(t, nested, &full, unknown);
+                    collect_unknown_paths(t, nested, &full, &child, unknown);
                 }
             }
             Some(NamedField {
@@ -92,7 +100,13 @@ pub(crate) fn collect_unknown_paths(
                     for (i, item) in items.iter().enumerate() {
                         if let Value::Map(t) = item {
                             let indexed = format!("{full}[{i}]");
-                            collect_unknown_paths(t, item_schema, &indexed, unknown);
+                            collect_unknown_paths(
+                                t,
+                                item_schema,
+                                &indexed,
+                                &child.clone().index(i),
+                                unknown,
+                            );
                         }
                     }
                 }
@@ -104,12 +118,19 @@ pub(crate) fn collect_unknown_paths(
                 // Each map entry's value is a nested object. The entry key
                 // forms a path segment, so `plugins.audit.rogue` is the
                 // path for an unknown key inside the `audit` entry of a
-                // `plugins` MapOf.
+                // `plugins` MapOf. A quoted dotted entry key is one
+                // [`ConfigPath`] segment even though `prefix` flattens it.
                 if let Value::Map(entries) = value {
                     for (entry_key, entry_value) in entries {
                         if let Value::Map(t) = entry_value {
                             let entry_path = format!("{full}.{entry_key}");
-                            collect_unknown_paths(t, item_schema, &entry_path, unknown);
+                            collect_unknown_paths(
+                                t,
+                                item_schema,
+                                &entry_path,
+                                &child.clone().key(entry_key),
+                                unknown,
+                            );
                         }
                     }
                 }
@@ -451,6 +472,7 @@ fn value_type_name(v: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::PathSegment;
     use crate::runtime::Field as RtField;
 
     fn test_schema() -> Schema {
@@ -484,7 +506,7 @@ mod tests {
 
     fn unknown_paths(table: &Map, schema: &Schema) -> Vec<String> {
         let mut unknown = Vec::new();
-        collect_unknown_paths(table, schema, "", &mut unknown);
+        collect_unknown_paths(table, schema, "", &ConfigPath::new(), &mut unknown);
         unknown.into_iter().map(|u| u.path).collect()
     }
 
@@ -534,6 +556,28 @@ mod tests {
             .build();
         let table = parse("[plugins.audit]\nrogue = 1\n");
         assert_eq!(unknown_paths(&table, &schema), vec!["plugins.audit.rogue"]);
+    }
+
+    #[test]
+    fn walker_keeps_quoted_dotted_map_of_key_as_one_segment() {
+        let schema = Schema::object("App")
+            .map_of(
+                "plugins",
+                Schema::object("Plugin").field("name", RtField::string().optional()),
+            )
+            .build();
+        let table = parse("[plugins.\"acme.prod\"]\nrogue = 1\n");
+        let mut unknown = Vec::new();
+        collect_unknown_paths(&table, &schema, "", &ConfigPath::new(), &mut unknown);
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(
+            unknown[0].config_path.segments(),
+            [
+                PathSegment::Key("plugins".into()),
+                PathSegment::Key("acme.prod".into()),
+                PathSegment::Key("rogue".into()),
+            ]
+        );
     }
 
     // --- fill_defaults_into ---

@@ -344,11 +344,12 @@ fn parent_path(path: &str) -> &str {
 /// Section path of `(path, leaf)`: `path` with the trailing leaf stripped
 /// (plus the `.` separator if any). Returns `""` for a top-level key.
 ///
-/// Shared with `validate::lookup_value` —
+/// Shared with the strictness cascade —
 /// dot-splitting `path` would miscount segments when the leaf is a
 /// quoted TOML key containing literal dots (e.g.
 /// `"acme.task-due-date-missing"`). Stripping the known leaf off the
-/// end is the only way to recover the correct section path.
+/// end is the only way to recover the correct section path. Value and
+/// span lookup walk the structured [`crate::format::ConfigPath`] instead.
 pub(crate) fn section_path_of<'a>(path: &'a str, leaf: &str) -> &'a str {
     path.strip_suffix(leaf)
         .map(|p| p.strip_suffix('.').unwrap_or(p))
