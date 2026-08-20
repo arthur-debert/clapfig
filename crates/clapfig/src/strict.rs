@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use crate::error::ClapfigError;
 use crate::format::{ConfigPath, PathSegment, Span};
-use crate::runtime::{DocumentRoot, Schema, Shape, TaggedShape};
+use crate::runtime::{DocumentRoot, KeyAcrossVariants, Schema, Shape, TaggedShape};
 use crate::types::InputType;
 use crate::value::{Map, Value};
 
@@ -671,18 +671,23 @@ fn resolve_tagged_kind(tagged: &TaggedShape, rest: &str) -> PathKind {
     if rest.is_empty() {
         return PathKind::Section;
     }
-    if rest == tagged.tag {
-        return PathKind::Leaf;
+    let (head, remaining) = match rest.split_once('.') {
+        Some((h, r)) => (h, r),
+        None => (rest, ""),
+    };
+    match tagged.resolve_key(head) {
+        KeyAcrossVariants::Tag => {
+            if remaining.is_empty() {
+                PathKind::Leaf
+            } else {
+                PathKind::Unknown
+            }
+        }
+        KeyAcrossVariants::Absent => PathKind::Unknown,
+        KeyAcrossVariants::Every(shapes) | KeyAcrossVariants::Partial(shapes) => {
+            union_path_kind(shapes.into_iter().map(|s| path_kind_in_shape(s, remaining)))
+        }
     }
-    if rest.starts_with(&format!("{}.", tagged.tag)) {
-        return PathKind::Unknown;
-    }
-    union_path_kind(
-        tagged
-            .variants
-            .iter()
-            .map(|v| resolve_path_kind(&v.schema, rest)),
-    )
 }
 
 /// Section in any variant wins (valid `strict_at` target). Leaf only
@@ -710,61 +715,61 @@ pub(crate) fn resolve_path_kind(schema: &Schema, dotted: &str) -> PathKind {
     if dotted.is_empty() {
         return PathKind::Section;
     }
-    let mut current = schema;
-    let mut segments = dotted.split('.').peekable();
-    while let Some(seg) = segments.next() {
-        let Some(field) = current.fields.iter().find(|f| f.name == seg) else {
-            return PathKind::Unknown;
-        };
-        match &field.field {
-            crate::runtime::Shape::Leaf(_) => {
-                return if segments.peek().is_some() {
-                    PathKind::Unknown
-                } else {
-                    PathKind::Leaf
-                };
+    let (head, rest) = match dotted.split_once('.') {
+        Some((h, r)) => (h, r),
+        None => (dotted, ""),
+    };
+    let Some(field) = schema.fields.iter().find(|f| f.name == head) else {
+        return PathKind::Unknown;
+    };
+    path_kind_in_shape(&field.field, rest)
+}
+
+fn path_kind_in_shape(shape: &Shape, rest: &str) -> PathKind {
+    match shape {
+        Shape::Leaf(_) => {
+            if rest.is_empty() {
+                PathKind::Leaf
+            } else {
+                PathKind::Unknown
             }
-            shape if shape.is_value_field() => {
-                return if segments.peek().is_some() {
-                    PathKind::Unknown
-                } else {
-                    PathKind::Leaf
-                };
+        }
+        shape if shape.is_value_field() => {
+            if rest.is_empty() {
+                PathKind::Leaf
+            } else {
+                PathKind::Unknown
             }
-            crate::runtime::Shape::Object(nested) => {
-                if segments.peek().is_none() {
-                    return PathKind::Section;
-                }
-                current = nested;
+        }
+        Shape::Object(nested) => {
+            if rest.is_empty() {
+                PathKind::Section
+            } else {
+                resolve_path_kind(nested, rest)
             }
-            crate::runtime::Shape::Array(_) | crate::runtime::Shape::Map(_) => {
-                if segments.peek().is_none() {
-                    return PathKind::Section;
-                }
-                let rest = remaining_dotted(segments);
-                return match field.field.peel_containers() {
-                    crate::runtime::Shape::Object(nested) => resolve_path_kind(nested, &rest),
-                    crate::runtime::Shape::Tagged(tagged) => resolve_tagged_kind(tagged, &rest),
-                    crate::runtime::Shape::Leaf(_) => PathKind::Unknown,
-                    crate::runtime::Shape::Array(_) | crate::runtime::Shape::Map(_) => {
+        }
+        Shape::Array(_) | Shape::Map(_) => {
+            if rest.is_empty() {
+                PathKind::Section
+            } else {
+                match shape.peel_containers() {
+                    Shape::Object(nested) => resolve_path_kind(nested, rest),
+                    Shape::Tagged(tagged) => resolve_tagged_kind(tagged, rest),
+                    Shape::Leaf(_) => PathKind::Unknown,
+                    Shape::Array(_) | Shape::Map(_) => {
                         unreachable!("peel_containers strips Array/Map")
                     }
-                };
-            }
-            crate::runtime::Shape::Tagged(tagged) => {
-                if segments.peek().is_none() {
-                    return PathKind::Section;
                 }
-                return resolve_tagged_kind(tagged, &remaining_dotted(segments));
+            }
+        }
+        Shape::Tagged(tagged) => {
+            if rest.is_empty() {
+                PathKind::Section
+            } else {
+                resolve_tagged_kind(tagged, rest)
             }
         }
     }
-    PathKind::Section
-}
-
-fn remaining_dotted<'a>(segments: impl Iterator<Item = &'a str>) -> String {
-    let parts: Vec<&str> = segments.collect();
-    parts.join(".")
 }
 
 /// Validate a list of `(path, strict)` overrides against a schema and

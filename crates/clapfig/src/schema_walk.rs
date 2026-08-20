@@ -47,7 +47,7 @@
 use crate::error::{ClapfigError, DiscoveryRecord};
 use crate::format::ConfigPath;
 use crate::origin::{Origin, OriginMap, OriginNode};
-use crate::runtime::{DocumentRoot, NamedField, Schema, Shape, TaggedShape};
+use crate::runtime::{DocumentRoot, KeyAcrossVariants, NamedField, Schema, Shape, TaggedShape};
 use crate::validate::UnknownKey;
 use crate::value::{Map, Value};
 
@@ -197,18 +197,18 @@ fn collect_unknown_tagged_phase1(
     for (key, value) in table {
         let full = join_prefix(prefix, key);
         let child = path.clone().key(key);
-        if key == &tagged.tag {
-            continue;
-        }
-        let shapes = tagged.field_shapes(key);
-        if shapes.is_empty() {
-            unknown.push(UnknownKey {
-                path: full,
-                leaf: key.clone(),
-                config_path: child,
-            });
-        } else {
-            collect_unknown_against_shapes_union(value, &shapes, &full, &child, unknown);
+        match tagged.resolve_key(key) {
+            KeyAcrossVariants::Tag => {}
+            KeyAcrossVariants::Absent => {
+                unknown.push(UnknownKey {
+                    path: full,
+                    leaf: key.clone(),
+                    config_path: child,
+                });
+            }
+            KeyAcrossVariants::Every(shapes) | KeyAcrossVariants::Partial(shapes) => {
+                collect_unknown_against_shapes_union(value, &shapes, &full, &child, unknown);
+            }
         }
     }
 }
@@ -292,17 +292,14 @@ fn collect_unknown_union_map(
                         nested.push(&nf.field);
                     }
                 }
-                Shape::Tagged(tagged) => {
-                    if key == tagged.tag.as_str() {
+                Shape::Tagged(tagged) => match tagged.resolve_key(key) {
+                    KeyAcrossVariants::Tag => known = true,
+                    KeyAcrossVariants::Absent => {}
+                    KeyAcrossVariants::Every(shapes) | KeyAcrossVariants::Partial(shapes) => {
                         known = true;
-                    } else {
-                        let field_shapes = tagged.field_shapes(key);
-                        if !field_shapes.is_empty() {
-                            known = true;
-                            nested.extend(field_shapes);
-                        }
+                        nested.extend(shapes);
                     }
-                }
+                },
                 Shape::Array(_) => {}
             }
         }
@@ -573,18 +570,11 @@ fn collect_exclusive_against_shape(
 fn nested_shapes_for_key<'a>(shape: &'a Shape, key: &str) -> Option<Vec<&'a Shape>> {
     match shape {
         Shape::Object(schema) => find_field(schema, key).map(|nf| vec![&nf.field]),
-        Shape::Tagged(tagged) => {
-            if key == tagged.tag.as_str() {
-                Some(Vec::new())
-            } else {
-                let field_shapes = tagged.field_shapes(key);
-                if field_shapes.is_empty() {
-                    None
-                } else {
-                    Some(field_shapes)
-                }
-            }
-        }
+        Shape::Tagged(tagged) => match tagged.resolve_key(key) {
+            KeyAcrossVariants::Tag => Some(Vec::new()),
+            KeyAcrossVariants::Absent => None,
+            KeyAcrossVariants::Every(shapes) | KeyAcrossVariants::Partial(shapes) => Some(shapes),
+        },
         Shape::Map(map) => Some(vec![map.item.as_ref()]),
         Shape::Leaf(_) => Some(Vec::new()),
         Shape::Array(_) => None,

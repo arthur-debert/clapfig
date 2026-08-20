@@ -15,7 +15,7 @@
 //! metadata lookups DWIM-friendly so callers don't have to remember which
 //! shape the user typed.
 
-use crate::runtime::{Schema, Shape};
+use crate::runtime::{KeyAcrossVariants, Schema, Shape};
 
 /// Look up the doc-comment lines for a config key in a [`Schema`].
 ///
@@ -106,27 +106,17 @@ fn walk_tagged(tagged: &crate::runtime::TaggedShape, segments: &[&str]) -> Optio
         return Some(tagged.doc.clone());
     }
     let head = segments[0];
-    if segment_matches(&tagged.tag, head) {
-        return if segments.len() == 1 {
-            Some(tagged.doc.clone())
-        } else {
-            None
-        };
-    }
-    let matching: Vec<&Shape> = tagged
-        .variants
-        .iter()
-        .filter_map(|v| {
-            v.schema
-                .fields
-                .iter()
-                .find(|f| segment_matches(&f.name, head))
-                .map(|f| &f.field)
-        })
-        .collect();
-    if matching.is_empty() {
-        return None;
-    }
+    let matching = match tagged.resolve_key_with(head, segment_matches) {
+        KeyAcrossVariants::Tag => {
+            return if segments.len() == 1 {
+                Some(tagged.doc.clone())
+            } else {
+                None
+            };
+        }
+        KeyAcrossVariants::Absent => return None,
+        KeyAcrossVariants::Every(shapes) | KeyAcrossVariants::Partial(shapes) => shapes,
+    };
     if segments.len() == 1 {
         return agreed_doc(matching.iter().map(|s| s.field_doc().to_vec()).collect());
     }
