@@ -1,7 +1,8 @@
 //! Builder API for configuring and loading layered configuration.
 //!
 //! Entry point: [`crate::Clapfig::builder(schema)`](crate::Clapfig::builder)
-//! (`impl Into<crate::runtime::Shape>`; a [`Schema`] converts as
+//! (`impl Into<crate::runtime::Shape>`; a
+//! [`Schema`](crate::runtime::Schema) converts as
 //! [`crate::runtime::Shape::Object`]).
 //! The builder follows a "set what you need, load" pattern: `app_name`
 //! derives sensible defaults (file name, search paths, env prefix), and
@@ -68,7 +69,8 @@ enum FileNaming {
 ///
 /// The schema is supplied as a value (via [`crate::Clapfig::builder`],
 /// which takes `impl Into<crate::runtime::Shape>`) and the loaded output
-/// is a value [`Map`]. Object-root [`Schema`] values convert as
+/// is a value [`Map`]. Object-root
+/// [`Schema`](crate::runtime::Schema) values convert as
 /// [`crate::runtime::Shape::Object`]. For typed output, derive
 /// [`Schema`](crate::Schema) and use
 /// [`Clapfig::typed`](crate::Clapfig::typed), whose

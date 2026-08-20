@@ -2,8 +2,8 @@
 
 - **`runtime::Shape`**: `Leaf | Object | Map | Array | Tagged`. [`runtime::Schema`](https://docs.rs/clapfig/latest/clapfig/runtime/struct.Schema.html) stays the named-field object constructor (`Schema::object(...)`), not the node and not renamed to `Object`. [`clapfig::Schema`](https://docs.rs/clapfig/latest/clapfig/trait.Schema.html) stays the derive trait. An object's field value is a `Shape`; `Field` is not a second node in this contract (the public collapse of `Field` / `LeafType::Map` / `LeafType::Array` is the pipeline-swap slice).
 - **Legal document roots**: Object, Map, Tagged. Leaf and Array construct as nested shapes and panic as a document root. Root Map and Tagged construct; `Clapfig::builder` `todo!()`s them rather than loading as an object.
-- **Tagged construction**: variants are objects (`Schema`). Discriminator set is closed: at least one variant; post-rename names unique and non-empty. Construction panics on empty unions, empty tag/discriminator names, collisions, and non-object variants.
-- **Static mirror**: `static_schema::ShapeStatic` / `TaggedVariantStatic` so derive can emit const trees later. `Schema::shape()` defaults to wrapping `schema()` as `Shape::Object`.
+- **Tagged construction**: variants are objects (`Schema`). Discriminator set is closed: at least one variant; post-rename names unique and non-empty. Construction panics on empty unions, empty tag/discriminator names, tag names that contain `.` / `[` / `]`, collisions, variant fields named as the tag, and non-object variants.
+- **Static mirror**: `static_schema::ShapeStatic` / `TaggedVariantStatic` so derive can emit const trees later. `Schema::shape()` is `Shape::Leaf(Enum)` for unit-only enums (preserving renamed variants) and `Shape::Object` for named-field structs. `ShapeStatic::Object` rejects a unit-enum schema.
 - **`Clapfig::builder` takes `impl Into<Shape>`**. Object-root callers keep passing a `Schema`.
 
 **Migration (hard cut, per project policy):**

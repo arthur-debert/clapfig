@@ -23,7 +23,7 @@ use crate::runtime::{
     ArrayShape as RuntimeArrayShape, Field as RuntimeField, Leaf as RuntimeLeaf,
     LeafType as RuntimeLeafType, MapShape as RuntimeMapShape, NamedField as RuntimeNamedField,
     Schema as RuntimeSchema, Shape as RuntimeShape, TaggedShape as RuntimeTaggedShape,
-    TaggedVariant as RuntimeTaggedVariant,
+    TaggedVariant as RuntimeTaggedVariant, reject_variant_tag_clash, validate_path_segment,
 };
 use crate::value::Value;
 
@@ -62,8 +62,10 @@ pub struct SchemaStatic {
 /// Tagged variants are objects ([`SchemaStatic`]), not an arbitrary
 /// [`ShapeStatic`]. `to_runtime` enforces the same construction
 /// invariants as [`Shape::tagged`](crate::runtime::Shape::tagged):
-/// non-empty tag, at least one variant, unique non-empty discriminators,
-/// and no unit-enum schema in variant position.
+/// non-empty tag without `.`/`[`/`]`, at least one variant, unique
+/// non-empty discriminators, no unit-enum schema in variant position,
+/// and no variant field named the tag. `ShapeStatic::Object` rejects a
+/// unit-enum [`SchemaStatic`] — unit enums are [`ShapeStatic::Leaf`].
 #[derive(Debug)]
 pub enum ShapeStatic {
     Leaf(LeafStatic),
@@ -263,15 +265,25 @@ impl SchemaStatic {
 impl ShapeStatic {
     /// Convert to the owned runtime node.
     ///
-    /// Tagged construction invariants (empty tag, empty union, empty or
-    /// duplicate discriminators, unit-enum variants) panic here — the
-    /// same deferred-authoring-error pattern as a malformed datetime
-    /// default. Leaf and Array convert; they remain illegal as *document*
-    /// roots ([`runtime::Shape::require_document_root`](crate::runtime::Shape::require_document_root)).
+    /// Tagged construction invariants (empty tag, reserved path
+    /// characters in the tag, empty union, empty or duplicate
+    /// discriminators, unit-enum variants, variant fields named as the
+    /// tag) panic here — the same deferred-authoring-error pattern as a
+    /// malformed datetime default. `ShapeStatic::Object` of a unit-enum
+    /// schema also panics (unit enums are `Leaf`). Leaf and Array
+    /// convert; they remain illegal as *document* roots
+    /// ([`runtime::Shape::require_document_root`](crate::runtime::Shape::require_document_root)).
     pub fn to_runtime(&self) -> RuntimeShape {
         match self {
             ShapeStatic::Leaf(leaf) => RuntimeShape::Leaf(leaf.to_runtime()),
-            ShapeStatic::Object(schema) => RuntimeShape::Object(schema.to_runtime()),
+            ShapeStatic::Object(schema) => {
+                assert!(
+                    !schema.is_enum(),
+                    "clapfig: ShapeStatic::Object must be a named-field object, got unit enum `{}`",
+                    schema.name
+                );
+                RuntimeShape::Object(schema.to_runtime())
+            }
             ShapeStatic::Map {
                 name,
                 doc,
@@ -312,10 +324,7 @@ fn tagged_static_to_runtime(
     tag: &str,
     variants: &[TaggedVariantStatic],
 ) -> RuntimeTaggedShape {
-    assert!(
-        !tag.is_empty(),
-        "clapfig: tagged discriminator field name must not be empty"
-    );
+    validate_path_segment("tagged discriminator field name", tag);
     assert!(
         !variants.is_empty(),
         "clapfig: tagged union {name:?} must have at least one variant"
@@ -337,6 +346,11 @@ fn tagged_static_to_runtime(
             "clapfig: tagged variant {:?} must be an object, got unit enum `{}`",
             variant.discriminator,
             variant.schema.name
+        );
+        reject_variant_tag_clash(
+            tag,
+            variant.discriminator,
+            variant.schema.fields.iter().map(|f| f.name),
         );
         seen.push(variant.discriminator);
         runtime_variants.push(RuntimeTaggedVariant {
@@ -380,6 +394,21 @@ fn enum_variant_values(s: &SchemaStatic) -> Vec<Value> {
         .iter()
         .map(|v| Value::String((*v).to_string()))
         .collect()
+}
+
+/// Unit-only enum as a leaf node. The closed set lives on
+/// [`SchemaStatic::enum_variants`]; wrapping the empty-fields runtime
+/// object would drop it.
+fn unit_enum_leaf(s: &SchemaStatic) -> RuntimeLeaf {
+    RuntimeLeaf {
+        doc: s.doc.iter().map(|d| (*d).to_string()).collect(),
+        ty: RuntimeLeafType::Enum {
+            values: enum_variant_values(s),
+        },
+        default: None,
+        optional: false,
+        env: None,
+    }
 }
 
 impl FieldStatic {
@@ -640,12 +669,19 @@ pub trait Schema {
 
     /// This type as a [`runtime::Shape`](crate::runtime::Shape) node.
     ///
-    /// The default wraps [`schema`](Self::schema) as
+    /// Unit-only enums become [`Shape::Leaf`](crate::runtime::Shape::Leaf)
+    /// with [`LeafType::Enum`](crate::runtime::LeafType::Enum), preserving
+    /// the closed post-rename variant set from [`STATIC`](Self::STATIC).
+    /// Named-field structs wrap [`schema`](Self::schema) as
     /// [`Shape::Object`](crate::runtime::Shape::Object). Root Map and
     /// Tagged typed loads (later workstreams) override this; walkers
     /// still consume [`schema`](Self::schema) today.
     fn shape() -> crate::runtime::Shape {
-        crate::runtime::Shape::Object(Self::schema().clone())
+        if Self::STATIC.is_enum() {
+            crate::runtime::Shape::Leaf(unit_enum_leaf(Self::STATIC))
+        } else {
+            crate::runtime::Shape::Object(Self::schema().clone())
+        }
     }
 
     /// `Arc`-flavored access to the same cached runtime view. Used by the
@@ -1328,6 +1364,45 @@ mod tests {
         }],
     };
 
+    static DOTTED_TAG: ShapeStatic = ShapeStatic::Tagged {
+        name: "Block",
+        doc: EMPTY_DOC,
+        strict: None,
+        tag: "k.ind",
+        variants: &[TaggedVariantStatic {
+            discriminator: "rust",
+            schema: &NESTED_INNER,
+        }],
+    };
+
+    static TAG_CLASH_OBJECT: SchemaStatic = SchemaStatic {
+        name: "Rust",
+        doc: EMPTY_DOC,
+        strict: None,
+        fields: &[NamedFieldStatic {
+            name: "kind",
+            field: FieldStatic::Leaf(LeafStatic {
+                doc: EMPTY_DOC,
+                ty: LeafTypeStatic::String,
+                default: None,
+                optional: false,
+                env: None,
+            }),
+        }],
+        enum_variants: &[],
+    };
+
+    static TAG_FIELD_CLASH: ShapeStatic = ShapeStatic::Tagged {
+        name: "Block",
+        doc: EMPTY_DOC,
+        strict: None,
+        tag: "kind",
+        variants: &[TaggedVariantStatic {
+            discriminator: "rust",
+            schema: &TAG_CLASH_OBJECT,
+        }],
+    };
+
     #[test]
     #[should_panic(expected = "must have at least one variant")]
     fn shape_static_tagged_rejects_empty_union() {
@@ -1350,5 +1425,23 @@ mod tests {
     #[should_panic(expected = "must be an object, got unit enum")]
     fn shape_static_tagged_rejects_unit_enum_variant() {
         let _ = UNIT_ENUM_VARIANT.to_runtime();
+    }
+
+    #[test]
+    #[should_panic(expected = "contains '.'")]
+    fn shape_static_tagged_rejects_tag_with_dot() {
+        let _ = DOTTED_TAG.to_runtime();
+    }
+
+    #[test]
+    #[should_panic(expected = "must not declare a field named \"kind\"")]
+    fn shape_static_tagged_rejects_variant_field_named_as_tag() {
+        let _ = TAG_FIELD_CLASH.to_runtime();
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a named-field object, got unit enum")]
+    fn shape_static_object_rejects_unit_enum() {
+        let _ = ShapeStatic::Object(&ENUM_PDF_PAGE).to_runtime();
     }
 }

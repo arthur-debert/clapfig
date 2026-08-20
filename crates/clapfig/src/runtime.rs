@@ -548,14 +548,13 @@ impl Shape {
     /// `name` is the node name (the enum type name). `tag` is the
     /// discriminator field (`serde(tag = ...)`), reserved on every variant
     /// object and not itself a field of the variant. Panics if `tag` is
-    /// empty. Call [`TaggedShapeBuilder::variant`] at least once before
+    /// empty or contains `.`, `[`, or `]` — the same path-segment rules
+    /// as a field name, because the tag is a field key. Call
+    /// [`TaggedShapeBuilder::variant`] at least once before
     /// [`build`](TaggedShapeBuilder::build).
     pub fn tagged(name: impl Into<String>, tag: impl Into<String>) -> TaggedShapeBuilder {
         let tag = tag.into();
-        assert!(
-            !tag.is_empty(),
-            "clapfig: tagged discriminator field name must not be empty"
-        );
+        validate_path_segment("tagged discriminator field name", &tag);
         TaggedShapeBuilder {
             name: name.into(),
             doc: Vec::new(),
@@ -637,6 +636,24 @@ impl From<ArrayShape> for Shape {
 impl From<TaggedShape> for Shape {
     fn from(tagged: TaggedShape) -> Self {
         Shape::Tagged(tagged)
+    }
+}
+
+impl From<MapShapeBuilder> for Shape {
+    fn from(builder: MapShapeBuilder) -> Self {
+        Shape::Map(builder.build())
+    }
+}
+
+impl From<ArrayShapeBuilder> for Shape {
+    fn from(builder: ArrayShapeBuilder) -> Self {
+        Shape::Array(builder.build())
+    }
+}
+
+impl From<TaggedShapeBuilder> for Shape {
+    fn from(builder: TaggedShapeBuilder) -> Self {
+        Shape::Tagged(builder.build())
     }
 }
 
@@ -765,7 +782,9 @@ impl TaggedShapeBuilder {
 
     /// Add a variant. `shape` must be [`Shape::Object`]; other constructors
     /// panic. `discriminator` is the post-rename name: non-empty and unique
-    /// within this union.
+    /// within this union. Panics if the variant object already has a
+    /// (post-rename) field named the union tag — the tag is reserved, not
+    /// a field of the variant.
     pub fn variant(mut self, discriminator: impl Into<String>, shape: impl Into<Shape>) -> Self {
         let discriminator = discriminator.into();
         assert!(
@@ -788,6 +807,11 @@ impl TaggedShapeBuilder {
                 other.constructor_name()
             ),
         };
+        reject_variant_tag_clash(
+            &self.tag,
+            &discriminator,
+            schema.fields.iter().map(|f| f.name.as_str()),
+        );
         self.variants.push(TaggedVariant {
             discriminator,
             schema,
@@ -816,31 +840,50 @@ impl TaggedShapeBuilder {
     }
 }
 
-/// Reject field names that would confuse every downstream consumer
-/// (resolve, persist, cascade lookup) the moment they're constructed.
+/// Reject a single path-segment name (a field or a tagged-union tag).
 ///
-/// - `.` would be re-parsed as a dotted-path separator (`Schema::field("a.b", ...)`
-///   would never be findable via `find_field(schema, "a")`).
-/// - `[` / `]` collide with the array-index syntax the cascade walker
-///   strips out.
-/// - Empty names produce confusing `KeyNotFound` errors with a blank
-///   token.
-/// - Duplicate names within one schema make `find_field` order-dependent
-///   and `valid_keys` collide.
-fn validate_field_name(schema: &Schema, name: &str) {
-    assert!(!name.is_empty(), "clapfig: field name must not be empty");
+/// `.` / `[` / `]` / empty break dotted-path lookup and array-index
+/// syntax the same way for a discriminator field as for any other key.
+pub(crate) fn validate_path_segment(label: &str, name: &str) {
+    assert!(!name.is_empty(), "clapfig: {label} must not be empty");
     assert!(
         !name.contains('.'),
-        "clapfig: field name {name:?} contains '.', which conflicts with the dotted-path separator"
+        "clapfig: {label} {name:?} contains '.', which conflicts with the dotted-path separator"
     );
     assert!(
         !name.contains('['),
-        "clapfig: field name {name:?} contains '[', which conflicts with array-index syntax"
+        "clapfig: {label} {name:?} contains '[', which conflicts with array-index syntax"
     );
     assert!(
         !name.contains(']'),
-        "clapfig: field name {name:?} contains ']', which conflicts with array-index syntax"
+        "clapfig: {label} {name:?} contains ']', which conflicts with array-index syntax"
     );
+}
+
+/// The tag is reserved on every variant object and is not a field of the
+/// variant. A post-rename field named the same as the tag is an authoring
+/// error (schema and serde would fight).
+pub(crate) fn reject_variant_tag_clash<'a>(
+    tag: &str,
+    discriminator: &str,
+    field_names: impl IntoIterator<Item = &'a str>,
+) {
+    for name in field_names {
+        assert!(
+            name != tag,
+            "clapfig: tagged variant {discriminator:?} must not declare a field named {tag:?} (the union tag)"
+        );
+    }
+}
+
+/// Reject field names that would confuse every downstream consumer
+/// (resolve, persist, cascade lookup) the moment they're constructed.
+///
+/// Path-segment rules are [`validate_path_segment`]. Duplicate names
+/// within one schema make `find_field` order-dependent and `valid_keys`
+/// collide.
+fn validate_field_name(schema: &Schema, name: &str) {
+    validate_path_segment("field name", name);
     assert!(
         !schema.fields.iter().any(|f| f.name == name),
         "clapfig: duplicate field name {name:?} on schema {:?}",
@@ -1350,5 +1393,48 @@ mod tests {
         let _ = Shape::tagged("Block", "kind")
             .variant("rust", inner)
             .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "contains '.'")]
+    fn tagged_rejects_tag_with_dot() {
+        let _ = Shape::tagged("Block", "k.ind");
+    }
+
+    #[test]
+    #[should_panic(expected = "contains '['")]
+    fn tagged_rejects_tag_with_open_bracket() {
+        let _ = Shape::tagged("Block", "k[ind]");
+    }
+
+    #[test]
+    #[should_panic(expected = "contains ']'")]
+    fn tagged_rejects_tag_with_close_bracket() {
+        let _ = Shape::tagged("Block", "k]ind");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not declare a field named \"kind\"")]
+    fn tagged_rejects_variant_field_named_as_tag() {
+        let _ = Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .field("kind", Field::string())
+                    .build(),
+            )
+            .build();
+    }
+
+    #[test]
+    fn shape_builders_convert_without_build() {
+        let map: Shape = Shape::map("blocks", object("Block")).into();
+        assert!(matches!(map, Shape::Map(_)));
+        let array: Shape = Shape::array("xs", Field::string()).into();
+        assert!(matches!(array, Shape::Array(_)));
+        let tagged: Shape = Shape::tagged("Block", "kind")
+            .variant("rust", object("Rust"))
+            .into();
+        assert!(matches!(tagged, Shape::Tagged(_)));
     }
 }

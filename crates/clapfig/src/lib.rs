@@ -862,8 +862,8 @@ impl Clapfig {
     /// `schema` is `impl Into<Shape>` so today's object-root callers keep
     /// passing a [`runtime::Schema`](crate::runtime::Schema) (`From` wraps
     /// it as [`Shape::Object`](crate::runtime::Shape::Object)). Legal
-    /// document roots are Object, Map, and Tagged; Leaf and Array panic
-    /// at construction.
+    /// document roots are Object, Map, and Tagged; Leaf and Array are
+    /// valid nested shapes and panic when used as the document root.
     ///
     /// Resolve still walks today's object schema (SHP01-WS02 switches the
     /// pipeline). A root Map or Tagged therefore `todo!()` here — it must
@@ -890,7 +890,9 @@ impl Clapfig {
     ///     .load()?;
     /// ```
     pub fn builder(schema: impl Into<crate::runtime::Shape>) -> Builder {
-        match schema.into() {
+        let shape = schema.into();
+        shape.require_document_root();
+        match shape {
             crate::runtime::Shape::Object(schema) => Builder::new(schema),
             crate::runtime::Shape::Map(_) | crate::runtime::Shape::Tagged(_) => {
                 todo!(
@@ -899,12 +901,9 @@ impl Clapfig {
                      (SHP01-WS02); root-map load is SHP01-WS03 and tagged walk is SHP01-WS04"
                 )
             }
-            crate::runtime::Shape::Leaf(_) => panic!(
-                "clapfig: a Leaf is not a legal document root (legal roots: Object, Map, Tagged)"
-            ),
-            crate::runtime::Shape::Array(_) => panic!(
-                "clapfig: an Array is not a legal document root (legal roots: Object, Map, Tagged)"
-            ),
+            crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => {
+                unreachable!("illegal document roots are rejected by require_document_root")
+            }
         }
     }
 
