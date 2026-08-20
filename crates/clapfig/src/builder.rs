@@ -289,7 +289,8 @@ impl Builder {
     /// is registered, the callback receives an
     /// [`UnknownKeyContext`](crate::UnknownKeyContext) carrying the dotted
     /// path, the leaf segment, the parsed value, the source file, and the
-    /// line number — enough to apply a domain-specific decision.
+    /// line number when the span index locates the key — enough to apply
+    /// a domain-specific decision.
     /// Returning
     /// [`UnknownKeyDecision::Accept`](crate::UnknownKeyDecision::Accept)
     /// drops the key silently;

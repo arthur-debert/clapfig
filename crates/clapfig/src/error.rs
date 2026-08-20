@@ -2,8 +2,8 @@
 //!
 //! All errors are designed to be shown directly to end users. Each variant
 //! includes enough context to diagnose the problem without reaching for a
-//! debugger: file paths and line numbers (TOML, YAML, and JSON) for unknown
-//! keys, the list of
+//! debugger: file paths and, when the span index locates the key, line
+//! numbers (TOML, YAML, and JSON) for unknown keys, the list of
 //! available scopes when a scope name is wrong, and references to the
 //! builder method that needs to be called when a prerequisite is missing.
 //!

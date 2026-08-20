@@ -2,8 +2,8 @@
 
 Strict mode is **on by default**. When a config file contains a key that
 doesn't match any field in your schema, loading fails with the file
-path, key name, and the line number. This catches typos and stale
-keys early.
+path, key name, and the line number when the span index locates the
+key. This catches typos and stale keys early.
 
 Some apps want one uniform answer ("strict everywhere" or "lenient
 everywhere"). Others want a mix: typed fields catch typos, a plugin

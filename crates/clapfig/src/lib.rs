@@ -131,8 +131,8 @@
 //! logs, not in a debugger attached to a fork.
 //!
 //! `tracing` is an unconditional dependency. Events are no-ops when no
-//! subscriber is installed. Enable the full story with
-//! `RUST_LOG=clapfig=trace`.
+//! subscriber is installed. With a subscriber that honors `RUST_LOG`,
+//! enable the full story with `RUST_LOG=clapfig=trace`.
 //!
 //! Level discipline:
 //!
@@ -367,7 +367,7 @@
 //!
 //! Strict mode is **on by default**. When a config file contains a key that
 //! doesn't match any field in your schema, loading fails with the file path,
-//! key name, and the line number:
+//! key name, and the line number when the span index locates the key:
 //!
 //! ```text
 //! Unknown key 'typo_key' in /home/user/.config/myapp/myapp.toml (line 5)
@@ -780,8 +780,9 @@
 //! # Error handling
 //!
 //! All fallible operations return [`ClapfigError`]. Errors are designed to
-//! be user-facing: unknown keys include file paths and line numbers
-//! (TOML, YAML, and JSON), unknown scopes list the available ones, and missing
+//! be user-facing: unknown keys include file paths and, when the span
+//! index locates the key, line numbers (TOML, YAML, and JSON), unknown
+//! scopes list the available ones, and missing
 //! prerequisites reference the builder method to call. See the [`error`]
 //! module for the full set.
 
