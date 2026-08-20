@@ -338,6 +338,25 @@ fn root_map_nested_strict_false_still_rejects_unknown_at_entry_top_level() {
 }
 
 #[test]
+fn root_map_entry_named_like_nested_strict_path_does_not_steal_override() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("demo.toml"), "[db]\nrogue = 1\n").unwrap();
+    let err = Clapfig::builder(nested_strict_root(false))
+        .app_name("demo")
+        .file_name("demo.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .strict(true)
+        .load()
+        .unwrap_err();
+    let keys = err.unknown_keys().expect("expected UnknownKeys");
+    assert_eq!(
+        keys[0].key, "db.rogue",
+        "entry named db must not inherit item db.strict(false): {keys:?}"
+    );
+}
+
+#[test]
 fn root_map_nested_strict_true_rejects_unknown_under_every_file_entry() {
     let dir = TempDir::new().unwrap();
     fs::write(

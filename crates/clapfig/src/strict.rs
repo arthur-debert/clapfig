@@ -223,7 +223,8 @@ pub(crate) struct StrictnessOverrides {
     /// When the document root is a homogeneous Map, item-schema `strict`
     /// annotations are stored root-relative (`db`), while runtime paths
     /// include the dynamic entry key (`core.db.rogue`). Cascade lookup
-    /// then also probes the path with that first segment stripped.
+    /// probes only the path with that first segment stripped — never the
+    /// physical cursor, so an entry named `db` cannot steal `db.strict`.
     skip_root_entry: bool,
 }
 
@@ -298,8 +299,11 @@ impl StrictnessOverrides {
     ///   override set on the item schema applies to any entry.
     /// - **Root-map paths** (`core.db.rogue`): item-schema overrides are
     ///   stored without the dynamic entry key (`db`). When the document
-    ///   root is a Map, the cascade also probes the path after stripping
-    ///   that first segment, so `db.strict(false)` governs every entry.
+    ///   root is a Map, lookup never matches the physical cursor (an
+    ///   entry named `db` must not steal `db.strict(...)`); it probes
+    ///   only the path after stripping that first segment, so
+    ///   `db.strict(false)` governs `<entry>.db.*` and `entries[""]`
+    ///   remains the root-map override.
     ///
     /// The cascade walks from the leaf's section path upward, returning
     /// the first explicit override found. With no override on any
@@ -324,6 +328,23 @@ impl StrictnessOverrides {
     /// Direct match, then the array-index and root-map schema forms of
     /// `cursor` when those probes apply.
     fn probe(&self, cursor: &str) -> Option<bool> {
+        if self.skip_root_entry {
+            // The physical cursor starts with a user-supplied entry key.
+            // Matching it against item-relative entries would let an
+            // entry named `db` steal `db.strict(...)`. Empty cursor is
+            // the root-map override; every other cursor is looked up
+            // only after stripping that first segment.
+            if cursor.is_empty() {
+                return self.entries.get("").copied();
+            }
+            if cursor.contains('[') {
+                let schema_form = strip_brackets(cursor);
+                if let Some(v) = self.entries.get(strip_first_segment(&schema_form)) {
+                    return Some(*v);
+                }
+            }
+            return self.entries.get(strip_first_segment(cursor)).copied();
+        }
         if let Some(v) = self.entries.get(cursor) {
             return Some(*v);
         }
@@ -337,16 +358,6 @@ impl StrictnessOverrides {
             if let Some(v) = self.entries.get(&schema_form) {
                 return Some(*v);
             }
-            if self.skip_root_entry
-                && let Some(v) = self.entries.get(strip_first_segment(&schema_form))
-            {
-                return Some(*v);
-            }
-        }
-        if self.skip_root_entry
-            && let Some(v) = self.entries.get(strip_first_segment(cursor))
-        {
-            return Some(*v);
         }
         None
     }
@@ -769,6 +780,16 @@ mod tests {
         // Unknown at the item top-level still uses the builder default
         // (no item-root strict here).
         assert!(overrides.effective_strict("core.rogue", "rogue", true));
+        // An entry whose key equals a nested override path must not
+        // inherit that override at the entry's own top level.
+        assert!(
+            overrides.effective_strict("db.rogue", "rogue", true),
+            "entry named db must not steal item db.strict(false) for db.rogue"
+        );
+        assert!(
+            !overrides.effective_strict("db.db.rogue", "rogue", true),
+            "the nested db section under an entry named db still matches"
+        );
     }
 
     #[test]
