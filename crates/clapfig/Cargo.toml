@@ -49,6 +49,10 @@ thiserror = "2"
 # type. yamlpath/yamlpatch are held to the 1.26 series: later releases
 # pull tree-sitter-iter builds whose MSRV (1.97) exceeds ours.
 serde_norway = "0.9"
+# Unconditional (ADR-0009): events are free without a subscriber; a Cargo
+# feature would remove the narration exactly when a developer needs it
+# (`RUST_LOG=clapfig=trace`). Values never appear in events.
+tracing = "0.1"
 yamlpath = ">=1.26, <1.28"
 yamlpatch = ">=1.26, <1.28"
 yaml_serde = "0.10"

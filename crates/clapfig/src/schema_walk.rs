@@ -15,7 +15,8 @@
 //!   empty tables (an absent map is the empty map), and absent array-of
 //!   nodes and non-optional array leaves without a default materialize as
 //!   empty arrays (an absent array is the empty array). Default origins
-//!   are filled in the same walk (ADR-0004).
+//!   are filled in the same walk (ADR-0004). Each fill emits a `trace`
+//!   event naming the [`ConfigPath`] and value type, never the value.
 //! - **[`finalize`]**: applies schema-driven coercions (string values in
 //!   TOML's four datetime lexical forms become [`Value::Datetime`] on
 //!   datetime leaves per ADR-0001; integer values become [`Value::Float`]
@@ -160,22 +161,45 @@ fn find_field<'a>(schema: &'a Schema, name: &str) -> Option<&'a NamedField> {
 /// Default origins are filled in the same walk (ADR-0004): a newly
 /// inserted default, empty map, or empty array gets [`Origin::default`]
 /// naming the schema key; existing origin nodes are left in place.
+/// Each fill emits a `trace` event with the [`ConfigPath`] and value
+/// **type** (never the value); a `debug` summary reports how many were
+/// filled. Path tracking for those events is skipped when TRACE is
+/// disabled.
 pub(crate) fn fill_defaults_into(table: &mut Map, origins: &mut OriginMap, schema: &Schema) {
-    fill_defaults_at(table, origins, schema, "");
+    let mut filled = 0usize;
+    let path = crate::trace::trace_event_enabled().then(ConfigPath::new);
+    fill_defaults_at(table, origins, schema, "", path, &mut filled);
+    crate::trace::defaults_filled(filled);
 }
 
-fn fill_defaults_at(table: &mut Map, origins: &mut OriginMap, schema: &Schema, prefix: &str) {
+fn fill_defaults_at(
+    table: &mut Map,
+    origins: &mut OriginMap,
+    schema: &Schema,
+    prefix: &str,
+    path: Option<ConfigPath>,
+    filled: &mut usize,
+) {
     for nf in &schema.fields {
         let schema_key = if prefix.is_empty() {
             nf.name.clone()
         } else {
             format!("{prefix}.{}", nf.name)
         };
+        let child = path.as_ref().map(|p| p.clone().key(&nf.name));
         match &nf.field {
             Field::Leaf(leaf) => {
                 if !table.contains_key(&nf.name) {
                     if let Some(default) = &leaf.default {
-                        insert_default(table, origins, &nf.name, default.clone(), &schema_key);
+                        insert_default(
+                            table,
+                            origins,
+                            &nf.name,
+                            default.clone(),
+                            child.as_ref(),
+                            &schema_key,
+                            filled,
+                        );
                     } else if !leaf.optional && matches!(leaf.ty, crate::runtime::LeafType::Map(_))
                     {
                         // A non-optional map leaf (bare `HashMap<String,
@@ -192,7 +216,9 @@ fn fill_defaults_at(table: &mut Map, origins: &mut OriginMap, schema: &Schema, p
                             origins,
                             &nf.name,
                             Value::Map(Map::new()),
+                            child.as_ref(),
                             &schema_key,
+                            filled,
                         );
                     } else if !leaf.optional
                         && matches!(leaf.ty, crate::runtime::LeafType::Array(_))
@@ -211,7 +237,9 @@ fn fill_defaults_at(table: &mut Map, origins: &mut OriginMap, schema: &Schema, p
                             origins,
                             &nf.name,
                             Value::Array(Vec::new()),
+                            child.as_ref(),
                             &schema_key,
+                            filled,
                         );
                     }
                 }
@@ -225,10 +253,11 @@ fn fill_defaults_at(table: &mut Map, origins: &mut OriginMap, schema: &Schema, p
                     origins.entry(nf.name.clone()).or_insert_with(|| {
                         OriginNode::map(Origin::default(&schema_key), OriginMap::new())
                     });
+                    trace_default_filled(child.as_ref(), "map", filled);
                 }
                 if let Value::Map(t) = entry {
                     let child_origins = child_map_origins(origins, &nf.name, &schema_key);
-                    fill_defaults_at(t, child_origins, nested, &schema_key);
+                    fill_defaults_at(t, child_origins, nested, &schema_key, child, filled);
                 }
             }
             Field::ArrayOf(item_schema) => {
@@ -247,6 +276,7 @@ fn fill_defaults_at(table: &mut Map, origins: &mut OriginMap, schema: &Schema, p
                     origins.entry(nf.name.clone()).or_insert_with(|| {
                         OriginNode::array(Origin::default(&schema_key), Vec::new())
                     });
+                    trace_default_filled(child.as_ref(), "array", filled);
                 }
                 if let Value::Array(items) = entry {
                     let child_origins = child_array_origins(origins, &nf.name, &schema_key);
@@ -260,7 +290,15 @@ fn fill_defaults_at(table: &mut Map, origins: &mut OriginMap, schema: &Schema, p
                                 ));
                             }
                             let entry_origins = child_origins[i].map_children_mut();
-                            fill_defaults_at(t, entry_origins, item_schema, &indexed);
+                            let indexed_path = child.as_ref().map(|p| p.clone().index(i));
+                            fill_defaults_at(
+                                t,
+                                entry_origins,
+                                item_schema,
+                                &indexed,
+                                indexed_path,
+                                filled,
+                            );
                         }
                     }
                 }
@@ -281,6 +319,7 @@ fn fill_defaults_at(table: &mut Map, origins: &mut OriginMap, schema: &Schema, p
                     origins.entry(nf.name.clone()).or_insert_with(|| {
                         OriginNode::map(Origin::default(&schema_key), OriginMap::new())
                     });
+                    trace_default_filled(child.as_ref(), "map", filled);
                 }
                 if let Value::Map(entries) = entry {
                     let child_origins = child_map_origins(origins, &nf.name, &schema_key);
@@ -289,7 +328,15 @@ fn fill_defaults_at(table: &mut Map, origins: &mut OriginMap, schema: &Schema, p
                             let entry_path = format!("{schema_key}.{entry_key}");
                             let entry_origins =
                                 child_map_entry_origins(child_origins, entry_key, &entry_path);
-                            fill_defaults_at(t, entry_origins, item_schema, &entry_path);
+                            let entry_cfg = child.as_ref().map(|p| p.clone().key(entry_key));
+                            fill_defaults_at(
+                                t,
+                                entry_origins,
+                                item_schema,
+                                &entry_path,
+                                entry_cfg,
+                                filled,
+                            );
                         }
                     }
                 }
@@ -298,13 +345,23 @@ fn fill_defaults_at(table: &mut Map, origins: &mut OriginMap, schema: &Schema, p
     }
 }
 
+fn trace_default_filled(key: Option<&ConfigPath>, value_type: &str, filled: &mut usize) {
+    *filled += 1;
+    if let Some(key) = key {
+        crate::trace::default_filled(key, value_type);
+    }
+}
+
 fn insert_default(
     table: &mut Map,
     origins: &mut OriginMap,
     name: &str,
     value: Value,
+    key: Option<&ConfigPath>,
     schema_key: &str,
+    filled: &mut usize,
 ) {
+    trace_default_filled(key, value.type_str(), filled);
     origins.insert(
         name.to_string(),
         OriginNode::from_value(&value, Origin::default(schema_key)),

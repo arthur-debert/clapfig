@@ -136,6 +136,37 @@ impl Origin {
         }
     }
 
+    /// A log-safe label for this origin: layer plus the identifier that
+    /// layer knows (file path, env var, URL key, override/schema key).
+    /// Never includes a config value.
+    pub(crate) fn label(&self) -> String {
+        match self.layer {
+            OriginLayer::File => match &self.file {
+                Some(path) => format!("file:{}", path.display()),
+                None => "file".into(),
+            },
+            OriginLayer::Env => {
+                if self.env_vars.is_empty() {
+                    "env".into()
+                } else {
+                    format!("env:{}", self.env_vars.join(","))
+                }
+            }
+            OriginLayer::Url => match &self.url_key {
+                Some(key) => format!("url:{key}"),
+                None => "url".into(),
+            },
+            OriginLayer::Override => match &self.key {
+                Some(key) => format!("override:{key}"),
+                None => "override".into(),
+            },
+            OriginLayer::Default => match &self.key {
+                Some(key) => format!("default:{key}"),
+                None => "default".into(),
+            },
+        }
+    }
+
     /// Flatten onto the public [`OriginFacts`] carried by `InvalidValue`.
     pub(crate) fn to_facts(&self) -> OriginFacts {
         OriginFacts {
@@ -390,6 +421,20 @@ mod tests {
             OriginLayer::Override,
             OriginLayer::Default,
         ];
+    }
+
+    #[test]
+    fn origin_label_names_layer_and_identifier_never_a_value() {
+        let source: Arc<str> = Arc::from("token = \"secret\"\n");
+        let file = Origin::file("/tmp/app.toml".into(), Span { start: 8, end: 16 }, source);
+        assert_eq!(file.label(), "file:/tmp/app.toml");
+        assert_eq!(
+            Origin::env(vec!["APP__TOKEN".into()]).label(),
+            "env:APP__TOKEN"
+        );
+        assert_eq!(Origin::url("token").label(), "url:token");
+        assert_eq!(Origin::r#override("token").label(), "override:token");
+        assert_eq!(Origin::default("token").label(), "default:token");
     }
 
     #[test]

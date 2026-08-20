@@ -10,6 +10,11 @@
 //! 3. Finalize the merged table against the schema (defaults +
 //!    required-field and type checks, via [`crate::schema_walk`])
 //!
+//! Each stage emits structured `tracing` events (target `"clapfig"`):
+//! discovery probes, parse, layer construction, overlay wins (origins and
+//! value types, never values), defaults filled, validation. `debug` is
+//! per-stage summaries; `info` and above stay silent on a healthy load.
+//!
 //! The layer order is configurable via [`ResolveInput::layer_order`]. Both
 //! entry points — `Clapfig::builder(schema)` and the derive-driven
 //! `Clapfig::typed::<C>()` — thread in the same [`Schema`]; the typed path
@@ -156,6 +161,8 @@ pub(crate) fn resolve(
     let default_order = default_layer_order();
     let order = input.layer_order.as_deref().unwrap_or(&default_order);
 
+    crate::trace::discovery_complete(&input.discovery);
+
     // Files layer: parse → (optionally) normalize → validate → merge.
     // Validation runs against the parsed Table — never the raw text — so
     // normalized keys are checked in the same form they will reach the merge.
@@ -196,6 +203,7 @@ pub(crate) fn resolve(
                     source: Box::new(e),
                     source_text: Some(Arc::clone(&source)),
                 })?;
+            crate::trace::parsed_file(path, adapter.name());
             let mut table = match parsed.value {
                 Value::Map(map) => map,
                 other => {
@@ -233,6 +241,7 @@ pub(crate) fn resolve(
             let file_origins = origin_map_from_file(&table, &spans, path, &source);
             (t, origins) = deep_merge(t, table, origins, file_origins);
         }
+        crate::trace::files_layer_constructed(input.files.len(), t.len());
         (t, origins)
     } else {
         (Map::new(), OriginMap::new())
@@ -275,29 +284,36 @@ pub(crate) fn resolve(
         collected_unknowns.append(&mut env_filtered);
     }
     let env_layer = env_layer.map(|(table, _, winners)| {
+        crate::trace::env_layer_constructed(table.len());
         let origins = origin_map_from_env(&table, &winners);
         (table, origins)
     });
 
-    // URL layer
+    // URL / CLI layers. Construction and the `* layer constructed` summary
+    // both gate on membership, matching files and env: omitting a layer
+    // excludes it entirely, so a populated-but-omitted input must not
+    // narrate a layer that will never merge.
     #[cfg(feature = "url")]
-    let url_layer = if input.url_overrides.is_empty() {
+    let url_layer = if !order.contains(&Layer::Url) || input.url_overrides.is_empty() {
         None
     } else {
-        Some(overrides::overrides_to_table_with_original_keys(
+        let layer = overrides::overrides_to_table_with_original_keys(
             &normalize_override_keys(&input.url_overrides, input.normalize_keys),
             |k| Origin::url(k),
-        ))
+        );
+        crate::trace::url_layer_constructed(layer.0.len());
+        Some(layer)
     };
 
-    // CLI layer
-    let cli_layer = if input.cli_overrides.is_empty() {
+    let cli_layer = if !order.contains(&Layer::Cli) || input.cli_overrides.is_empty() {
         None
     } else {
-        Some(overrides::overrides_to_table_with_original_keys(
+        let layer = overrides::overrides_to_table_with_original_keys(
             &normalize_override_keys(&input.cli_overrides, input.normalize_keys),
             |k| Origin::r#override(k),
-        ))
+        );
+        crate::trace::cli_layer_constructed(layer.0.len());
+        Some(layer)
     };
 
     // Merge layers in the specified order (first = lowest priority)
@@ -315,6 +331,7 @@ pub(crate) fn resolve(
             (merged, origins) = deep_merge(merged, t, origins, layer_origins);
         }
     }
+    crate::trace::merge_complete(merged.len());
 
     // Schema-driven default injection: populate the table from the schema's
     // declared defaults so `finalize` only has to check required fields.
@@ -322,6 +339,7 @@ pub(crate) fn resolve(
     schema_walk::fill_defaults_into(&mut merged, &mut origins, input.schema);
 
     let output = schema_walk::finalize(merged, &origins, input.schema, &input.discovery)?;
+    crate::trace::validation_complete();
     Ok((output, collected_unknowns))
 }
 
