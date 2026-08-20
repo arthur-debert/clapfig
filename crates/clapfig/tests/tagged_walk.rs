@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use clapfig::format::{FormatAdapter, TomlAdapter};
 use clapfig::runtime::{Field, Schema, Shape};
 use clapfig::types::{InputType, SearchPath};
 use clapfig::{Clapfig, ClapfigError, UnknownKeyContext, UnknownKeyDecision, value::Value};
@@ -406,6 +407,202 @@ fn nested_tagged_cli_overrides_from_matches_tag_and_variant_leaves() {
     let block = table["block"].as_map().unwrap();
     assert_eq!(block["kind"], Value::String("rust".into()));
     assert_eq!(block["mount"], Value::String(".".into()));
+}
+
+fn array_of_tagged_schema() -> Schema {
+    Schema::object("App")
+        .field("blocks", Shape::array("blocks", block_shape()))
+        .build()
+}
+
+fn map_of_array_of_tagged_schema() -> Schema {
+    Schema::object("App")
+        .field(
+            "groups",
+            Field::map_of(Shape::array("blocks", block_shape())),
+        )
+        .build()
+}
+
+#[test]
+fn array_of_tagged_loads_two_entries_with_different_discriminators() {
+    let table = load_file(
+        array_of_tagged_schema().into(),
+        "[[blocks]]\nkind = \"rust\"\nmount = \".\"\n[[blocks]]\nkind = \"payload\"\nmount = \"/data\"\nartifact = \"out\"\n",
+    )
+    .unwrap();
+    let items = table["blocks"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0].as_map().unwrap()["kind"],
+        Value::String("rust".into())
+    );
+    assert_eq!(
+        items[1].as_map().unwrap()["kind"],
+        Value::String("payload".into())
+    );
+}
+
+#[test]
+fn array_of_tagged_unknown_discriminator_is_invalid_value_on_indexed_tag() {
+    let err = load_file(
+        array_of_tagged_schema().into(),
+        "[[blocks]]\nkind = \"rus\"\nmount = \".\"\n",
+    )
+    .unwrap_err();
+    match err {
+        ClapfigError::InvalidValue {
+            key,
+            reason,
+            origin,
+        } => {
+            assert_eq!(key, "blocks[0].kind");
+            assert!(reason.contains("not in allowed set"), "{reason}");
+            assert_eq!(origin.input_type, Some(InputType::File));
+        }
+        other => panic!("expected InvalidValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn array_of_tagged_missing_tag_is_missing_required() {
+    let err = load_file(
+        array_of_tagged_schema().into(),
+        "[[blocks]]\nmount = \".\"\n",
+    )
+    .unwrap_err();
+    match err {
+        ClapfigError::MissingRequired { key, .. } => assert_eq!(key, "blocks[0].kind"),
+        other => panic!("expected MissingRequired, got {other:?}"),
+    }
+}
+
+#[test]
+fn array_of_tagged_branch_exclusive_key_is_unknown_at_phase2() {
+    let err = load_file(
+        array_of_tagged_schema().into(),
+        "[[blocks]]\nkind = \"rust\"\nmount = \".\"\nartifact = \"x\"\n",
+    )
+    .unwrap_err();
+    let keys = err.unknown_keys().expect("UnknownKeys");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].key, "blocks[0].artifact");
+}
+
+#[test]
+fn array_of_tagged_true_unknown_is_rejected_pre_merge() {
+    let err = load_file(
+        array_of_tagged_schema().into(),
+        "[[blocks]]\nkind = \"rust\"\nmount = \".\"\nnot_a_field = 1\n",
+    )
+    .unwrap_err();
+    let keys = err.unknown_keys().expect("UnknownKeys");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].key, "blocks[0].not_a_field");
+}
+
+#[test]
+fn map_of_array_of_tagged_loads() {
+    let table = load_file(
+        map_of_array_of_tagged_schema().into(),
+        "[[groups.core]]\nkind = \"rust\"\nmount = \".\"\n[[groups.core]]\nkind = \"off\"\n",
+    )
+    .unwrap();
+    let core = table["groups"].as_map().unwrap()["core"]
+        .as_array()
+        .unwrap();
+    assert_eq!(core.len(), 2);
+    assert_eq!(
+        core[0].as_map().unwrap()["kind"],
+        Value::String("rust".into())
+    );
+    assert_eq!(
+        core[1].as_map().unwrap()["kind"],
+        Value::String("off".into())
+    );
+}
+
+fn uncomment_tagged_variant(template: &str, discriminator: &str) -> String {
+    let uncommented: String = template
+        .lines()
+        .map(|line| line.strip_prefix('#').unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("<key>", "core");
+    let needle = format!("kind = \"{discriminator}\"");
+    let mut current = String::new();
+    let mut chosen = String::new();
+    for line in uncommented.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[[") && trimmed.ends_with("]]") && !current.trim().is_empty() {
+            if current.contains(&needle) {
+                chosen = std::mem::take(&mut current);
+                break;
+            }
+            current.clear();
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if chosen.is_empty() && current.contains(&needle) {
+        chosen = current;
+    }
+    chosen
+}
+
+#[test]
+fn toml_template_array_of_tagged_uncommented_one_variant_at_a_time_loads() {
+    let schema = array_of_tagged_schema();
+    let text = TomlAdapter
+        .template(&Shape::Object(schema.clone()))
+        .unwrap();
+    for kind in ["rust", "payload", "off"] {
+        let uncommented = uncomment_tagged_variant(&text, kind);
+        let table = load_file(schema.clone().into(), &uncommented)
+            .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{uncommented}\nfrom {text}"));
+        let items = table["blocks"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{uncommented}");
+        assert_eq!(
+            items[0].as_map().unwrap()["kind"],
+            Value::String(kind.into())
+        );
+    }
+}
+
+#[test]
+fn toml_template_map_of_array_of_tagged_uncommented_one_variant_at_a_time_loads() {
+    let schema = map_of_array_of_tagged_schema();
+    let text = TomlAdapter
+        .template(&Shape::Object(schema.clone()))
+        .unwrap();
+    for kind in ["rust", "payload", "off"] {
+        let uncommented = uncomment_tagged_variant(&text, kind);
+        let table = load_file(schema.clone().into(), &uncommented)
+            .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{uncommented}\nfrom {text}"));
+        let groups = table["groups"].as_map().unwrap();
+        let entry = groups
+            .get("<key>")
+            .or_else(|| groups.values().next())
+            .unwrap();
+        let items = entry.as_array().unwrap();
+        assert_eq!(items.len(), 1, "{uncommented}");
+        assert_eq!(
+            items[0].as_map().unwrap()["kind"],
+            Value::String(kind.into())
+        );
+    }
+}
+
+#[test]
+fn map_of_array_of_tagged_branch_exclusive_key_is_unknown_at_phase2() {
+    let err = load_file(
+        map_of_array_of_tagged_schema().into(),
+        "[[groups.core]]\nkind = \"rust\"\nmount = \".\"\nartifact = \"x\"\n",
+    )
+    .unwrap_err();
+    let keys = err.unknown_keys().expect("UnknownKeys");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].key, "groups.core[0].artifact");
 }
 
 #[test]

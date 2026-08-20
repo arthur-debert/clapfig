@@ -2480,4 +2480,126 @@ mod tests {
             "intra-shape and inter-shape exclusive keys must be reported once: {paths:?}"
         );
     }
+
+    fn array_of_tagged_schema() -> Schema {
+        Schema::object("App")
+            .field(
+                "blocks",
+                Shape::array("blocks", Shape::from(tagged_block())),
+            )
+            .build()
+    }
+
+    fn map_of_array_of_tagged_schema() -> Schema {
+        Schema::object("App")
+            .field(
+                "groups",
+                RtField::map_of(Shape::array("blocks", Shape::from(tagged_block()))),
+            )
+            .build()
+    }
+
+    fn exclusive_paths(table: &Map, schema: &Schema) -> Vec<String> {
+        let mut unknown = Vec::new();
+        collect_branch_exclusive_root(table, DocumentRoot::Object(schema), &mut unknown);
+        unknown.into_iter().map(|u| u.path).collect()
+    }
+
+    #[test]
+    fn array_of_tagged_phase1_flags_true_unknown_and_skips_branch_exclusive() {
+        let schema = array_of_tagged_schema();
+        let table = parse(
+            "[[blocks]]\nkind = \"rust\"\nmount = \".\"\nartifact = \"x\"\nnot_a_field = 1\n",
+        );
+        assert_eq!(
+            unknown_paths(&table, &schema),
+            vec!["blocks[0].not_a_field"]
+        );
+        assert_eq!(exclusive_paths(&table, &schema), vec!["blocks[0].artifact"]);
+    }
+
+    #[test]
+    fn map_of_array_of_tagged_phase1_and_phase2_index_the_entry() {
+        let schema = map_of_array_of_tagged_schema();
+        let table = parse(
+            "[[groups.core]]\nkind = \"rust\"\nmount = \".\"\nartifact = \"x\"\nnot_a_field = 1\n",
+        );
+        assert_eq!(
+            unknown_paths(&table, &schema),
+            vec!["groups.core[0].not_a_field"]
+        );
+        assert_eq!(
+            exclusive_paths(&table, &schema),
+            vec!["groups.core[0].artifact"]
+        );
+    }
+
+    #[test]
+    fn array_of_tagged_fill_defaults_only_selected_variant() {
+        let tagged = crate::runtime::Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .field("mount", RtField::string().default("."))
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .field("artifact", RtField::string().default("none"))
+                    .build(),
+            )
+            .build();
+        let schema = Schema::object("App")
+            .field("blocks", Shape::array("blocks", Shape::from(tagged)))
+            .build();
+        let mut table = parse("[[blocks]]\nkind = \"rust\"\n");
+        fill(&mut table, &schema);
+        let item = table["blocks"].as_array().unwrap()[0].as_map().unwrap();
+        assert_eq!(item.get("mount"), Some(&Value::String(".".into())));
+        assert!(!item.contains_key("artifact"));
+    }
+
+    #[test]
+    fn array_of_tagged_finalize_unknown_discriminator_and_missing_tag() {
+        let schema = array_of_tagged_schema();
+        let err = finalize(
+            parse("[[blocks]]\nkind = \"rus\"\nmount = \".\"\n"),
+            &schema,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::InvalidValue { key, reason, .. } => {
+                assert_eq!(key, "blocks[0].kind");
+                assert!(reason.contains("not in allowed set"), "{reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+        let err = finalize(parse("[[blocks]]\nmount = \".\"\n"), &schema).unwrap_err();
+        match err {
+            ClapfigError::MissingRequired { key, .. } => {
+                assert_eq!(key, "blocks[0].kind");
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_of_tagged_finalize_good_items() {
+        let schema = array_of_tagged_schema();
+        let out = finalize(
+            parse("[[blocks]]\nkind = \"rust\"\nmount = \".\"\n[[blocks]]\nkind = \"off\"\n"),
+            &schema,
+        )
+        .unwrap();
+        let items = out["blocks"].as_array().unwrap();
+        assert_eq!(
+            items[0].as_map().unwrap()["kind"],
+            Value::String("rust".into())
+        );
+        assert_eq!(
+            items[1].as_map().unwrap()["kind"],
+            Value::String("off".into())
+        );
+    }
 }
