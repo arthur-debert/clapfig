@@ -111,7 +111,7 @@ pub fn set_in_document(
     let existing = parsed.as_ref().map(|p| &p.value);
 
     let disc_shape;
-    let field = match persist_target(shape, &canonical, existing) {
+    let field = match persist_target(shape, &canonical, existing, normalize_keys) {
         PersistTarget::Shape(s) => Some(s),
         PersistTarget::Discriminator(tagged) => {
             disc_shape = crate::runtime::Shape::leaf(tagged.discriminator_leaf_type());
@@ -482,14 +482,23 @@ fn persist_target<'a>(
     shape: &'a crate::runtime::Shape,
     dotted: &str,
     existing: Option<&Value>,
+    normalize_keys: bool,
 ) -> PersistTarget<'a> {
     match shape {
-        crate::runtime::Shape::Object(schema) => {
-            persist_target_schema(schema, dotted, existing.and_then(Value::as_map), "")
-        }
-        crate::runtime::Shape::Tagged(tagged) => {
-            persist_target_tagged(tagged, dotted, existing.and_then(Value::as_map), "")
-        }
+        crate::runtime::Shape::Object(schema) => persist_target_schema(
+            schema,
+            dotted,
+            existing.and_then(Value::as_map),
+            "",
+            normalize_keys,
+        ),
+        crate::runtime::Shape::Tagged(tagged) => persist_target_tagged(
+            tagged,
+            dotted,
+            existing.and_then(Value::as_map),
+            "",
+            normalize_keys,
+        ),
         crate::runtime::Shape::Map(_)
         | crate::runtime::Shape::Leaf(_)
         | crate::runtime::Shape::Array(_) => PersistTarget::Missing,
@@ -556,6 +565,7 @@ fn persist_target_schema<'a>(
     dotted: &str,
     table: Option<&crate::value::Map>,
     prefix: &str,
+    normalize_keys: bool,
 ) -> PersistTarget<'a> {
     let Some((head, rest)) = split_first(dotted) else {
         return PersistTarget::Missing;
@@ -566,8 +576,9 @@ fn persist_target_schema<'a>(
     persist_target_in_shape(
         &nf.field,
         rest,
-        table.and_then(|t| t.get(head)),
+        table.and_then(|t| persist_table_get(t, head, normalize_keys)),
         &join_prefix(prefix, head),
+        normalize_keys,
     )
 }
 
@@ -576,6 +587,7 @@ fn persist_target_in_shape<'a>(
     rest: &str,
     value: Option<&Value>,
     walked: &str,
+    normalize_keys: bool,
 ) -> PersistTarget<'a> {
     if rest.is_empty() {
         return if shape.is_value_field() {
@@ -585,12 +597,20 @@ fn persist_target_in_shape<'a>(
         };
     }
     match shape {
-        crate::runtime::Shape::Object(inner) => {
-            persist_target_schema(inner, rest, value.and_then(Value::as_map), walked)
-        }
-        crate::runtime::Shape::Tagged(tagged) => {
-            persist_target_tagged(tagged, rest, value.and_then(Value::as_map), walked)
-        }
+        crate::runtime::Shape::Object(inner) => persist_target_schema(
+            inner,
+            rest,
+            value.and_then(Value::as_map),
+            walked,
+            normalize_keys,
+        ),
+        crate::runtime::Shape::Tagged(tagged) => persist_target_tagged(
+            tagged,
+            rest,
+            value.and_then(Value::as_map),
+            walked,
+            normalize_keys,
+        ),
         _ => PersistTarget::Missing,
     }
 }
@@ -600,6 +620,7 @@ fn persist_target_tagged<'a>(
     dotted: &str,
     table: Option<&crate::value::Map>,
     prefix: &str,
+    normalize_keys: bool,
 ) -> PersistTarget<'a> {
     let Some((head, rest)) = split_first(dotted) else {
         return PersistTarget::Missing;
@@ -612,14 +633,14 @@ fn persist_target_tagged<'a>(
         };
     }
     let section = tagged_section(prefix, tagged);
-    if let Some(variant) = table.and_then(|t| tagged.selected(t)) {
+    if let Some(variant) = table.and_then(|t| persist_selected_variant(tagged, t, normalize_keys)) {
         if variant.schema.fields.iter().all(|f| f.name != head) {
             return PersistTarget::Unaddressable {
                 section,
                 kind: "a tagged union",
             };
         }
-        return persist_target_schema(&variant.schema, dotted, table, prefix);
+        return persist_target_schema(&variant.schema, dotted, table, prefix, normalize_keys);
     }
     let declared = tagged.field_shapes(head);
     if declared.is_empty() {
@@ -634,13 +655,13 @@ fn persist_target_tagged<'a>(
         };
     }
     let walked = join_prefix(prefix, head);
-    let child = table.and_then(|t| t.get(head));
+    let child = table.and_then(|t| persist_table_get(t, head, normalize_keys));
     if rest.is_empty() {
         return unambiguous_value_shapes(declared, section);
     }
     let mut agreed: Option<PersistTarget<'a>> = None;
     for shape in declared {
-        let next = persist_target_in_shape(shape, rest, child, &walked);
+        let next = persist_target_in_shape(shape, rest, child, &walked, normalize_keys);
         agreed = Some(match (agreed, next) {
             (None, t) => t,
             (Some(PersistTarget::Shape(a)), PersistTarget::Shape(b))
@@ -662,6 +683,34 @@ fn persist_target_tagged<'a>(
         });
     }
     agreed.unwrap_or(PersistTarget::Missing)
+}
+
+/// Look up a schema field name in a raw persist document. With
+/// `normalize_keys`, dash and underscore spellings are equivalent — the
+/// same rule [`resolve_document_path`] uses — so a kebab-case tagged
+/// document still selects the variant for `block_kind` stored as
+/// `block-kind`.
+fn persist_table_get<'a>(
+    table: &'a crate::value::Map,
+    schema_key: &str,
+    normalize_keys: bool,
+) -> Option<&'a Value> {
+    if normalize_keys {
+        resolve_table_key(table, schema_key).and_then(|k| table.get(k))
+    } else {
+        table.get(schema_key)
+    }
+}
+
+fn persist_selected_variant<'a>(
+    tagged: &'a crate::runtime::TaggedShape,
+    table: &crate::value::Map,
+    normalize_keys: bool,
+) -> Option<&'a crate::runtime::TaggedVariant> {
+    match persist_table_get(table, &tagged.tag, normalize_keys) {
+        Some(Value::String(name)) => tagged.variant(name),
+        _ => None,
+    }
 }
 
 fn unambiguous_value_shapes<'a>(
@@ -2212,5 +2261,66 @@ mod tests {
         )
         .unwrap();
         assert!(result.contains("artifact = \"123\""), "{result}");
+    }
+
+    fn kebab_tagged_block() -> Shape {
+        use crate::runtime::{Field, Schema};
+        Shape::from(
+            Shape::tagged("Block", "block_kind")
+                .variant(
+                    "rust",
+                    Schema::object("Rust")
+                        .field("mount", Field::string())
+                        .field("crate_path", Field::string().optional())
+                        .build(),
+                )
+                .variant(
+                    "payload",
+                    Schema::object("Payload")
+                        .field("mount", Field::string())
+                        .field("artifact", Field::string())
+                        .build(),
+                )
+                .build(),
+        )
+    }
+
+    fn nested_kebab_tagged_app() -> Shape {
+        use crate::runtime::Schema;
+        Shape::from(
+            Schema::object("App")
+                .field("site_block", kebab_tagged_block())
+                .build(),
+        )
+    }
+
+    #[test]
+    fn set_variant_exclusive_field_in_kebab_tagged_document() {
+        let result = set_in_document(
+            &TomlAdapter,
+            &kebab_tagged_block(),
+            Some("block-kind = \"payload\"\nmount = \".\"\nartifact = \"old\"\n"),
+            "artifact",
+            "123",
+            true,
+        )
+        .unwrap();
+        assert!(result.contains("artifact = \"123\""), "{result}");
+        assert!(result.contains("block-kind = \"payload\""), "{result}");
+    }
+
+    #[test]
+    fn set_nested_variant_exclusive_field_in_kebab_tagged_document() {
+        let result = set_in_document(
+            &TomlAdapter,
+            &nested_kebab_tagged_app(),
+            Some("[site-block]\nblock-kind = \"payload\"\nmount = \".\"\nartifact = \"old\"\n"),
+            "site-block.artifact",
+            "123",
+            true,
+        )
+        .unwrap();
+        assert!(result.contains("artifact = \"123\""), "{result}");
+        assert!(result.contains("block-kind = \"payload\""), "{result}");
     }
 }
