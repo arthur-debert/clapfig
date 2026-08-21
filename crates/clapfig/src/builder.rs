@@ -866,7 +866,7 @@ impl Builder {
                 }
             }
             ConfigAction::Schema { output } => {
-                let value = crate::json_schema::generate_from_shape(self.schema.as_shape());
+                let value = crate::json_schema::generate_schema_ref(self.schema.as_shape());
                 let schema = serde_json::to_string_pretty(&value)
                     .expect("serde_json::Value serialization is infallible");
                 match output {

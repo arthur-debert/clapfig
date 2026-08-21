@@ -10,4 +10,4 @@
 
 - `Clapfig::typed::<C>()` is now generic over `DocumentRoot` (a named-field `Schema` struct, or `BTreeMap`/`HashMap<String, T>` where `T: Schema`). Unit-only enums remain valid *field* types and still derive `Schema`; they are not legal document roots.
 - `FormatAdapter::template` takes `&Shape`. Object-root callers wrap `Shape::Object(schema)` (or pass the shape the builder already holds).
-- `json_schema::generate_from_shape` is the shape-node exporter; `generate_schema(&Schema)` remains the object-root convenience.
+- `json_schema::generate_schema` takes `impl Into<Shape>` (object, map, and tagged roots). Object-root callers pass a `Schema`. There is no object-root convenience twin.

@@ -519,6 +519,12 @@ struct PdfDoc {
 }
 
 #[test]
+#[should_panic(expected = "is a unit-only enum")]
+fn unit_enum_schema_accessor_fails_loudly() {
+    let _ = PdfPageSize::schema();
+}
+
+#[test]
 fn unit_enum_schema_carries_variant_names_post_rename() {
     let s = PdfPageSize::schema_static();
     assert_eq!(s.enum_variants, &["a4", "letter", "legal"]);

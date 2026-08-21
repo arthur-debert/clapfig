@@ -181,7 +181,7 @@ fn root_map_type_error_names_origin() {
 
 #[test]
 fn json_schema_additional_properties_at_document_root() {
-    let value = clapfig::json_schema::generate_from_shape(&root_map());
+    let value = clapfig::json_schema::generate_schema(root_map());
     assert_eq!(value["type"], "object");
     assert!(
         value.get("properties").is_none(),
