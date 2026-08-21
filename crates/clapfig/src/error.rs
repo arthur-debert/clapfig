@@ -242,25 +242,28 @@ pub enum ClapfigError {
         suggestion: Option<String>,
     },
 
-    /// A `config set` action key targets a
-    /// [`Shape::Array`](crate::runtime::Shape::Array) /
+    /// A `config set` action key targets a path a dotted CLI key cannot
+    /// address: a [`Shape::Array`](crate::runtime::Shape::Array) /
     /// [`Shape::Map`](crate::runtime::Shape::Map) of objects (or a root
-    /// map) or a path inside one.
-    /// A dotted CLI key cannot say which entry it means — entry keys and
-    /// array indexes are user data, not schema fields — so these paths
-    /// are deliberately not settable and the config file is the surface
-    /// for editing them. (An indexed path syntax like `servers[0].host`
-    /// is a possible future extension.)
+    /// map) or a path inside one — entry keys and array indexes are user
+    /// data, not schema fields — or a variant-specific / structurally
+    /// conflicting field of a [`Shape::Tagged`](crate::runtime::Shape::Tagged)
+    /// union (no valid discriminator selects a variant, or the selected
+    /// variant does not declare the key). These paths are deliberately
+    /// not settable; the config file is the surface for editing them.
+    /// (An indexed path syntax like `servers[0].host` is a possible
+    /// future extension.)
     #[error(
         "Key '{key}' cannot be set: '{section}' is {kind} of sections, and keys inside it cannot be addressed with a dotted CLI key — edit the config file directly"
     )]
     UnaddressableKey {
         /// The dotted action key as the caller supplied it.
         key: String,
-        /// Canonical dotted path of the array/map-of-objects section the
-        /// key runs into.
+        /// Canonical dotted path of the array, map-of-objects, or tagged
+        /// union the key runs into.
         section: String,
-        /// `"an array"` or `"a map"` — which container kind refused.
+        /// `"an array"`, `"a map"`, or `"a tagged union"` — which kind
+        /// refused.
         kind: &'static str,
     },
 

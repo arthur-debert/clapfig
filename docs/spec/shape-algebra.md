@@ -414,24 +414,26 @@ rule**. Three cases:
    closed enum leaf: settable, validated against the variant set. An
    unknown discriminator is `InvalidValue` on the tag (allowed set),
    the same wording a unit-enum leaf already uses.
-2. **The document already carries a discriminator that selects a
-   variant.** Address that variant's fields normally. A key the selected
-   variant does not declare is `UnaddressableKey`.
-3. **No discriminator present.** A key declared by *every* variant is
-   addressable when all declarations agree structurally — `mount` as a
-   string on every variant is unambiguous. A key declared by *some*
-   variants is `UnaddressableKey`: variant-specific, refuse until a
-   discriminator selects a branch. A key declared by none is
-   `KeyNotFound`.
+2. **A valid discriminator already selects a variant.** Address that
+   variant's fields normally. A key the selected variant does not
+   declare is `UnaddressableKey`.
+3. **No valid discriminator selects a variant** (the tag is missing,
+   unknown, or mistyped — a non-string value, or a string that names
+   no variant). A key declared by *every* variant is addressable when
+   all declarations agree structurally — `mount` as a string on every
+   variant is unambiguous. A key declared by *some* variants is
+   `UnaddressableKey`: variant-specific, refuse until a discriminator
+   selects a branch. A key declared by none is `KeyNotFound`.
 
 This is not the unknown-key policy. Phase-1 unknown-key treats a key as
-known if *any* variant declares it; persist with no discriminator only
-addresses a key when *every* variant declares it and the declarations
-agree. The two consumers answer different questions and stay distinct.
+known if *any* variant declares it; persist with no valid discriminator
+only addresses a key when *every* variant declares it and the
+declarations agree. The two consumers answer different questions and
+stay distinct.
 
 Keys whose path segment is user data (map entries) keep today's targeted
 refuse. This epic does not invent addressing for map-entry keys, or for
-variant-specific keys given an unset discriminator.
+variant-specific keys given no valid discriminator.
 
 ### Public surface
 
