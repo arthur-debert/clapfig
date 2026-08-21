@@ -230,7 +230,7 @@ fn nested_and_map_of_tagged_json_schema_compose() {
         serde_json::json!({})
     );
 
-    let listed = clapfig::json_schema::generate_schema(Plugins::schema());
+    let listed = clapfig::json_schema::generate_schema(Plugins::shape());
     let items = &listed["properties"]["plugins"]["items"];
     assert!(items.get("discriminator").is_none(), "{items}");
     assert_eq!(items["oneOf"][0]["properties"]["kind"]["const"], "rust");
