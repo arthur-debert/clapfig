@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use crate::error::ClapfigError;
 use crate::format::{ConfigPath, PathSegment, Span};
-use crate::runtime::{DocumentRoot, Schema, Shape, TaggedShape};
+use crate::runtime::{DocumentRoot, KeyAcrossVariants, Schema, Shape, TaggedShape};
 use crate::types::InputType;
 use crate::value::{Map, Value};
 
@@ -653,6 +653,20 @@ fn strip_root_map_entry(section: &str, entry: Option<&str>) -> String {
     strip_first_segment(section).to_string()
 }
 
+/// First dotted segment and remainder.
+///
+/// `None` when `dotted` contains an empty segment (leading, trailing, or
+/// doubled `.`). The wholly empty path is the document root and is
+/// handled by the caller before this split. A path with no `.` is one
+/// segment with an empty remainder.
+fn split_strict_path(dotted: &str) -> Option<(&str, &str)> {
+    match dotted.split_once('.') {
+        Some((head, rest)) if !head.is_empty() && !rest.is_empty() => Some((head, rest)),
+        Some(_) => None,
+        None => Some((dotted, "")),
+    }
+}
+
 fn resolve_path_kind_root(root: DocumentRoot<'_>, dotted: &str) -> PathKind {
     match root {
         DocumentRoot::Object(schema) => resolve_path_kind(schema, dotted),
@@ -671,18 +685,22 @@ fn resolve_tagged_kind(tagged: &TaggedShape, rest: &str) -> PathKind {
     if rest.is_empty() {
         return PathKind::Section;
     }
-    if rest == tagged.tag {
-        return PathKind::Leaf;
-    }
-    if rest.starts_with(&format!("{}.", tagged.tag)) {
+    let Some((head, remaining)) = split_strict_path(rest) else {
         return PathKind::Unknown;
+    };
+    match tagged.resolve_key(head) {
+        KeyAcrossVariants::Tag => {
+            if remaining.is_empty() {
+                PathKind::Leaf
+            } else {
+                PathKind::Unknown
+            }
+        }
+        KeyAcrossVariants::Absent => PathKind::Unknown,
+        KeyAcrossVariants::Every(shapes) | KeyAcrossVariants::Partial(shapes) => {
+            union_path_kind(shapes.into_iter().map(|s| path_kind_in_shape(s, remaining)))
+        }
     }
-    union_path_kind(
-        tagged
-            .variants
-            .iter()
-            .map(|v| resolve_path_kind(&v.schema, rest)),
-    )
 }
 
 /// Section in any variant wins (valid `strict_at` target). Leaf only
@@ -710,61 +728,60 @@ pub(crate) fn resolve_path_kind(schema: &Schema, dotted: &str) -> PathKind {
     if dotted.is_empty() {
         return PathKind::Section;
     }
-    let mut current = schema;
-    let mut segments = dotted.split('.').peekable();
-    while let Some(seg) = segments.next() {
-        let Some(field) = current.fields.iter().find(|f| f.name == seg) else {
-            return PathKind::Unknown;
-        };
-        match &field.field {
-            crate::runtime::Shape::Leaf(_) => {
-                return if segments.peek().is_some() {
-                    PathKind::Unknown
-                } else {
-                    PathKind::Leaf
-                };
+    let Some((head, rest)) = split_strict_path(dotted) else {
+        return PathKind::Unknown;
+    };
+    let Some(field) = schema.fields.iter().find(|f| f.name == head) else {
+        return PathKind::Unknown;
+    };
+    path_kind_in_shape(&field.field, rest)
+}
+
+fn path_kind_in_shape(shape: &Shape, rest: &str) -> PathKind {
+    match shape {
+        Shape::Leaf(_) => {
+            if rest.is_empty() {
+                PathKind::Leaf
+            } else {
+                PathKind::Unknown
             }
-            shape if shape.is_value_field() => {
-                return if segments.peek().is_some() {
-                    PathKind::Unknown
-                } else {
-                    PathKind::Leaf
-                };
+        }
+        shape if shape.is_value_field() => {
+            if rest.is_empty() {
+                PathKind::Leaf
+            } else {
+                PathKind::Unknown
             }
-            crate::runtime::Shape::Object(nested) => {
-                if segments.peek().is_none() {
-                    return PathKind::Section;
-                }
-                current = nested;
+        }
+        Shape::Object(nested) => {
+            if rest.is_empty() {
+                PathKind::Section
+            } else {
+                resolve_path_kind(nested, rest)
             }
-            crate::runtime::Shape::Array(_) | crate::runtime::Shape::Map(_) => {
-                if segments.peek().is_none() {
-                    return PathKind::Section;
-                }
-                let rest = remaining_dotted(segments);
-                return match field.field.peel_containers() {
-                    crate::runtime::Shape::Object(nested) => resolve_path_kind(nested, &rest),
-                    crate::runtime::Shape::Tagged(tagged) => resolve_tagged_kind(tagged, &rest),
-                    crate::runtime::Shape::Leaf(_) => PathKind::Unknown,
-                    crate::runtime::Shape::Array(_) | crate::runtime::Shape::Map(_) => {
+        }
+        Shape::Array(_) | Shape::Map(_) => {
+            if rest.is_empty() {
+                PathKind::Section
+            } else {
+                match shape.peel_containers() {
+                    Shape::Object(nested) => resolve_path_kind(nested, rest),
+                    Shape::Tagged(tagged) => resolve_tagged_kind(tagged, rest),
+                    Shape::Leaf(_) => PathKind::Unknown,
+                    Shape::Array(_) | Shape::Map(_) => {
                         unreachable!("peel_containers strips Array/Map")
                     }
-                };
-            }
-            crate::runtime::Shape::Tagged(tagged) => {
-                if segments.peek().is_none() {
-                    return PathKind::Section;
                 }
-                return resolve_tagged_kind(tagged, &remaining_dotted(segments));
+            }
+        }
+        Shape::Tagged(tagged) => {
+            if rest.is_empty() {
+                PathKind::Section
+            } else {
+                resolve_tagged_kind(tagged, rest)
             }
         }
     }
-    PathKind::Section
-}
-
-fn remaining_dotted<'a>(segments: impl Iterator<Item = &'a str>) -> String {
-    let parts: Vec<&str> = segments.collect();
-    parts.join(".")
 }
 
 /// Validate a list of `(path, strict)` overrides against a schema and
@@ -1176,6 +1193,119 @@ mod tests {
             resolve_path_kind_root(DocumentRoot::Tagged(&tagged), "params"),
             PathKind::Section
         );
+    }
+
+    #[test]
+    fn resolve_path_kind_rejects_empty_segments() {
+        let schema = Schema::object("App")
+            .nested(
+                "database",
+                Schema::object("Database").field("url", Field::string().optional()),
+            )
+            .field(
+                "containers",
+                Field::array_of_type(Schema::object("Item").nested(
+                    "policy",
+                    Schema::object("Policy").field("name", Field::string().optional()),
+                )),
+            )
+            .field(
+                "groups",
+                Field::map_of(Schema::object("Item").field("timeout", Field::integer().optional())),
+            )
+            .field(
+                "block",
+                Shape::from(
+                    Shape::tagged("Block", "kind")
+                        .variant(
+                            "rust",
+                            Schema::object("Rust")
+                                .field("mount", Field::string())
+                                .build(),
+                        )
+                        .variant(
+                            "payload",
+                            Schema::object("Payload")
+                                .field("artifact", Field::string())
+                                .build(),
+                        )
+                        .build(),
+                ),
+            )
+            .build();
+
+        assert_eq!(resolve_path_kind(&schema, ""), PathKind::Section);
+        for path in [
+            "database.",
+            ".database",
+            "database..url",
+            "containers.",
+            "groups.timeout.",
+            "block.",
+            "block.kind.",
+            "block.mount.",
+        ] {
+            assert_eq!(
+                resolve_path_kind(&schema, path),
+                PathKind::Unknown,
+                "{path:?} must not resolve"
+            );
+        }
+
+        let tagged = Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .field("mount", Field::string())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .nested(
+                        "meta",
+                        Schema::object("PM").field("artifact", Field::string().optional()),
+                    )
+                    .build(),
+            )
+            .build();
+        assert_eq!(
+            resolve_path_kind_root(DocumentRoot::Tagged(&tagged), ""),
+            PathKind::Section
+        );
+        for path in ["kind.", "mount.", "meta.", ".kind", "kind.."] {
+            assert_eq!(
+                resolve_path_kind_root(DocumentRoot::Tagged(&tagged), path),
+                PathKind::Unknown,
+                "{path:?} must not resolve on a tagged root"
+            );
+        }
+
+        let err = build_strict_overrides_root(
+            &[("database.".into(), false)],
+            false,
+            DocumentRoot::Object(&schema),
+        )
+        .expect_err("trailing separator is not a valid strict_at path");
+        match err {
+            ClapfigError::InvalidStrictPath { path, .. } => {
+                assert_eq!(path, "database.");
+            }
+            other => panic!("expected InvalidStrictPath, got {other:?}"),
+        }
+
+        let tagged_err = build_strict_overrides_root(
+            &[("meta.".into(), false)],
+            false,
+            DocumentRoot::Tagged(&tagged),
+        )
+        .expect_err("trailing separator is not a valid tagged strict_at path");
+        match tagged_err {
+            ClapfigError::InvalidStrictPath { path, .. } => {
+                assert_eq!(path, "meta.");
+            }
+            other => panic!("expected InvalidStrictPath, got {other:?}"),
+        }
     }
 
     fn opposing_meta_tagged() -> crate::runtime::TaggedShape {

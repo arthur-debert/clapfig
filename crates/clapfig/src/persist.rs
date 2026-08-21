@@ -558,14 +558,17 @@ fn unaddressable_in_tagged(
     if rest.is_empty() {
         return None;
     }
-    let (head, _) = split_first(rest)?;
-    if head == tagged.tag {
-        return None;
+    let (head, remaining) = split_first(rest)?;
+    match tagged.resolve_key(head) {
+        crate::runtime::KeyAcrossVariants::Tag | crate::runtime::KeyAcrossVariants::Absent => None,
+        crate::runtime::KeyAcrossVariants::Every(shapes)
+        | crate::runtime::KeyAcrossVariants::Partial(shapes) => {
+            let walked = join_prefix(prefix, head);
+            shapes
+                .into_iter()
+                .find_map(|shape| unaddressable_in_shape(shape, remaining, &walked))
+        }
     }
-    tagged
-        .variants
-        .iter()
-        .find_map(|variant| unaddressable_in_schema(&variant.schema, rest, prefix))
 }
 
 fn persist_target_schema<'a>(
@@ -633,64 +636,82 @@ fn persist_target_tagged<'a>(
     let Some((head, rest)) = split_first(dotted) else {
         return PersistTarget::Missing;
     };
-    if head == tagged.tag {
-        return if rest.is_empty() {
-            PersistTarget::Discriminator(tagged)
-        } else {
-            PersistTarget::Missing
-        };
-    }
     let section = tagged_section(prefix, tagged);
-    if let Some(variant) = table.and_then(|t| persist_selected_variant(tagged, t, normalize_keys)) {
-        if variant.schema.fields.iter().all(|f| f.name != head) {
-            return PersistTarget::Unaddressable {
-                section,
-                kind: "a tagged union",
-            };
+    match tagged.resolve_key(head) {
+        crate::runtime::KeyAcrossVariants::Tag => {
+            if rest.is_empty() {
+                PersistTarget::Discriminator(tagged)
+            } else {
+                PersistTarget::Missing
+            }
         }
-        return persist_target_schema(&variant.schema, dotted, table, prefix, normalize_keys);
-    }
-    let declared = tagged.field_shapes(head);
-    if declared.is_empty() {
-        return PersistTarget::Missing;
-    }
-    // A field missing from some variants is variant-specific: refuse
-    // until a discriminator selects a branch (spec: targeted refuse).
-    if declared.len() != tagged.variants.len() {
-        return PersistTarget::Unaddressable {
-            section,
-            kind: "a tagged union",
-        };
-    }
-    let walked = join_prefix(prefix, head);
-    let child = table.and_then(|t| persist_table_get(t, head, normalize_keys));
-    if rest.is_empty() {
-        return unambiguous_value_shapes(declared, section);
-    }
-    let mut agreed: Option<PersistTarget<'a>> = None;
-    for shape in declared {
-        let next = persist_target_in_shape(shape, rest, child, &walked, normalize_keys);
-        agreed = Some(match (agreed, next) {
-            (None, t) => t,
-            (Some(PersistTarget::Shape(a)), PersistTarget::Shape(b))
-                if same_persist_shape(a, b) =>
+        classification => {
+            if let Some(variant) =
+                table.and_then(|t| persist_selected_variant(tagged, t, normalize_keys))
             {
-                PersistTarget::Shape(a)
+                if variant.schema.fields.iter().all(|f| f.name != head) {
+                    return PersistTarget::Unaddressable {
+                        section,
+                        kind: "a tagged union",
+                    };
+                }
+                return persist_target_schema(
+                    &variant.schema,
+                    dotted,
+                    table,
+                    prefix,
+                    normalize_keys,
+                );
             }
-            (Some(PersistTarget::Discriminator(a)), PersistTarget::Discriminator(b))
-                if a.tag == b.tag =>
-            {
-                PersistTarget::Discriminator(a)
+            let declared = match classification {
+                crate::runtime::KeyAcrossVariants::Tag => {
+                    unreachable!("tag handled above")
+                }
+                crate::runtime::KeyAcrossVariants::Absent => {
+                    return PersistTarget::Missing;
+                }
+                crate::runtime::KeyAcrossVariants::Partial(_) => {
+                    // A field missing from some variants is variant-specific:
+                    // refuse until a discriminator selects a branch (spec:
+                    // targeted refuse).
+                    return PersistTarget::Unaddressable {
+                        section,
+                        kind: "a tagged union",
+                    };
+                }
+                crate::runtime::KeyAcrossVariants::Every(shapes) => shapes,
+            };
+            let walked = join_prefix(prefix, head);
+            let child = table.and_then(|t| persist_table_get(t, head, normalize_keys));
+            if rest.is_empty() {
+                return unambiguous_value_shapes(declared, section);
             }
-            _ => {
-                return PersistTarget::Unaddressable {
-                    section,
-                    kind: "a tagged union",
-                };
+            let mut agreed: Option<PersistTarget<'a>> = None;
+            for shape in declared {
+                let next = persist_target_in_shape(shape, rest, child, &walked, normalize_keys);
+                agreed = Some(match (agreed, next) {
+                    (None, t) => t,
+                    (Some(PersistTarget::Shape(a)), PersistTarget::Shape(b))
+                        if a.structurally_agrees_with(b) =>
+                    {
+                        PersistTarget::Shape(a)
+                    }
+                    (Some(PersistTarget::Discriminator(a)), PersistTarget::Discriminator(b))
+                        if a.tag == b.tag =>
+                    {
+                        PersistTarget::Discriminator(a)
+                    }
+                    _ => {
+                        return PersistTarget::Unaddressable {
+                            section,
+                            kind: "a tagged union",
+                        };
+                    }
+                });
             }
-        });
+            agreed.unwrap_or(PersistTarget::Missing)
+        }
     }
-    agreed.unwrap_or(PersistTarget::Missing)
 }
 
 /// Look up a schema field name in a raw persist document. With
@@ -738,7 +759,7 @@ fn unambiguous_value_shapes<'a>(
     if declared
         .iter()
         .skip(1)
-        .all(|s| same_persist_shape(first, s))
+        .all(|s| first.structurally_agrees_with(s))
     {
         PersistTarget::Shape(first)
     } else {
@@ -774,41 +795,6 @@ fn split_first(dotted: &str) -> Option<(&str, &str)> {
     match dotted.find('.') {
         Some(i) => Some((&dotted[..i], &dotted[i + 1..])),
         None => Some((dotted, "")),
-    }
-}
-
-fn same_persist_shape(a: &crate::runtime::Shape, b: &crate::runtime::Shape) -> bool {
-    use crate::runtime::Shape;
-    match (a, b) {
-        (Shape::Leaf(la), Shape::Leaf(lb)) => leaf_types_match(&la.ty, &lb.ty),
-        (Shape::Array(aa), Shape::Array(ab)) => same_persist_shape(&aa.item, &ab.item),
-        (Shape::Map(ma), Shape::Map(mb)) => same_persist_shape(&ma.item, &mb.item),
-        (Shape::Object(_), Shape::Object(_)) => true,
-        (Shape::Tagged(ta), Shape::Tagged(tb)) => ta.tag == tb.tag,
-        _ => false,
-    }
-}
-
-fn leaf_types_match(a: &crate::runtime::LeafType, b: &crate::runtime::LeafType) -> bool {
-    use crate::runtime::LeafType;
-    match (a, b) {
-        (LeafType::String, LeafType::String)
-        | (LeafType::Float, LeafType::Float)
-        | (LeafType::Bool, LeafType::Bool)
-        | (LeafType::DateTime, LeafType::DateTime)
-        | (LeafType::Value, LeafType::Value) => true,
-        (
-            LeafType::Integer {
-                min: a_min,
-                max: a_max,
-            },
-            LeafType::Integer {
-                min: b_min,
-                max: b_max,
-            },
-        ) => a_min == b_min && a_max == b_max,
-        (LeafType::Enum { values: a }, LeafType::Enum { values: b }) => a == b,
-        _ => false,
     }
 }
 

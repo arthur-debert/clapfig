@@ -723,6 +723,59 @@ impl Shape {
             }
         }
     }
+
+    /// Whether two shapes are the same persist target.
+    ///
+    /// Recurses through [`Array`](Shape::Array) / [`Map`](Shape::Map)
+    /// items and compares [`Leaf`](Shape::Leaf) types (integer bounds and
+    /// enum members included). Two **shallow** arms are load-bearing and
+    /// are not accidental fallthrough:
+    ///
+    /// - [`Object`](Shape::Object) / [`Object`](Shape::Object) agrees
+    ///   regardless of fields. Persist addresses a value, not a nested
+    ///   object's contents; once both sides are objects the target is the
+    ///   same kind of node.
+    /// - [`Tagged`](Shape::Tagged) / [`Tagged`](Shape::Tagged) compares
+    ///   the tag name only. Variant sets are not compared: a nested union
+    ///   is the same persist target when it is selected by the same
+    ///   discriminator field.
+    ///
+    /// Cross-constructor pairs never agree. This is not general shape
+    /// equality — Object fields and Tagged variants stay uncompared on
+    /// purpose. Persist is the consumer; do not reuse this as a schema
+    /// diff.
+    pub(crate) fn structurally_agrees_with(&self, other: &Shape) -> bool {
+        match (self, other) {
+            (Shape::Leaf(la), Shape::Leaf(lb)) => leaf_types_agree(&la.ty, &lb.ty),
+            (Shape::Array(aa), Shape::Array(ab)) => aa.item.structurally_agrees_with(&ab.item),
+            (Shape::Map(ma), Shape::Map(mb)) => ma.item.structurally_agrees_with(&mb.item),
+            (Shape::Object(_), Shape::Object(_)) => true,
+            (Shape::Tagged(ta), Shape::Tagged(tb)) => ta.tag == tb.tag,
+            _ => false,
+        }
+    }
+}
+
+fn leaf_types_agree(a: &LeafType, b: &LeafType) -> bool {
+    match (a, b) {
+        (LeafType::String, LeafType::String)
+        | (LeafType::Float, LeafType::Float)
+        | (LeafType::Bool, LeafType::Bool)
+        | (LeafType::DateTime, LeafType::DateTime)
+        | (LeafType::Value, LeafType::Value) => true,
+        (
+            LeafType::Integer {
+                min: a_min,
+                max: a_max,
+            },
+            LeafType::Integer {
+                min: b_min,
+                max: b_max,
+            },
+        ) => a_min == b_min && a_max == b_max,
+        (LeafType::Enum { values: a }, LeafType::Enum { values: b }) => a == b,
+        _ => false,
+    }
 }
 
 impl From<Schema> for Shape {
@@ -955,6 +1008,45 @@ pub struct TaggedVariant {
     pub schema: Schema,
 }
 
+/// How a single key is declared across a tagged union's variants.
+///
+/// Classification is shared; combination is not. The four consumers keep
+/// distinct policies because they answer different questions — they must
+/// not be unified:
+///
+/// - **schema_walk** (`collect_unknown_against_shapes_union`): a key is
+///   known at phase 1 if **any** variant declares it (`Every` or
+///   `Partial`). True unknowns are `Absent`. The tag is never unknown.
+/// - **meta** (`agreed_doc`): the shared doc vector when every
+///   participating variant has the same vector, including empty
+///   vectors. `Partial` and `Every` both look up; they differ only in
+///   how many docs participate. Disagreement yields `Some(vec![])`
+///   (the key exists, no unique doc); `None` means the key is absent.
+/// - **strict** (`union_path_kind`): path kind is the union across
+///   variants that declare the path — section in any variant wins; a
+///   leaf only when every declaration is a leaf.
+/// - **persist** (`unambiguous_value_shapes`): a settable target only
+///   when **every** variant declares the key (`Every`) and those
+///   declarations [agree structurally](Shape::structurally_agrees_with).
+///   `Partial` is unaddressable until a discriminator selects a branch.
+///
+/// "Unknown only if every variant says unknown" is not "settable only if
+/// every variant agrees."
+#[derive(Debug)]
+pub(crate) enum KeyAcrossVariants<'a> {
+    /// The discriminator field itself. Never an unknown key; not a
+    /// variant field.
+    Tag,
+    /// No variant declares this name.
+    Absent,
+    /// Every variant declares this name. Shapes are in variant order.
+    Every(Vec<&'a Shape>),
+    /// Some but not all variants declare this name (branch-exclusive
+    /// candidate). Shapes are in variant order among those that declare
+    /// it.
+    Partial(Vec<&'a Shape>),
+}
+
 impl TaggedShape {
     /// Variant whose discriminator matches `name`.
     pub(crate) fn variant(&self, name: &str) -> Option<&TaggedVariant> {
@@ -983,20 +1075,40 @@ impl TaggedShape {
         }
     }
 
-    /// Every field shape declared for `key` across variants (empty if
-    /// no variant owns the name). Phase 1 treats a key as known when this
-    /// is non-empty.
-    pub(crate) fn field_shapes(&self, key: &str) -> Vec<&Shape> {
-        self.variants
-            .iter()
-            .filter_map(|v| {
-                v.schema
-                    .fields
-                    .iter()
-                    .find(|f| f.name == key)
-                    .map(|f| &f.field)
-            })
-            .collect()
+    /// Classify `key` once across this union's variants.
+    ///
+    /// Callers state a combination policy on the result; they do not walk
+    /// [`Self::variants`] looking up a field name. See
+    /// [`KeyAcrossVariants`] for the four policies and why they differ.
+    pub(crate) fn resolve_key(&self, key: &str) -> KeyAcrossVariants<'_> {
+        self.resolve_key_with(key, |a, b| a == b)
+    }
+
+    /// Same classification as [`Self::resolve_key`], comparing names with
+    /// `eq`. Metadata lookups pass kebab/snake-equivalent matching; other
+    /// consumers use exact equality via [`Self::resolve_key`].
+    pub(crate) fn resolve_key_with(
+        &self,
+        key: &str,
+        eq: impl Fn(&str, &str) -> bool,
+    ) -> KeyAcrossVariants<'_> {
+        if eq(&self.tag, key) {
+            return KeyAcrossVariants::Tag;
+        }
+        let n = self.variants.len();
+        let mut shapes = Vec::new();
+        for variant in &self.variants {
+            if let Some(field) = variant.schema.fields.iter().find(|f| eq(&f.name, key)) {
+                shapes.push(&field.field);
+            }
+        }
+        if shapes.is_empty() {
+            KeyAcrossVariants::Absent
+        } else if shapes.len() == n {
+            KeyAcrossVariants::Every(shapes)
+        } else {
+            KeyAcrossVariants::Partial(shapes)
+        }
     }
 }
 
@@ -1699,5 +1811,113 @@ mod tests {
             .variant("rust", object("Rust"))
             .into();
         assert!(matches!(tagged, Shape::Tagged(_)));
+    }
+
+    fn block_union() -> TaggedShape {
+        Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .field("mount", Field::string())
+                    .field("crate_path", Field::string())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .field("mount", Field::string())
+                    .field("artifact", Field::string())
+                    .build(),
+            )
+            .build()
+    }
+
+    #[test]
+    fn resolve_key_classifies_tag_absent_every_partial() {
+        let tagged = block_union();
+        assert!(matches!(tagged.resolve_key("kind"), KeyAcrossVariants::Tag));
+        assert!(matches!(
+            tagged.resolve_key("nope"),
+            KeyAcrossVariants::Absent
+        ));
+        match tagged.resolve_key("mount") {
+            KeyAcrossVariants::Every(shapes) => assert_eq!(shapes.len(), 2),
+            other => panic!("expected Every, got {other:?}"),
+        }
+        match tagged.resolve_key("crate_path") {
+            KeyAcrossVariants::Partial(shapes) => assert_eq!(shapes.len(), 1),
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structurally_agrees_objects_ignore_fields() {
+        let a = Shape::from(Schema::object("A").field("x", Field::string()).build());
+        let b = Shape::from(
+            Schema::object("B")
+                .field("y", Field::integer())
+                .field("z", Field::boolean())
+                .build(),
+        );
+        assert!(
+            a.structurally_agrees_with(&b),
+            "Object/Object agrees regardless of fields"
+        );
+    }
+
+    #[test]
+    fn structurally_agrees_tagged_compares_tag_only() {
+        let same_tag = Shape::from(
+            Shape::tagged("A", "kind")
+                .variant("rust", Schema::object("Rust").build())
+                .build(),
+        );
+        let same_tag_other_variants = Shape::from(
+            Shape::tagged("B", "kind")
+                .variant(
+                    "payload",
+                    Schema::object("Payload")
+                        .field("artifact", Field::string())
+                        .build(),
+                )
+                .build(),
+        );
+        let other_tag = Shape::from(
+            Shape::tagged("C", "type")
+                .variant("rust", Schema::object("Rust").build())
+                .build(),
+        );
+        assert!(
+            same_tag.structurally_agrees_with(&same_tag_other_variants),
+            "Tagged/Tagged compares the tag only, not variants"
+        );
+        assert!(
+            !same_tag.structurally_agrees_with(&other_tag),
+            "different tags must not agree"
+        );
+    }
+
+    #[test]
+    fn structurally_agrees_leaves_and_containers() {
+        let string = Shape::from(Field::string());
+        let other_string = Shape::from(Field::string());
+        let integer = Shape::from(Field::integer());
+        let bounded = Shape::from(Field::integer_in(Some(0), Some(255)));
+        assert!(string.structurally_agrees_with(&other_string));
+        assert!(!string.structurally_agrees_with(&integer));
+        assert!(!integer.structurally_agrees_with(&bounded));
+
+        let a = Shape::from(Field::array_of_type(Field::string()));
+        let b = Shape::from(Field::array_of_type(Field::string()));
+        let c = Shape::from(Field::array_of_type(Field::integer()));
+        assert!(a.structurally_agrees_with(&b));
+        assert!(!a.structurally_agrees_with(&c));
+
+        let map_s = Shape::from(Field::map_of(Field::string()));
+        let map_i = Shape::from(Field::map_of(Field::integer()));
+        assert!(map_s.structurally_agrees_with(&Shape::from(Field::map_of(Field::string()))));
+        assert!(!map_s.structurally_agrees_with(&map_i));
+
+        assert!(!string.structurally_agrees_with(&Shape::from(object("App"))));
     }
 }
