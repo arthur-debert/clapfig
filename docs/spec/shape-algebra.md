@@ -416,7 +416,7 @@ rule**. Three cases:
    the same wording a unit-enum leaf already uses.
 2. **A valid discriminator already selects a variant.** Address that
    variant's fields normally. A key the selected variant does not
-   declare is `UnaddressableKey`.
+   declare is `UnaddressableKey` (including keys no variant declares).
 3. **No valid discriminator selects a variant** (the tag is missing,
    unknown, or mistyped — a non-string value, or a string that names
    no variant). A key declared by *every* variant is addressable when

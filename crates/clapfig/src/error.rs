@@ -250,9 +250,9 @@ pub enum ClapfigError {
     /// conflicting field of a [`Shape::Tagged`](crate::runtime::Shape::Tagged)
     /// union (no valid discriminator selects a variant, or the selected
     /// variant does not declare the key). Array/map interiors are edited
-    /// in the config file. Tagged-union keys need a valid discriminator
-    /// (set it first) or a file edit. (An indexed path syntax like
-    /// `servers[0].host` is a possible future extension.)
+    /// in the config file. Tagged-union keys need a variant that
+    /// declares them (select it, or edit the file). (An indexed path
+    /// syntax like `servers[0].host` is a possible future extension.)
     #[error("{}", format_unaddressable_key(.key, .section, .kind))]
     UnaddressableKey {
         /// The dotted action key as the caller supplied it.
@@ -464,11 +464,12 @@ impl ClapfigError {
 }
 
 fn format_unaddressable_key(key: &str, section: &str, kind: &str) -> String {
-    // Tagged-union keys are addressable after a discriminator is set;
-    // array/map interiors are not.
+    // Tagged-union keys are addressable under a selection that declares
+    // them; array/map interiors are not. One string covers missing,
+    // invalid, and valid-but-non-owning discriminators.
     if kind == "a tagged union" {
         format!(
-            "Key '{key}' cannot be set: '{section}' is {kind} of sections, and this variant-specific key needs a valid discriminator — set it first, or edit the config file directly"
+            "Key '{key}' cannot be set: '{section}' is {kind} of sections, and the current tagged-union selection does not address this key — select a variant that declares it, or edit the config file directly"
         )
     } else {
         format!(
@@ -668,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn unaddressable_tagged_union_points_at_discriminator() {
+    fn unaddressable_tagged_union_points_at_selection() {
         let err = ClapfigError::UnaddressableKey {
             key: "block.artifact".into(),
             section: "block".into(),
@@ -676,14 +677,15 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("this variant-specific key needs a valid discriminator"),
+            msg.contains("the current tagged-union selection does not address this key"),
             "{msg}"
         );
-        assert!(msg.contains("set it first"), "{msg}");
+        assert!(msg.contains("select a variant that declares it"), "{msg}");
         assert!(
             !msg.contains("cannot be addressed with a dotted CLI key"),
             "{msg}"
         );
+        assert!(!msg.contains("needs a valid discriminator"), "{msg}");
     }
 
     #[test]
