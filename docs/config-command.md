@@ -209,14 +209,14 @@ declared by only some variants is refused until a discriminator selects a
 branch; a key declared by none is a missing key.
 
 The refusal is the same targeted error as map/array interiors, naming
-the tagged union. Unlike those, the key can be addressed once a variant
-that declares it is selected — set or change the discriminator, or edit
-the config file. A key such as `block.artifact` (`block` is a tagged
-union; `artifact` exists only on some variants) is refused until then:
+the tagged union: this key is not addressable under the current
+selection. When the key belongs to another variant (e.g. `block.artifact`
+exists only on some variants), selecting that variant then retrying
+succeeds:
 
 ```sh
 $ myapp config set block.artifact out
-# Error: Key 'block.artifact' cannot be set: 'block' is a tagged union of sections, and the current tagged-union selection does not address this key — select a variant that declares it, or edit the config file directly
+# Error: Key 'block.artifact' cannot be set: 'block' is a tagged union of sections, and this key is not addressable under the current tagged-union selection
 
 $ myapp config set block.kind payload
 Set block.kind = payload
