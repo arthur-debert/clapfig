@@ -141,8 +141,13 @@ fn comment_key_allowlist() -> Value {
 /// Returns a `serde_json::Value` — the caller serializes it to a string,
 /// writes it to a file, or embeds it wherever needed.
 pub fn generate_schema(shape: impl Into<Shape>) -> Value {
-    let shape = shape.into();
-    let mut root = match &shape {
+    generate_schema_ref(&shape.into())
+}
+
+/// Borrowed walk for crate-internal holders of `&Shape`. Public callers
+/// go through [`generate_schema`].
+pub(crate) fn generate_schema_ref(shape: &Shape) -> Value {
+    let mut root = match shape {
         Shape::Object(schema) => schema_to_object(schema),
         Shape::Map(map) => map_root_to_object(map),
         Shape::Tagged(tagged) => tagged_to_schema(tagged),
@@ -564,6 +569,14 @@ mod tests {
 
     fn schema() -> Value {
         generate_schema(test_schema())
+    }
+
+    #[test]
+    fn generate_schema_ref_matches_owned_wrapper() {
+        assert_eq!(
+            generate_schema_ref(&Shape::from(test_schema())),
+            generate_schema(test_schema()),
+        );
     }
 
     #[test]
