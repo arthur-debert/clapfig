@@ -53,6 +53,11 @@ struct Sites {
     blocks: BTreeMap<String, Block>,
 }
 
+#[derive(Schema, Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct Plugins {
+    plugins: Vec<Block>,
+}
+
 fn write_and_load_typed<C: clapfig::DocumentRoot + serde::de::DeserializeOwned>(
     contents: &str,
 ) -> Result<C, clapfig::ClapfigError> {
@@ -149,6 +154,38 @@ fn map_of_tagged_loads() {
 }
 
 #[test]
+fn vec_of_tagged_enum_loads_two_entries_and_typed_deserializes() {
+    match &Plugins::schema().fields[0].field {
+        Shape::Array(array) => match array.item.as_ref() {
+            Shape::Tagged(tagged) => assert_eq!(tagged.tag, "kind"),
+            other => panic!("expected Tagged item, got {other:?}"),
+        },
+        other => panic!("expected Array, got {other:?}"),
+    }
+
+    let cfg: Plugins = write_and_load_typed(
+        "[[plugins]]\nkind = \"rust\"\nmount = \".\"\n[plugins.params]\nshape = \"cli\"\n\n[[plugins]]\nkind = \"payload\"\nmount = \"/data\"\n[plugins.params]\nartifact = \"out\"\nentry = \"start\"\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.plugins.len(), 2);
+    match &cfg.plugins[0] {
+        Block::Rust { mount, params, .. } => {
+            assert_eq!(mount, ".");
+            assert_eq!(params.shape, "cli");
+        }
+        other => panic!("expected rust, got {other:?}"),
+    }
+    match &cfg.plugins[1] {
+        Block::Payload { mount, params } => {
+            assert_eq!(mount, "/data");
+            assert_eq!(params.artifact, "out");
+            assert_eq!(params.entry, "start");
+        }
+        other => panic!("expected payload, got {other:?}"),
+    }
+}
+
+#[test]
 fn tagged_json_schema_is_oneof_with_const_no_openapi_discriminator() {
     let s = clapfig::json_schema::generate_from_shape(&Block::shape());
     assert!(
@@ -184,6 +221,11 @@ fn nested_and_map_of_tagged_json_schema_compose() {
         mapped["properties"]["blocks"]["patternProperties"]["^//"],
         serde_json::json!({})
     );
+
+    let listed = clapfig::json_schema::generate_schema(Plugins::schema());
+    let items = &listed["properties"]["plugins"]["items"];
+    assert!(items.get("discriminator").is_none(), "{items}");
+    assert_eq!(items["oneOf"][0]["properties"]["kind"]["const"], "rust");
 }
 
 #[test]

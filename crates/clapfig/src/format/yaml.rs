@@ -1007,6 +1007,9 @@ impl TemplateRenderer for YamlTemplate {
         if let Shape::Tagged(tagged) = item {
             return emit_tagged_yaml_map(self, out, depth, Some(name), tagged);
         }
+        if let Some(tagged) = tagged_array_item(item) {
+            return emit_tagged_yaml_map_of_array(self, out, depth, Some(name), tagged);
+        }
         let indent = "  ".repeat(*depth);
         emit_object_doc(out, &indent, item);
         let mut buf = String::new();
@@ -1026,6 +1029,9 @@ impl TemplateRenderer for YamlTemplate {
     ) -> Result<(), FormatError> {
         if let Shape::Tagged(tagged) = item {
             return emit_tagged_yaml_map(self, out, depth, None, tagged);
+        }
+        if let Some(tagged) = tagged_array_item(item) {
+            return emit_tagged_yaml_map_of_array(self, out, depth, None, tagged);
         }
         let indent = "  ".repeat(*depth);
         // Value-shaped items are assignments, not mappings: a leaf or
@@ -1128,6 +1134,48 @@ fn emit_tagged_yaml_map(
     Ok(())
 }
 
+/// One commented `name: / <key>: / - item` example per tagged variant.
+fn emit_tagged_yaml_map_of_array(
+    renderer: &mut YamlTemplate,
+    out: &mut String,
+    depth: &usize,
+    name: Option<&str>,
+    tagged: &crate::runtime::TaggedShape,
+) -> Result<(), FormatError> {
+    let indent = "  ".repeat(*depth);
+    for (i, variant) in tagged.variants.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let example = tagged_variant_example_schema(tagged, variant);
+        let mut buf = String::new();
+        let (dash_depth, item_depth) = if let Some(name) = name {
+            let _ = writeln!(buf, "{indent}{}:", inline_scalar(name));
+            let _ = writeln!(buf, "{indent}  <key>:");
+            (depth + 2, depth + 3)
+        } else {
+            let _ = writeln!(buf, "{indent}<key>:");
+            (depth + 1, depth + 2)
+        };
+        let mut item_buf = String::new();
+        walk_level(renderer, &example, &item_depth, &mut item_buf)?;
+        buf.push_str(&with_sequence_dash(&item_buf, dash_depth));
+        push_commented_block(out, &buf);
+    }
+    Ok(())
+}
+
+/// The tagged item of `Array { item: Tagged }`, if `shape` is that composition.
+fn tagged_array_item(shape: &Shape) -> Option<&crate::runtime::TaggedShape> {
+    match shape {
+        Shape::Array(array) => match array.item.as_ref() {
+            Shape::Tagged(tagged) => Some(tagged),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn emit_object_doc(out: &mut String, indent: &str, item: &Shape) {
     if let Shape::Object(child) = item {
         for line in &child.doc {
@@ -1138,7 +1186,9 @@ fn emit_object_doc(out: &mut String, indent: &str, item: &Shape) {
 
 /// Render one example item at `depth`. Nested Maps emit a `<key>:`
 /// wrapper; nested Arrays emit a sequence dash; objects walk the child
-/// schema. Tagged items emit one complete example per variant.
+/// schema. Tagged items emit one complete example per variant. An array
+/// of tagged objects dashes each variant as its own sequence item so
+/// later variants are not keys of the first mapping.
 fn emit_yaml_item(
     renderer: &mut YamlTemplate,
     out: &mut String,
@@ -1153,6 +1203,18 @@ fn emit_yaml_item(
             emit_yaml_item(renderer, out, &(depth + 1), &map.item)
         }
         Shape::Array(array) => {
+            if let Shape::Tagged(tagged) = array.item.as_ref() {
+                for (i, variant) in tagged.variants.iter().enumerate() {
+                    if i > 0 {
+                        out.push('\n');
+                    }
+                    let example = tagged_variant_example_schema(tagged, variant);
+                    let mut item_buf = String::new();
+                    walk_level(renderer, &example, &(depth + 1), &mut item_buf)?;
+                    out.push_str(&with_sequence_dash(&item_buf, *depth));
+                }
+                return Ok(());
+            }
             let mut item_buf = String::new();
             emit_yaml_item(renderer, &mut item_buf, &(depth + 1), &array.item)?;
             out.push_str(&with_sequence_dash(&item_buf, *depth));
@@ -2216,6 +2278,94 @@ db:
             .join("\n")
     }
 
+    fn tagged_block() -> crate::runtime::TaggedShape {
+        use crate::runtime::{Field, Schema as RtSchema};
+        crate::runtime::Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                RtSchema::object("Rust")
+                    .field("mount", Field::string())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                RtSchema::object("Payload")
+                    .field("mount", Field::string())
+                    .field("artifact", Field::string())
+                    .build(),
+            )
+            .build()
+    }
+
+    fn yaml_block_has_kind(block: &str, discriminator: &str) -> bool {
+        block.lines().any(|line| {
+            let t = line.trim().trim_start_matches('-').trim();
+            t.starts_with("kind:") && t.contains(discriminator)
+        })
+    }
+
+    /// Uncomment the top-level example whose `kind` is `discriminator`.
+    /// Map placeholders (`<key>`) become `core`.
+    fn uncomment_tagged_variant(template: &str, discriminator: &str) -> String {
+        let uncommented = uncomment_lines(template).replace("<key>", "core");
+        let mut current = String::new();
+        let mut chosen = String::new();
+        for line in uncommented.lines() {
+            let is_top = !line.is_empty() && !line.starts_with(' ') && !line.starts_with('\t');
+            if is_top && !current.trim().is_empty() {
+                if yaml_block_has_kind(&current, discriminator) {
+                    chosen = std::mem::take(&mut current);
+                    break;
+                }
+                current.clear();
+            }
+            current.push_str(line);
+            current.push('\n');
+        }
+        if chosen.is_empty() && yaml_block_has_kind(&current, discriminator) {
+            chosen = current;
+        }
+        chosen
+    }
+
+    fn array_of_tagged_schema() -> crate::runtime::Schema {
+        use crate::runtime::{Field, Schema as RtSchema};
+        RtSchema::object("App")
+            .field("blocks", Field::array_of_type(Shape::from(tagged_block())))
+            .build()
+    }
+
+    fn map_of_array_of_tagged_schema() -> crate::runtime::Schema {
+        use crate::runtime::{Field, Schema as RtSchema};
+        RtSchema::object("App")
+            .field(
+                "groups",
+                Field::map_of(Shape::array("blocks", Shape::from(tagged_block()))),
+            )
+            .build()
+    }
+
+    fn root_map_of_array_of_tagged() -> crate::runtime::MapShape {
+        Shape::map(
+            "groups",
+            Shape::array("blocks", Shape::from(tagged_block())),
+        )
+        .build()
+    }
+
+    fn array_of_map_of_array_of_tagged_schema() -> crate::runtime::Schema {
+        use crate::runtime::{Field, Schema as RtSchema};
+        RtSchema::object("App")
+            .field(
+                "groups",
+                Field::array_of_type(Field::map_of(Shape::array(
+                    "blocks",
+                    Shape::from(tagged_block()),
+                ))),
+            )
+            .build()
+    }
+
     #[test]
     fn template_nested_tagged_example_is_a_complete_object() {
         use crate::error::DiscoveryRecord;
@@ -2242,6 +2392,154 @@ db:
             &DiscoveryRecord::empty(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn template_array_of_tagged_uncommented_one_variant_at_a_time_parses() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let schema = array_of_tagged_schema();
+        let text = YamlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        for kind in ["rust", "payload"] {
+            let uncommented = uncomment_tagged_variant(&text, kind);
+            let map = parse_map(&uncommented);
+            let blocks = map["blocks"].as_array().unwrap_or_else(|| {
+                panic!("array-of-tagged example must be a sequence, got {map:?} from {uncommented}")
+            });
+            assert_eq!(blocks.len(), 1, "{uncommented}");
+            assert_eq!(
+                blocks[0].as_map().unwrap()["kind"],
+                Value::String(kind.into())
+            );
+            finalize_root(
+                map,
+                &OriginMap::new(),
+                DocumentRoot::Object(&schema),
+                &DiscoveryRecord::empty(),
+            )
+            .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{uncommented}"));
+        }
+    }
+
+    #[test]
+    fn template_map_of_array_of_tagged_uncommented_one_variant_at_a_time_parses() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let schema = map_of_array_of_tagged_schema();
+        let text = YamlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        for kind in ["rust", "payload"] {
+            let uncommented = uncomment_tagged_variant(&text, kind);
+            let map = parse_map(&uncommented);
+            let groups = map["groups"].as_map().unwrap_or_else(|| {
+                panic!("map-of-array-of-tagged must be a mapping, got {map:?} from {uncommented}")
+            });
+            let entry = groups.get("<key>").or_else(|| groups.values().next());
+            let items = entry.and_then(Value::as_array).unwrap_or_else(|| {
+                panic!("entry must be a sequence, got {groups:?} from {uncommented}")
+            });
+            assert_eq!(items.len(), 1, "{uncommented}");
+            assert_eq!(
+                items[0].as_map().unwrap()["kind"],
+                Value::String(kind.into())
+            );
+            finalize_root(
+                map,
+                &OriginMap::new(),
+                DocumentRoot::Object(&schema),
+                &DiscoveryRecord::empty(),
+            )
+            .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{uncommented}"));
+        }
+    }
+
+    #[test]
+    fn template_root_map_of_array_of_tagged_uncommented_one_variant_at_a_time_parses() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let root = root_map_of_array_of_tagged();
+        let text = YamlAdapter.template(&Shape::Map(root.clone())).unwrap();
+        for kind in ["rust", "payload"] {
+            let uncommented = uncomment_tagged_variant(&text, kind);
+            let map = parse_map(&uncommented);
+            let entry = map.get("core").unwrap_or_else(|| {
+                panic!("root map example must assign core, got {map:?} from {uncommented}")
+            });
+            let items = entry.as_array().unwrap_or_else(|| {
+                panic!("root Map<Array<Tagged>> entry must be a sequence, got {entry:?} from {uncommented}")
+            });
+            assert_eq!(items.len(), 1, "{uncommented}");
+            assert_eq!(
+                items[0].as_map().unwrap()["kind"],
+                Value::String(kind.into())
+            );
+            finalize_root(
+                map,
+                &OriginMap::new(),
+                DocumentRoot::Map(&root),
+                &DiscoveryRecord::empty(),
+            )
+            .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{uncommented}"));
+        }
+    }
+
+    #[test]
+    fn template_array_of_map_of_array_of_tagged_uncommented_parses() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let schema = array_of_map_of_array_of_tagged_schema();
+        let text = YamlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        let uncommented = uncomment_lines(&text).replace("<key>", "core");
+        let map = parse_map(&uncommented);
+        let groups = map["groups"].as_array().unwrap_or_else(|| {
+            panic!("array-of-map example must be a sequence, got {map:?} from {uncommented}")
+        });
+        assert_eq!(groups.len(), 1, "{uncommented}");
+        let inner = groups[0].as_map().unwrap_or_else(|| {
+            panic!("array item must be a mapping, got {groups:?} from {uncommented}")
+        });
+        let items = inner
+            .get("core")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| {
+                panic!("inner map entry must be a sequence of tagged items, got {inner:?} from {uncommented}")
+            });
+        let kinds: Vec<_> = items
+            .iter()
+            .map(|item| item.as_map().unwrap()["kind"].clone())
+            .collect();
+        assert!(
+            kinds.contains(&Value::String("rust".into())),
+            "rust variant missing from nested example: {uncommented}\nfrom {text}"
+        );
+        assert!(
+            kinds.contains(&Value::String("payload".into())),
+            "payload variant missing from nested example: {uncommented}\nfrom {text}"
+        );
+        finalize_root(
+            map,
+            &OriginMap::new(),
+            DocumentRoot::Object(&schema),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap_or_else(|e| panic!("nested load failed: {e}\n{uncommented}"));
     }
 
     #[test]

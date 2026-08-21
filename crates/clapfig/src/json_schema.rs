@@ -1144,6 +1144,44 @@ mod tests {
     }
 
     #[test]
+    fn array_of_tagged_items_are_oneof_with_per_branch_tag_const() {
+        use crate::runtime::Field;
+        use crate::runtime::Schema as RtSchema;
+        let s = generate_schema(
+            &RtSchema::object("App")
+                .field("blocks", Field::array_of_type(Shape::from(tagged_block())))
+                .build(),
+        );
+        let blocks = &s["properties"]["blocks"];
+        assert_eq!(blocks["type"], "array");
+        let items = &blocks["items"];
+        assert!(items.get("discriminator").is_none(), "{items}");
+        assert_eq!(items["oneOf"][0]["properties"]["kind"]["const"], "rust");
+        assert_eq!(items["oneOf"][1]["properties"]["kind"]["const"], "payload");
+        assert_eq!(items["oneOf"][0]["patternProperties"]["^//"], json!({}));
+    }
+
+    #[test]
+    fn map_of_array_of_tagged_additional_properties_items_are_oneof() {
+        use crate::runtime::Field;
+        use crate::runtime::Schema as RtSchema;
+        let s = generate_schema(
+            &RtSchema::object("App")
+                .field(
+                    "groups",
+                    Field::map_of(Shape::array("blocks", Shape::from(tagged_block()))),
+                )
+                .build(),
+        );
+        let groups = &s["properties"]["groups"];
+        assert_eq!(groups["type"], "object");
+        let items = &groups["additionalProperties"]["items"];
+        assert!(items.get("discriminator").is_none(), "{items}");
+        assert_eq!(items["oneOf"][0]["properties"]["kind"]["const"], "rust");
+        assert_eq!(groups["additionalProperties"]["type"], "array");
+    }
+
+    #[test]
     fn schema_serializes_to_valid_json() {
         let s = schema();
         let json_text = serde_json::to_string_pretty(&s).unwrap();
