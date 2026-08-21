@@ -36,10 +36,15 @@ use crate::value::Value;
 /// fails, naming the expected type, before the file is touched. A key
 /// addressing a [`Shape::Array`](crate::runtime::Shape::Array) /
 /// [`Shape::Map`](crate::runtime::Shape::Map) of objects, a root Map
-/// entry, or a path inside one fails with the targeted
+/// entry, or a path inside one, or a variant-specific / structurally
+/// conflicting field of a [`Shape::Tagged`](crate::runtime::Shape::Tagged)
+/// union, fails with the targeted
 /// [`ClapfigError::UnaddressableKey`] instead of a bare key-not-found:
-/// dotted CLI keys cannot say which entry they mean, so the config file
-/// is the surface for editing those sections.
+/// dotted CLI keys cannot index into maps/arrays, and a tagged-union
+/// key is refused when the current selection does not address it, so
+/// the config file (or selecting a variant that declares the key) is
+/// required to edit those sections. Keys no variant declares are
+/// [`ClapfigError::KeyNotFound`].
 ///
 /// With `normalize_keys`, the action key follows the load path's
 /// acceptance: dash and underscore spellings are equivalent. The key is
@@ -461,7 +466,8 @@ fn dotted_config_path(key: &str) -> ConfigPath {
 /// return that section's dotted path and a kind
 /// label (`"an array"` / `"a map"`) for [`ClapfigError::UnaddressableKey`].
 /// `None` means the key misses the schema some other way (a plain
-/// key-not-found).
+/// key-not-found). Tagged-union refusals that depend on the document's
+/// discriminator are classified later by [`persist_target`].
 fn unaddressable_container_shape(
     shape: &crate::runtime::Shape,
     canonical: &str,

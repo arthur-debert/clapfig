@@ -242,25 +242,27 @@ pub enum ClapfigError {
         suggestion: Option<String>,
     },
 
-    /// A `config set` action key targets a
-    /// [`Shape::Array`](crate::runtime::Shape::Array) /
+    /// A `config set` action key targets a path a dotted CLI key cannot
+    /// address as given: a [`Shape::Array`](crate::runtime::Shape::Array) /
     /// [`Shape::Map`](crate::runtime::Shape::Map) of objects (or a root
-    /// map) or a path inside one.
-    /// A dotted CLI key cannot say which entry it means — entry keys and
-    /// array indexes are user data, not schema fields — so these paths
-    /// are deliberately not settable and the config file is the surface
-    /// for editing them. (An indexed path syntax like `servers[0].host`
-    /// is a possible future extension.)
-    #[error(
-        "Key '{key}' cannot be set: '{section}' is {kind} of sections, and keys inside it cannot be addressed with a dotted CLI key — edit the config file directly"
-    )]
+    /// map) or a path inside one — entry keys and array indexes are user
+    /// data, not schema fields — or a variant-specific / structurally
+    /// conflicting field of a [`Shape::Tagged`](crate::runtime::Shape::Tagged)
+    /// union (no valid discriminator selects a variant, or the selected
+    /// variant does not declare a key that another variant does). Keys
+    /// no variant declares are [`KeyNotFound`](Self::KeyNotFound). Array/map interiors are
+    /// edited in the config file. Tagged-union keys need a variant that
+    /// declares them (select it, or edit the file). (An indexed path
+    /// syntax like `servers[0].host` is a possible future extension.)
+    #[error("{}", format_unaddressable_key(.key, .section, .kind))]
     UnaddressableKey {
         /// The dotted action key as the caller supplied it.
         key: String,
-        /// Canonical dotted path of the array/map-of-objects section the
-        /// key runs into.
+        /// Canonical dotted path of the array, map-of-objects, or tagged
+        /// union the key runs into.
         section: String,
-        /// `"an array"` or `"a map"` — which container kind refused.
+        /// `"an array"`, `"a map"`, or `"a tagged union"` — which kind
+        /// refused.
         kind: &'static str,
     },
 
@@ -462,6 +464,21 @@ impl ClapfigError {
     }
 }
 
+fn format_unaddressable_key(key: &str, section: &str, kind: &str) -> String {
+    // UnaddressableKey is only reached for keys `valid_keys_shape`
+    // already accepted (declared by at least one variant). Keys no
+    // variant declares are KeyNotFound first.
+    if kind == "a tagged union" {
+        format!(
+            "Key '{key}' cannot be set: '{section}' is {kind} of sections, and the current tagged-union selection does not address this key — select a variant that declares it, or edit the config file directly"
+        )
+    } else {
+        format!(
+            "Key '{key}' cannot be set: '{section}' is {kind} of sections, and keys inside it cannot be addressed with a dotted CLI key — edit the config file directly"
+        )
+    }
+}
+
 fn format_invalid_value(key: &str, reason: &str, origin: &OriginFacts) -> String {
     use std::fmt::Write;
     let mut out = format!("Invalid value for '{key}': {reason}");
@@ -650,6 +667,40 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("did you mean 'database.url'?"), "{msg}");
+    }
+
+    #[test]
+    fn unaddressable_tagged_union_points_at_declaring_variant() {
+        let err = ClapfigError::UnaddressableKey {
+            key: "block.artifact".into(),
+            section: "block".into(),
+            kind: "a tagged union",
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("the current tagged-union selection does not address this key"),
+            "{msg}"
+        );
+        assert!(msg.contains("select a variant that declares it"), "{msg}");
+        assert!(
+            !msg.contains("cannot be addressed with a dotted CLI key"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn unaddressable_map_stays_file_only() {
+        let err = ClapfigError::UnaddressableKey {
+            key: "servers.web.host".into(),
+            section: "servers".into(),
+            kind: "a map",
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("keys inside it cannot be addressed with a dotted CLI key"),
+            "{msg}"
+        );
+        assert!(!msg.contains("discriminator"), "{msg}");
     }
 
     #[test]
