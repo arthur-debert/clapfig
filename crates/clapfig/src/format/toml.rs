@@ -1260,6 +1260,27 @@ pool_size = 5
             .build()
     }
 
+    fn root_map_of_array_of_tagged() -> crate::runtime::MapShape {
+        Shape::map(
+            "groups",
+            Shape::array("blocks", Shape::from(tagged_block())),
+        )
+        .build()
+    }
+
+    fn array_of_map_of_array_of_tagged_schema() -> crate::runtime::Schema {
+        use crate::runtime::{Field, Schema as RtSchema};
+        RtSchema::object("App")
+            .field(
+                "groups",
+                Field::array_of_type(Field::map_of(Shape::array(
+                    "blocks",
+                    Shape::from(tagged_block()),
+                ))),
+            )
+            .build()
+    }
+
     #[test]
     fn template_nested_tagged_example_is_a_complete_object() {
         use crate::error::DiscoveryRecord;
@@ -1404,6 +1425,100 @@ pool_size = 5
             )
             .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{uncommented}"));
         }
+    }
+
+    #[test]
+    fn template_root_map_of_array_of_tagged_uncommented_one_variant_at_a_time_parses() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let root = root_map_of_array_of_tagged();
+        let text = TomlAdapter.template(&Shape::Map(root.clone())).unwrap();
+        for kind in ["rust", "payload"] {
+            let uncommented = uncomment_tagged_variant(&text, kind);
+            assert!(
+                uncommented.contains(&format!("kind = \"{kind}\"")),
+                "variant {kind} missing from uncommented example: {uncommented}\nfrom {text}"
+            );
+            assert!(
+                uncommented.matches("kind = ").count() == 1,
+                "uncommenting {kind} must not keep other variants: {uncommented}"
+            );
+            let map = match TomlAdapter.parse(&uncommented).unwrap().value {
+                Value::Map(map) => map,
+                other => panic!("expected map, got {other:?} from {uncommented}"),
+            };
+            let entry = map.get("core").unwrap_or_else(|| {
+                panic!("root map example must assign core, got {map:?} from {uncommented}")
+            });
+            let items = entry.as_array().unwrap_or_else(|| {
+                panic!("root Map<Array<Tagged>> entry must be an array, got {entry:?} from {uncommented}")
+            });
+            assert_eq!(items.len(), 1, "{uncommented}");
+            assert_eq!(
+                items[0].as_map().unwrap()["kind"],
+                Value::String(kind.into())
+            );
+            finalize_root(
+                map,
+                &OriginMap::new(),
+                DocumentRoot::Map(&root),
+                &DiscoveryRecord::empty(),
+            )
+            .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{uncommented}"));
+        }
+    }
+
+    #[test]
+    fn template_array_of_map_of_array_of_tagged_uncommented_parses() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let schema = array_of_map_of_array_of_tagged_schema();
+        let text = TomlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        let uncommented = uncomment_lines(&text).replace("<key>", "core");
+        let map = match TomlAdapter.parse(&uncommented).unwrap().value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?} from {uncommented}"),
+        };
+        let groups = map["groups"].as_array().unwrap_or_else(|| {
+            panic!("array-of-map example must be an array, got {map:?} from {uncommented}")
+        });
+        assert_eq!(groups.len(), 1, "{uncommented}");
+        let inner = groups[0].as_map().unwrap_or_else(|| {
+            panic!("array item must be a map, got {groups:?} from {uncommented}")
+        });
+        let items = inner
+            .get("core")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| {
+                panic!("inner map entry must be an array of tagged items, got {inner:?} from {uncommented}")
+            });
+        let kinds: Vec<_> = items
+            .iter()
+            .map(|item| item.as_map().unwrap()["kind"].clone())
+            .collect();
+        assert!(
+            kinds.contains(&Value::String("rust".into())),
+            "rust variant missing from nested example: {uncommented}\nfrom {text}"
+        );
+        assert!(
+            kinds.contains(&Value::String("payload".into())),
+            "payload variant missing from nested example: {uncommented}\nfrom {text}"
+        );
+        finalize_root(
+            map,
+            &OriginMap::new(),
+            DocumentRoot::Object(&schema),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap_or_else(|e| panic!("nested load failed: {e}\n{uncommented}"));
     }
 
     #[test]

@@ -2234,6 +2234,14 @@ mod tests {
             .build()
     }
 
+    fn root_map_of_array_of_tagged() -> crate::runtime::MapShape {
+        Shape::map(
+            "groups",
+            Shape::array("blocks", Shape::from(tagged_block())),
+        )
+        .build()
+    }
+
     fn snippet_object(line: &str) -> Json {
         serde_json::from_str(&format!("{{{line}}}"))
             .unwrap_or_else(|e| panic!("snippet must parse as a JSON object: {e}: {line}"))
@@ -2385,6 +2393,52 @@ mod tests {
                 map,
                 &OriginMap::new(),
                 DocumentRoot::Object(&schema),
+                &DiscoveryRecord::empty(),
+            )
+            .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{snippet}"));
+        }
+    }
+
+    #[test]
+    fn template_root_map_of_array_of_tagged_snippets_parse_one_variant_at_a_time() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let root = root_map_of_array_of_tagged();
+        let text = JsonAdapter.template(&Shape::Map(root.clone())).unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let lines = comment_lines(&json["//"]);
+        for kind in ["rust", "payload"] {
+            let snippet = lines
+                .iter()
+                .find(|l| l.contains(&format!("\"{kind}\"")))
+                .unwrap_or_else(|| panic!("{kind} example missing: {text}"));
+            let assigned = snippet.replace("<key>", "core");
+            let parsed = snippet_object(&assigned);
+            let entry = parsed.get("core").unwrap_or_else(|| {
+                panic!("root-map snippet must assign core, got {parsed} from {snippet}")
+            });
+            assert!(
+                entry.get("core").is_none(),
+                "must not wrap the array item in a second key: {parsed}"
+            );
+            let items = entry.as_array().unwrap_or_else(|| {
+                panic!(
+                    "root Map<Array<Tagged>> snippet must be an array, got {entry} from {snippet}"
+                )
+            });
+            assert_eq!(items.len(), 1, "{snippet}");
+            assert_eq!(items[0]["kind"], kind);
+            let map = match JsonAdapter.parse(&format!("{{{assigned}}}")).unwrap().value {
+                Value::Map(map) => map,
+                other => panic!("expected map, got {other:?}"),
+            };
+            finalize_root(
+                map,
+                &OriginMap::new(),
+                DocumentRoot::Map(&root),
                 &DiscoveryRecord::empty(),
             )
             .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{snippet}"));
