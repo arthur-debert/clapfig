@@ -1017,10 +1017,11 @@ pub struct TaggedVariant {
 /// - **schema_walk** (`collect_unknown_against_shapes_union`): a key is
 ///   known at phase 1 if **any** variant declares it (`Every` or
 ///   `Partial`). True unknowns are `Absent`. The tag is never unknown.
-/// - **meta** (`agreed_doc`): documentation is `Some` only when every
-///   non-empty doc agrees. `Partial` and `Every` both look up; they
-///   differ only in how many docs participate. Disagreement yields
-///   `Some(vec![])` (the key exists, no unique doc).
+/// - **meta** (`agreed_doc`): the shared doc vector when every
+///   participating variant has the same vector, including empty
+///   vectors. `Partial` and `Every` both look up; they differ only in
+///   how many docs participate. Disagreement yields `Some(vec![])`
+///   (the key exists, no unique doc); `None` means the key is absent.
 /// - **strict** (`union_path_kind`): path kind is the union across
 ///   variants that declare the path — section in any variant wins; a
 ///   leaf only when every declaration is a leaf.
