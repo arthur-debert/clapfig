@@ -60,7 +60,7 @@ use crate::runtime::{Schema, Shape};
 use crate::value::{Map, Value};
 
 use super::template::{
-    TemplateRenderer, doc_lines, example_leaf_value, leaf_annotations,
+    TemplateRenderer, doc_lines, example_leaf_value, leaf_annotations, placeholder,
     tagged_variant_example_schema, walk_level, walk_root,
 };
 use super::{
@@ -934,7 +934,10 @@ impl TemplateRenderer for JsonTemplate {
                 // JSON cannot comment out a real key, so the assignment
                 // snippet rides inside the comment — the counterpart of
                 // TOML's `#name = ""` line.
-                lines.push(assignment_snippet(name, placeholder_json(field.shape)));
+                lines.push(assignment_snippet(
+                    name,
+                    placeholder(field.shape, &mut |v| inline_json(v, name))?,
+                ));
                 out.insert(comment_key(name), comment_value(lines));
             }
         }
@@ -1206,13 +1209,6 @@ fn compact(json: &Json) -> String {
 fn inline_json(value: &Value, key: &str) -> Result<String, FormatError> {
     let mut path = vec![PathSegment::Key(key.to_string())];
     Ok(compact(&value_to_json(value, &mut path)?))
-}
-
-/// Placeholder rendered in an assignment snippet for a leaf without a
-/// default, hinting the expected value shape: the shared table with JSON's
-/// quoted spellings for the string and datetime arms.
-fn placeholder_json(shape: &crate::runtime::Shape) -> String {
-    super::template::placeholder(shape, "\"\"", "\"1970-01-01T00:00:00Z\"")
 }
 
 #[cfg(test)]
@@ -1976,6 +1972,81 @@ mod tests {
                 .unwrap(),
             golden
         );
+    }
+
+    fn uncomment_json_fields(template: &str, names: &[&str]) -> String {
+        let json: Json = serde_json::from_str(template).unwrap();
+        let obj = json.as_object().unwrap();
+        let mut snippets = Vec::new();
+        for name in names {
+            let comment = &obj[&format!("//{name}")];
+            let lines: Vec<&str> = match comment {
+                Json::String(s) => vec![s.as_str()],
+                Json::Array(items) => items.iter().filter_map(Json::as_str).collect(),
+                other => panic!("comment for {name} is not string/array: {other}"),
+            };
+            let encoded = compact(&Json::String((*name).to_string()));
+            let snippet = lines
+                .iter()
+                .rev()
+                .find(|line| line.starts_with(&encoded))
+                .unwrap_or_else(|| panic!("no assignment snippet for {name} in {lines:?}"));
+            snippets.push((*snippet).to_string());
+        }
+        format!("{{\n  {}\n}}\n", snippets.join(",\n  "))
+    }
+
+    #[test]
+    fn template_enum_placeholder_uses_format_encoder() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::{DocumentRoot, Field, Schema as RtSchema};
+        use crate::schema_walk::finalize_root;
+
+        let quoted = r#"a"b\c"#;
+        let broken = "line\nbreak";
+        let schema = RtSchema::object("App")
+            .field("ratio", Field::enum_of([1.5_f64]))
+            .field("label", Field::enum_of([quoted]))
+            .field("note", Field::enum_of([broken]))
+            .build();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        assert!(
+            text.contains("1.5"),
+            "float enum member must be serialized, not 0.0: {text}"
+        );
+        assert!(
+            !text.contains(r#""ratio": 0.0"#) && !text.contains(r#""ratio": 0"#),
+            "float enum must not collapse to unconstrained 0.0: {text}"
+        );
+        let uncommented = uncomment_json_fields(&text, &["ratio", "label", "note"]);
+        let parsed = JsonAdapter
+            .parse(&uncommented)
+            .unwrap_or_else(|e| {
+                panic!("uncommented enum placeholders must parse: {e}\n{text}\n{uncommented}")
+            })
+            .value;
+        let map = parsed.as_map().unwrap();
+        assert_eq!(map["ratio"], Value::Float(1.5), "{text}\n{uncommented}");
+        assert_eq!(
+            map["label"],
+            Value::String(quoted.into()),
+            "{text}\n{uncommented}"
+        );
+        assert_eq!(
+            map["note"],
+            Value::String(broken.into()),
+            "{text}\n{uncommented}"
+        );
+        finalize_root(
+            map.clone(),
+            &OriginMap::new(),
+            DocumentRoot::Object(&schema),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap_or_else(|e| panic!("uncommented examples must be allowed members: {e}\n{text}"));
     }
 
     #[test]

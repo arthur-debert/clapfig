@@ -943,7 +943,7 @@ impl TemplateRenderer for YamlTemplate {
                 );
             }
             None => {
-                let hint = placeholder(field.shape, "''", "1970-01-01T00:00:00Z");
+                let hint = placeholder(field.shape, &mut |v| Ok(format_inline_yaml(v)))?;
                 let _ = writeln!(out, "{indent}#{}: {hint}", inline_scalar(name));
             }
         }
@@ -1045,7 +1045,7 @@ impl TemplateRenderer for YamlTemplate {
             }
             let example = match field.default {
                 Some(value) => format_inline_yaml(value),
-                None => placeholder(field.shape, "''", "1970-01-01T00:00:00Z").to_string(),
+                None => placeholder(field.shape, &mut |v| Ok(format_inline_yaml(v)))?,
             };
             let _ = writeln!(out, "{indent}#<key>: {example}");
             return Ok(());
@@ -2039,6 +2039,67 @@ db:
                 .unwrap(),
             golden
         );
+    }
+
+    fn uncomment_yaml_assignments(template: &str, names: &[&str]) -> String {
+        template
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix('#')?;
+                names
+                    .iter()
+                    .any(|name| rest.starts_with(&format!("{name}:")))
+                    .then(|| rest.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn template_enum_placeholder_uses_format_encoder() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::{DocumentRoot, Field, Schema as RtSchema};
+        use crate::schema_walk::finalize_root;
+
+        let quoted = r#"a"b\c"#;
+        let broken = "line\nbreak";
+        let schema = RtSchema::object("App")
+            .field("ratio", Field::enum_of([1.5_f64]))
+            .field("label", Field::enum_of([quoted]))
+            .field("note", Field::enum_of([broken]))
+            .build();
+        let text = YamlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        assert!(
+            text.contains("1.5"),
+            "float enum member must be serialized, not 0.0: {text}"
+        );
+        assert!(
+            !text.contains("#ratio: 0.0") && !text.contains("ratio: 0"),
+            "float enum must not collapse to unconstrained 0.0: {text}"
+        );
+        let uncommented = uncomment_yaml_assignments(&text, &["ratio", "label", "note"]);
+        let map = parse_map(&uncommented);
+        assert_eq!(map["ratio"], Value::Float(1.5), "{text}\n{uncommented}");
+        assert_eq!(
+            map["label"],
+            Value::String(quoted.into()),
+            "{text}\n{uncommented}"
+        );
+        assert_eq!(
+            map["note"],
+            Value::String(broken.into()),
+            "{text}\n{uncommented}"
+        );
+        finalize_root(
+            map,
+            &OriginMap::new(),
+            DocumentRoot::Object(&schema),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap_or_else(|e| panic!("uncommented examples must be allowed members: {e}\n{text}"));
     }
 
     #[test]

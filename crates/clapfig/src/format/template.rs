@@ -350,7 +350,7 @@ pub(crate) fn example_shape_value(shape: &Shape) -> Value {
                 }
                 Value::Map(map)
             })
-            .unwrap_or(Value::Map(Map::new())),
+            .unwrap_or_else(|| Value::Map(Map::new())),
     }
 }
 
@@ -476,39 +476,22 @@ fn describe_shape_item(shape: &Shape) -> String {
 /// Commented-out template spelling of a defaultless value-shaped field.
 ///
 /// Arrays and maps stay `[]` / `{}` (empty containers, not one-entry
-/// examples). Leaves render [`example_leaf_value`]: empty string and
-/// datetime keep the format-specific `string_hint` / `datetime_hint` so
-/// TOML/JSON `""` and YAML `''` cannot drift, while enums and bounded
-/// integers use the honest value (a member of the allowed set, a number
-/// inside the range). Matching the [`Value`] rather than [`LeafType`]
-/// means a new leaf variant is a compile error only in
-/// [`example_leaf_value`].
+/// examples). Leaves render [`example_leaf_value`] through `inline` —
+/// the same format-specific encoder that `Allowed:` listings and
+/// default assignments already use — so an enum member is a legal,
+/// escaped spelling of that value (a float stays `1.5`, a string with
+/// quotes or a newline stays one line of valid syntax). A new leaf
+/// variant is a compile error only in [`example_leaf_value`].
 pub(crate) fn placeholder(
     shape: &Shape,
-    string_hint: &'static str,
-    datetime_hint: &'static str,
-) -> String {
+    inline: &mut dyn FnMut(&Value) -> Result<String, FormatError>,
+) -> Result<String, FormatError> {
     match shape {
-        Shape::Array(_) => "[]".to_string(),
-        Shape::Map(_) => "{}".to_string(),
-        Shape::Leaf(leaf) => match example_leaf_value(&leaf.ty) {
-            Value::String(s) if s.is_empty() => string_hint.to_string(),
-            Value::String(s) => quote_like_string_hint(&s, string_hint),
-            Value::Integer(n) => n.to_string(),
-            Value::Float(_) => "0.0".to_string(),
-            Value::Boolean(b) => b.to_string(),
-            Value::Datetime(_) => datetime_hint.to_string(),
-            Value::Array(_) | Value::Map(_) => unreachable!("leaf examples are scalars"),
-        },
+        Shape::Array(_) => Ok("[]".to_string()),
+        Shape::Map(_) => Ok("{}".to_string()),
+        Shape::Leaf(leaf) => inline(&example_leaf_value(&leaf.ty)),
         Shape::Object(_) | Shape::Tagged(_) => unreachable!("not a value field"),
     }
-}
-
-/// Wrap `s` in the same quotes as `string_hint` (`""` for TOML/JSON,
-/// `''` for YAML).
-fn quote_like_string_hint(s: &str, string_hint: &str) -> String {
-    let quote = string_hint.chars().next().unwrap_or('"');
-    format!("{quote}{s}{quote}")
 }
 
 /// Append one doc-comment line at `indent` (`# line`, or `#` alone for
@@ -674,58 +657,59 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_varies_only_the_string_and_datetime_arms() {
-        for shape in [
-            Shape::from(Field::string()),
-            Shape::from(Field::enum_of(Vec::<&str>::new())),
-            Shape::from(Field::value()),
-        ] {
-            assert_eq!(placeholder(&shape, "\"\"", "dt"), "\"\"");
-            assert_eq!(placeholder(&shape, "''", "dt"), "''");
-        }
-        assert_eq!(
-            placeholder(&Shape::from(Field::datetime()), "s", "dt-hint"),
-            "dt-hint"
-        );
-        assert_eq!(placeholder(&Shape::from(Field::integer()), "s", "dt"), "0");
-        assert_eq!(placeholder(&Shape::from(Field::float()), "s", "dt"), "0.0");
-        assert_eq!(
-            placeholder(&Shape::from(Field::boolean()), "s", "dt"),
-            "false"
-        );
+    fn placeholder_containers_stay_empty_and_leaves_go_through_inline() {
+        let mut boom = |_: &Value| -> Result<String, FormatError> {
+            unreachable!("containers do not serialize an example value")
+        };
         assert_eq!(
             placeholder(
                 &Shape::from(Field::array_of_type(LeafType::String)),
-                "s",
-                "dt"
-            ),
+                &mut boom
+            )
+            .unwrap(),
             "[]"
         );
         assert_eq!(
-            placeholder(&Shape::from(Field::map_of(LeafType::String)), "s", "dt"),
+            placeholder(&Shape::from(Field::map_of(LeafType::String)), &mut boom).unwrap(),
             "{}"
         );
-        // Enum members and integer bounds come from the shared table, not
-        // a parallel string spelling.
+
+        let mut debug = |v: &Value| Ok(format!("{v:?}"));
         assert_eq!(
-            placeholder(
-                &Shape::from(Field::enum_of(["alpha", "beta"])),
-                "\"\"",
-                "dt"
-            ),
-            "\"alpha\""
+            placeholder(&Shape::from(Field::string()), &mut debug).unwrap(),
+            format!("{:?}", Value::String(String::new()))
         );
         assert_eq!(
-            placeholder(&Shape::from(Field::enum_of(["alpha", "beta"])), "''", "dt"),
-            "'alpha'"
+            placeholder(&Shape::from(Field::integer()), &mut debug).unwrap(),
+            format!("{:?}", Value::Integer(0))
+        );
+        assert_eq!(
+            placeholder(&Shape::from(Field::float()), &mut debug).unwrap(),
+            format!("{:?}", Value::Float(0.0))
+        );
+        assert_eq!(
+            placeholder(&Shape::from(Field::boolean()), &mut debug).unwrap(),
+            format!("{:?}", Value::Boolean(false))
+        );
+        assert_eq!(
+            placeholder(&Shape::from(Field::enum_of(["alpha", "beta"])), &mut debug).unwrap(),
+            format!("{:?}", Value::String("alpha".into()))
+        );
+        assert_eq!(
+            placeholder(&Shape::from(Field::enum_of([1.5_f64])), &mut debug).unwrap(),
+            format!("{:?}", Value::Float(1.5))
+        );
+        assert_eq!(
+            placeholder(&Shape::from(Field::enum_of([r#"a"b\c"#])), &mut debug).unwrap(),
+            format!("{:?}", Value::String(r#"a"b\c"#.into()))
         );
         assert_eq!(
             placeholder(
                 &Shape::from(Field::integer_in(Some(5), Some(10))),
-                "s",
-                "dt"
-            ),
-            "5"
+                &mut debug
+            )
+            .unwrap(),
+            format!("{:?}", Value::Integer(5))
         );
     }
 }

@@ -414,7 +414,7 @@ impl TemplateRenderer for TomlTemplate {
                 let _ = writeln!(out, "{name} = {}", format_inline_toml(value));
             }
             None => {
-                let hint = placeholder(field.shape, "\"\"", "1970-01-01T00:00:00Z");
+                let hint = placeholder(field.shape, &mut |v| Ok(format_inline_toml(v)))?;
                 let _ = writeln!(out, "#{name} = {hint}");
             }
         }
@@ -537,7 +537,7 @@ impl TemplateRenderer for TomlTemplate {
             }
             let example = match field.default {
                 Some(value) => format_inline_toml(value),
-                None => placeholder(field.shape, "\"\"", "1970-01-01T00:00:00Z").to_string(),
+                None => placeholder(field.shape, &mut |v| Ok(format_inline_toml(v)))?,
             };
             let _ = writeln!(out, "#<key> = {example}");
             return Ok(());
@@ -777,7 +777,14 @@ fn emit_tagged_toml_item(
 
 /// Format an owned [`Value`] as it would appear inline in a TOML file (no
 /// surrounding whitespace, no trailing newline).
+///
+/// Strings are always a one-line basic string: `toml::to_string` prefers
+/// multiline `"""…"""` when the value contains a newline, which would
+/// leak uncommented lines out of a `#key = …` placeholder.
 fn format_inline_toml(value: &Value) -> String {
+    if let Value::String(s) = value {
+        return toml_basic_string(s);
+    }
     // toml::to_string handles inline encoding for primitives correctly;
     // for arrays/tables it produces a TOML fragment we trim.
     toml::to_string(&toml::Value::Table({
@@ -794,6 +801,31 @@ fn format_inline_toml(value: &Value) -> String {
             .unwrap_or_else(|| trimmed.to_string())
     })
     .unwrap_or_else(|_| format!("{value:?}"))
+}
+
+/// One-line TOML basic string. Escapes match JSON's (a subset of TOML's
+/// basic-string escapes), so a commented assignment cannot contain a
+/// raw newline, quote, or backslash.
+fn toml_basic_string(s: &str) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
@@ -1061,6 +1093,60 @@ pool_size = 5
             !text.contains("#kind = \"\""),
             "object-root enum placeholder must not be the empty string: {text}"
         );
+    }
+
+    #[test]
+    fn template_enum_placeholder_uses_format_encoder() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::{DocumentRoot, Field, Schema as RtSchema};
+        use crate::schema_walk::finalize_root;
+
+        let quoted = r#"a"b\c"#;
+        let broken = "line\nbreak";
+        let schema = RtSchema::object("App")
+            .field("ratio", Field::enum_of([1.5_f64]))
+            .field("label", Field::enum_of([quoted]))
+            .field("note", Field::enum_of([broken]))
+            .field(
+                "matrix",
+                Field::array_of_type(Field::array_of_type(
+                    RtSchema::object("Cell")
+                        .field("ratio", Field::enum_of([1.5_f64]))
+                        .field("label", Field::enum_of([quoted])),
+                )),
+            )
+            .build();
+        let text = TomlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        assert!(
+            text.contains("1.5"),
+            "float enum member must be serialized, not 0.0: {text}"
+        );
+        assert!(
+            !text.contains("#ratio = 0.0") && !text.contains("ratio = 0.0"),
+            "float enum must not collapse to unconstrained 0.0: {text}"
+        );
+        let parsed = TomlAdapter
+            .parse(&uncommented_toml_assignments(&text))
+            .unwrap_or_else(|e| panic!("uncommented enum placeholders must parse: {e}\n{text}"))
+            .value;
+        let map = parsed.as_map().unwrap();
+        assert_eq!(map["ratio"], Value::Float(1.5), "{text}");
+        assert_eq!(map["label"], Value::String(quoted.into()), "{text}");
+        assert_eq!(map["note"], Value::String(broken.into()), "{text}");
+        let cell = &map["matrix"].as_array().unwrap()[0].as_array().unwrap()[0];
+        let cell_map = cell.as_map().unwrap();
+        assert_eq!(cell_map["ratio"], Value::Float(1.5), "{text}");
+        assert_eq!(cell_map["label"], Value::String(quoted.into()), "{text}");
+        finalize_root(
+            map.clone(),
+            &OriginMap::new(),
+            DocumentRoot::Object(&schema),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap_or_else(|e| panic!("uncommented examples must be allowed members: {e}\n{text}"));
     }
 
     #[test]
