@@ -196,6 +196,26 @@ not a schema field, so `set` refuses with a targeted error telling you to
 edit the config file directly. (An indexed path syntax is a possible
 future extension.)
 
+Tagged unions have three `config set` cases. The tag itself (nothing after
+it) is a closed enum leaf — settable, and an unknown discriminator is the
+same `InvalidValue` a unit-enum field already raises. When the document
+already carries a discriminator that selects a variant, `set` addresses
+that variant's fields normally; a key that variant does not declare is
+refused. When the document has no discriminator yet, a key declared by
+**every** variant is settable if those declarations agree structurally
+(`mount` as a string on every branch is unambiguous); a key declared by
+only some variants is refused until a discriminator selects a branch; a
+key declared by none is a missing key.
+
+The refusal is the same targeted error as map/array interiors. It names
+the tagged union and tells you to edit the config file directly. You can
+also set the discriminator first, then retry:
+
+```sh
+$ myapp config set artifact out
+# Error: Key 'artifact' cannot be set: 'Block' is a tagged union of sections, and keys inside it cannot be addressed with a dotted CLI key — edit the config file directly
+```
+
 With `--scope`:
 
 ```sh
