@@ -1163,7 +1163,7 @@ mod tests {
         use crate::runtime::Field;
         use crate::runtime::Schema as RtSchema;
         let s = generate_schema(
-            &RtSchema::object("App")
+            RtSchema::object("App")
                 .field("blocks", Field::array_of_type(Shape::from(tagged_block())))
                 .build(),
         );
@@ -1181,7 +1181,7 @@ mod tests {
         use crate::runtime::Field;
         use crate::runtime::Schema as RtSchema;
         let s = generate_schema(
-            &RtSchema::object("App")
+            RtSchema::object("App")
                 .field(
                     "groups",
                     Field::map_of(Shape::array("blocks", Shape::from(tagged_block()))),

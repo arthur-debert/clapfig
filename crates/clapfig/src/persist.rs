@@ -40,8 +40,9 @@ use crate::value::Value;
 /// conflicting field of a [`Shape::Tagged`](crate::runtime::Shape::Tagged)
 /// union, fails with the targeted
 /// [`ClapfigError::UnaddressableKey`] instead of a bare key-not-found:
-/// dotted CLI keys cannot say which entry or variant they mean, so the
-/// config file is the surface for editing those sections.
+/// dotted CLI keys cannot index into maps/arrays, and variant-specific
+/// keys require a valid discriminator, so the config file (or a
+/// preceding discriminator set) is required to edit those sections.
 ///
 /// With `normalize_keys`, the action key follows the load path's
 /// acceptance: dash and underscore spellings are equivalent. The key is

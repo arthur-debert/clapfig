@@ -207,15 +207,15 @@ structurally (`mount` as a string on every branch is unambiguous); a key
 declared by only some variants is refused until a discriminator selects a
 branch; a key declared by none is a missing key.
 
-The refusal is the same targeted error as map/array interiors. It names
-the tagged union and tells you to edit the config file directly. A
-variant-specific key (e.g. `block.artifact` where `block` is a tagged
-union and `artifact` exists only on some variants) is refused until a
-discriminator selects a branch; set the discriminator first, then retry:
+The refusal is the same targeted error as map/array interiors, naming
+the tagged union. Unlike those, a variant-specific key can be addressed
+after a discriminator selects a branch — set it first, or edit the
+config file. A key such as `block.artifact` (`block` is a tagged union;
+`artifact` exists only on some variants) is refused until then:
 
 ```sh
 $ myapp config set block.artifact out
-# Error: Key 'block.artifact' cannot be set: 'block' is a tagged union of sections, and keys inside it cannot be addressed with a dotted CLI key — edit the config file directly
+# Error: Key 'block.artifact' cannot be set: 'block' is a tagged union of sections, and this variant-specific key needs a valid discriminator — set it first, or edit the config file directly
 
 $ myapp config set block.kind payload
 Set block.kind = payload

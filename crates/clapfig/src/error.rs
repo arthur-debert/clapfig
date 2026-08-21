@@ -243,19 +243,17 @@ pub enum ClapfigError {
     },
 
     /// A `config set` action key targets a path a dotted CLI key cannot
-    /// address: a [`Shape::Array`](crate::runtime::Shape::Array) /
+    /// address as given: a [`Shape::Array`](crate::runtime::Shape::Array) /
     /// [`Shape::Map`](crate::runtime::Shape::Map) of objects (or a root
     /// map) or a path inside one — entry keys and array indexes are user
     /// data, not schema fields — or a variant-specific / structurally
     /// conflicting field of a [`Shape::Tagged`](crate::runtime::Shape::Tagged)
     /// union (no valid discriminator selects a variant, or the selected
-    /// variant does not declare the key). These paths are deliberately
-    /// not settable; the config file is the surface for editing them.
-    /// (An indexed path syntax like `servers[0].host` is a possible
-    /// future extension.)
-    #[error(
-        "Key '{key}' cannot be set: '{section}' is {kind} of sections, and keys inside it cannot be addressed with a dotted CLI key — edit the config file directly"
-    )]
+    /// variant does not declare the key). Array/map interiors are edited
+    /// in the config file. Tagged-union keys need a valid discriminator
+    /// (set it first) or a file edit. (An indexed path syntax like
+    /// `servers[0].host` is a possible future extension.)
+    #[error("{}", format_unaddressable_key(.key, .section, .kind))]
     UnaddressableKey {
         /// The dotted action key as the caller supplied it.
         key: String,
@@ -465,6 +463,20 @@ impl ClapfigError {
     }
 }
 
+fn format_unaddressable_key(key: &str, section: &str, kind: &str) -> String {
+    // Tagged-union keys are addressable after a discriminator is set;
+    // array/map interiors are not.
+    if kind == "a tagged union" {
+        format!(
+            "Key '{key}' cannot be set: '{section}' is {kind} of sections, and this variant-specific key needs a valid discriminator — set it first, or edit the config file directly"
+        )
+    } else {
+        format!(
+            "Key '{key}' cannot be set: '{section}' is {kind} of sections, and keys inside it cannot be addressed with a dotted CLI key — edit the config file directly"
+        )
+    }
+}
+
 fn format_invalid_value(key: &str, reason: &str, origin: &OriginFacts) -> String {
     use std::fmt::Write;
     let mut out = format!("Invalid value for '{key}': {reason}");
@@ -653,6 +665,40 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("did you mean 'database.url'?"), "{msg}");
+    }
+
+    #[test]
+    fn unaddressable_tagged_union_points_at_discriminator() {
+        let err = ClapfigError::UnaddressableKey {
+            key: "block.artifact".into(),
+            section: "block".into(),
+            kind: "a tagged union",
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("this variant-specific key needs a valid discriminator"),
+            "{msg}"
+        );
+        assert!(msg.contains("set it first"), "{msg}");
+        assert!(
+            !msg.contains("cannot be addressed with a dotted CLI key"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn unaddressable_map_stays_file_only() {
+        let err = ClapfigError::UnaddressableKey {
+            key: "servers.web.host".into(),
+            section: "servers".into(),
+            kind: "a map",
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("keys inside it cannot be addressed with a dotted CLI key"),
+            "{msg}"
+        );
+        assert!(!msg.contains("discriminator"), "{msg}");
     }
 
     #[test]
