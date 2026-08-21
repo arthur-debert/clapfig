@@ -41,7 +41,10 @@ use crate::value::Value;
 /// union, fails with the targeted
 /// [`ClapfigError::UnaddressableKey`] instead of a bare key-not-found:
 /// dotted CLI keys cannot index into maps/arrays, and a tagged-union
-/// key is refused when the current selection does not address it.
+/// key is refused when the current selection does not address it, so
+/// the config file (or selecting a variant that declares the key) is
+/// required to edit those sections. Keys no variant declares are
+/// [`ClapfigError::KeyNotFound`].
 ///
 /// With `normalize_keys`, the action key follows the load path's
 /// acceptance: dash and underscore spellings are equivalent. The key is

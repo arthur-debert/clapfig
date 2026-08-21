@@ -200,8 +200,8 @@ Tagged unions have three `config set` cases. The tag itself (nothing after
 it) is a closed enum leaf — settable, and an unknown discriminator is the
 same `InvalidValue` a unit-enum field already raises. When a valid
 discriminator already selects a variant, `set` addresses that variant's
-fields normally; a key that variant does not declare is refused
-(including keys no variant declares). When no
+fields normally; a key declared by another variant but not this one is
+refused. A key no variant declares is a missing key. When no
 valid discriminator selects a variant (missing, unknown, or mistyped), a
 key declared by **every** variant is settable if those declarations agree
 structurally (`mount` as a string on every branch is unambiguous); a key
@@ -209,14 +209,14 @@ declared by only some variants is refused until a discriminator selects a
 branch; a key declared by none is a missing key.
 
 The refusal is the same targeted error as map/array interiors, naming
-the tagged union: this key is not addressable under the current
-selection. When the key belongs to another variant (e.g. `block.artifact`
-exists only on some variants), selecting that variant then retrying
-succeeds:
+the tagged union. Unlike those, the key can be addressed once a variant
+that declares it is selected — set or change the discriminator, or edit
+the config file. A key such as `block.artifact` (`block` is a tagged
+union; `artifact` exists only on some variants) is refused until then:
 
 ```sh
 $ myapp config set block.artifact out
-# Error: Key 'block.artifact' cannot be set: 'block' is a tagged union of sections, and this key is not addressable under the current tagged-union selection
+# Error: Key 'block.artifact' cannot be set: 'block' is a tagged union of sections, and the current tagged-union selection does not address this key — select a variant that declares it, or edit the config file directly
 
 $ myapp config set block.kind payload
 Set block.kind = payload

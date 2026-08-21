@@ -249,11 +249,11 @@ pub enum ClapfigError {
     /// data, not schema fields — or a variant-specific / structurally
     /// conflicting field of a [`Shape::Tagged`](crate::runtime::Shape::Tagged)
     /// union (no valid discriminator selects a variant, or the selected
-    /// variant does not declare the key, including keys no variant
-    /// declares). Array/map interiors are edited in the config file.
-    /// Tagged-union keys are refused when the current selection does not
-    /// address them. (An indexed path syntax like `servers[0].host` is a
-    /// possible future extension.)
+    /// variant does not declare a key that another variant does). Keys
+    /// no variant declares are [`KeyNotFound`](Self::KeyNotFound). Array/map interiors are
+    /// edited in the config file. Tagged-union keys need a variant that
+    /// declares them (select it, or edit the file). (An indexed path
+    /// syntax like `servers[0].host` is a possible future extension.)
     #[error("{}", format_unaddressable_key(.key, .section, .kind))]
     UnaddressableKey {
         /// The dotted action key as the caller supplied it.
@@ -465,12 +465,12 @@ impl ClapfigError {
 }
 
 fn format_unaddressable_key(key: &str, section: &str, kind: &str) -> String {
-    // One string for every tagged refusal (missing, invalid, non-owning,
-    // or absent-from-all). Do not promise a remedy that is only valid
-    // for some of those states.
+    // UnaddressableKey is only reached for keys `valid_keys_shape`
+    // already accepted (declared by at least one variant). Keys no
+    // variant declares are KeyNotFound first.
     if kind == "a tagged union" {
         format!(
-            "Key '{key}' cannot be set: '{section}' is {kind} of sections, and this key is not addressable under the current tagged-union selection"
+            "Key '{key}' cannot be set: '{section}' is {kind} of sections, and the current tagged-union selection does not address this key — select a variant that declares it, or edit the config file directly"
         )
     } else {
         format!(
@@ -669,33 +669,23 @@ mod tests {
         assert!(msg.contains("did you mean 'database.url'?"), "{msg}");
     }
 
-    fn assert_tagged_unaddressable_is_neutral(key: &str) {
+    #[test]
+    fn unaddressable_tagged_union_points_at_declaring_variant() {
         let err = ClapfigError::UnaddressableKey {
-            key: key.into(),
+            key: "block.artifact".into(),
             section: "block".into(),
             kind: "a tagged union",
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("this key is not addressable under the current tagged-union selection"),
+            msg.contains("the current tagged-union selection does not address this key"),
             "{msg}"
         );
-        assert!(!msg.contains("select a variant"), "{msg}");
-        assert!(!msg.contains("edit the config file"), "{msg}");
+        assert!(msg.contains("select a variant that declares it"), "{msg}");
         assert!(
             !msg.contains("cannot be addressed with a dotted CLI key"),
             "{msg}"
         );
-    }
-
-    #[test]
-    fn unaddressable_tagged_union_is_neutral_for_variant_key() {
-        assert_tagged_unaddressable_is_neutral("block.artifact");
-    }
-
-    #[test]
-    fn unaddressable_tagged_union_is_neutral_when_no_variant_declares() {
-        assert_tagged_unaddressable_is_neutral("block.no_such_field");
     }
 
     #[test]
