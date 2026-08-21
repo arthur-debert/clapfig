@@ -13,14 +13,16 @@
 //! [`walk_level`] driver walks a schema level and dispatches each field to
 //! a per-format [`TemplateRenderer`], which owns only the format-specific
 //! spelling (TOML's `[section]` headers, YAML's indentation, JSON's
-//! comment keys). The leaf annotation lines ([`leaf_annotations`]) and the
-//! placeholder table ([`placeholder`]) are shared outright, as are the
-//! comment-line helpers the text formats print through.
+//! comment keys). The leaf annotation lines ([`leaf_annotations`]) are
+//! shared outright, as are the comment-line helpers the text formats
+//! print through. The single example-value table is
+//! [`example_leaf_value`]: [`placeholder`] renders it, and
+//! [`with_example_defaults`] / [`example_shape_value`] consume it.
 
 use std::fmt::Write;
 
 use crate::runtime::{Field, LeafType, Schema, Shape, TaggedShape, TaggedVariant};
-use crate::value::Value;
+use crate::value::{Map, Value};
 
 use super::FormatError;
 
@@ -311,7 +313,53 @@ fn with_example_defaults(shape: &Shape) -> Shape {
     }
 }
 
-fn example_leaf_value(ty: &LeafType) -> Value {
+/// One-entry example [`Value`] for a shape: declared defaults win,
+/// otherwise a constraint-satisfying leaf ([`example_leaf_value`]) or a
+/// one-entry nested example (container). Used when a template must keep
+/// nested array layers in an inline assignment.
+pub(crate) fn example_shape_value(shape: &Shape) -> Value {
+    match shape {
+        Shape::Leaf(leaf) => leaf
+            .default
+            .clone()
+            .unwrap_or_else(|| example_leaf_value(&leaf.ty)),
+        Shape::Object(schema) => {
+            let mut map = Map::new();
+            for nf in &schema.fields {
+                map.insert(nf.name.clone(), example_shape_value(&nf.field));
+            }
+            Value::Map(map)
+        }
+        Shape::Array(array) => array
+            .default
+            .clone()
+            .unwrap_or_else(|| Value::Array(vec![example_shape_value(&array.item)])),
+        Shape::Map(map) => map.default.clone().unwrap_or_else(|| {
+            let mut entry = Map::new();
+            entry.insert("<key>".into(), example_shape_value(&map.item));
+            Value::Map(entry)
+        }),
+        Shape::Tagged(tagged) => tagged
+            .variants
+            .first()
+            .map(|variant| {
+                let example = tagged_variant_example_schema(tagged, variant);
+                let mut map = Map::new();
+                for nf in &example.fields {
+                    map.insert(nf.name.clone(), example_shape_value(&nf.field));
+                }
+                Value::Map(map)
+            })
+            .unwrap_or(Value::Map(Map::new())),
+    }
+}
+
+/// Constraint-satisfying example value for a leaf: the first enum
+/// member, an integer inside declared bounds, otherwise a typed
+/// zero/empty. This is the single example-value table;
+/// [`placeholder`] renders it and [`example_shape_value`] /
+/// [`with_example_defaults`] consume it.
+pub(crate) fn example_leaf_value(ty: &LeafType) -> Value {
     match ty {
         LeafType::String | LeafType::Value => Value::String(String::new()),
         LeafType::Enum { values } => values
@@ -425,28 +473,42 @@ fn describe_shape_item(shape: &Shape) -> String {
     }
 }
 
-/// Single-word placeholder rendered in a commented-out template line for a
-/// leaf without a default, hinting the expected value shape. Two arms vary
-/// by format: `string_hint` is the empty-string spelling (`""` for
-/// TOML/JSON, `''` for YAML; enums and any-value leaves use it too) and
-/// `datetime_hint` the epoch example (quoted in JSON, bare elsewhere).
+/// Commented-out template spelling of a defaultless value-shaped field.
+///
+/// Arrays and maps stay `[]` / `{}` (empty containers, not one-entry
+/// examples). Leaves render [`example_leaf_value`]: empty string and
+/// datetime keep the format-specific `string_hint` / `datetime_hint` so
+/// TOML/JSON `""` and YAML `''` cannot drift, while enums and bounded
+/// integers use the honest value (a member of the allowed set, a number
+/// inside the range). Matching the [`Value`] rather than [`LeafType`]
+/// means a new leaf variant is a compile error only in
+/// [`example_leaf_value`].
 pub(crate) fn placeholder(
     shape: &Shape,
     string_hint: &'static str,
     datetime_hint: &'static str,
-) -> &'static str {
+) -> String {
     match shape {
-        Shape::Array(_) => "[]",
-        Shape::Map(_) => "{}",
-        Shape::Leaf(leaf) => match &leaf.ty {
-            LeafType::String | LeafType::Enum { .. } | LeafType::Value => string_hint,
-            LeafType::Integer { .. } => "0",
-            LeafType::Float => "0.0",
-            LeafType::Bool => "false",
-            LeafType::DateTime => datetime_hint,
+        Shape::Array(_) => "[]".to_string(),
+        Shape::Map(_) => "{}".to_string(),
+        Shape::Leaf(leaf) => match example_leaf_value(&leaf.ty) {
+            Value::String(s) if s.is_empty() => string_hint.to_string(),
+            Value::String(s) => quote_like_string_hint(&s, string_hint),
+            Value::Integer(n) => n.to_string(),
+            Value::Float(_) => "0.0".to_string(),
+            Value::Boolean(b) => b.to_string(),
+            Value::Datetime(_) => datetime_hint.to_string(),
+            Value::Array(_) | Value::Map(_) => unreachable!("leaf examples are scalars"),
         },
         Shape::Object(_) | Shape::Tagged(_) => unreachable!("not a value field"),
     }
+}
+
+/// Wrap `s` in the same quotes as `string_hint` (`""` for TOML/JSON,
+/// `''` for YAML).
+fn quote_like_string_hint(s: &str, string_hint: &str) -> String {
+    let quote = string_hint.chars().next().unwrap_or('"');
+    format!("{quote}{s}{quote}")
 }
 
 /// Append one doc-comment line at `indent` (`# line`, or `#` alone for
@@ -561,6 +623,20 @@ mod tests {
     }
 
     #[test]
+    fn example_leaf_value_enum_is_first_allowed_member() {
+        assert_eq!(
+            example_leaf_value(&LeafType::Enum {
+                values: vec![Value::String("alpha".into()), Value::String("beta".into())]
+            }),
+            Value::String("alpha".into())
+        );
+        assert_eq!(
+            example_shape_value(&Shape::from(Field::enum_of(["alpha", "beta"]))),
+            Value::String("alpha".into())
+        );
+    }
+
+    #[test]
     fn tagged_variant_example_materializes_nested_tagged_as_first_variant() {
         let inner = Shape::tagged("Inner", "kind")
             .variant(
@@ -628,6 +704,28 @@ mod tests {
         assert_eq!(
             placeholder(&Shape::from(Field::map_of(LeafType::String)), "s", "dt"),
             "{}"
+        );
+        // Enum members and integer bounds come from the shared table, not
+        // a parallel string spelling.
+        assert_eq!(
+            placeholder(
+                &Shape::from(Field::enum_of(["alpha", "beta"])),
+                "\"\"",
+                "dt"
+            ),
+            "\"alpha\""
+        );
+        assert_eq!(
+            placeholder(&Shape::from(Field::enum_of(["alpha", "beta"])), "''", "dt"),
+            "'alpha'"
+        );
+        assert_eq!(
+            placeholder(
+                &Shape::from(Field::integer_in(Some(5), Some(10))),
+                "s",
+                "dt"
+            ),
+            "5"
         );
     }
 }

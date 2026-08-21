@@ -15,12 +15,12 @@
 
 use std::collections::BTreeMap;
 
-use crate::runtime::{LeafType, Schema, Shape};
+use crate::runtime::{Schema, Shape};
 use crate::value::{Map, Value};
 
 use super::template::{
-    TemplateRenderer, leaf_annotations, placeholder, push_comment_line, push_commented_block,
-    tagged_variant_example_schema, walk_level, walk_root,
+    TemplateRenderer, example_shape_value, leaf_annotations, placeholder, push_comment_line,
+    push_commented_block, tagged_variant_example_schema, walk_level, walk_root,
 };
 use super::{ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, Span, SpanEntry};
 
@@ -686,60 +686,6 @@ fn has_array_in_array(shape: &Shape) -> bool {
     }
 }
 
-/// One-entry example value for a shape, used when a template must keep
-/// nested array layers in inline TOML. Defaults win; otherwise a
-/// placeholder (leaf) or a one-entry nested example (container).
-fn example_shape_value(shape: &Shape) -> Value {
-    match shape {
-        Shape::Leaf(leaf) => leaf
-            .default
-            .clone()
-            .unwrap_or_else(|| leaf_placeholder(&leaf.ty)),
-        Shape::Object(schema) => {
-            let mut map = Map::new();
-            for nf in &schema.fields {
-                map.insert(nf.name.clone(), example_shape_value(&nf.field));
-            }
-            Value::Map(map)
-        }
-        Shape::Array(array) => array
-            .default
-            .clone()
-            .unwrap_or_else(|| Value::Array(vec![example_shape_value(&array.item)])),
-        Shape::Map(map) => map.default.clone().unwrap_or_else(|| {
-            let mut entry = Map::new();
-            entry.insert("<key>".into(), example_shape_value(&map.item));
-            Value::Map(entry)
-        }),
-        Shape::Tagged(tagged) => tagged
-            .variants
-            .first()
-            .map(|variant| {
-                let example = tagged_variant_example_schema(tagged, variant);
-                let mut map = Map::new();
-                for nf in &example.fields {
-                    map.insert(nf.name.clone(), example_shape_value(&nf.field));
-                }
-                Value::Map(map)
-            })
-            .unwrap_or(Value::Map(Map::new())),
-    }
-}
-
-fn leaf_placeholder(ty: &LeafType) -> Value {
-    match ty {
-        LeafType::String | LeafType::Enum { .. } | LeafType::Value => Value::String(String::new()),
-        LeafType::Integer { .. } => Value::Integer(0),
-        LeafType::Float => Value::Float(0.0),
-        LeafType::Bool => Value::Boolean(false),
-        LeafType::DateTime => Value::Datetime(
-            "1970-01-01T00:00:00Z"
-                .parse()
-                .expect("epoch datetime placeholder is valid"),
-        ),
-    }
-}
-
 /// Render nested item content under `path`. The caller already emitted
 /// the field's own `[[path]]` / `[path.<key>]` header, except for a
 /// nested tagged array item: that path emits one `[[path]]` per variant
@@ -1047,6 +993,73 @@ pool_size = 5
             batches.get("<key>").or_else(|| batches.values().next()),
             Some(&Value::Array(vec![Value::Array(vec![timeout])])),
             "uncommented Map<Array<Array<Object>>> example must keep both array layers: {text}"
+        );
+    }
+
+    #[test]
+    fn template_nested_array_of_enum_leaf_uncommented_loads() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::{DocumentRoot, Field, Schema as RtSchema};
+        use crate::schema_walk::finalize_root;
+
+        // Array<Array<EnumLeaf>> as a value field would be the empty `[]`
+        // placeholder. The live defect is the inline nested-array path:
+        // Array<Array<Object { enum leaf }>> materializes a one-entry
+        // example the user uncomments.
+        let schema = RtSchema::object("App")
+            .field(
+                "matrix",
+                Field::array_of_type(Field::array_of_type(
+                    RtSchema::object("Cell").field("kind", Field::enum_of(["alpha", "beta"])),
+                )),
+            )
+            .build();
+        let text = TomlAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        assert!(
+            text.contains("\"alpha\""),
+            "enum example must be an allowed member: {text}"
+        );
+        assert!(
+            !text.contains("kind = \"\""),
+            "enum example must not be the empty string: {text}"
+        );
+        let parsed = TomlAdapter
+            .parse(&uncommented_toml_assignments(&text))
+            .unwrap()
+            .value;
+        let map = parsed.as_map().unwrap();
+        let inner = &map["matrix"].as_array().unwrap()[0].as_array().unwrap()[0];
+        assert_eq!(
+            inner.as_map().unwrap()["kind"],
+            Value::String("alpha".into()),
+            "uncommented Array<Array<EnumLeaf>> example must pick the first member: {text}"
+        );
+        finalize_root(
+            map.clone(),
+            &OriginMap::new(),
+            DocumentRoot::Object(&schema),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap_or_else(|e| panic!("uncommented nested enum example must load: {e}\n{text}"));
+    }
+
+    #[test]
+    fn template_enum_leaf_placeholder_is_an_allowed_member() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .field("kind", Field::enum_of(["alpha", "beta"]))
+            .build();
+        let text = TomlAdapter.template(&Shape::Object(schema)).unwrap();
+        assert!(
+            text.contains("#kind = \"alpha\""),
+            "object-root enum placeholder must be an allowed member: {text}"
+        );
+        assert!(
+            !text.contains("#kind = \"\""),
+            "object-root enum placeholder must not be the empty string: {text}"
         );
     }
 
