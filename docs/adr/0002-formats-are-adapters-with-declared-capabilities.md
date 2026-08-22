@@ -52,12 +52,25 @@ call sites never branch on format names.
 | --- | --- | --- | --- |
 | Parse → `Value` + spans (ADR-0005) | yes (`toml_edit`, one parse) | yes (comment keys stripped; owned span walk, ADR-0007) | yes (aliases resolved; tags / merge keys → typed error; spans via yamlpath, ADR-0008) |
 | Template generation | yes (native comments) | yes (`"//"` keys) | yes (native comments) |
+| Editor schema directive | yes (`#:schema <reference>`, first line) | no | no |
 | Serialize `Value` | yes | yes (non-finite floats → typed error) | yes |
 | Edit: set / replace an existing value | yes, lossless (`toml_edit`) | yes (comments-as-data survive; formatting normalized, documented) | yes, targeted span patch (`yamlpatch`); byte-preserving outside the span |
 | Edit: create a missing key / path | yes | yes | yes |
 | Edit: create a missing file | yes (seed from generated template) | yes (seed) | yes (seed) |
 | Edit: unset | yes | yes | yes |
 | Known refusals | — | — | sequence-item replace; flow-style list append |
+
+The editor schema directive is the row where the formats genuinely differ
+rather than merely spelling the same thing differently. TOML has a
+directive the language servers agree on (`#:schema <reference>`, read from
+the file's first line). YAML's schema comments are per-language-server
+conventions rather than one shared spelling, and JSON's `"$schema"` is a
+member of the instance — a configuration key clapfig's own strict
+validation would then have to reserve. So neither declares the operation,
+and a caller asking for a directive under them gets the typed refusal
+instead of a line their editor would not read. The reference itself is the
+caller's (`docs/editor-schemas.md`): clapfig validates it as one line and
+renders it verbatim.
 
 ## Baseline mapping table
 

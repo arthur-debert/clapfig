@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
+use crate::artifacts::{ArtifactOptions, ConfigArtifacts};
 use crate::error::{ClapfigError, DiscoveryRecord, FileProbe, ProbeOutcome};
 use crate::file;
 use crate::flatten;
@@ -716,6 +717,41 @@ impl Builder {
         self.handle(action).map(|r| r.to_string())
     }
 
+    /// Render this schema's config template and JSON Schema document
+    /// together, from the one [`Shape`] the builder holds.
+    ///
+    /// The template is rendered in the preferred (first-enabled) format —
+    /// the same body `config gen` writes to stdout, byte for byte, when
+    /// `options` carries no schema reference. With a reference, the
+    /// format's editor schema directive (TOML: `#:schema <reference>`) is
+    /// the template's first line and a blank line separates it from the
+    /// body. The JSON Schema text is what `config schema` emits.
+    ///
+    /// Nothing is written: the caller chooses both paths and writes the
+    /// two files. See the [`artifacts`](crate::artifacts) module for what
+    /// clapfig owns here and what the caller does.
+    ///
+    /// # Errors
+    ///
+    /// [`ClapfigError::AppNameRequired`] when `.app_name()` was not
+    /// called (the preferred format comes from the file-naming settings),
+    /// and the typed
+    /// [`UnsupportedByFormat`](crate::format::UnsupportedByFormat) refusal
+    /// — as [`ClapfigError::Format`] — when a reference is set and the
+    /// preferred format declares no schema directive (YAML, JSON).
+    pub fn artifacts(&self, options: &ArtifactOptions) -> Result<ConfigArtifacts, ClapfigError> {
+        let registry = self.effective_registry()?;
+        let preferred = registry
+            .preferred()
+            .expect("effective_registry always registers an adapter");
+        crate::artifacts::generate(
+            preferred,
+            self.schema.as_shape(),
+            self.normalize_keys,
+            options,
+        )
+    }
+
     /// Resolve the file path AND format adapter for a named persist
     /// scope.
     ///
@@ -866,9 +902,7 @@ impl Builder {
                 }
             }
             ConfigAction::Schema { output } => {
-                let value = crate::json_schema::generate_schema_ref(self.schema.as_shape());
-                let schema = serde_json::to_string_pretty(&value)
-                    .expect("serde_json::Value serialization is infallible");
+                let schema = crate::artifacts::schema_document(self.schema.as_shape());
                 match output {
                     Some(path) => {
                         if let Some(parent) = path.parent() {

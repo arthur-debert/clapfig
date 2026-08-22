@@ -205,5 +205,6 @@ See the [Resolver docs](https://docs.rs/clapfig/latest/clapfig/struct.Resolver.h
 - [Strictness Guide](docs/strictness.md) — the cascading strict-mode system
 - [Resolver Guide](docs/resolver.md) — per-directory resolution for tree-walk tools
 - [Config Command Guide](docs/config-command.md) — the `config gen|list|get|set|unset|schema` integration
+- [Editor-Discoverable Config Files](docs/editor-schemas.md) — generating a config template and its JSON Schema together, bound by a `#:schema` directive
 
 **API reference**: the full API with design rationale lives in the [crate-level docs on docs.rs](https://docs.rs/clapfig).

@@ -384,6 +384,15 @@ pub enum ClapfigError {
     #[error("Invalid formats list: {reason}")]
     InvalidFormats { reason: String },
 
+    /// A schema-document reference handed to
+    /// [`SchemaReference::new`](crate::artifacts::SchemaReference::new) is
+    /// not a single line: it is empty or whitespace-only, carries a line
+    /// break or another control character, or has leading/trailing
+    /// whitespace. The reference is otherwise opaque — this is not a
+    /// "that path does not exist" or "that URL is unreachable" error.
+    #[error("Invalid schema reference '{reference}': {reason}")]
+    InvalidSchemaReference { reference: String, reason: String },
+
     /// Stem-based discovery found more than one same-stem config file in
     /// one directory (e.g. `myapp.toml` AND `myapp.yaml`). The spec pins
     /// this as a hard error naming the files — no silent precedence, no

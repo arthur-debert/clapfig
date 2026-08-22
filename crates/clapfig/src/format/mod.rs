@@ -19,6 +19,11 @@
 //! Shipped adapters (TOML, YAML, JSON) fill the index so unknown-key
 //! and `InvalidValue` errors locate the token from byte spans.
 //!
+//! Editor schema directives are format syntax too: the adapter spells the
+//! line that binds a generated file to its JSON Schema
+//! ([`FormatAdapter::schema_directive`]), which is why TOML has one and
+//! YAML and JSON refuse.
+//!
 //! This module holds the contract and its pure data structures; the
 //! adapters themselves live in [`toml`], [`yaml`], and [`json`], and the
 //! shared walkers they drive — the schema → template traversal and the
@@ -53,6 +58,9 @@ pub enum Operation {
     Parse,
     /// Render a documented config template from a schema.
     Template,
+    /// Render the editor schema-document directive line that binds a
+    /// generated file to a JSON Schema (TOML's `#:schema <reference>`).
+    SchemaDirective,
     /// Serialize a [`Value`] tree to source text.
     Serialize,
     /// Edit: set/replace an existing value in a file, preserving the rest
@@ -72,6 +80,7 @@ impl fmt::Display for Operation {
         f.write_str(match self {
             Operation::Parse => "parsing",
             Operation::Template => "template generation",
+            Operation::SchemaDirective => "rendering an editor schema directive",
             Operation::Serialize => "serialization",
             Operation::EditSet => "replacing an existing value",
             Operation::EditCreateKey => "creating a missing key",
@@ -529,6 +538,30 @@ pub trait FormatAdapter: Send + Sync {
     /// templates that do not use new constructors stay unchanged.
     fn template(&self, shape: &Shape) -> Result<String, FormatError>;
 
+    /// Spell the editor schema-document directive naming `reference` —
+    /// the line an editor toolchain reads to find the JSON Schema a
+    /// generated config file is described by (TOML: `#:schema <reference>`).
+    ///
+    /// The returned line carries no trailing newline; the artifact
+    /// generator places it and the blank separator that follows. The
+    /// reference is opaque and goes in verbatim
+    /// ([`SchemaReference`](crate::artifacts::SchemaReference) has already
+    /// checked it is one line).
+    ///
+    /// The default refuses with the typed error, which is the honest answer
+    /// for a format with no such directive (YAML and JSON). An adapter that
+    /// declares [`Operation::SchemaDirective`] must override this.
+    fn schema_directive(
+        &self,
+        reference: &crate::artifacts::SchemaReference,
+    ) -> Result<String, FormatError> {
+        let _ = reference;
+        Err(FormatError::Unsupported(UnsupportedByFormat {
+            format: self.name(),
+            operation: Operation::SchemaDirective,
+        }))
+    }
+
     /// Apply one [`FileEdit`] to existing source text, returning the new
     /// text. Preservation honesty is per the format's declared edit
     /// capabilities; declared-but-unsupported shapes refuse with the typed
@@ -859,6 +892,8 @@ mod tests {
                 "toml should declare {operation}"
             );
         }
+        // Plus the row only TOML has: the editor schema directive.
+        assert!(toml::TomlAdapter.supports(Operation::SchemaDirective));
     }
 
     #[test]
@@ -872,6 +907,39 @@ mod tests {
                 "yaml should declare {operation}"
             );
         }
+    }
+
+    #[test]
+    fn only_toml_spells_the_editor_schema_directive() {
+        // The directive is format syntax: TOML has one, YAML and JSON do
+        // not, and the formats without one refuse rather than answering
+        // with a line their editors would not read.
+        let reference = crate::artifacts::SchemaReference::new("./app.schema.json").unwrap();
+        assert_eq!(
+            toml::TomlAdapter.schema_directive(&reference).unwrap(),
+            "#:schema ./app.schema.json"
+        );
+        for adapter in [&yaml::YamlAdapter as &dyn FormatAdapter, &json::JsonAdapter] {
+            assert!(!adapter.supports(Operation::SchemaDirective));
+            let err = adapter.schema_directive(&reference).unwrap_err();
+            assert_eq!(
+                err,
+                FormatError::Unsupported(UnsupportedByFormat {
+                    format: adapter.name(),
+                    operation: Operation::SchemaDirective,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn the_directive_carries_no_trailing_newline() {
+        // Placement — the blank separator under it — belongs to the
+        // artifact generator, not the adapter.
+        let reference = crate::artifacts::SchemaReference::new("./app.schema.json").unwrap();
+        let directive = toml::TomlAdapter.schema_directive(&reference).unwrap();
+        assert!(!directive.ends_with('\n'), "{directive:?}");
+        assert_eq!(directive.lines().count(), 1);
     }
 
     #[test]

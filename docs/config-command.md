@@ -257,6 +257,12 @@ myapp config schema
 myapp config schema --output myapp-schema.json
 ```
 
+To generate the template and the JSON Schema **together** — bound by the
+`#:schema` directive a TOML editor reads to validate the file as the user
+types — call `artifacts()` on the builder instead of dispatching two
+actions. See the [Editor-Discoverable Config Files](editor-schemas.md)
+guide.
+
 ## Persist scopes
 
 Scopes name where `config set` and `config unset` write. The first scope

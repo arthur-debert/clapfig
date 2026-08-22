@@ -70,3 +70,8 @@ required-features = ["clap", "derive"]
 [[example]]
 name = "runtime_schema"
 path = "examples/runtime_schema/main.rs"
+
+[[example]]
+name = "schema_directive"
+path = "examples/schema_directive/main.rs"
+required-features = ["derive"]

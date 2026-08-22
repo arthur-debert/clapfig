@@ -103,7 +103,8 @@
 //! module), one
 //! per format — TOML, YAML, JSON — behind a single contract
 //! ([`format::FormatAdapter`]) that parses text into `Value`, renders
-//! documented templates, serializes, and edits files.
+//! documented templates (and the editor schema directive that binds one
+//! to its JSON Schema), serializes, and edits files.
 //!
 //! The consequences you can observe:
 //!
@@ -732,6 +733,29 @@
 //! `config set` creates a new file, it seeds it from this template so the
 //! user gets a documented starting point.
 //!
+//! # Editor-discoverable artifacts
+//!
+//! [`artifacts()`](Builder::artifacts) renders the config template and its
+//! JSON Schema document together, from the one schema the builder holds,
+//! and can prefix the template with the editor schema directive
+//! (TOML: `#:schema <reference>`) a TOML language server reads to validate
+//! the file as a user types it:
+//!
+//! ```ignore
+//! use clapfig::artifacts::{ArtifactOptions, SchemaReference};
+//!
+//! let options = ArtifactOptions::new()
+//!     .schema_reference(SchemaReference::new("./blocks.schema.json")?);
+//! let pair = Clapfig::typed::<BlocksFile>().app_name("edward").artifacts(&options)?;
+//! std::fs::write(".edward/blocks.toml", &pair.template)?;
+//! std::fs::write(".edward/blocks.schema.json", &pair.schema)?;
+//! ```
+//!
+//! Clapfig generates the two contents; the caller chooses the reference,
+//! the paths, and when to write. Without a reference the template is
+//! byte-for-byte `config gen` output. See the
+//! [`artifacts`](mod@artifacts) module.
+//!
 //! # Metadata accessors
 //!
 //! Tools that build help text, tooltips, settings UIs, or `--describe`
@@ -804,6 +828,7 @@
 //! prerequisites reference the builder method to call. See the [`error`]
 //! module for the full set.
 
+pub mod artifacts;
 pub mod error;
 pub mod format;
 pub mod json_schema;
