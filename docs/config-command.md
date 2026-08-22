@@ -77,7 +77,11 @@ placeholders. Enum-typed fields additionally carry an `Allowed:` line;
 array/map fields carry an `Elements:`/`Values:` line naming the element
 type. A `Required.` line marks a placeholder the runtime rejects if left
 commented (a non-optional scalar with no default). Absent arrays and maps
-load as empty, so they do not get that line.
+load as empty, so they do not get that line. A tagged schema emits **one
+commented example per variant**, each a complete object for that
+discriminator — not one uncommented object that mixes keys from several
+variants. A root map shows a commented example entry, not an invented
+parent table.
 
 Write to a file with `--output` — the path's **extension selects the
 format**, independent of the enabled-formats list:
@@ -123,6 +127,9 @@ flip side is that the `//` key namespace is **reserved** — a `//`-prefixed
 member in a JSON config file is always a comment, never a configuration
 key. The exported JSON Schema (`config schema`) allowlists the `^//`
 pattern so third-party validators accept documented templates too.
+Tagged unions export as `oneOf` with a `const` on the tag field; a root
+map is `type: object` plus `additionalProperties` of the item at the
+document root.
 
 ### `config list`
 
@@ -182,12 +189,41 @@ myapp config set tags '["a", "b"]'
 myapp config set limits '{cpu = 2, mem = 8}'
 ```
 
-Keys inside `ArrayOf`/`MapOf` sections (arrays or maps **of sections**,
-e.g. `servers.web.host` where `servers` is a `HashMap<String, Server>`)
+Keys inside arrays or maps **of objects** (e.g. `servers.web.host` where
+`servers` is a `HashMap<String, Server>`), and keys inside a root map,
 are not addressable with a dotted CLI key — the entry key is user data,
 not a schema field, so `set` refuses with a targeted error telling you to
 edit the config file directly. (An indexed path syntax is a possible
 future extension.)
+
+Tagged unions have three `config set` cases. The tag itself (nothing after
+it) is a closed enum leaf — settable, and an unknown discriminator is the
+same `InvalidValue` a unit-enum field already raises. When a valid
+discriminator already selects a variant, `set` addresses that variant's
+fields normally; a key declared by another variant but not this one is
+refused. A key no variant declares is a missing key. When no
+valid discriminator selects a variant (missing, unknown, or mistyped), a
+key declared by **every** variant is settable if those declarations agree
+structurally (`mount` as a string on every branch is unambiguous); a key
+declared by only some variants is refused until a discriminator selects a
+branch; a key declared by none is a missing key.
+
+The refusal is the same targeted error as map/array interiors, naming
+the tagged union. Unlike those, the key can be addressed once a variant
+that declares it is selected — set or change the discriminator, or edit
+the config file. A key such as `block.artifact` (`block` is a tagged
+union; `artifact` exists only on some variants) is refused until then:
+
+```sh
+$ myapp config set block.artifact out
+# Error: Key 'block.artifact' cannot be set: 'block' is a tagged union of sections, and the current tagged-union selection does not address this key — select a variant that declares it, or edit the config file directly
+
+$ myapp config set block.kind payload
+Set block.kind = payload
+
+$ myapp config set block.artifact out
+Set block.artifact = out
+```
 
 With `--scope`:
 

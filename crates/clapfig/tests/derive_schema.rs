@@ -519,6 +519,12 @@ struct PdfDoc {
 }
 
 #[test]
+#[should_panic(expected = "is a unit-only enum")]
+fn unit_enum_schema_accessor_fails_loudly() {
+    let _ = PdfPageSize::schema();
+}
+
+#[test]
 fn unit_enum_schema_carries_variant_names_post_rename() {
     let s = PdfPageSize::schema_static();
     assert_eq!(s.enum_variants, &["a4", "letter", "legal"]);
@@ -526,10 +532,41 @@ fn unit_enum_schema_carries_variant_names_post_rename() {
 }
 
 #[test]
+fn unit_enum_shape_is_leaf_enum_preserving_renamed_variants() {
+    match PdfPageSize::shape() {
+        clapfig::runtime::Shape::Leaf(leaf) => match leaf.ty {
+            clapfig::runtime::LeafType::Enum { values } => {
+                assert_eq!(
+                    values,
+                    [
+                        clapfig::value::Value::String("a4".into()),
+                        clapfig::value::Value::String("letter".into()),
+                        clapfig::value::Value::String("legal".into()),
+                    ]
+                );
+            }
+            other => panic!("expected Enum, got {other:?}"),
+        },
+        other => panic!("expected Leaf, got {other:?}"),
+    }
+}
+
+#[test]
+fn struct_shape_wraps_schema_as_object() {
+    match PdfDoc::shape() {
+        clapfig::runtime::Shape::Object(schema) => {
+            assert_eq!(schema.name, "PdfDoc");
+            assert_eq!(schema.fields.len(), 1);
+        }
+        other => panic!("expected Object, got {other:?}"),
+    }
+}
+
+#[test]
 fn unit_enum_field_flattens_to_runtime_leaf_enum() {
     let s = PdfDoc::schema();
     let leaf = match &s.fields[0].field {
-        clapfig::runtime::Field::Leaf(l) => l,
+        clapfig::runtime::Shape::Leaf(l) => l,
         other => panic!("expected Leaf, got {other:?}"),
     };
     match &leaf.ty {
@@ -820,7 +857,7 @@ struct DocWithDefaultEnum {
 fn default_on_enum_typed_field_round_trips_through_schema() {
     let s = DocWithDefaultEnum::schema();
     let leaf = match &s.fields[0].field {
-        clapfig::runtime::Field::Leaf(l) => l,
+        clapfig::runtime::Shape::Leaf(l) => l,
         other => panic!("expected Leaf, got {other:?}"),
     };
     match &leaf.ty {
@@ -872,7 +909,7 @@ struct DocWithOptionalEnum {
 fn option_of_unit_enum_emits_optional_leaf_enum() {
     let s = DocWithOptionalEnum::schema();
     let leaf = match &s.fields[0].field {
-        clapfig::runtime::Field::Leaf(l) => l,
+        clapfig::runtime::Shape::Leaf(l) => l,
         other => panic!("expected Leaf, got {other:?}"),
     };
     assert!(matches!(leaf.ty, clapfig::runtime::LeafType::Enum { .. }));
@@ -916,7 +953,7 @@ fn explicit_env_on_enum_typed_field_carries_through() {
     }
     let s = EnvEnumDoc::schema();
     let leaf = match &s.fields[0].field {
-        clapfig::runtime::Field::Leaf(l) => l,
+        clapfig::runtime::Shape::Leaf(l) => l,
         other => panic!("expected Leaf, got {other:?}"),
     };
     assert_eq!(leaf.env.as_deref(), Some("PAGE_SIZE_OVERRIDE"));

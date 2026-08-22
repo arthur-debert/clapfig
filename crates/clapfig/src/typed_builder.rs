@@ -3,16 +3,14 @@
 //! Entry point: [`crate::Clapfig::typed::<C>()`](crate::Clapfig::typed).
 //!
 //! Internally this wraps a [`Builder`](crate::Builder)
-//! constructed from `C::schema_arc()` (the cached [`runtime::Schema`]
-//! view of the macro-emitted `SchemaStatic`, shared clone-free). Every
+//! constructed from `C::shape_arc()` (the cached document-root
+//! [`runtime::Shape`](crate::runtime::Shape), shared clone-free). Every
 //! method forwards through to the Map-out builder so both paths share
 //! one resolve pipeline. The only added work is the final `Map → C`
 //! deserialize step — exactly one per `load()` and per
 //! [`TypedResolver::resolve_at`] call (through the value model's serde
 //! bridge) — and the typed `post_validate(&C)` hook, which runs on that
 //! same deserialized instance.
-//!
-//! [`runtime::Schema`]: crate::runtime::Schema
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -23,11 +21,14 @@ use serde::de::DeserializeOwned;
 use crate::builder::{Builder, Resolver};
 use crate::error::ClapfigError;
 use crate::ops::ConfigResult;
-use crate::static_schema::Schema;
+use crate::static_schema::DocumentRoot;
 use crate::types::{ConfigAction, Layer, SearchMode, SearchPath};
 use crate::value::{Map, Value, from_value};
 
-/// Typed-config builder driven by a `#[derive(clapfig::Schema)]` struct.
+/// Typed-config builder driven by a [`DocumentRoot`] (a named-field
+/// `#[derive(clapfig::Schema)]` struct, an internally tagged
+/// `#[serde(tag = "...")]` enum deriving `Schema`, or
+/// `BTreeMap`/`HashMap<String, T>` where `T: Schema`).
 ///
 /// Same surface as [`Builder`](crate::Builder) — `app_name`,
 /// `search_paths`, `env_prefix`, `cli_override`, `post_validate`, `load`,
@@ -35,7 +36,7 @@ use crate::value::{Map, Value, from_value};
 /// `post_validate` receives a typed `&C`, and
 /// [`build_resolver`](Self::build_resolver) returns a
 /// [`TypedResolver<C>`] whose `resolve_at` yields a typed `C` per call.
-pub struct TypedBuilder<C: Schema> {
+pub struct TypedBuilder<C: DocumentRoot> {
     inner: Builder,
     post_validate: Option<TypedHook<C>>,
     _phantom: PhantomData<fn() -> C>,
@@ -56,13 +57,13 @@ fn run_typed_hook<C>(hook: Option<&TypedHook<C>>, typed: &C) -> Result<(), Clapf
     }
 }
 
-impl<C: Schema> TypedBuilder<C> {
+impl<C: DocumentRoot> TypedBuilder<C> {
     pub(crate) fn new() -> Self {
-        // Reuse the per-type `Arc<Schema>` cache the derive maintains —
-        // one `Arc::clone` (atomic increment, no allocation) per builder
-        // construction instead of a full schema-tree clone.
+        // Reuse the per-type `Arc<Shape>` cache (object-root derive, or
+        // a fresh Arc for HashMap/BTreeMap roots) — one `Arc::clone`
+        // per builder construction instead of a full schema-tree clone.
         Self {
-            inner: Builder::from_arc(C::schema_arc()),
+            inner: Builder::from_shape(C::shape_arc()),
             post_validate: None,
             _phantom: PhantomData,
         }
@@ -202,7 +203,7 @@ impl<C: Schema> TypedBuilder<C> {
     }
 }
 
-impl<C: Schema + DeserializeOwned> TypedBuilder<C> {
+impl<C: DocumentRoot + DeserializeOwned> TypedBuilder<C> {
     /// Post-merge validation hook. Receives the typed `&C`.
     ///
     /// Conceptually the same as
@@ -344,7 +345,7 @@ pub struct TypedResolver<C> {
     _phantom: PhantomData<fn() -> C>,
 }
 
-impl<C: Schema + DeserializeOwned> TypedResolver<C> {
+impl<C: DocumentRoot + DeserializeOwned> TypedResolver<C> {
     /// Resolve the configuration anchored at `start_dir`, returning a
     /// typed `C`. See [`Resolver::resolve_at`](crate::Resolver::resolve_at)
     /// for the anchoring and caching semantics. The merged [`Map`] is

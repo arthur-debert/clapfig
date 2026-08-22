@@ -28,16 +28,23 @@ use crate::value::Value;
 /// Pure function: patch a config document string, setting `key` to
 /// `raw_value`, through `adapter`.
 ///
-/// Validates the key against an owned [`Schema`](crate::runtime::Schema)
+/// Validates the key against an owned [`Shape`](crate::runtime::Shape)
 /// and parses the raw value **according to the leaf's declared
 /// [`LeafType`](crate::runtime::LeafType)** (see [`parse_raw_value`]) —
 /// with schema-driven datetime coercion for `DateTime` leaves (ADR-0001)
 /// — so a typo in the key name or a value the leaf type cannot accept
 /// fails, naming the expected type, before the file is touched. A key
-/// addressing an `ArrayOf`/`MapOf` section (or its interior) fails with
-/// the targeted [`ClapfigError::UnaddressableKey`] instead of a bare
-/// key-not-found: dotted CLI keys cannot say which entry they mean, so
-/// the config file is the surface for editing those sections.
+/// addressing a [`Shape::Array`](crate::runtime::Shape::Array) /
+/// [`Shape::Map`](crate::runtime::Shape::Map) of objects, a root Map
+/// entry, or a path inside one, or a variant-specific / structurally
+/// conflicting field of a [`Shape::Tagged`](crate::runtime::Shape::Tagged)
+/// union, fails with the targeted
+/// [`ClapfigError::UnaddressableKey`] instead of a bare key-not-found:
+/// dotted CLI keys cannot index into maps/arrays, and a tagged-union
+/// key is refused when the current selection does not address it, so
+/// the config file (or selecting a variant that declares the key) is
+/// required to edit those sections. Keys no variant declares are
+/// [`ClapfigError::KeyNotFound`].
 ///
 /// With `normalize_keys`, the action key follows the load path's
 /// acceptance: dash and underscore spellings are equivalent. The key is
@@ -77,16 +84,16 @@ use crate::value::Value;
 /// Returns the modified document string.
 pub fn set_in_document(
     adapter: &dyn FormatAdapter,
-    schema: &crate::runtime::Schema,
+    shape: &crate::runtime::Shape,
     content: Option<&str>,
     key: &str,
     raw_value: &str,
     normalize_keys: bool,
 ) -> Result<String, ClapfigError> {
     let canonical = canonical_key(key, normalize_keys);
-    let valid_keys = crate::overrides::valid_keys(schema);
+    let valid_keys = crate::overrides::valid_keys_shape(shape);
     if !valid_keys.contains(&canonical) {
-        if let Some((section, kind)) = unaddressable_container(schema, &canonical) {
+        if let Some((section, kind)) = unaddressable_container_shape(shape, &canonical) {
             return Err(ClapfigError::UnaddressableKey {
                 key: key.into(),
                 section,
@@ -95,30 +102,64 @@ pub fn set_in_document(
         }
         return Err(ClapfigError::KeyNotFound {
             key: key.into(),
-            suggestion: crate::meta::nearest_key(schema, &canonical, normalize_keys),
+            suggestion: crate::meta::nearest_key_shape(shape, &canonical, normalize_keys),
         });
     }
 
-    let leaf_ty = lookup_leaf_type(schema, &canonical);
-    let mut value = parse_raw_value(raw_value, leaf_ty)
+    // Parse an existing document before typed lookup so a tagged
+    // object's selected discriminator can resolve variant fields.
+    // Classification reuses the same tree.
+    let parsed = match content {
+        Some(c) => Some(adapter.parse(c).map_err(ClapfigError::from)?),
+        None => None,
+    };
+    // `persist_table_get` uses `resolve_table_key`, whose contract is
+    // that the whole document has already been collision-checked. Do
+    // that here — before tagged branch selection — so two equivalent
+    // discriminator spellings fail as `NormalizedKeyCollision` rather
+    // than one spelling silently selecting a variant.
+    if normalize_keys && let Some(Value::Map(map)) = parsed.as_ref().map(|p| &p.value) {
+        check_collisions(map).map_err(|c| c.into_error(Path::new("")))?;
+    }
+    let existing = parsed.as_ref().map(|p| &p.value);
+
+    let disc_shape;
+    let field = match persist_target(shape, &canonical, existing, normalize_keys) {
+        PersistTarget::Shape(s) => Some(s),
+        PersistTarget::Discriminator(tagged) => {
+            disc_shape = crate::runtime::Shape::leaf(tagged.discriminator_leaf_type());
+            Some(&disc_shape)
+        }
+        PersistTarget::Unaddressable { section, kind } => {
+            return Err(ClapfigError::UnaddressableKey {
+                key: key.into(),
+                section,
+                kind,
+            });
+        }
+        PersistTarget::Missing => {
+            return Err(ClapfigError::KeyNotFound {
+                key: key.into(),
+                suggestion: crate::meta::nearest_key_shape(shape, &canonical, normalize_keys),
+            });
+        }
+    };
+    let mut value = parse_raw_value(raw_value, field)
         .map_err(|reason| ClapfigError::invalid_value(key, reason))?;
-    if let Some(leaf_ty) = leaf_ty {
-        crate::schema_walk::coerce_value(&mut value, leaf_ty);
-        leaf_ty
-            .check(&value)
+    if let Some(shape) = field {
+        crate::schema_walk::coerce_value(&mut value, shape);
+        shape
+            .check_value(&value)
             .map_err(|reason| ClapfigError::invalid_value(key, reason))?;
     }
 
-    let (base, target, path) = match content {
-        Some(c) => {
+    let (base, target, path) = match (content, parsed) {
+        (Some(c), Some(parsed)) => {
             // Replace vs create-key depends on whether the path already
-            // resolves; classification parses the document — the edit's
-            // own first step, so parse failures (including a format that
-            // cannot parse at all) surface as-is. The same parsed tree
-            // resolves the concrete key spellings the edit targets.
-            let tree = adapter.parse(c).map_err(ClapfigError::from)?.value;
-            let (segments, exists) = resolve_document_path(&tree, &canonical, normalize_keys)
-                .map_err(|c| c.into_error(Path::new("")))?;
+            // resolves; classification uses the document parsed above.
+            let (segments, exists) =
+                resolve_document_path(&parsed.value, &canonical, normalize_keys)
+                    .map_err(|c| c.into_error(Path::new("")))?;
             let target = if exists {
                 SetTarget::ExistingValue
             } else {
@@ -126,7 +167,7 @@ pub fn set_in_document(
             };
             (c.to_string(), target, config_path(&segments))
         }
-        None => {
+        _ => {
             // Missing file: require the matrix row before template
             // seeding, so the refusal names the attempted operation
             // rather than template generation.
@@ -134,7 +175,7 @@ pub fn set_in_document(
                 .require(Operation::EditCreateFile)
                 .map_err(crate::format::FormatError::from)
                 .map_err(ClapfigError::from)?;
-            let seeded = crate::ops::generate_template(adapter, schema, normalize_keys)?;
+            let seeded = crate::ops::generate_template(adapter, shape, normalize_keys)?;
             // The seeded template spells every key the way the enabled
             // normalization emits (kebab-case when on), so the edit path
             // uses that emitted spelling and lands on the template's own
@@ -191,7 +232,7 @@ fn stamp_collision_path(err: ClapfigError, file_path: &Path) -> ClapfigError {
 /// key, never the assigned value.
 pub fn persist_value(
     adapter: &dyn FormatAdapter,
-    schema: &crate::runtime::Schema,
+    shape: &crate::runtime::Shape,
     file_path: &Path,
     key: &str,
     value: &str,
@@ -210,7 +251,7 @@ pub fn persist_value(
 
     let new_content = set_in_document(
         adapter,
-        schema,
+        shape,
         content.as_deref(),
         key,
         value,
@@ -233,27 +274,17 @@ pub fn persist_value(
     Ok(ConfigResult::value_set(adapter, key.into(), value.into()))
 }
 
-/// Descend a runtime schema by dotted key path and return the target leaf's
-/// declared type. `None` when the path doesn't resolve to a leaf.
-fn lookup_leaf_type<'a>(
-    schema: &'a crate::runtime::Schema,
-    dotted: &str,
-) -> Option<&'a crate::runtime::LeafType> {
-    let mut current = schema;
-    let mut segments = dotted.split('.').peekable();
-    while let Some(seg) = segments.next() {
-        let nf = current.fields.iter().find(|f| f.name == seg)?;
-        match &nf.field {
-            crate::runtime::Field::Leaf(leaf) if segments.peek().is_none() => {
-                return Some(&leaf.ty);
-            }
-            crate::runtime::Field::Nested(inner) if segments.peek().is_some() => {
-                current = inner;
-            }
-            _ => return None,
-        }
-    }
-    None
+/// Typed persist target for a canonical dotted key.
+enum PersistTarget<'a> {
+    /// A declared value-shaped field.
+    Shape(&'a crate::runtime::Shape),
+    /// The synthetic tag leaf of a tagged union (closed discriminator enum).
+    Discriminator(&'a crate::runtime::TaggedShape),
+    /// Variant-specific or conflicting field with no unique type, or a
+    /// selected variant that does not own the key.
+    Unaddressable { section: String, kind: &'static str },
+    /// Path does not resolve (should not happen after `valid_keys`).
+    Missing,
 }
 
 /// Pure function: remove a key from a config document string through
@@ -428,28 +459,349 @@ fn dotted_config_path(key: &str) -> ConfigPath {
     path
 }
 
-/// If the canonical dotted key targets an `ArrayOf`/`MapOf` schema field
-/// or a path inside one, return that section's dotted path and a kind
+/// If the canonical dotted key targets a
+/// [`Shape::Array`](crate::runtime::Shape::Array) /
+/// [`Shape::Map`](crate::runtime::Shape::Map) of objects (or a root map)
+/// or a path inside one,
+/// return that section's dotted path and a kind
 /// label (`"an array"` / `"a map"`) for [`ClapfigError::UnaddressableKey`].
 /// `None` means the key misses the schema some other way (a plain
-/// key-not-found).
+/// key-not-found). Tagged-union refusals that depend on the document's
+/// discriminator are classified later by [`persist_target`].
+fn unaddressable_container_shape(
+    shape: &crate::runtime::Shape,
+    canonical: &str,
+) -> Option<(String, &'static str)> {
+    match shape {
+        crate::runtime::Shape::Object(schema) => unaddressable_container(schema, canonical),
+        crate::runtime::Shape::Map(map) => {
+            // Any persist key against a root map is a dynamic entry (or a
+            // path inside one). Same refuse as a named Map field.
+            Some((root_map_section_label(map), "a map"))
+        }
+        crate::runtime::Shape::Tagged(tagged) => unaddressable_in_tagged(tagged, canonical, ""),
+        crate::runtime::Shape::Leaf(_) | crate::runtime::Shape::Array(_) => None,
+    }
+}
+
+fn root_map_section_label(map: &crate::runtime::MapShape) -> String {
+    if map.name.is_empty() {
+        "(root)".into()
+    } else {
+        map.name.clone()
+    }
+}
+
+fn persist_target<'a>(
+    shape: &'a crate::runtime::Shape,
+    dotted: &str,
+    existing: Option<&Value>,
+    normalize_keys: bool,
+) -> PersistTarget<'a> {
+    match shape {
+        crate::runtime::Shape::Object(schema) => persist_target_schema(
+            schema,
+            dotted,
+            existing.and_then(Value::as_map),
+            "",
+            normalize_keys,
+        ),
+        crate::runtime::Shape::Tagged(tagged) => persist_target_tagged(
+            tagged,
+            dotted,
+            existing.and_then(Value::as_map),
+            "",
+            normalize_keys,
+        ),
+        crate::runtime::Shape::Map(_)
+        | crate::runtime::Shape::Leaf(_)
+        | crate::runtime::Shape::Array(_) => PersistTarget::Missing,
+    }
+}
+
 fn unaddressable_container(
     schema: &crate::runtime::Schema,
     canonical: &str,
 ) -> Option<(String, &'static str)> {
-    let mut current = schema;
-    let mut walked: Vec<&str> = Vec::new();
-    for seg in canonical.split('.') {
-        let nf = current.fields.iter().find(|f| f.name == seg)?;
-        walked.push(seg);
-        match &nf.field {
-            crate::runtime::Field::ArrayOf(_) => return Some((walked.join("."), "an array")),
-            crate::runtime::Field::MapOf(_) => return Some((walked.join("."), "a map")),
-            crate::runtime::Field::Nested(inner) => current = inner,
-            crate::runtime::Field::Leaf(_) => return None,
+    unaddressable_in_schema(schema, canonical, "")
+}
+
+fn unaddressable_in_schema(
+    schema: &crate::runtime::Schema,
+    canonical: &str,
+    prefix: &str,
+) -> Option<(String, &'static str)> {
+    let (head, rest) = split_first(canonical)?;
+    let nf = schema.fields.iter().find(|f| f.name == head)?;
+    unaddressable_in_shape(&nf.field, rest, &join_prefix(prefix, head))
+}
+
+fn unaddressable_in_shape(
+    shape: &crate::runtime::Shape,
+    rest: &str,
+    walked: &str,
+) -> Option<(String, &'static str)> {
+    match shape {
+        crate::runtime::Shape::Array(array) if !array.item.is_value_field() => {
+            Some((walked.to_string(), "an array"))
+        }
+        crate::runtime::Shape::Map(map) if !map.item.is_value_field() => {
+            Some((walked.to_string(), "a map"))
+        }
+        crate::runtime::Shape::Object(inner) => unaddressable_in_schema(inner, rest, walked),
+        crate::runtime::Shape::Tagged(tagged) => unaddressable_in_tagged(tagged, rest, walked),
+        crate::runtime::Shape::Leaf(_)
+        | crate::runtime::Shape::Array(_)
+        | crate::runtime::Shape::Map(_) => None,
+    }
+}
+
+fn unaddressable_in_tagged(
+    tagged: &crate::runtime::TaggedShape,
+    rest: &str,
+    prefix: &str,
+) -> Option<(String, &'static str)> {
+    if rest.is_empty() {
+        return None;
+    }
+    let (head, remaining) = split_first(rest)?;
+    match tagged.resolve_key(head) {
+        crate::runtime::KeyAcrossVariants::Tag | crate::runtime::KeyAcrossVariants::Absent => None,
+        crate::runtime::KeyAcrossVariants::Every(shapes)
+        | crate::runtime::KeyAcrossVariants::Partial(shapes) => {
+            let walked = join_prefix(prefix, head);
+            shapes
+                .into_iter()
+                .find_map(|shape| unaddressable_in_shape(shape, remaining, &walked))
         }
     }
-    None
+}
+
+fn persist_target_schema<'a>(
+    schema: &'a crate::runtime::Schema,
+    dotted: &str,
+    table: Option<&crate::value::Map>,
+    prefix: &str,
+    normalize_keys: bool,
+) -> PersistTarget<'a> {
+    let Some((head, rest)) = split_first(dotted) else {
+        return PersistTarget::Missing;
+    };
+    let Some(nf) = schema.fields.iter().find(|f| f.name == head) else {
+        return PersistTarget::Missing;
+    };
+    persist_target_in_shape(
+        &nf.field,
+        rest,
+        table.and_then(|t| persist_table_get(t, head, normalize_keys)),
+        &join_prefix(prefix, head),
+        normalize_keys,
+    )
+}
+
+fn persist_target_in_shape<'a>(
+    shape: &'a crate::runtime::Shape,
+    rest: &str,
+    value: Option<&Value>,
+    walked: &str,
+    normalize_keys: bool,
+) -> PersistTarget<'a> {
+    if rest.is_empty() {
+        return if shape.is_value_field() {
+            PersistTarget::Shape(shape)
+        } else {
+            PersistTarget::Missing
+        };
+    }
+    match shape {
+        crate::runtime::Shape::Object(inner) => persist_target_schema(
+            inner,
+            rest,
+            value.and_then(Value::as_map),
+            walked,
+            normalize_keys,
+        ),
+        crate::runtime::Shape::Tagged(tagged) => persist_target_tagged(
+            tagged,
+            rest,
+            value.and_then(Value::as_map),
+            walked,
+            normalize_keys,
+        ),
+        _ => PersistTarget::Missing,
+    }
+}
+
+fn persist_target_tagged<'a>(
+    tagged: &'a crate::runtime::TaggedShape,
+    dotted: &str,
+    table: Option<&crate::value::Map>,
+    prefix: &str,
+    normalize_keys: bool,
+) -> PersistTarget<'a> {
+    let Some((head, rest)) = split_first(dotted) else {
+        return PersistTarget::Missing;
+    };
+    let section = tagged_section(prefix, tagged);
+    match tagged.resolve_key(head) {
+        crate::runtime::KeyAcrossVariants::Tag => {
+            if rest.is_empty() {
+                PersistTarget::Discriminator(tagged)
+            } else {
+                PersistTarget::Missing
+            }
+        }
+        classification => {
+            if let Some(variant) =
+                table.and_then(|t| persist_selected_variant(tagged, t, normalize_keys))
+            {
+                if variant.schema.fields.iter().all(|f| f.name != head) {
+                    return PersistTarget::Unaddressable {
+                        section,
+                        kind: "a tagged union",
+                    };
+                }
+                return persist_target_schema(
+                    &variant.schema,
+                    dotted,
+                    table,
+                    prefix,
+                    normalize_keys,
+                );
+            }
+            let declared = match classification {
+                crate::runtime::KeyAcrossVariants::Tag => {
+                    unreachable!("tag handled above")
+                }
+                crate::runtime::KeyAcrossVariants::Absent => {
+                    return PersistTarget::Missing;
+                }
+                crate::runtime::KeyAcrossVariants::Partial(_) => {
+                    // A field missing from some variants is variant-specific:
+                    // refuse until a discriminator selects a branch (spec:
+                    // targeted refuse).
+                    return PersistTarget::Unaddressable {
+                        section,
+                        kind: "a tagged union",
+                    };
+                }
+                crate::runtime::KeyAcrossVariants::Every(shapes) => shapes,
+            };
+            let walked = join_prefix(prefix, head);
+            let child = table.and_then(|t| persist_table_get(t, head, normalize_keys));
+            if rest.is_empty() {
+                return unambiguous_value_shapes(declared, section);
+            }
+            let mut agreed: Option<PersistTarget<'a>> = None;
+            for shape in declared {
+                let next = persist_target_in_shape(shape, rest, child, &walked, normalize_keys);
+                agreed = Some(match (agreed, next) {
+                    (None, t) => t,
+                    (Some(PersistTarget::Shape(a)), PersistTarget::Shape(b))
+                        if a.structurally_agrees_with(b) =>
+                    {
+                        PersistTarget::Shape(a)
+                    }
+                    (Some(PersistTarget::Discriminator(a)), PersistTarget::Discriminator(b))
+                        if a.tag == b.tag =>
+                    {
+                        PersistTarget::Discriminator(a)
+                    }
+                    _ => {
+                        return PersistTarget::Unaddressable {
+                            section,
+                            kind: "a tagged union",
+                        };
+                    }
+                });
+            }
+            agreed.unwrap_or(PersistTarget::Missing)
+        }
+    }
+}
+
+/// Look up a schema field name in a raw persist document. With
+/// `normalize_keys`, dash and underscore spellings are equivalent — the
+/// same rule [`resolve_document_path`] uses — so a kebab-case tagged
+/// document still selects the variant for `block_kind` stored as
+/// `block-kind`.
+///
+/// Callers must already have run [`check_collisions`] on the document
+/// (see [`set_in_document`]); this only chooses the concrete spelling.
+fn persist_table_get<'a>(
+    table: &'a crate::value::Map,
+    schema_key: &str,
+    normalize_keys: bool,
+) -> Option<&'a Value> {
+    if normalize_keys {
+        resolve_table_key(table, schema_key).and_then(|k| table.get(k))
+    } else {
+        table.get(schema_key)
+    }
+}
+
+fn persist_selected_variant<'a>(
+    tagged: &'a crate::runtime::TaggedShape,
+    table: &crate::value::Map,
+    normalize_keys: bool,
+) -> Option<&'a crate::runtime::TaggedVariant> {
+    match persist_table_get(table, &tagged.tag, normalize_keys) {
+        Some(Value::String(name)) => tagged.variant(name),
+        _ => None,
+    }
+}
+
+fn unambiguous_value_shapes<'a>(
+    declared: Vec<&'a crate::runtime::Shape>,
+    section: String,
+) -> PersistTarget<'a> {
+    if !declared.iter().all(|s| s.is_value_field()) {
+        return PersistTarget::Unaddressable {
+            section,
+            kind: "a tagged union",
+        };
+    }
+    let first = declared[0];
+    if declared
+        .iter()
+        .skip(1)
+        .all(|s| first.structurally_agrees_with(s))
+    {
+        PersistTarget::Shape(first)
+    } else {
+        PersistTarget::Unaddressable {
+            section,
+            kind: "a tagged union",
+        }
+    }
+}
+
+fn tagged_section(prefix: &str, tagged: &crate::runtime::TaggedShape) -> String {
+    if !prefix.is_empty() {
+        prefix.to_string()
+    } else if !tagged.name.is_empty() {
+        tagged.name.clone()
+    } else {
+        tagged.tag.clone()
+    }
+}
+
+fn join_prefix(prefix: &str, head: &str) -> String {
+    if prefix.is_empty() {
+        head.to_string()
+    } else {
+        format!("{prefix}.{head}")
+    }
+}
+
+fn split_first(dotted: &str) -> Option<(&str, &str)> {
+    if dotted.is_empty() {
+        return None;
+    }
+    match dotted.find('.') {
+        Some(i) => Some((&dotted[..i], &dotted[i + 1..])),
+        None => Some((dotted, "")),
+    }
 }
 
 /// Parse a raw `config set` string into a typed config value **according
@@ -476,62 +828,57 @@ fn unaddressable_container(
 ///
 /// Errors are human-readable reasons for
 /// [`ClapfigError::InvalidValue`](crate::error::ClapfigError::InvalidValue).
-fn parse_raw_value(raw: &str, ty: Option<&crate::runtime::LeafType>) -> Result<Value, String> {
-    use crate::runtime::LeafType;
-    let Some(ty) = ty else {
+fn parse_raw_value(raw: &str, shape: Option<&crate::runtime::Shape>) -> Result<Value, String> {
+    use crate::runtime::{LeafType, Shape};
+    let Some(shape) = shape else {
         return Ok(crate::env::parse_env_value(raw));
     };
-    match ty {
-        LeafType::String => Ok(Value::String(raw.to_owned())),
-        LeafType::Integer { .. } => raw
-            .parse::<i64>()
-            .map(Value::Integer)
-            .map_err(|_| format!("expected integer, got '{raw}'")),
-        LeafType::Float => raw
-            .parse::<f64>()
-            .map(Value::Float)
-            .map_err(|_| format!("expected float, got '{raw}'")),
-        LeafType::Bool => {
-            if raw.eq_ignore_ascii_case("true") {
-                Ok(Value::Boolean(true))
-            } else if raw.eq_ignore_ascii_case("false") {
-                Ok(Value::Boolean(false))
-            } else {
-                Err(format!("expected bool ('true' or 'false'), got '{raw}'"))
+    match shape {
+        Shape::Array(_) => parse_inline_container(raw, "array", "[\"a\", \"b\"]"),
+        Shape::Map(_) => parse_inline_container(raw, "map", "{key = \"value\"}"),
+        Shape::Leaf(leaf) => match &leaf.ty {
+            LeafType::String => Ok(Value::String(raw.to_owned())),
+            LeafType::Integer { .. } => raw
+                .parse::<i64>()
+                .map(Value::Integer)
+                .map_err(|_| format!("expected integer, got '{raw}'")),
+            LeafType::Float => raw
+                .parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| format!("expected float, got '{raw}'")),
+            LeafType::Bool => {
+                if raw.eq_ignore_ascii_case("true") {
+                    Ok(Value::Boolean(true))
+                } else if raw.eq_ignore_ascii_case("false") {
+                    Ok(Value::Boolean(false))
+                } else {
+                    Err(format!("expected bool ('true' or 'false'), got '{raw}'"))
+                }
             }
-        }
-        LeafType::DateTime => Ok(Value::String(raw.to_owned())),
-        LeafType::Enum { values } => {
-            let sniffed = crate::env::parse_env_value(raw);
-            if values.contains(&sniffed) {
-                Ok(sniffed)
-            } else {
-                Ok(Value::String(raw.to_owned()))
+            LeafType::DateTime => Ok(Value::String(raw.to_owned())),
+            LeafType::Enum { values } => {
+                let sniffed = crate::env::parse_env_value(raw);
+                if values.contains(&sniffed) {
+                    Ok(sniffed)
+                } else {
+                    Ok(Value::String(raw.to_owned()))
+                }
             }
-        }
-        LeafType::Array(_) | LeafType::Map(_) => parse_inline_container(raw, ty),
-        LeafType::Value => Ok(crate::env::parse_env_value(raw)),
+            LeafType::Value => Ok(crate::env::parse_env_value(raw)),
+        },
+        Shape::Object(_) | Shape::Tagged(_) => Ok(crate::env::parse_env_value(raw)),
     }
 }
 
-/// Parse a raw `config set` string destined for an `Array`/`Map` leaf as
+/// Parse a raw `config set` string destined for an `Array`/`Map` field as
 /// a TOML inline value. TOML is the value model's baseline vocabulary
 /// (ADR-0001), so the CLI accepts one container syntax regardless of the
 /// file's format; the resulting [`Value`] is then written through the
 /// active format's adapter like any other. A raw string TOML cannot
 /// parse as a value errors naming the expected container type with an
 /// example spelling.
-fn parse_inline_container(raw: &str, ty: &crate::runtime::LeafType) -> Result<Value, String> {
-    let example = match ty {
-        crate::runtime::LeafType::Array(_) => "[\"a\", \"b\"]",
-        _ => "{key = \"value\"}",
-    };
-    let refuse = || {
-        format!(
-            "expected {} in TOML inline syntax (e.g. {example}), got '{raw}'",
-            ty.name()
-        )
-    };
+fn parse_inline_container(raw: &str, kind: &str, example: &str) -> Result<Value, String> {
+    let refuse = || format!("expected {kind} in TOML inline syntax (e.g. {example}), got '{raw}'");
     let doc = format!("v = {raw}");
     match crate::format::TomlAdapter.parse(&doc) {
         // Require exactly the probe key back: a raw string smuggling
@@ -549,11 +896,19 @@ mod tests {
     use super::*;
     use crate::fixtures::test::{enum_schema, test_schema};
     use crate::format::TomlAdapter;
+    use crate::runtime::Shape;
     use std::fs;
     use tempfile::TempDir;
 
     fn set_toml(content: Option<&str>, key: &str, value: &str) -> Result<String, ClapfigError> {
-        set_in_document(&TomlAdapter, &test_schema(), content, key, value, false)
+        set_in_document(
+            &TomlAdapter,
+            &Shape::Object(test_schema()),
+            content,
+            key,
+            value,
+            false,
+        )
     }
 
     fn persist_toml(
@@ -561,7 +916,14 @@ mod tests {
         key: &str,
         value: &str,
     ) -> Result<ConfigResult, ClapfigError> {
-        persist_value(&TomlAdapter, &test_schema(), path, key, value, false)
+        persist_value(
+            &TomlAdapter,
+            &Shape::Object(test_schema()),
+            path,
+            key,
+            value,
+            false,
+        )
     }
 
     // --- validation tests ---
@@ -598,7 +960,7 @@ mod tests {
 
         fn template(
             &self,
-            _schema: &crate::runtime::Schema,
+            _shape: &crate::runtime::Shape,
         ) -> Result<String, crate::format::FormatError> {
             Err(self
                 .require(crate::format::Operation::Template)
@@ -633,7 +995,7 @@ mod tests {
         // Key exists in the document → replacing an existing value.
         let u = refusal(set_in_document(
             &ParseOnly,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some("port = 1\n"),
             "port",
             "2",
@@ -644,7 +1006,7 @@ mod tests {
         // File exists, key does not → creating a missing key.
         let u = refusal(set_in_document(
             &ParseOnly,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some("port = 1\n"),
             "debug",
             "true",
@@ -656,7 +1018,12 @@ mod tests {
         // template seeding (ParseOnly's template also refuses; the
         // create-file refusal must win).
         let u = refusal(set_in_document(
-            &ParseOnly, &schema, None, "port", "1", false,
+            &ParseOnly,
+            &Shape::Object(schema.clone()),
+            None,
+            "port",
+            "1",
+            false,
         ));
         assert_eq!(u.operation, Operation::EditCreateFile);
     }
@@ -695,7 +1062,7 @@ mod tests {
 
         fn template(
             &self,
-            _schema: &crate::runtime::Schema,
+            _shape: &crate::runtime::Shape,
         ) -> Result<String, crate::format::FormatError> {
             Err(self
                 .require(crate::format::Operation::Template)
@@ -719,7 +1086,7 @@ mod tests {
         // it, so that is the honest earliest error.
         let u = refusal(set_in_document(
             &RefusesAll,
-            &test_schema(),
+            &Shape::Object(test_schema()),
             Some("port = 1\n"),
             "port",
             "2",
@@ -738,7 +1105,7 @@ mod tests {
     fn set_kebab_key_suggests_snake_when_normalization_is_off() {
         let err = set_in_document(
             &TomlAdapter,
-            &test_schema(),
+            &Shape::Object(test_schema()),
             Some(""),
             "database.pool-size",
             "10",
@@ -758,7 +1125,7 @@ mod tests {
     fn set_rejects_invalid_enum_value() {
         let result = set_in_document(
             &TomlAdapter,
-            &enum_schema(),
+            &Shape::Object(enum_schema()),
             Some(""),
             "mode",
             "garbage",
@@ -780,7 +1147,7 @@ mod tests {
     fn set_accepts_valid_enum_value() {
         let result = set_in_document(
             &TomlAdapter,
-            &enum_schema(),
+            &Shape::Object(enum_schema()),
             Some(""),
             "mode",
             "fast",
@@ -823,7 +1190,7 @@ mod tests {
 
         let result = persist_value(
             &TomlAdapter,
-            &enum_schema(),
+            &Shape::Object(enum_schema()),
             &path,
             "mode",
             "garbage",
@@ -876,63 +1243,46 @@ mod tests {
 
     #[test]
     fn value_parsing_follows_declared_leaf_type() {
-        use crate::runtime::LeafType;
+        use crate::runtime::{Field, Shape};
         // The same raw string lands as different types depending on the
         // declared leaf — never on what the string looks like.
         assert_eq!(
-            parse_raw_value("123", Some(&LeafType::String)).unwrap(),
+            parse_raw_value("123", Some(&Shape::from(Field::string()))).unwrap(),
             Value::String("123".into())
         );
         assert_eq!(
-            parse_raw_value(
-                "123",
-                Some(&LeafType::Integer {
-                    min: None,
-                    max: None,
-                }),
-            )
-            .unwrap(),
+            parse_raw_value("123", Some(&Shape::from(Field::integer()))).unwrap(),
             Value::Integer(123)
         );
         assert_eq!(
-            parse_raw_value("123", Some(&LeafType::Float)).unwrap(),
+            parse_raw_value("123", Some(&Shape::from(Field::float()))).unwrap(),
             Value::Float(123.0)
         );
         assert_eq!(
-            parse_raw_value("TRUE", Some(&LeafType::Bool)).unwrap(),
+            parse_raw_value("TRUE", Some(&Shape::from(Field::boolean()))).unwrap(),
             Value::Boolean(true)
         );
     }
 
     #[test]
     fn value_parsing_errors_name_the_expected_type() {
-        use crate::runtime::LeafType;
-        for (raw, ty, expected) in [
-            (
-                "abc",
-                LeafType::Integer {
-                    min: None,
-                    max: None,
-                },
-                "expected integer",
-            ),
-            ("abc", LeafType::Float, "expected float"),
-            ("yes", LeafType::Bool, "expected bool"),
+        use crate::runtime::{Field, LeafType, Shape};
+        for (raw, shape, expected) in [
+            ("abc", Shape::from(Field::integer()), "expected integer"),
+            ("abc", Shape::from(Field::float()), "expected float"),
+            ("yes", Shape::from(Field::boolean()), "expected bool"),
             (
                 "a,b",
-                LeafType::Array(Box::new(LeafType::String)),
+                Shape::from(Field::array_of_type(LeafType::String)),
                 "expected array",
             ),
             (
                 "a=1",
-                LeafType::Map(Box::new(LeafType::Integer {
-                    min: None,
-                    max: None,
-                })),
+                Shape::from(Field::map_of(Field::integer())),
                 "expected map",
             ),
         ] {
-            let err = parse_raw_value(raw, Some(&ty)).unwrap_err();
+            let err = parse_raw_value(raw, Some(&shape)).unwrap_err();
             assert!(err.contains(expected), "{raw}: {err}");
             assert!(err.contains(raw), "{raw}: {err}");
         }
@@ -942,10 +1292,10 @@ mod tests {
     fn value_parsing_without_leaf_type_keeps_the_heuristic() {
         // `Value` leaves and unresolvable keys have no declared shape to
         // parse toward — the env-style sniff stays.
-        use crate::runtime::LeafType;
+        use crate::runtime::{Field, Shape};
         assert_eq!(parse_raw_value("42", None).unwrap(), Value::Integer(42));
         assert_eq!(
-            parse_raw_value("1.5", Some(&LeafType::Value)).unwrap(),
+            parse_raw_value("1.5", Some(&Shape::from(Field::value()))).unwrap(),
             Value::Float(1.5)
         );
         assert_eq!(
@@ -974,7 +1324,7 @@ mod tests {
             .build();
         let result = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "tags",
             "[\"a\", \"b\"]",
@@ -984,8 +1334,15 @@ mod tests {
         assert!(result.contains("tags = [\"a\", \"b\"]"), "{result}");
 
         // Element types are still checked against the declared element.
-        let err =
-            set_in_document(&TomlAdapter, &schema, Some(""), "tags", "[1, 2]", false).unwrap_err();
+        let err = set_in_document(
+            &TomlAdapter,
+            &Shape::Object(schema.clone()),
+            Some(""),
+            "tags",
+            "[1, 2]",
+            false,
+        )
+        .unwrap_err();
         match err {
             ClapfigError::InvalidValue { reason, .. } => {
                 assert!(reason.contains("expected string"), "{reason}");
@@ -1009,7 +1366,7 @@ mod tests {
             .build();
         let result = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "limits",
             "{cpu = 2, mem = 8}",
@@ -1034,7 +1391,7 @@ mod tests {
             .build();
         let err = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "tags",
             "[]\nother = 1",
@@ -1053,7 +1410,15 @@ mod tests {
         let schema = Schema::object("T")
             .field("gear", Field::enum_of(["1", "2", "reverse"]).optional())
             .build();
-        let result = set_in_document(&TomlAdapter, &schema, Some(""), "gear", "1", false).unwrap();
+        let result = set_in_document(
+            &TomlAdapter,
+            &Shape::Object(schema.clone()),
+            Some(""),
+            "gear",
+            "1",
+            false,
+        )
+        .unwrap();
         assert!(result.contains("gear = \"1\""), "{result}");
     }
 
@@ -1063,7 +1428,15 @@ mod tests {
         let schema = Schema::object("T")
             .field("level", Field::enum_of([1i64, 2i64, 3i64]).optional())
             .build();
-        let result = set_in_document(&TomlAdapter, &schema, Some(""), "level", "2", false).unwrap();
+        let result = set_in_document(
+            &TomlAdapter,
+            &Shape::Object(schema.clone()),
+            Some(""),
+            "level",
+            "2",
+            false,
+        )
+        .unwrap();
         assert!(result.contains("level = 2"), "{result}");
     }
 
@@ -1096,7 +1469,7 @@ mod tests {
     fn set_into_map_of_interior_names_the_section() {
         let err = set_in_document(
             &TomlAdapter,
-            &container_schema(),
+            &Shape::Object(container_schema()),
             Some(""),
             "servers.web.host",
             "example.com",
@@ -1117,7 +1490,7 @@ mod tests {
     fn set_into_array_of_interior_names_the_section() {
         let err = set_in_document(
             &TomlAdapter,
-            &container_schema(),
+            &Shape::Object(container_schema()),
             Some(""),
             "plugins.name",
             "x",
@@ -1138,8 +1511,15 @@ mod tests {
         // The section path walks through Nested wrappers, and targeting
         // the container field itself (no interior segment) refuses too.
         for key in ["outer.inner.web.port", "outer.inner"] {
-            let err = set_in_document(&TomlAdapter, &container_schema(), Some(""), key, "1", false)
-                .unwrap_err();
+            let err = set_in_document(
+                &TomlAdapter,
+                &Shape::Object(container_schema()),
+                Some(""),
+                key,
+                "1",
+                false,
+            )
+            .unwrap_err();
             match err {
                 ClapfigError::UnaddressableKey { section, kind, .. } => {
                     assert_eq!(section, "outer.inner", "{key}");
@@ -1154,7 +1534,7 @@ mod tests {
     fn set_unknown_key_off_containers_is_still_key_not_found() {
         let err = set_in_document(
             &TomlAdapter,
-            &container_schema(),
+            &Shape::Object(container_schema()),
             Some(""),
             "nonexistent.path",
             "1",
@@ -1175,7 +1555,7 @@ mod tests {
             .build();
         let err = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "my-servers.web.host",
             "h",
@@ -1199,7 +1579,7 @@ mod tests {
             .build();
         let result = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "stamp",
             "2024-01-02T03:04:05Z",
@@ -1213,7 +1593,7 @@ mod tests {
 
         let err = set_in_document(
             &TomlAdapter,
-            &schema,
+            &Shape::Object(schema.clone()),
             Some(""),
             "stamp",
             "not-a-date",
@@ -1324,9 +1704,15 @@ mod tests {
         // the next load). The kebab action key must work too.
         for (adapter, doc) in docs("pool-size") {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let out =
-                    set_in_document(adapter, &test_schema(), Some(&doc), action_key, "20", true)
-                        .unwrap();
+                let out = set_in_document(
+                    adapter,
+                    &Shape::Object(test_schema()),
+                    Some(&doc),
+                    action_key,
+                    "20",
+                    true,
+                )
+                .unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -1351,9 +1737,15 @@ mod tests {
         // not rewrite the document to kebab.
         for (adapter, doc) in docs("pool_size") {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let out =
-                    set_in_document(adapter, &test_schema(), Some(&doc), action_key, "20", true)
-                        .unwrap();
+                let out = set_in_document(
+                    adapter,
+                    &Shape::Object(test_schema()),
+                    Some(&doc),
+                    action_key,
+                    "20",
+                    true,
+                )
+                .unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -1383,7 +1775,7 @@ mod tests {
         for (adapter, base) in bases {
             let out = set_in_document(
                 adapter,
-                &test_schema(),
+                &Shape::Object(test_schema()),
                 Some(base),
                 "database.pool_size",
                 "20",
@@ -1411,8 +1803,15 @@ mod tests {
         let adapters: [&dyn FormatAdapter; 3] = [&TomlAdapter, &YamlAdapter, &JsonAdapter];
         for adapter in adapters {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let out =
-                    set_in_document(adapter, &test_schema(), None, action_key, "20", true).unwrap();
+                let out = set_in_document(
+                    adapter,
+                    &Shape::Object(test_schema()),
+                    None,
+                    action_key,
+                    "20",
+                    true,
+                )
+                .unwrap();
                 let map = doc_map(adapter, &out);
                 let db = map["database"].as_map().unwrap();
                 assert_eq!(
@@ -1442,7 +1841,7 @@ mod tests {
         // the canonical leaf.
         let result = set_in_document(
             &TomlAdapter,
-            &test_schema(),
+            &Shape::Object(test_schema()),
             Some(""),
             "database.pool-size",
             "not_a_number",
@@ -1521,8 +1920,14 @@ mod tests {
         // editing one of the two entries and leaving the file unloadable.
         for (adapter, doc) in colliding_docs() {
             for action_key in ["database.pool-size", "database.pool_size"] {
-                let result =
-                    set_in_document(adapter, &test_schema(), Some(doc), action_key, "20", true);
+                let result = set_in_document(
+                    adapter,
+                    &Shape::Object(test_schema()),
+                    Some(doc),
+                    action_key,
+                    "20",
+                    true,
+                );
                 assert_collision(
                     result,
                     "database",
@@ -1547,7 +1952,14 @@ mod tests {
             )
             .build();
         let doc = "[my-db]\nsize = 1\n\n[my_db]\nsize = 2\n";
-        let result = set_in_document(&TomlAdapter, &schema, Some(doc), "my_db.size", "3", true);
+        let result = set_in_document(
+            &TomlAdapter,
+            &Shape::Object(schema.clone()),
+            Some(doc),
+            "my_db.size",
+            "3",
+            true,
+        );
         assert_collision(result, "", "my_db", &["my-db", "my_db"], "intermediate");
     }
 
@@ -1560,7 +1972,14 @@ mod tests {
         // edited.
         for (adapter, doc) in colliding_docs() {
             let doc = with_host(adapter, doc);
-            let result = set_in_document(adapter, &test_schema(), Some(&doc), "host", "h2", true);
+            let result = set_in_document(
+                adapter,
+                &Shape::Object(test_schema()),
+                Some(&doc),
+                "host",
+                "h2",
+                true,
+            );
             assert_collision(
                 result,
                 "database",
@@ -1628,7 +2047,7 @@ mod tests {
         for result in [
             persist_value(
                 &TomlAdapter,
-                &test_schema(),
+                &Shape::Object(test_schema()),
                 &path,
                 "database.pool_size",
                 "20",
@@ -1730,5 +2149,222 @@ mod tests {
 
         let result = unset_value(&TomlAdapter, &path, "port", false).unwrap();
         assert!(matches!(result, ConfigResult::ValueUnset { .. }));
+    }
+
+    fn tagged_block() -> Shape {
+        use crate::runtime::{Field, Schema};
+        Shape::from(
+            Shape::tagged("Block", "kind")
+                .variant(
+                    "rust",
+                    Schema::object("Rust")
+                        .field("mount", Field::string())
+                        .field("crate_path", Field::string().optional())
+                        .build(),
+                )
+                .variant(
+                    "payload",
+                    Schema::object("Payload")
+                        .field("mount", Field::string())
+                        .field("artifact", Field::string())
+                        .build(),
+                )
+                .build(),
+        )
+    }
+
+    fn nested_tagged_app() -> Shape {
+        use crate::runtime::Schema;
+        Shape::from(Schema::object("App").field("block", tagged_block()).build())
+    }
+
+    #[test]
+    fn set_tagged_tag_rejects_numeric_looking_invalid_discriminator() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &tagged_block(),
+            Some("kind = \"rust\"\nmount = \".\"\n"),
+            "kind",
+            "123",
+            false,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::InvalidValue { key, reason, .. } => {
+                assert_eq!(key, "kind");
+                assert!(reason.contains("not in allowed set"), "{reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_tagged_string_field_keeps_numeric_looking_value() {
+        let result = set_in_document(
+            &TomlAdapter,
+            &tagged_block(),
+            Some("kind = \"rust\"\nmount = \".\"\n"),
+            "mount",
+            "123",
+            false,
+        )
+        .unwrap();
+        assert!(result.contains("mount = \"123\""), "{result}");
+    }
+
+    #[test]
+    fn set_nested_tagged_tag_rejects_numeric_looking_invalid_discriminator() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &nested_tagged_app(),
+            Some("[block]\nkind = \"rust\"\nmount = \".\"\n"),
+            "block.kind",
+            "123",
+            false,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::InvalidValue { key, reason, .. } => {
+                assert_eq!(key, "block.kind");
+                assert!(reason.contains("not in allowed set"), "{reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_variant_exclusive_field_without_discriminator_refuses() {
+        let err = set_in_document(
+            &TomlAdapter,
+            &tagged_block(),
+            Some(""),
+            "artifact",
+            "out",
+            false,
+        )
+        .unwrap_err();
+        match err {
+            ClapfigError::UnaddressableKey { key, kind, .. } => {
+                assert_eq!(key, "artifact");
+                assert_eq!(kind, "a tagged union");
+            }
+            other => panic!("expected UnaddressableKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_variant_exclusive_field_uses_selected_discriminator() {
+        let result = set_in_document(
+            &TomlAdapter,
+            &tagged_block(),
+            Some("kind = \"payload\"\nmount = \".\"\nartifact = \"old\"\n"),
+            "artifact",
+            "123",
+            false,
+        )
+        .unwrap();
+        assert!(result.contains("artifact = \"123\""), "{result}");
+    }
+
+    fn kebab_tagged_block() -> Shape {
+        use crate::runtime::{Field, Schema};
+        Shape::from(
+            Shape::tagged("Block", "block_kind")
+                .variant(
+                    "rust",
+                    Schema::object("Rust")
+                        .field("mount", Field::string())
+                        .field("crate_path", Field::string().optional())
+                        .build(),
+                )
+                .variant(
+                    "payload",
+                    Schema::object("Payload")
+                        .field("mount", Field::string())
+                        .field("artifact", Field::string())
+                        .build(),
+                )
+                .build(),
+        )
+    }
+
+    fn nested_kebab_tagged_app() -> Shape {
+        use crate::runtime::Schema;
+        Shape::from(
+            Schema::object("App")
+                .field("site_block", kebab_tagged_block())
+                .build(),
+        )
+    }
+
+    #[test]
+    fn set_variant_exclusive_field_in_kebab_tagged_document() {
+        let result = set_in_document(
+            &TomlAdapter,
+            &kebab_tagged_block(),
+            Some("block-kind = \"payload\"\nmount = \".\"\nartifact = \"old\"\n"),
+            "artifact",
+            "123",
+            true,
+        )
+        .unwrap();
+        assert!(result.contains("artifact = \"123\""), "{result}");
+        assert!(result.contains("block-kind = \"payload\""), "{result}");
+    }
+
+    #[test]
+    fn set_nested_variant_exclusive_field_in_kebab_tagged_document() {
+        let result = set_in_document(
+            &TomlAdapter,
+            &nested_kebab_tagged_app(),
+            Some("[site-block]\nblock-kind = \"payload\"\nmount = \".\"\nartifact = \"old\"\n"),
+            "site-block.artifact",
+            "123",
+            true,
+        )
+        .unwrap();
+        assert!(result.contains("artifact = \"123\""), "{result}");
+        assert!(result.contains("block-kind = \"payload\""), "{result}");
+    }
+
+    #[test]
+    fn colliding_discriminator_spellings_fail_as_normalized_key_collision() {
+        // Both spellings, different variants: collision must win over
+        // picking one discriminator and then UnaddressableKey / a typed
+        // write against the wrong branch.
+        let result = set_in_document(
+            &TomlAdapter,
+            &kebab_tagged_block(),
+            Some("block-kind = \"payload\"\nblock_kind = \"rust\"\nmount = \".\"\n"),
+            "artifact",
+            "123",
+            true,
+        );
+        assert_collision(
+            result,
+            "",
+            "block_kind",
+            &["block-kind", "block_kind"],
+            "root tagged discriminator collision",
+        );
+    }
+
+    #[test]
+    fn colliding_nested_discriminator_spellings_fail_as_normalized_key_collision() {
+        let result = set_in_document(
+            &TomlAdapter,
+            &nested_kebab_tagged_app(),
+            Some("[site-block]\nblock-kind = \"payload\"\nblock_kind = \"rust\"\nmount = \".\"\n"),
+            "site-block.artifact",
+            "123",
+            true,
+        );
+        assert_collision(
+            result,
+            "site_block",
+            "block_kind",
+            &["block-kind", "block_kind"],
+            "nested tagged discriminator collision",
+        );
     }
 }

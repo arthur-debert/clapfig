@@ -37,7 +37,7 @@ pub use yaml::YamlAdapter;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::runtime::Schema;
+use crate::runtime::Shape;
 use crate::value::Value;
 
 /// One operation from ADR-0002's capability matrix.
@@ -522,10 +522,12 @@ pub trait FormatAdapter: Send + Sync {
     /// Serialize a [`Value`] tree to this format's source text.
     fn serialize(&self, value: &Value) -> Result<String, FormatError>;
 
-    /// Render a documented config template from a schema, carrying docs in
-    /// the format's comment representation (native comments, or JSON's
-    /// `"//"` keys).
-    fn template(&self, schema: &Schema) -> Result<String, FormatError>;
+    /// Render a documented config template from a document-root [`Shape`],
+    /// carrying docs in the format's comment representation (native
+    /// comments, or JSON's `"//"` keys). A root [`Shape::Map`] emits a
+    /// commented example entry, not an invented parent table. Object-root
+    /// templates that do not use new constructors stay unchanged.
+    fn template(&self, shape: &Shape) -> Result<String, FormatError>;
 
     /// Apply one [`FileEdit`] to existing source text, returning the new
     /// text. Preservation honesty is per the format's declared edit
@@ -653,7 +655,7 @@ mod tests {
             Err(self.require(Operation::Serialize).unwrap_err().into())
         }
 
-        fn template(&self, _schema: &Schema) -> Result<String, FormatError> {
+        fn template(&self, _shape: &Shape) -> Result<String, FormatError> {
             Err(self.require(Operation::Template).unwrap_err().into())
         }
 

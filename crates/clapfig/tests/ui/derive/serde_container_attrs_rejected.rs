@@ -23,10 +23,10 @@ enum UntaggedEnum {
 }
 
 #[derive(Schema, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind")]
-enum TaggedEnum {
-    A,
-    B,
+#[serde(tag = "kind", content = "body")]
+enum AdjacentEnum {
+    A { mount: String },
+    B { mount: String },
 }
 
 impl Default for ContainerDefault {

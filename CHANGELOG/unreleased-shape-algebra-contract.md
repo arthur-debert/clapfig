@@ -1,0 +1,12 @@
+**Shape algebra contract** ([#165](https://github.com/arthur-debert/clapfig/issues/165), epic [#164](https://github.com/arthur-debert/clapfig/issues/164)) — the schema node is a new `Shape` enum. Hard cut, no shims (per project policy). Walkers take [`Shape`](https://docs.rs/clapfig/latest/clapfig/runtime/enum.Shape.html); root-map and tagged load landed in later slices of this epic (see sibling fragments).
+
+- **`runtime::Shape`**: `Leaf | Object | Map | Array | Tagged`. [`runtime::Schema`](https://docs.rs/clapfig/latest/clapfig/runtime/struct.Schema.html) stays the named-field object constructor (`Schema::object(...)`), not the node and not renamed to `Object`. [`clapfig::Schema`](https://docs.rs/clapfig/latest/clapfig/trait.Schema.html) stays the derive trait. An object's field value is a `Shape`; `Field` is not a second node. The public collapse of `Field` / `LeafType::Map` / `LeafType::Array` landed in the pipeline-swap slice.
+- **Legal document roots**: Object, Map, Tagged. Leaf and Array construct as nested shapes and panic as a document root. Root Map and Tagged construct and load: [`Clapfig::builder`](https://docs.rs/clapfig/latest/clapfig/struct.Clapfig.html#method.builder) takes `impl Into<Shape>`.
+- **Tagged construction**: variants are objects (`Schema`). Discriminator set is closed: at least one variant; post-rename names unique and non-empty. Construction panics on empty unions, empty tag/discriminator names, tag names that contain `.` / `[` / `]`, collisions, variant fields named as the tag, and non-object variants.
+- **Static mirror**: `static_schema::SchemaStatic` / `TaggedVariantStatic` (plus `NamedFieldStatic`, `FieldStatic`, `LeafStatic`, `LeafTypeStatic`) so derive can emit const trees. `Schema::shape()` is `Shape::Leaf(Enum)` for unit-only enums (preserving renamed variants), `Shape::Tagged` for internally tagged enums, and `Shape::Object` for named-field structs.
+- **`Clapfig::builder` takes `impl Into<Shape>`**. Object-root callers keep passing a `Schema`.
+
+**Migration (hard cut, per project policy):**
+
+- `Clapfig::builder(schema: Schema)` is now `Clapfig::builder(schema: impl Into<Shape>)`. Passing a `Schema` still compiles (`From<Schema> for Shape`). Function-pointer types that named `fn(Schema) -> Builder` must update.
+- Exhaustive matches on schema-node types that this slice adds (`Shape`) must name all five constructors. `Field` as a node enum and `LeafType::Map` / `LeafType::Array` collapsed in the pipeline-swap slice (see `unreleased-shape-algebra-pipeline-swap.md`).

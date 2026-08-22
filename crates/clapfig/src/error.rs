@@ -49,10 +49,10 @@ pub struct UnknownKeyInfo {
     /// Dotted key path that was not recognized by the config schema
     /// (e.g. `"database.typo"`).
     pub key: String,
-    /// Path to the config file that contained the unknown key. For an
-    /// env-derived key (see [`env_var`](Self::env_var)) this is the
-    /// synthesized `<env>` placeholder — renderers name the variable
-    /// instead.
+    /// Path to the config file that contained the unknown key. Non-file
+    /// winners use a synthesized placeholder (`<env>`, `<url>`,
+    /// `<override>`) — renderers name the variable, query key, or
+    /// override key instead of dressing those sources as a config file.
     pub path: PathBuf,
     /// 1-indexed line number where the key was found, or `0` if the line
     /// could not be located. Derived from [`span`](Self::span) (the key
@@ -77,6 +77,9 @@ pub struct UnknownKeyInfo {
     /// URL query-parameter key that supplied this unknown key, when it
     /// came from the URL layer.
     pub url_key: Option<String>,
+    /// Override key that supplied this unknown key, when it came from a
+    /// programmatic override (`cli_override` / `cli_overrides_from`).
+    pub override_key: Option<String>,
     /// Which input type produced the key. `None` when unset; env-derived
     /// keys already name [`env_var`](Self::env_var).
     pub input_type: Option<InputType>,
@@ -239,22 +242,27 @@ pub enum ClapfigError {
         suggestion: Option<String>,
     },
 
-    /// A `config set` action key targets an `ArrayOf`/`MapOf` schema
-    /// section or a path inside one. A dotted CLI key cannot say which
-    /// entry it means — entry keys and array indexes are user data, not
-    /// schema fields — so these paths are deliberately not settable and
-    /// the config file is the surface for editing them. (An indexed path
+    /// A `config set` action key targets a path a dotted CLI key cannot
+    /// address as given: a [`Shape::Array`](crate::runtime::Shape::Array) /
+    /// [`Shape::Map`](crate::runtime::Shape::Map) of objects (or a root
+    /// map) or a path inside one — entry keys and array indexes are user
+    /// data, not schema fields — or a variant-specific / structurally
+    /// conflicting field of a [`Shape::Tagged`](crate::runtime::Shape::Tagged)
+    /// union (no valid discriminator selects a variant, or the selected
+    /// variant does not declare a key that another variant does). Keys
+    /// no variant declares are [`KeyNotFound`](Self::KeyNotFound). Array/map interiors are
+    /// edited in the config file. Tagged-union keys need a variant that
+    /// declares them (select it, or edit the file). (An indexed path
     /// syntax like `servers[0].host` is a possible future extension.)
-    #[error(
-        "Key '{key}' cannot be set: '{section}' is {kind} of sections, and keys inside it cannot be addressed with a dotted CLI key — edit the config file directly"
-    )]
+    #[error("{}", format_unaddressable_key(.key, .section, .kind))]
     UnaddressableKey {
         /// The dotted action key as the caller supplied it.
         key: String,
-        /// Canonical dotted path of the `ArrayOf`/`MapOf` section the key
-        /// runs into.
+        /// Canonical dotted path of the array, map-of-objects, or tagged
+        /// union the key runs into.
         section: String,
-        /// `"an array"` or `"a map"` — which container kind refused.
+        /// `"an array"`, `"a map"`, or `"a tagged union"` — which kind
+        /// refused.
         kind: &'static str,
     },
 
@@ -456,6 +464,21 @@ impl ClapfigError {
     }
 }
 
+fn format_unaddressable_key(key: &str, section: &str, kind: &str) -> String {
+    // UnaddressableKey is only reached for keys `valid_keys_shape`
+    // already accepted (declared by at least one variant). Keys no
+    // variant declares are KeyNotFound first.
+    if kind == "a tagged union" {
+        format!(
+            "Key '{key}' cannot be set: '{section}' is {kind} of sections, and the current tagged-union selection does not address this key — select a variant that declares it, or edit the config file directly"
+        )
+    } else {
+        format!(
+            "Key '{key}' cannot be set: '{section}' is {kind} of sections, and keys inside it cannot be addressed with a dotted CLI key — edit the config file directly"
+        )
+    }
+}
+
 fn format_invalid_value(key: &str, reason: &str, origin: &OriginFacts) -> String {
     use std::fmt::Write;
     let mut out = format!("Invalid value for '{key}': {reason}");
@@ -520,34 +543,56 @@ fn format_missing_required(key: &str, discovery: &DiscoveryRecord) -> String {
 
 fn format_unknown_keys(infos: &[UnknownKeyInfo]) -> String {
     use std::fmt::Write;
-    let header = if infos.iter().all(|i| i.env_var.is_some()) {
-        "Unknown keys in environment:"
-    } else {
-        "Unknown keys in config file:"
-    };
+    let header = unknown_keys_header(infos);
     let mut out = String::from(header);
     for info in infos {
-        match (&info.env_var, info.line) {
-            (Some(var), _) => {
-                let _ = write!(out, "\n  - '{}' from environment variable {var}", info.key);
-            }
+        if let Some(var) = &info.env_var {
+            let _ = write!(out, "\n  - '{}' from environment variable {var}", info.key);
+        } else if let Some(url_key) = &info.url_key {
+            let _ = write!(
+                out,
+                "\n  - '{}' from URL query parameter {url_key}",
+                info.key
+            );
+        } else if let Some(override_key) = &info.override_key {
+            let _ = write!(
+                out,
+                "\n  - '{}' from programmatic override {override_key}",
+                info.key
+            );
+        } else if info.line == 0 {
             // Line 0 means "could not be located" (no span-index entry
             // for the path) — omit it rather than render a bogus
             // `(line 0)`.
-            (None, 0) => {
-                let _ = write!(out, "\n  - '{}' in {}", info.key, info.path.display());
-            }
-            (None, line) => {
-                let _ = write!(
-                    out,
-                    "\n  - '{}' in {} (line {line})",
-                    info.key,
-                    info.path.display(),
-                );
-            }
+            let _ = write!(out, "\n  - '{}' in {}", info.key, info.path.display());
+        } else {
+            let _ = write!(
+                out,
+                "\n  - '{}' in {} (line {})",
+                info.key,
+                info.path.display(),
+                info.line,
+            );
         }
     }
     out
+}
+
+fn unknown_keys_header(infos: &[UnknownKeyInfo]) -> &'static str {
+    if infos.iter().all(|i| i.env_var.is_some()) {
+        "Unknown keys in environment:"
+    } else if infos.iter().all(|i| i.url_key.is_some()) {
+        "Unknown keys in URL query:"
+    } else if infos.iter().all(|i| i.override_key.is_some()) {
+        "Unknown keys in programmatic overrides:"
+    } else if infos
+        .iter()
+        .all(|i| i.env_var.is_none() && i.url_key.is_none() && i.override_key.is_none())
+    {
+        "Unknown keys in config file:"
+    } else {
+        "Unknown keys:"
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +608,7 @@ mod tests {
             env_var: None,
             span: None,
             url_key: None,
+            override_key: None,
             input_type: None,
         }
     }
@@ -624,6 +670,40 @@ mod tests {
     }
 
     #[test]
+    fn unaddressable_tagged_union_points_at_declaring_variant() {
+        let err = ClapfigError::UnaddressableKey {
+            key: "block.artifact".into(),
+            section: "block".into(),
+            kind: "a tagged union",
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("the current tagged-union selection does not address this key"),
+            "{msg}"
+        );
+        assert!(msg.contains("select a variant that declares it"), "{msg}");
+        assert!(
+            !msg.contains("cannot be addressed with a dotted CLI key"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn unaddressable_map_stays_file_only() {
+        let err = ClapfigError::UnaddressableKey {
+            key: "servers.web.host".into(),
+            section: "servers".into(),
+            kind: "a map",
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("keys inside it cannot be addressed with a dotted CLI key"),
+            "{msg}"
+        );
+        assert!(!msg.contains("discriminator"), "{msg}");
+    }
+
+    #[test]
     fn unknown_key_line_zero_is_suppressed() {
         // Line 0 means "could not be located"; never print `(line 0)`.
         let msg = ClapfigError::UnknownKeys(vec![info("typo", 0)]).to_string();
@@ -644,6 +724,41 @@ mod tests {
         );
         assert!(!msg.contains("config file"), "{msg}");
         assert!(!msg.contains("<env>"), "{msg}");
+    }
+
+    #[test]
+    fn url_derived_unknown_key_names_the_query_parameter() {
+        let mut i = info("artifact", 0);
+        i.path = "<url>".into();
+        i.url_key = Some("artifact".into());
+        i.input_type = Some(InputType::Url);
+        let msg = ClapfigError::UnknownKeys(vec![i]).to_string();
+        assert!(msg.contains("Unknown keys in URL query:"), "{msg}");
+        assert!(
+            msg.contains("'artifact' from URL query parameter artifact"),
+            "{msg}"
+        );
+        assert!(!msg.contains("<env>"), "{msg}");
+        assert!(!msg.contains("config file"), "{msg}");
+    }
+
+    #[test]
+    fn override_derived_unknown_key_names_the_override_key() {
+        let mut i = info("artifact", 0);
+        i.path = "<override>".into();
+        i.override_key = Some("artifact".into());
+        i.input_type = Some(InputType::Override);
+        let msg = ClapfigError::UnknownKeys(vec![i]).to_string();
+        assert!(
+            msg.contains("Unknown keys in programmatic overrides:"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("'artifact' from programmatic override artifact"),
+            "{msg}"
+        );
+        assert!(!msg.contains("<env>"), "{msg}");
+        assert!(!msg.contains("config file"), "{msg}");
     }
 
     #[test]

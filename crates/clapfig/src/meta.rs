@@ -15,7 +15,7 @@
 //! metadata lookups DWIM-friendly so callers don't have to remember which
 //! shape the user typed.
 
-use crate::runtime::{Field, Schema};
+use crate::runtime::{KeyAcrossVariants, Schema, Shape};
 
 /// Look up the doc-comment lines for a config key in a [`Schema`].
 ///
@@ -48,6 +48,43 @@ pub fn doc_for(schema: &Schema, key: &str) -> Option<Vec<String>> {
     walk_segments(schema, &segments)
 }
 
+/// [`doc_for`] against a document-root [`Shape`]. Root-map keys are user
+/// data, so lookup walks the item schema after the entry segment. Tagged
+/// roots walk the synthetic tag key and the union of variant fields;
+/// variant fields whose docs disagree across alternatives return
+/// `Some(vec![])` (the key exists, no unique doc).
+pub fn doc_for_shape(shape: &Shape, key: &str) -> Option<Vec<String>> {
+    let segments: Vec<&str> = key.split('.').collect();
+    walk_shape_segments(shape, &segments)
+}
+
+fn walk_shape_segments(shape: &Shape, segments: &[&str]) -> Option<Vec<String>> {
+    match shape {
+        Shape::Object(schema) => walk_segments(schema, segments),
+        Shape::Map(map) => {
+            if segments.is_empty() {
+                return None;
+            }
+            // Drop the user-supplied entry key; remaining segments are
+            // fields of the item shape.
+            let rest = &segments[1..];
+            if rest.is_empty() {
+                Some(map.item.field_doc().to_vec())
+            } else {
+                walk_shape_segments(&map.item, rest)
+            }
+        }
+        Shape::Tagged(tagged) => walk_tagged(tagged, segments),
+        Shape::Leaf(_) | Shape::Array(_) => {
+            if segments.is_empty() {
+                Some(shape.field_doc().to_vec())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn walk_segments(schema: &Schema, segments: &[&str]) -> Option<Vec<String>> {
     if segments.is_empty() {
         return None;
@@ -56,22 +93,53 @@ fn walk_segments(schema: &Schema, segments: &[&str]) -> Option<Vec<String>> {
     for field in &schema.fields {
         if segment_matches(&field.name, head) {
             if segments.len() == 1 {
-                return Some(match &field.field {
-                    Field::Leaf(leaf) => leaf.doc.clone(),
-                    Field::Nested(s) | Field::ArrayOf(s) | Field::MapOf(s) => s.doc.clone(),
-                });
+                return Some(field.field.field_doc().to_vec());
             }
-            return match &field.field {
-                Field::Nested(nested) | Field::ArrayOf(nested) | Field::MapOf(nested) => {
-                    walk_segments(nested, &segments[1..])
-                }
-                // Hit a leaf with segments still pending — the rest of the
-                // path can't resolve.
-                Field::Leaf(_) => None,
-            };
+            return walk_shape_segments(field.field.peel_containers(), &segments[1..]);
         }
     }
     None
+}
+
+fn walk_tagged(tagged: &crate::runtime::TaggedShape, segments: &[&str]) -> Option<Vec<String>> {
+    if segments.is_empty() {
+        return Some(tagged.doc.clone());
+    }
+    let head = segments[0];
+    let matching = match tagged.resolve_key_with(head, segment_matches) {
+        KeyAcrossVariants::Tag => {
+            return if segments.len() == 1 {
+                Some(tagged.doc.clone())
+            } else {
+                None
+            };
+        }
+        KeyAcrossVariants::Absent => return None,
+        KeyAcrossVariants::Every(shapes) | KeyAcrossVariants::Partial(shapes) => shapes,
+    };
+    if segments.len() == 1 {
+        return agreed_doc(matching.iter().map(|s| s.field_doc().to_vec()).collect());
+    }
+    let nested: Vec<Vec<String>> = matching
+        .iter()
+        .filter_map(|s| walk_shape_segments(s.peel_containers(), &segments[1..]))
+        .collect();
+    if nested.is_empty() {
+        None
+    } else {
+        agreed_doc(nested)
+    }
+}
+
+/// Docs that every alternative agrees on, or `Some(vec![])` when the
+/// field exists but documentation differs across variants.
+fn agreed_doc(docs: Vec<Vec<String>>) -> Option<Vec<String>> {
+    let first = docs.first()?;
+    if docs.iter().all(|d| d == first) {
+        Some(first.clone())
+    } else {
+        Some(Vec::new())
+    }
 }
 
 /// The nearest valid schema key to a mistyped dotted `key`, when one is
@@ -89,14 +157,37 @@ fn walk_segments(schema: &Schema, segments: &[&str]) -> Option<Vec<String>> {
 /// garbage doesn't "suggest" an unrelated short key); ties break to the
 /// lexicographically smallest candidate. Returns `None` when nothing is
 /// close enough.
+/// [`nearest_key`] against a document-root [`Shape`]. A root Map has no
+/// addressable keys, so there is never a suggestion. Tagged roots use
+/// [`crate::overrides::valid_keys_shape`].
+pub fn nearest_key_shape(shape: &Shape, key: &str, normalize_keys: bool) -> Option<String> {
+    match shape {
+        Shape::Object(schema) => nearest_key(schema, key, normalize_keys),
+        Shape::Tagged(_) => nearest_from_keys(
+            crate::overrides::valid_keys_shape(shape),
+            key,
+            normalize_keys,
+        ),
+        Shape::Map(_) | Shape::Leaf(_) | Shape::Array(_) => None,
+    }
+}
+
 pub fn nearest_key(schema: &Schema, key: &str, normalize_keys: bool) -> Option<String> {
+    nearest_from_keys(crate::overrides::valid_keys(schema), key, normalize_keys)
+}
+
+fn nearest_from_keys(
+    candidates: impl IntoIterator<Item = String>,
+    key: &str,
+    normalize_keys: bool,
+) -> Option<String> {
     let needle = if normalize_keys {
         crate::normalize::normalize_key(key)
     } else {
         key.to_string()
     };
     let mut best: Option<(usize, String)> = None;
-    for candidate in crate::overrides::valid_keys(schema) {
+    for candidate in candidates {
         let haystack = if normalize_keys {
             crate::normalize::normalize_key(&candidate)
         } else {
@@ -254,6 +345,36 @@ mod tests {
     }
 
     #[test]
+    fn doc_for_walks_through_nested_containers() {
+        let schema = Schema::object("App")
+            .field(
+                "groups",
+                Field::array_of_type(Field::array_of_type(Schema::object("Item").field(
+                    "timeout",
+                    Field::integer().doc("Deadline in ms.").default(1i64),
+                ))),
+            )
+            .field(
+                "servers",
+                Field::map_of(Field::array_of_type(Schema::object("Server").field(
+                    "host",
+                    Field::string().doc("Listen address.").default("localhost"),
+                ))),
+            )
+            .build();
+        let timeout = doc_for(&schema, "groups.timeout").expect("timeout exists under arrays");
+        assert!(
+            timeout.iter().any(|line| line.contains("Deadline in ms")),
+            "{timeout:?}"
+        );
+        let host = doc_for(&schema, "servers.host").expect("host exists under map then array");
+        assert!(
+            host.iter().any(|line| line.contains("Listen address")),
+            "{host:?}"
+        );
+    }
+
+    #[test]
     fn nested_field_section_doc() {
         // Asking for the section itself ("database") yields the section's
         // own doc comment (it has one: "Database settings.").
@@ -323,5 +444,93 @@ mod tests {
         assert!(segment_matches("foo-bar", "foo_bar"));
         assert!(!segment_matches("pool_size", "pool"));
         assert!(!segment_matches("pool_size", "pool_zize"));
+    }
+
+    fn tagged_docs() -> Shape {
+        use crate::runtime::Field;
+        Shape::from(
+            Shape::tagged("Block", "kind")
+                .doc("Union of blocks.")
+                .variant(
+                    "rust",
+                    Schema::object("Rust")
+                        .field("mount", Field::string().doc("Shared mount."))
+                        .field("crate_path", Field::string().doc("Rust crate path.")),
+                )
+                .variant(
+                    "payload",
+                    Schema::object("Payload")
+                        .field("mount", Field::string().doc("Shared mount."))
+                        .field("artifact", Field::string().doc("Payload artifact.")),
+                )
+                .build(),
+        )
+    }
+
+    #[test]
+    fn doc_for_shape_tagged_tag_and_agreed_variant_fields() {
+        let shape = tagged_docs();
+        let tag = doc_for_shape(&shape, "kind").expect("tag exists");
+        assert!(tag.iter().any(|l| l.contains("Union of blocks")), "{tag:?}");
+        let mount = doc_for_shape(&shape, "mount").expect("shared field exists");
+        assert!(
+            mount.iter().any(|l| l.contains("Shared mount")),
+            "{mount:?}"
+        );
+        let crate_path = doc_for_shape(&shape, "crate_path").expect("exclusive field exists");
+        assert!(
+            crate_path.iter().any(|l| l.contains("Rust crate path")),
+            "{crate_path:?}"
+        );
+        assert!(doc_for_shape(&shape, "nope").is_none());
+    }
+
+    #[test]
+    fn doc_for_shape_nested_tagged_and_conflicting_docs() {
+        use crate::runtime::Field;
+        let nested = Shape::from(
+            Schema::object("App")
+                .field(
+                    "block",
+                    Shape::from(
+                        Shape::tagged("Block", "kind")
+                            .variant(
+                                "rust",
+                                Schema::object("Rust")
+                                    .field("mount", Field::string().doc("Rust mount.")),
+                            )
+                            .variant(
+                                "payload",
+                                Schema::object("Payload")
+                                    .field("mount", Field::string().doc("Payload mount.")),
+                            )
+                            .build(),
+                    ),
+                )
+                .build(),
+        );
+        let mount = doc_for_shape(&nested, "block.mount").expect("field exists on both");
+        assert!(
+            mount.is_empty(),
+            "conflicting variant docs must not pick a winner: {mount:?}"
+        );
+        assert!(
+            doc_for_shape(&nested, "block.kind").is_some(),
+            "synthetic tag key must be documented as present"
+        );
+    }
+
+    #[test]
+    fn nearest_key_shape_suggests_tagged_keys() {
+        let shape = tagged_docs();
+        assert_eq!(
+            nearest_key_shape(&shape, "knd", true).as_deref(),
+            Some("kind")
+        );
+        assert_eq!(
+            nearest_key_shape(&shape, "mountt", true).as_deref(),
+            Some("mount")
+        );
+        assert_eq!(nearest_key_shape(&shape, "kind", true), None);
     }
 }

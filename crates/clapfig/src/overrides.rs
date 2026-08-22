@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::origin::{Origin, OriginMap, OriginNode};
-use crate::runtime::{Field, Schema};
+use crate::runtime::{DocumentRoot, Schema};
 use crate::value::{Map, Value};
 
 /// Convert dotted-key overrides into a nested config value [`Map`].
@@ -79,9 +79,36 @@ fn set_nested_with_origin(
 /// Returns dotted paths like `"host"`, `"database.url"`, `"database.pool_size"`.
 /// Section names (nested structs) are excluded — only leaf fields are returned.
 pub fn valid_keys(schema: &Schema) -> HashSet<String> {
+    valid_keys_root(DocumentRoot::Object(schema))
+}
+
+pub(crate) fn valid_keys_root(root: DocumentRoot<'_>) -> HashSet<String> {
     let mut keys = HashSet::new();
-    collect_keys(schema, "", &mut keys);
+    match root {
+        DocumentRoot::Object(schema) => collect_keys(schema, "", &mut keys),
+        DocumentRoot::Map(_) => {}
+        DocumentRoot::Tagged(tagged) => {
+            keys.insert(tagged.tag.clone());
+            for variant in &tagged.variants {
+                collect_keys(&variant.schema, "", &mut keys);
+            }
+        }
+    }
     keys
+}
+
+/// Addressable dotted keys for a document-root [`Shape`].
+///
+/// Object roots use [`valid_keys`]. A root Map has no addressable keys
+/// (every segment is user data).
+pub fn valid_keys_shape(shape: &crate::runtime::Shape) -> HashSet<String> {
+    match shape {
+        crate::runtime::Shape::Object(schema) => valid_keys(schema),
+        crate::runtime::Shape::Tagged(tagged) => valid_keys_root(DocumentRoot::Tagged(tagged)),
+        crate::runtime::Shape::Map(_)
+        | crate::runtime::Shape::Leaf(_)
+        | crate::runtime::Shape::Array(_) => HashSet::new(),
+    }
 }
 
 fn collect_keys(schema: &Schema, prefix: &str, keys: &mut HashSet<String>) {
@@ -92,34 +119,51 @@ fn collect_keys(schema: &Schema, prefix: &str, keys: &mut HashSet<String>) {
             format!("{prefix}.{}", field.name)
         };
         match &field.field {
-            Field::Leaf(_) => {
+            crate::runtime::Shape::Leaf(_) => {
                 keys.insert(dotted);
             }
-            Field::Nested(nested) => {
+            crate::runtime::Shape::Object(nested) => {
                 collect_keys(nested, &dotted, keys);
             }
-            Field::ArrayOf(_) => {
-                // Skip ArrayOf subtrees. Dotted-key consumers (cli_overrides,
-                // url_query, persist set/unset) build nested tables, not
-                // arrays-of-tables, so listing `plugins.name` as valid would
-                // let `config set plugins.name foo` write `[plugins]
-                // name = "foo"` — which then fails runtime validation with
-                // "expected array, got map". The right surface for setting
-                // entries inside an array of tables would be an indexed
-                // dotted syntax (`plugins[0].name`) that none of the current
-                // consumers parses. Until then, ArrayOf keys are not
-                // addressable by dotted path.
+            crate::runtime::Shape::Array(array) if array.item.is_value_field() => {
+                // Homogeneous array of leaves is addressable as one key
+                // (`tags = ["a", "b"]`), like the old LeafType::Array.
+                keys.insert(dotted);
             }
-            Field::MapOf(_) => {
-                // Skip MapOf subtrees for the same reason ArrayOf is
-                // skipped: dotted-key consumers can't tell whether
+            crate::runtime::Shape::Map(map) if map.item.is_value_field() => {
+                keys.insert(dotted);
+            }
+            crate::runtime::Shape::Array(_) => {
+                // Skip array-of-objects subtrees. Dotted-key consumers
+                // (cli_overrides, url_query, persist set/unset) build
+                // nested tables, not arrays-of-tables, so listing
+                // `plugins.name` as valid would let `config set
+                // plugins.name foo` write `[plugins] name = "foo"` —
+                // which then fails runtime validation with "expected
+                // array, got map". The right surface for setting
+                // entries inside an array of tables would be an indexed
+                // dotted syntax (`plugins[0].name`) that none of the
+                // current consumers parses. Until then, those keys are
+                // not addressable by dotted path.
+            }
+            crate::runtime::Shape::Map(_) => {
+                // Skip map-of-objects subtrees for the same reason:
+                // dotted-key consumers can't tell whether
                 // `plugins.audit` means "set the `audit` entry" (a real
                 // user-supplied key) or "set the `audit` leaf inside a
-                // known schema field." The entries' inner keys aren't
-                // declared in the schema, so listing them up-front isn't
-                // possible — callers writing to map entries need a
-                // different surface (top-level `[plugins.audit]` in a
-                // config file, not a dotted CLI override).
+                // known schema field."
+            }
+            crate::runtime::Shape::Tagged(tagged) => {
+                // Addressable nested tagged: the tag leaf and every
+                // variant's leaf paths under this prefix. The tagged
+                // object itself is a section, not a leaf. Tagged values
+                // behind unaddressable map/array entry syntax never
+                // reach here — those containers skip their subtrees
+                // above.
+                keys.insert(format!("{dotted}.{}", tagged.tag));
+                for variant in &tagged.variants {
+                    collect_keys(&variant.schema, &dotted, keys);
+                }
             }
         }
     }
@@ -203,5 +247,39 @@ mod tests {
         let schema = crate::fixtures::test::test_schema();
         let keys = valid_keys(&schema);
         assert!(!keys.contains("database"));
+    }
+
+    #[test]
+    fn valid_keys_collects_nested_tagged_tag_and_variant_leaves() {
+        use crate::runtime::{Field, Schema, Shape};
+        let schema = Schema::object("App")
+            .field(
+                "block",
+                Shape::from(
+                    Shape::tagged("Block", "kind")
+                        .variant(
+                            "rust",
+                            Schema::object("Rust")
+                                .field("mount", Field::string())
+                                .field("crate_path", Field::string().optional())
+                                .build(),
+                        )
+                        .variant(
+                            "payload",
+                            Schema::object("Payload")
+                                .field("mount", Field::string())
+                                .field("artifact", Field::string())
+                                .build(),
+                        )
+                        .build(),
+                ),
+            )
+            .build();
+        let keys = valid_keys(&schema);
+        assert!(keys.contains("block.kind"), "{keys:?}");
+        assert!(keys.contains("block.mount"), "{keys:?}");
+        assert!(keys.contains("block.crate_path"), "{keys:?}");
+        assert!(keys.contains("block.artifact"), "{keys:?}");
+        assert!(!keys.contains("block"), "{keys:?}");
     }
 }

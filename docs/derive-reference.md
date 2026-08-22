@@ -1,9 +1,16 @@
 # Derive Reference
 
 `#[derive(clapfig::Schema)]` is the typed path into clapfig. It reads the
-struct (or unit-only enum), field types, `///` docs, and `#[clapfig(...)]`
-attributes, and emits a const schema tree that every consumer — loading,
-`config gen`, JSON Schema, persistence, strictness — walks.
+struct, unit-only enum, or internally tagged enum, field types, `///`
+docs, and `#[clapfig(...)]` attributes, and emits a const schema tree
+that every consumer — loading, `config gen`, JSON Schema, persistence,
+strictness — walks. The node those consumers walk is
+[`Shape`](https://docs.rs/clapfig/latest/clapfig/runtime/enum.Shape.html)
+(leaf, object, map, array, tagged union).
+[`runtime::Schema`](https://docs.rs/clapfig/latest/clapfig/runtime/struct.Schema.html)
+stays the named-field object constructor, not the node. Legal typed
+document roots are a named-field struct, an internally tagged enum, or
+`BTreeMap<String, T>` / `HashMap<String, T>` where `T: Schema`.
 
 This page is the attribute vocabulary. Pair it with
 [Getting Started](./getting-started.md) for the first load, and with the
@@ -227,9 +234,6 @@ On variants the only supported clapfig attribute is `rename = "..."`;
 anything else is a derive error. `rename_all` on the enum itself is fully
 supported (serde-exact, same two-spelling rule as structs).
 
-Non-unit enums (tuple or struct variants) are not a schema shape. Use
-`#[clapfig(value)]` and take over deserialize, or flatten to unit variants.
-
 ### Deferred-panic contract for enum-typed fields
 
 A default on an enum-typed field (`#[clapfig(default = "letter")] mode:
@@ -249,44 +253,70 @@ runtime config error.
 `Option<UnitEnum>` is supported (absent → `None`). `Option<NestedStruct>`
 is not: it compiles and panics at the first `schema()` call — drop the
 `Option`; an absent nested section is already the empty-table state.
-`Vec<UnitEnum>` flattens to `LeafType::Array(Enum)`;
-`HashMap<String, UnitEnum>` / `BTreeMap<String, UnitEnum>` flatten to
-`LeafType::Map(Enum)`.
+`Vec<UnitEnum>` is `Shape::Array` of an enum leaf;
+`HashMap<String, UnitEnum>` / `BTreeMap<String, UnitEnum>` are
+`Shape::Map` of an enum leaf.
+
+Internally tagged enums (`#[serde(tag = "...")]`) are a different
+constructor — see [Tagged unions](#tagged-unions). Tuple variants,
+untagged / adjacent tagging, and struct-variant enums without
+`#[serde(tag)]` are not a schema shape: use `#[clapfig(value)]` and take
+over deserialize, or flatten to unit variants. There is no clapfig-only
+`#[clapfig(tag)]`.
 
 ## Maps
 
-String-keyed maps only — TOML map keys are strings.
+String-keyed maps only — TOML map keys are strings. Homogeneous maps are
+one constructor, `Shape::Map`: a map of leaves and a map of objects
+differ only in the item shape.
 
 - `HashMap<String, V>` / `BTreeMap<String, V>` where `V` is a scalar,
-  `Value`, or array-of-scalar: a `LeafType::Map(V)` leaf. Templates carry
+  `Value`, or array-of-scalar: `Shape::Map` of that leaf. Templates carry
   a `Values:` hint.
-- `HashMap<String, NestedStruct>` / `BTreeMap<String, NestedStruct>`: a
-  `Field::MapOf` section (map of nested objects).
-- `HashMap<String, UnitEnum>`: flattens to `LeafType::Map(Enum)`.
+- `HashMap<String, NestedStruct>` / `BTreeMap<String, NestedStruct>`:
+  `Shape::Map` of that object (TOML `[name.<key>]`).
+- `HashMap<String, UnitEnum>`: `Shape::Map` of an enum leaf.
+
+The typed **document root** may itself be `BTreeMap<String, T>` or
+`HashMap<String, T>` where `T: Schema` —
+`Clapfig::typed::<BTreeMap<String, T>>()` loads `[core]` / `[site]` with
+no parent field. JSON Schema is `type: object` plus
+`additionalProperties` of the item at the document root; `config gen`
+shows a commented example entry, not an invented parent table. A
+named-field struct that *contains* a map field stays the way to keep a
+reserved sibling next to user-named entries.
 
 An absent map loads as the empty map. `Option<HashMap<String, V>>` /
 `Option<BTreeMap<String, V>>` keeps the presence signal (absent → `None`)
-when `V` is a scalar, `Value`, or array-of-scalar. `Option` around a
-`MapOf` shape — `Option<HashMap<String, NestedStruct>>`, including a
+when `V` is a scalar, `Value`, or array-of-scalar. `Option` around a map
+of objects — `Option<HashMap<String, NestedStruct>>`, including a
 unit-enum value syntactically routed through the same Nested
 classification — is a derive-time error (an absent map is already the
 empty map). Non-`String` keys, map-of-map, map-of-`Option`, and map of
 arrays of nested schema types are also derive-time errors.
 
-Keys inside a `MapOf` section (`servers.web.host` where `servers` is a
-`HashMap<String, Server>`) are not addressable with a dotted `config set`
-key — the entry key is user data. Edit the file directly.
+Keys inside a map of objects (`servers.web.host` where `servers` is a
+`HashMap<String, Server>`), and keys inside a root map, are not
+addressable with a dotted `config set` key — the entry key is user data.
+Edit the file directly.
 
 ## Arrays
 
-- `Vec<T>` of a scalar: `LeafType::Array(T)`. A declared
+Homogeneous arrays are one constructor, `Shape::Array`: a `Vec` of
+leaves and a `Vec` of objects differ only in the item shape.
+
+- `Vec<T>` of a scalar: `Shape::Array` of that leaf. A declared
   `#[clapfig(default = [...])]` wins over the empty-array materialization.
-- `Vec<NestedStruct>`: `Field::ArrayOf` (TOML `[[name]]` array of tables).
-  Typed loading, per-entry defaults, per-entry required/type checks, and
-  strict unknown-key detection with indexed paths (`plugins[1].rogue`)
-  all work. Defaults on the array itself are rejected.
-- `Vec<UnitEnum>`: flattens to `LeafType::Array(Enum)` so entries
-  validate against the variant set.
+- `Vec<NestedStruct>`: `Shape::Array` of that object (TOML `[[name]]`
+  array of tables). Typed loading, per-entry defaults, per-entry
+  required/type checks, and strict unknown-key detection with indexed
+  paths (`plugins[1].rogue`) all work. Defaults on the array itself are
+  rejected.
+- `Vec<UnitEnum>`: `Shape::Array` of an enum leaf so entries validate
+  against the variant set.
+
+Array is not a legal **document root** (`Vec<T>` as the typed document
+type is a compile-time error). Nested use is unchanged.
 
 Support for nested element types is **trait-resolved**: the macro emits
 `<T as Schema>::STATIC` and the compiler decides whether `T` qualifies. A
@@ -303,6 +333,37 @@ Still rejected at derive time: `Vec<Vec<...>>`, `Vec<Option<T>>`,
 
 Indexed dotted-key syntax (`plugins[0].id`) for `config set` is not
 supported; same as maps of sections, edit the file.
+
+## Tagged unions
+
+Internally tagged enums honor `#[serde(tag = "...")]` — the same
+attribute serde uses on the wire. There is no clapfig-only
+`#[clapfig(tag)]`.
+
+```rust
+#[derive(Schema, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum Block {
+    #[serde(rename = "rust")]
+    Rust { mount: String, params: RustParams },
+    #[serde(rename = "payload")]
+    Payload { mount: String, params: PayloadParams },
+}
+```
+
+The tag is declared on the enum, not a field of any variant (a variant
+field of the tag name is a derive-time error). Discriminators follow
+`rename` / `rename_all`; empty unions, empty names, and post-rename
+collisions are derive-time errors. Unit variants are the empty object:
+the file carries only the tag. An internally tagged enum is a legal
+document root (`Clapfig::typed::<Block>()`).
+
+JSON Schema describes tagged alternatives as `oneOf` branches with a
+`const` on the tag field. `config gen` emits one commented example per
+variant, each a complete object for that discriminator — not one
+uncommented object that mixes keys from several variants. Untagged /
+`content` / adjacent tagging stay derive-time errors naming
+`#[clapfig(value)]`. Flatten stays rejected.
 
 ## Datetimes
 
@@ -334,17 +395,21 @@ error** naming the attribute and the divergence it would cause. There is
 no silent ignore and no compatibility path.
 
 **Honored:** `rename` (fields/variants, directional included),
-`rename_all` (structs and unit-only enums, directional included),
-`deserialize_with` / `with` for shape-preserving normalization.
+`rename_all` (structs, unit-only enums, and internally tagged enums,
+directional included), `#[serde(tag = "...")]` on enums (internally
+tagged unions of objects), `deserialize_with` / `with` for
+shape-preserving normalization. There is no clapfig-only
+`#[clapfig(tag)]`.
 
 **Accepted and inert** for config loading: serialize-only attributes
 (`skip_serializing`, `serialize_with`, …) and derive plumbing (`bound`,
 `borrow`, `crate`, `expecting`).
 
 **Rejected:** `default`, `flatten`, `alias`, `skip`, `skip_deserializing`,
-`tag` / `untagged` / `content`, `deny_unknown_fields`, `transparent`,
-`from` / `try_from`, and anything else the schema would disagree with.
-Supporting any of those is future work, not a missing flag.
+`untagged` / `content` (adjacent tagging), `deny_unknown_fields`,
+`transparent`, `from` / `try_from`, and anything else the schema would
+disagree with. Supporting any of those is future work, not a missing
+flag.
 
 A shape-changing deserializer must be paired with `#[clapfig(value)]` so
 the schema declares a free-form leaf. Without `value`, schema validation
@@ -357,7 +422,8 @@ runs first and rejects the unexpected wire shape with a type error.
 width's bounds), `f32`/`f64`, `clapfig::value::Datetime`,
 `clapfig::value::Value`, `Vec<T>` (scalar or Schema-deriving element),
 `HashMap<String, V>` / `BTreeMap<String, V>`, nested structs that also
-derive `Schema`, unit-only enums.
+derive `Schema`, unit-only enums, internally tagged enums
+(`#[serde(tag = "...")]`).
 
 **Supported `Option` wrappers:** `Option<T>` where `T` is a scalar,
 `Value`, or unit-only enum; `Option<Vec<T>>` of a scalar or unit-only

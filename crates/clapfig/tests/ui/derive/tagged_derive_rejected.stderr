@@ -1,0 +1,50 @@
+error: tagged variant field "kind" clashes with #[serde(tag = "kind")] — the tag is reserved on the object and is not a field of the variant. Rename the field, or pick a different tag.
+  --> tests/ui/derive/tagged_derive_rejected.rs:11:12
+   |
+11 |     Rust { kind: String, mount: String },
+   |            ^^^^
+
+error: variant field name `kind` conflicts with internal tag
+  --> tests/ui/derive/tagged_derive_rejected.rs:9:1
+   |
+ 9 | / #[serde(tag = "kind")]
+10 | | enum TagFieldClash {
+11 | |     Rust { kind: String, mount: String },
+12 | | }
+   | |_^
+
+error: invalid schema field name "" from #[serde(tag)]: the name is empty. Pick a non-empty name without '.', '[' or ']'.
+  --> tests/ui/derive/tagged_derive_rejected.rs:16:6
+   |
+16 | enum EmptyTag {
+   |      ^^^^^^^^
+
+error: invalid tagged discriminator "": discriminators must be non-empty
+  --> tests/ui/derive/tagged_derive_rejected.rs:24:5
+   |
+24 |     Rust { mount: String },
+   |     ^^^^
+
+error: duplicate tagged discriminator "rust" after rename — two variants would produce the same schema value
+  --> tests/ui/derive/tagged_derive_rejected.rs:33:5
+   |
+33 |     AlsoRust { mount: String },
+   |     ^^^^^^^^
+
+error: duplicate tagged discriminator "foo" after rename — two variants would produce the same schema value
+  --> tests/ui/derive/tagged_derive_rejected.rs:41:5
+   |
+41 |     Bar { mount: String },
+   |     ^^^
+
+error: internally tagged clapfig::Schema enums only support unit variants (empty object) and named-field struct variants. Tuple and newtype variants have no internally tagged object shape — use `#[clapfig(value)]` on the field that holds the union instead.
+  --> tests/ui/derive/tagged_derive_rejected.rs:47:9
+   |
+47 |     Rust(String),
+   |         ^^^^^^^^
+
+error: #[serde(flatten)] on a field deriving clapfig::Schema is not supported: the schema keeps this as a nested key while serde inlines the inner fields at this level, so schema validation and the typed deserialize disagree about the entire subtree. Supporting it is out of scope by design — any serde attribute the schema does not honor is rejected at derive time rather than left to silently diverge.
+  --> tests/ui/derive/tagged_derive_rejected.rs:59:17
+   |
+59 |         #[serde(flatten)]
+   |                 ^^^^^^^

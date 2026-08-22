@@ -34,10 +34,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::ClapfigError;
-use crate::format::Span;
-use crate::runtime::{Field, Schema};
+use crate::format::{ConfigPath, PathSegment, Span};
+use crate::runtime::{DocumentRoot, KeyAcrossVariants, Schema, Shape, TaggedShape};
 use crate::types::InputType;
-use crate::value::Value;
+use crate::value::{Map, Value};
 
 /// Context handed to an [`on_unknown_key`](crate::Builder::on_unknown_key)
 /// callback. Carries every signal the callback needs to make a per-key
@@ -101,6 +101,10 @@ pub struct UnknownKeyContext<'a> {
     /// the URL layer.
     pub url_key: Option<&'a str>,
 
+    /// Override key that supplied this key, when it came from a
+    /// programmatic override (`cli_override` / `cli_overrides_from`).
+    pub override_key: Option<&'a str>,
+
     /// Which input type produced the key. `None` when unset.
     pub input_type: Option<InputType>,
 }
@@ -158,6 +162,9 @@ pub struct CollectedUnknown {
     /// URL query-parameter key that supplied this key, when it came from
     /// the URL layer.
     pub url_key: Option<String>,
+    /// Override key that supplied this key, when it came from a
+    /// programmatic override.
+    pub override_key: Option<String>,
     /// Which input type produced the key. `None` when unset.
     pub input_type: Option<InputType>,
 }
@@ -220,17 +227,82 @@ pub(crate) fn dotted_extension_callback(
 #[derive(Debug, Default, Clone)]
 pub(crate) struct StrictnessOverrides {
     entries: HashMap<String, bool>,
+    /// When the document root is a homogeneous Map, item-schema `strict`
+    /// annotations are stored root-relative (`db`), while runtime paths
+    /// include the dynamic entry key (`core.db.rogue`). Cascade lookup
+    /// probes only the path with that first segment stripped.
+    skip_root_entry: bool,
+    /// Builder `strict_at` pairs, recorded so phase 2 can rebuild
+    /// schema-derived entries from the selected variant and replay these
+    /// overlays on top (builder wins at the same path).
+    builder_overlay: Vec<(String, bool)>,
 }
 
 impl StrictnessOverrides {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            skip_root_entry: false,
+            builder_overlay: Vec::new(),
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn insert(&mut self, path: impl Into<String>, strict: bool) {
         self.entries.insert(path.into(), strict);
+    }
+
+    /// Schema-derived insert: conflicting values at the same path from
+    /// sibling variants union to `true` (any-strict-wins, declaration
+    /// order independent). Never used for builder `strict_at`.
+    fn insert_schema(&mut self, path: impl Into<String>, strict: bool) {
+        let path = path.into();
+        match self.entries.get(&path) {
+            None => {
+                self.entries.insert(path, strict);
+            }
+            Some(&existing) if existing == strict => {}
+            Some(_) => {
+                self.entries.insert(path, true);
+            }
+        }
+    }
+
+    /// Builder `strict_at` overlay: overwrites schema-derived entries at
+    /// the same path and is replayed after phase-2 selected-variant rebuild.
+    fn overlay(&mut self, path: impl Into<String>, strict: bool) {
+        let path = path.into();
+        self.entries.insert(path.clone(), strict);
+        self.builder_overlay.push((path, strict));
+    }
+
+    /// Phase-2 map: schema-derived strictness from the selected tagged
+    /// branch, including tagged items inside arrays and maps (recorded at
+    /// indexed/keyed runtime paths), then builder overlays.
+    pub(crate) fn for_selected_branch(&self, root: DocumentRoot<'_>, merged: &Map) -> Self {
+        let mut out = Self::new();
+        out.skip_root_entry = self.skip_root_entry;
+        match root {
+            DocumentRoot::Object(schema) => {
+                walk_selected_object(schema, Some(merged), "", &mut out);
+            }
+            DocumentRoot::Map(map) => {
+                out.skip_root_entry = true;
+                if let Some(value) = map.strict {
+                    out.insert_schema(String::new(), value);
+                }
+                for (key, value) in merged {
+                    walk_selected_shape(&map.item, Some(value), key, &mut out);
+                }
+            }
+            DocumentRoot::Tagged(tagged) => {
+                walk_selected_tagged(tagged, Some(merged), "", &mut out);
+            }
+        }
+        for (path, strict) in &self.builder_overlay {
+            out.entries.insert(path.clone(), *strict);
+        }
+        out
     }
 
     /// `true` when at least one override could promote some key to strict.
@@ -249,6 +321,26 @@ impl StrictnessOverrides {
         let mut out = Self::new();
         walk_schema_strict(schema, "", &mut out);
         out
+    }
+
+    pub(crate) fn from_root(root: DocumentRoot<'_>) -> Self {
+        match root {
+            DocumentRoot::Object(schema) => Self::from_schema(schema),
+            DocumentRoot::Map(map) => {
+                let mut out = Self::new();
+                out.skip_root_entry = true;
+                if let Some(value) = map.strict {
+                    out.insert(String::new(), value);
+                }
+                walk_shape_strict(&map.item, "", &mut out);
+                out
+            }
+            DocumentRoot::Tagged(tagged) => {
+                let mut out = Self::new();
+                walk_tagged_strict(tagged, "", &mut out);
+                out
+            }
+        }
     }
 
     /// Resolve the effective strictness for an unknown key at `(path, leaf)`.
@@ -270,26 +362,41 @@ impl StrictnessOverrides {
     /// The cascade walks from the leaf's section path upward, returning
     /// the first explicit override found. With no override on any
     /// ancestor, `default` is returned.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn effective_strict(&self, path: &str, leaf: &str, default: bool) -> bool {
-        // Walk subslices of the original `path` to avoid an allocation per
-        // step — `HashMap<String, _>::get` accepts `&str` via the `Borrow`
-        // impl. The only allocation in the loop body is `strip_brackets`,
-        // which we now skip when the cursor has no brackets to strip.
-        let mut cursor: &str = section_path_of(path, leaf);
+        self.effective_strict_at(path, leaf, None, default)
+    }
+
+    /// Like [`effective_strict`], but a root-map lookup strips the
+    /// structured first key rather than the first textual `.` segment —
+    /// a quoted entry `"acme.prod"` must not be split into `acme` / `prod`.
+    pub(crate) fn effective_strict_at(
+        &self,
+        path: &str,
+        leaf: &str,
+        config_path: Option<&ConfigPath>,
+        default: bool,
+    ) -> bool {
+        // Walk subslices of the (possibly schema-relative) path to avoid
+        // an allocation per step — `HashMap<String, _>::get` accepts
+        // `&str` via the `Borrow` impl. The only allocation in the loop
+        // body is `strip_brackets`, which we now skip when the cursor
+        // has no brackets to strip.
+        let section = section_path_of(path, leaf);
+        let relative;
+        let mut cursor: &str = if self.skip_root_entry {
+            let entry = config_path.and_then(|p| match p.segments().first() {
+                Some(PathSegment::Key(k)) => Some(k.as_str()),
+                _ => None,
+            });
+            relative = strip_root_map_entry(section, entry);
+            &relative
+        } else {
+            section
+        };
         loop {
-            if let Some(v) = self.entries.get(cursor) {
-                return *v;
-            }
-            // Also probe the bracket-stripped form so an override set on a
-            // runtime ArrayOf schema (e.g. `plugins.audit`) is consulted
-            // when the unknown key sits inside an array entry
-            // (`plugins[0].audit.rogue`). Allocation-free fast path when
-            // there are no brackets in the cursor.
-            if cursor.contains('[') {
-                let schema_form = strip_brackets(cursor);
-                if let Some(v) = self.entries.get(&schema_form) {
-                    return *v;
-                }
+            if let Some(v) = self.probe(cursor) {
+                return v;
             }
             if cursor.is_empty() {
                 return default;
@@ -297,13 +404,26 @@ impl StrictnessOverrides {
             cursor = parent_path(cursor);
         }
     }
+
+    fn probe(&self, cursor: &str) -> Option<bool> {
+        if let Some(v) = self.entries.get(cursor) {
+            return Some(*v);
+        }
+        if cursor.contains('[') {
+            let schema_form = strip_brackets(cursor);
+            if let Some(v) = self.entries.get(&schema_form) {
+                return Some(*v);
+            }
+        }
+        None
+    }
 }
 
 /// Recursively visit `schema` and populate `out` with every node whose
 /// `strict` is explicitly set.
 fn walk_schema_strict(schema: &Schema, prefix: &str, out: &mut StrictnessOverrides) {
     if let Some(value) = schema.strict {
-        out.insert(prefix.to_string(), value);
+        out.insert_schema(prefix.to_string(), value);
     }
     for field in &schema.fields {
         let dotted = if prefix.is_empty() {
@@ -311,13 +431,148 @@ fn walk_schema_strict(schema: &Schema, prefix: &str, out: &mut StrictnessOverrid
         } else {
             format!("{prefix}.{}", field.name)
         };
-        match &field.field {
-            Field::Leaf(_) => {
-                // Leaves don't carry a `strict` override.
+        walk_shape_strict(&field.field, &dotted, out);
+    }
+}
+
+fn walk_shape_strict(shape: &Shape, dotted: &str, out: &mut StrictnessOverrides) {
+    match shape {
+        Shape::Leaf(_) => {}
+        Shape::Object(nested) => walk_schema_strict(nested, dotted, out),
+        Shape::Array(array) => {
+            if let Some(value) = array.strict {
+                out.insert_schema(dotted.to_string(), value);
             }
-            Field::Nested(nested) | Field::ArrayOf(nested) | Field::MapOf(nested) => {
-                walk_schema_strict(nested, &dotted, out);
+            walk_shape_strict(&array.item, dotted, out);
+        }
+        Shape::Map(map) => {
+            if let Some(value) = map.strict {
+                out.insert_schema(dotted.to_string(), value);
             }
+            walk_shape_strict(&map.item, dotted, out);
+        }
+        Shape::Tagged(tagged) => walk_tagged_strict(tagged, dotted, out),
+    }
+}
+
+/// Phase-1 tagged walk: the tagged node owns `dotted` (spec: the tagged
+/// object is the cascade parent). Variant root `schema.strict` does not
+/// write that path. Nested fields of every variant union with
+/// any-strict-wins so declaration order does not change behavior.
+fn walk_tagged_strict(tagged: &TaggedShape, dotted: &str, out: &mut StrictnessOverrides) {
+    if let Some(value) = tagged.strict {
+        out.insert_schema(dotted.to_string(), value);
+    }
+    for variant in &tagged.variants {
+        for field in &variant.schema.fields {
+            let child = if dotted.is_empty() {
+                field.name.clone()
+            } else {
+                format!("{dotted}.{}", field.name)
+            };
+            walk_shape_strict(&field.field, &child, out);
+        }
+    }
+}
+
+fn walk_selected_object(
+    schema: &Schema,
+    table: Option<&Map>,
+    prefix: &str,
+    out: &mut StrictnessOverrides,
+) {
+    if let Some(value) = schema.strict {
+        out.insert_schema(prefix.to_string(), value);
+    }
+    for field in &schema.fields {
+        let dotted = if prefix.is_empty() {
+            field.name.to_string()
+        } else {
+            format!("{prefix}.{}", field.name)
+        };
+        walk_selected_shape(
+            &field.field,
+            table.and_then(|t| t.get(&field.name)),
+            &dotted,
+            out,
+        );
+    }
+}
+
+fn walk_selected_tagged(
+    tagged: &TaggedShape,
+    table: Option<&Map>,
+    dotted: &str,
+    out: &mut StrictnessOverrides,
+) {
+    if let Some(value) = tagged.strict {
+        out.insert_schema(dotted.to_string(), value);
+    }
+    let Some(table) = table else {
+        return;
+    };
+    let Some(selected) = tagged.selected(table) else {
+        return;
+    };
+    for field in &selected.schema.fields {
+        let child = if dotted.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{dotted}.{}", field.name)
+        };
+        walk_selected_shape(&field.field, table.get(&field.name), &child, out);
+    }
+}
+
+fn walk_selected_shape(
+    shape: &Shape,
+    value: Option<&Value>,
+    dotted: &str,
+    out: &mut StrictnessOverrides,
+) {
+    match shape {
+        Shape::Leaf(_) => {}
+        Shape::Object(nested) => {
+            walk_selected_object(nested, value.and_then(Value::as_map), dotted, out);
+        }
+        Shape::Array(array) => {
+            if let Some(v) = array.strict {
+                out.insert_schema(dotted.to_string(), v);
+            }
+            match value {
+                Some(Value::Array(items)) => {
+                    for (i, item) in items.iter().enumerate() {
+                        walk_selected_shape(
+                            &array.item,
+                            Some(item),
+                            &format!("{dotted}[{i}]"),
+                            out,
+                        );
+                    }
+                }
+                _ => walk_shape_strict(&array.item, dotted, out),
+            }
+        }
+        Shape::Map(map) => {
+            if let Some(v) = map.strict {
+                out.insert_schema(dotted.to_string(), v);
+            }
+            match value {
+                Some(Value::Map(entries)) => {
+                    for (key, entry) in entries {
+                        walk_selected_shape(
+                            &map.item,
+                            Some(entry),
+                            &format!("{dotted}.{key}"),
+                            out,
+                        );
+                    }
+                }
+                _ => walk_shape_strict(&map.item, dotted, out),
+            }
+        }
+        Shape::Tagged(tagged) => {
+            walk_selected_tagged(tagged, value.and_then(Value::as_map), dotted, out);
         }
     }
 }
@@ -376,33 +631,157 @@ fn strip_brackets(path: &str) -> String {
 /// Resolve a dotted path against a schema and return the kind of the node
 /// it lands on (`Nested`, `ArrayOf`, or `Leaf`). Used to validate
 /// `strict_at` paths at `build_resolver` time.
+fn strip_first_segment(path: &str) -> &str {
+    match path.find('.') {
+        Some(i) => &path[i + 1..],
+        None => "",
+    }
+}
+
+/// Drop the root-map entry key from a display section path. `entry` is
+/// the structured first key (may contain `.`); without it, fall back to
+/// first-dot splitting.
+fn strip_root_map_entry(section: &str, entry: Option<&str>) -> String {
+    if let Some(entry) = entry {
+        if section == entry {
+            return String::new();
+        }
+        if let Some(rest) = section.strip_prefix(entry) {
+            return rest.strip_prefix('.').unwrap_or(rest).to_string();
+        }
+    }
+    strip_first_segment(section).to_string()
+}
+
+/// First dotted segment and remainder.
+///
+/// `None` when `dotted` contains an empty segment (leading, trailing, or
+/// doubled `.`). The wholly empty path is the document root and is
+/// handled by the caller before this split. A path with no `.` is one
+/// segment with an empty remainder.
+fn split_strict_path(dotted: &str) -> Option<(&str, &str)> {
+    match dotted.split_once('.') {
+        Some((head, rest)) if !head.is_empty() && !rest.is_empty() => Some((head, rest)),
+        Some(_) => None,
+        None => Some((dotted, "")),
+    }
+}
+
+fn resolve_path_kind_root(root: DocumentRoot<'_>, dotted: &str) -> PathKind {
+    match root {
+        DocumentRoot::Object(schema) => resolve_path_kind(schema, dotted),
+        DocumentRoot::Map(_) => {
+            if dotted.is_empty() {
+                PathKind::Section
+            } else {
+                PathKind::Unknown
+            }
+        }
+        DocumentRoot::Tagged(tagged) => resolve_tagged_kind(tagged, dotted),
+    }
+}
+
+fn resolve_tagged_kind(tagged: &TaggedShape, rest: &str) -> PathKind {
+    if rest.is_empty() {
+        return PathKind::Section;
+    }
+    let Some((head, remaining)) = split_strict_path(rest) else {
+        return PathKind::Unknown;
+    };
+    match tagged.resolve_key(head) {
+        KeyAcrossVariants::Tag => {
+            if remaining.is_empty() {
+                PathKind::Leaf
+            } else {
+                PathKind::Unknown
+            }
+        }
+        KeyAcrossVariants::Absent => PathKind::Unknown,
+        KeyAcrossVariants::Every(shapes) | KeyAcrossVariants::Partial(shapes) => {
+            union_path_kind(shapes.into_iter().map(|s| path_kind_in_shape(s, remaining)))
+        }
+    }
+}
+
+/// Section in any variant wins (valid `strict_at` target). Leaf only
+/// when every variant that knows the path treats it as a leaf.
+fn union_path_kind(kinds: impl IntoIterator<Item = PathKind>) -> PathKind {
+    let mut saw_section = false;
+    let mut saw_leaf = false;
+    for kind in kinds {
+        match kind {
+            PathKind::Section => saw_section = true,
+            PathKind::Leaf => saw_leaf = true,
+            PathKind::Unknown => {}
+        }
+    }
+    if saw_section {
+        PathKind::Section
+    } else if saw_leaf {
+        PathKind::Leaf
+    } else {
+        PathKind::Unknown
+    }
+}
+
 pub(crate) fn resolve_path_kind(schema: &Schema, dotted: &str) -> PathKind {
     if dotted.is_empty() {
         return PathKind::Section;
     }
-    let mut current = schema;
-    let mut segments = dotted.split('.').peekable();
-    while let Some(seg) = segments.next() {
-        let Some(field) = current.fields.iter().find(|f| f.name == seg) else {
-            return PathKind::Unknown;
-        };
-        match &field.field {
-            Field::Leaf(_) => {
-                return if segments.peek().is_some() {
-                    PathKind::Unknown
-                } else {
-                    PathKind::Leaf
-                };
+    let Some((head, rest)) = split_strict_path(dotted) else {
+        return PathKind::Unknown;
+    };
+    let Some(field) = schema.fields.iter().find(|f| f.name == head) else {
+        return PathKind::Unknown;
+    };
+    path_kind_in_shape(&field.field, rest)
+}
+
+fn path_kind_in_shape(shape: &Shape, rest: &str) -> PathKind {
+    match shape {
+        Shape::Leaf(_) => {
+            if rest.is_empty() {
+                PathKind::Leaf
+            } else {
+                PathKind::Unknown
             }
-            Field::Nested(nested) | Field::ArrayOf(nested) | Field::MapOf(nested) => {
-                if segments.peek().is_none() {
-                    return PathKind::Section;
+        }
+        shape if shape.is_value_field() => {
+            if rest.is_empty() {
+                PathKind::Leaf
+            } else {
+                PathKind::Unknown
+            }
+        }
+        Shape::Object(nested) => {
+            if rest.is_empty() {
+                PathKind::Section
+            } else {
+                resolve_path_kind(nested, rest)
+            }
+        }
+        Shape::Array(_) | Shape::Map(_) => {
+            if rest.is_empty() {
+                PathKind::Section
+            } else {
+                match shape.peel_containers() {
+                    Shape::Object(nested) => resolve_path_kind(nested, rest),
+                    Shape::Tagged(tagged) => resolve_tagged_kind(tagged, rest),
+                    Shape::Leaf(_) => PathKind::Unknown,
+                    Shape::Array(_) | Shape::Map(_) => {
+                        unreachable!("peel_containers strips Array/Map")
+                    }
                 }
-                current = nested;
+            }
+        }
+        Shape::Tagged(tagged) => {
+            if rest.is_empty() {
+                PathKind::Section
+            } else {
+                resolve_tagged_kind(tagged, rest)
             }
         }
     }
-    PathKind::Section
 }
 
 /// Validate a list of `(path, strict)` overrides against a schema and
@@ -418,20 +797,20 @@ pub(crate) fn resolve_path_kind(schema: &Schema, dotted: &str) -> PathKind {
 /// When `normalize_keys` is `true`, each path is rewritten through
 /// `normalize::normalize_key` before lookup so the override accepts the
 /// same kebab/snake spellings the rest of the pipeline does.
-pub(crate) fn build_strict_overrides(
+pub(crate) fn build_strict_overrides_root(
     entries: &[(String, bool)],
     normalize_keys: bool,
-    schema: &Schema,
+    root: DocumentRoot<'_>,
 ) -> Result<StrictnessOverrides, ClapfigError> {
-    let mut out = StrictnessOverrides::from_schema(schema);
+    let mut out = StrictnessOverrides::from_root(root);
     for (raw_path, strict) in entries {
         let path = if normalize_keys {
             crate::normalize::normalize_key(raw_path)
         } else {
             raw_path.clone()
         };
-        match resolve_path_kind(schema, &path) {
-            PathKind::Section => out.insert(path, *strict),
+        match resolve_path_kind_root(root, &path) {
+            PathKind::Section => out.overlay(path, *strict),
             PathKind::Leaf => {
                 return Err(ClapfigError::InvalidStrictPath {
                     path: raw_path.clone(),
@@ -465,6 +844,7 @@ pub(crate) enum PathKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::Field;
 
     #[test]
     fn parent_path_works() {
@@ -557,11 +937,94 @@ mod tests {
     }
 
     #[test]
+    fn root_map_strips_structured_entry_not_first_dot() {
+        use crate::format::ConfigPath;
+        use crate::runtime::Shape;
+        let item = Schema::object("Site").nested(
+            "db",
+            Schema::object("Db")
+                .strict(false)
+                .field("url", Field::string().optional()),
+        );
+        let map = Shape::map("sites", item).build();
+        let overrides = StrictnessOverrides::from_root(DocumentRoot::Map(&map));
+        let path = ConfigPath::new().key("acme.prod").key("db").key("rogue");
+        assert!(
+            !overrides.effective_strict_at("acme.prod.db.rogue", "rogue", Some(&path), true),
+            "db.strict(false) must govern a quoted dotted entry"
+        );
+        let tight = Schema::object("Site").nested(
+            "db",
+            Schema::object("Db")
+                .strict(true)
+                .field("url", Field::string().optional()),
+        );
+        let tight_map = Shape::map("sites", tight).build();
+        let tight_ov = StrictnessOverrides::from_root(DocumentRoot::Map(&tight_map));
+        assert!(
+            tight_ov.effective_strict_at("acme.prod.db.rogue", "rogue", Some(&path), false),
+            "db.strict(true) must govern a quoted dotted entry"
+        );
+    }
+
+    #[test]
     fn strip_brackets_removes_array_indices() {
         assert_eq!(strip_brackets("plugins[0].audit"), "plugins.audit");
         assert_eq!(strip_brackets("a[10].b[2].c"), "a.b.c");
         assert_eq!(strip_brackets("a.b.c"), "a.b.c");
         assert_eq!(strip_brackets(""), "");
+    }
+
+    #[test]
+    fn from_schema_records_array_and_map_node_strict() {
+        use crate::runtime::Shape;
+        let plugin = Schema::object("Plugin").field("name", Field::string().optional());
+        let schema = Schema::object("App")
+            .field(
+                "plugins",
+                Shape::array("plugins", plugin.clone()).strict(false),
+            )
+            .field("servers", Shape::map("servers", plugin).strict(false))
+            .build();
+        let overrides = StrictnessOverrides::from_schema(&schema);
+        assert!(
+            !overrides.effective_strict("plugins[0].rogue", "rogue", true),
+            "array-node strict(false) must govern unknown keys in nested items"
+        );
+        assert!(
+            !overrides.effective_strict("servers.core.rogue", "rogue", true),
+            "map-node strict(false) must govern unknown keys in nested items"
+        );
+    }
+
+    #[test]
+    fn resolve_path_kind_walks_through_nested_containers() {
+        let schema = Schema::object("App")
+            .field(
+                "containers",
+                Field::array_of_type(Field::array_of_type(Schema::object("Item").nested(
+                    "policy",
+                    Schema::object("Policy").field("name", Field::string().optional()),
+                ))),
+            )
+            .field(
+                "groups",
+                Field::map_of(Field::array_of_type(
+                    Schema::object("Item").field("timeout", Field::integer().optional()),
+                )),
+            )
+            .build();
+        assert_eq!(resolve_path_kind(&schema, "containers"), PathKind::Section);
+        assert_eq!(
+            resolve_path_kind(&schema, "containers.policy"),
+            PathKind::Section
+        );
+        assert_eq!(
+            resolve_path_kind(&schema, "containers.policy.name"),
+            PathKind::Leaf
+        );
+        assert_eq!(resolve_path_kind(&schema, "groups"), PathKind::Section);
+        assert_eq!(resolve_path_kind(&schema, "groups.timeout"), PathKind::Leaf);
     }
 
     #[test]
@@ -586,6 +1049,7 @@ mod tests {
             span: Some(Span { start: 10, end: 14 }),
             env_var: None,
             url_key: None,
+            override_key: None,
             input_type: Some(InputType::File),
         };
         assert_eq!(ctx.path, "plugins[3].host");
@@ -606,11 +1070,323 @@ mod tests {
             span: None,
             env_var: Some("MYAPP__ROGUE".into()),
             url_key: None,
+            override_key: None,
             input_type: Some(InputType::Env),
         };
         assert_eq!(collected.env_var.as_deref(), Some("MYAPP__ROGUE"));
         assert_eq!(collected.input_type, Some(InputType::Env));
         assert!(collected.span.is_none());
         assert!(collected.url_key.is_none());
+    }
+
+    #[test]
+    fn tagged_root_strict_is_not_overwritten_by_variant_schema_strict() {
+        let tagged = Shape::tagged("Block", "kind")
+            .strict(false)
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .strict(true)
+                    .field("mount", Field::string())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .strict(true)
+                    .field("artifact", Field::string())
+                    .build(),
+            )
+            .build();
+        let overrides = StrictnessOverrides::from_root(DocumentRoot::Tagged(&tagged));
+        assert!(
+            !overrides.effective_strict("crate_path", "crate_path", true),
+            "tagged.strict(false) must govern keys at the tagged object"
+        );
+    }
+
+    #[test]
+    fn sibling_variant_nested_strict_union_is_declaration_order_independent() {
+        let rust_lenient_params = Schema::object("Rust")
+            .nested(
+                "params",
+                Schema::object("P")
+                    .strict(false)
+                    .field("shape", Field::string().optional()),
+            )
+            .build();
+        let payload_strict_params = Schema::object("Payload")
+            .nested(
+                "params",
+                Schema::object("Q")
+                    .strict(true)
+                    .field("artifact", Field::string().optional()),
+            )
+            .build();
+        let a = Shape::tagged("Block", "kind")
+            .variant("rust", rust_lenient_params.clone())
+            .variant("payload", payload_strict_params.clone())
+            .build();
+        let b = Shape::tagged("Block", "kind")
+            .variant("payload", payload_strict_params)
+            .variant("rust", rust_lenient_params)
+            .build();
+        let first = StrictnessOverrides::from_root(DocumentRoot::Tagged(&a));
+        let reversed = StrictnessOverrides::from_root(DocumentRoot::Tagged(&b));
+        assert_eq!(
+            first.effective_strict("params.rogue", "rogue", false),
+            reversed.effective_strict("params.rogue", "rogue", false),
+        );
+        assert!(
+            first.effective_strict("params.rogue", "rogue", false),
+            "any-strict-wins: one variant's params.strict(true) makes phase 1 strict"
+        );
+    }
+
+    #[test]
+    fn resolve_path_kind_walks_nested_tagged_as_section() {
+        let schema = Schema::object("App")
+            .field(
+                "block",
+                Shape::from(
+                    Shape::tagged("Block", "kind")
+                        .variant(
+                            "rust",
+                            Schema::object("Rust")
+                                .field("mount", Field::string())
+                                .build(),
+                        )
+                        .variant(
+                            "payload",
+                            Schema::object("Payload")
+                                .field("artifact", Field::string())
+                                .build(),
+                        )
+                        .build(),
+                ),
+            )
+            .build();
+        assert_eq!(resolve_path_kind(&schema, "block"), PathKind::Section);
+        assert_eq!(resolve_path_kind(&schema, "block.kind"), PathKind::Leaf);
+        assert_eq!(resolve_path_kind(&schema, "block.mount"), PathKind::Leaf);
+        assert_eq!(resolve_path_kind(&schema, "block.artifact"), PathKind::Leaf);
+    }
+
+    #[test]
+    fn resolve_path_kind_section_wins_when_any_variant_is_a_section() {
+        let tagged = Shape::tagged("Block", "kind")
+            .variant(
+                "a",
+                Schema::object("A").field("params", Field::string()).build(),
+            )
+            .variant(
+                "b",
+                Schema::object("B")
+                    .nested(
+                        "params",
+                        Schema::object("P").field("x", Field::string().optional()),
+                    )
+                    .build(),
+            )
+            .build();
+        assert_eq!(
+            resolve_path_kind_root(DocumentRoot::Tagged(&tagged), "params"),
+            PathKind::Section
+        );
+    }
+
+    #[test]
+    fn resolve_path_kind_rejects_empty_segments() {
+        let schema = Schema::object("App")
+            .nested(
+                "database",
+                Schema::object("Database").field("url", Field::string().optional()),
+            )
+            .field(
+                "containers",
+                Field::array_of_type(Schema::object("Item").nested(
+                    "policy",
+                    Schema::object("Policy").field("name", Field::string().optional()),
+                )),
+            )
+            .field(
+                "groups",
+                Field::map_of(Schema::object("Item").field("timeout", Field::integer().optional())),
+            )
+            .field(
+                "block",
+                Shape::from(
+                    Shape::tagged("Block", "kind")
+                        .variant(
+                            "rust",
+                            Schema::object("Rust")
+                                .field("mount", Field::string())
+                                .build(),
+                        )
+                        .variant(
+                            "payload",
+                            Schema::object("Payload")
+                                .field("artifact", Field::string())
+                                .build(),
+                        )
+                        .build(),
+                ),
+            )
+            .build();
+
+        assert_eq!(resolve_path_kind(&schema, ""), PathKind::Section);
+        for path in [
+            "database.",
+            ".database",
+            "database..url",
+            "containers.",
+            "groups.timeout.",
+            "block.",
+            "block.kind.",
+            "block.mount.",
+        ] {
+            assert_eq!(
+                resolve_path_kind(&schema, path),
+                PathKind::Unknown,
+                "{path:?} must not resolve"
+            );
+        }
+
+        let tagged = Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .field("mount", Field::string())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .nested(
+                        "meta",
+                        Schema::object("PM").field("artifact", Field::string().optional()),
+                    )
+                    .build(),
+            )
+            .build();
+        assert_eq!(
+            resolve_path_kind_root(DocumentRoot::Tagged(&tagged), ""),
+            PathKind::Section
+        );
+        for path in ["kind.", "mount.", "meta.", ".kind", "kind.."] {
+            assert_eq!(
+                resolve_path_kind_root(DocumentRoot::Tagged(&tagged), path),
+                PathKind::Unknown,
+                "{path:?} must not resolve on a tagged root"
+            );
+        }
+
+        let err = build_strict_overrides_root(
+            &[("database.".into(), false)],
+            false,
+            DocumentRoot::Object(&schema),
+        )
+        .expect_err("trailing separator is not a valid strict_at path");
+        match err {
+            ClapfigError::InvalidStrictPath { path, .. } => {
+                assert_eq!(path, "database.");
+            }
+            other => panic!("expected InvalidStrictPath, got {other:?}"),
+        }
+
+        let tagged_err = build_strict_overrides_root(
+            &[("meta.".into(), false)],
+            false,
+            DocumentRoot::Tagged(&tagged),
+        )
+        .expect_err("trailing separator is not a valid tagged strict_at path");
+        match tagged_err {
+            ClapfigError::InvalidStrictPath { path, .. } => {
+                assert_eq!(path, "meta.");
+            }
+            other => panic!("expected InvalidStrictPath, got {other:?}"),
+        }
+    }
+
+    fn opposing_meta_tagged() -> crate::runtime::TaggedShape {
+        Shape::tagged("Plugin", "kind")
+            .variant(
+                "rust",
+                Schema::object("Rust")
+                    .nested(
+                        "meta",
+                        Schema::object("RM")
+                            .strict(false)
+                            .field("crate_path", Field::string().optional()),
+                    )
+                    .build(),
+            )
+            .variant(
+                "payload",
+                Schema::object("Payload")
+                    .nested(
+                        "meta",
+                        Schema::object("PM")
+                            .strict(true)
+                            .field("artifact", Field::string().optional()),
+                    )
+                    .build(),
+            )
+            .build()
+    }
+
+    fn tagged_item_table(kind: &str) -> Map {
+        let mut item = Map::new();
+        item.insert("kind".into(), Value::String(kind.into()));
+        item
+    }
+
+    #[test]
+    fn selected_branch_strictness_follows_each_array_item_variant() {
+        let tagged = opposing_meta_tagged();
+        let schema = Schema::object("App")
+            .field("plugins", Shape::array("plugins", Shape::from(tagged)))
+            .build();
+        let mut table = Map::new();
+        table.insert(
+            "plugins".into(),
+            Value::Array(vec![
+                Value::Map(tagged_item_table("rust")),
+                Value::Map(tagged_item_table("payload")),
+            ]),
+        );
+        let overrides = StrictnessOverrides::from_root(DocumentRoot::Object(&schema))
+            .for_selected_branch(DocumentRoot::Object(&schema), &table);
+        assert!(
+            !overrides.effective_strict("plugins[0].meta.artifact", "artifact", true),
+            "rust item's meta.strict(false) must govern that occurrence"
+        );
+        assert!(
+            overrides.effective_strict("plugins[1].meta.crate_path", "crate_path", false),
+            "payload item's meta.strict(true) must govern that occurrence"
+        );
+    }
+
+    #[test]
+    fn selected_branch_strictness_follows_each_map_entry_variant() {
+        let tagged = opposing_meta_tagged();
+        let schema = Schema::object("App")
+            .field("plugins", Shape::map("plugins", Shape::from(tagged)))
+            .build();
+        let mut entries = Map::new();
+        entries.insert("core".into(), Value::Map(tagged_item_table("rust")));
+        entries.insert("edge".into(), Value::Map(tagged_item_table("payload")));
+        let mut table = Map::new();
+        table.insert("plugins".into(), Value::Map(entries));
+        let overrides = StrictnessOverrides::from_root(DocumentRoot::Object(&schema))
+            .for_selected_branch(DocumentRoot::Object(&schema), &table);
+        assert!(
+            !overrides.effective_strict("plugins.core.meta.artifact", "artifact", true),
+            "rust entry's meta.strict(false) must govern that occurrence"
+        );
+        assert!(
+            overrides.effective_strict("plugins.edge.meta.crate_path", "crate_path", false),
+            "payload entry's meta.strict(true) must govern that occurrence"
+        );
     }
 }

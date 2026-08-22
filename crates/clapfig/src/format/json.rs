@@ -56,10 +56,13 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map as JsonMap, Value as Json};
 
-use crate::runtime::{Field, Leaf, LeafType, Schema};
+use crate::runtime::{Schema, Shape};
 use crate::value::{Map, Value};
 
-use super::template::{TemplateRenderer, doc_lines, leaf_annotations, walk_level};
+use super::template::{
+    TemplateRenderer, doc_lines, example_leaf_value, leaf_annotations, placeholder,
+    tagged_variant_example_schema, walk_level, walk_root,
+};
 use super::{
     ConfigPath, FileEdit, FormatAdapter, FormatError, Operation, Parsed, PathSegment, Span,
     SpanEntry, walk_label,
@@ -125,9 +128,9 @@ impl FormatAdapter for JsonAdapter {
         Ok(render(&json))
     }
 
-    fn template(&self, schema: &Schema) -> Result<String, FormatError> {
+    fn template(&self, shape: &Shape) -> Result<String, FormatError> {
         let mut object = JsonMap::new();
-        walk_level(&mut JsonTemplate, schema, &(), &mut object)?;
+        walk_root(&mut JsonTemplate, shape, &(), &mut object)?;
         Ok(render(&Json::Object(object)))
     }
 
@@ -916,10 +919,10 @@ impl TemplateRenderer for JsonTemplate {
         out: &mut Self::Out,
         _ctx: &(),
         name: &str,
-        leaf: &Leaf,
+        field: super::template::ValueView<'_>,
     ) -> Result<(), FormatError> {
-        let mut lines = leaf_annotations(leaf, "JSON", &mut |v| inline_json(v, name))?;
-        match &leaf.default {
+        let mut lines = leaf_annotations(field, "JSON", &mut |v| inline_json(v, name))?;
+        match field.default {
             Some(default) => {
                 if !lines.is_empty() {
                     out.insert(comment_key(name), comment_value(lines));
@@ -933,7 +936,7 @@ impl TemplateRenderer for JsonTemplate {
                 // TOML's `#name = ""` line.
                 lines.push(assignment_snippet(
                     name,
-                    placeholder_json(&leaf.ty).to_string(),
+                    placeholder(field.shape, &mut |v| inline_json(v, name))?,
                 ));
                 out.insert(comment_key(name), comment_value(lines));
             }
@@ -957,16 +960,23 @@ impl TemplateRenderer for JsonTemplate {
     fn array_of(
         &mut self,
         out: &mut Self::Out,
-        _ctx: &(),
+        ctx: &(),
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError> {
         // Entry count is the user's call, so no real key is emitted (an
         // absent array-of resolves to the empty list); the comment carries
-        // a one-entry example.
-        let mut lines = doc_lines(&child.doc);
-        let example = Json::Array(vec![Json::Object(example_object(child, name)?)]);
-        lines.push(assignment_snippet(name, compact(&example)));
+        // a one-entry example (one per tagged variant).
+        let mut lines = doc_lines(item.field_doc());
+        if let Shape::Tagged(tagged) = item {
+            for variant in &tagged.variants {
+                let example = Json::Array(vec![tagged_variant_json(self, ctx, tagged, variant)?]);
+                lines.push(assignment_snippet(name, compact(&example)));
+            }
+        } else {
+            let example = Json::Array(vec![example_value(item, name)?]);
+            lines.push(assignment_snippet(name, compact(&example)));
+        }
         out.insert(comment_key(name), comment_value(lines));
         Ok(())
     }
@@ -974,28 +984,134 @@ impl TemplateRenderer for JsonTemplate {
     fn map_of(
         &mut self,
         out: &mut Self::Out,
-        _ctx: &(),
+        ctx: &(),
         name: &str,
-        child: &Schema,
+        item: &Shape,
     ) -> Result<(), FormatError> {
         // Entry keys are user-supplied, so no real key is emitted (an
         // absent map-of resolves to the empty map); the comment carries a
-        // placeholder-keyed example.
-        let mut lines = doc_lines(&child.doc);
-        let mut example = JsonMap::new();
-        example.insert(
-            "<key>".to_string(),
-            Json::Object(example_object(child, name)?),
-        );
-        lines.push(assignment_snippet(name, compact(&Json::Object(example))));
+        // placeholder-keyed example (one per tagged variant).
+        let mut lines = doc_lines(item.field_doc());
+        if let Shape::Tagged(tagged) = item {
+            for variant in &tagged.variants {
+                let mut example = JsonMap::new();
+                example.insert(
+                    "<key>".to_string(),
+                    tagged_variant_json(self, ctx, tagged, variant)?,
+                );
+                lines.push(assignment_snippet(name, compact(&Json::Object(example))));
+            }
+        } else if let Some(tagged) = tagged_array_item(item) {
+            for variant in &tagged.variants {
+                let mut example = JsonMap::new();
+                example.insert(
+                    "<key>".to_string(),
+                    Json::Array(vec![tagged_variant_json(self, ctx, tagged, variant)?]),
+                );
+                lines.push(assignment_snippet(name, compact(&Json::Object(example))));
+            }
+        } else {
+            let mut example = JsonMap::new();
+            example.insert("<key>".to_string(), example_value(item, name)?);
+            lines.push(assignment_snippet(name, compact(&Json::Object(example))));
+        }
         out.insert(comment_key(name), comment_value(lines));
         Ok(())
+    }
+
+    fn root_map(
+        &mut self,
+        out: &mut Self::Out,
+        ctx: &(),
+        item: &Shape,
+        doc: &[String],
+    ) -> Result<(), FormatError> {
+        // Root-map docs live on the MapShape (`doc`); item docs are the
+        // entry example's own prose. The assignment value is the item
+        // example directly — wrapping it in a second `<key>` object
+        // would advertise a map level the schema does not accept.
+        let mut lines = doc_lines(doc);
+        lines.extend(doc_lines(item.field_doc()));
+        if let Shape::Tagged(tagged) = item {
+            for variant in &tagged.variants {
+                lines.push(assignment_snippet(
+                    "<key>",
+                    compact(&tagged_variant_json(self, ctx, tagged, variant)?),
+                ));
+            }
+        } else if let Some(tagged) = tagged_array_item(item) {
+            for variant in &tagged.variants {
+                lines.push(assignment_snippet(
+                    "<key>",
+                    compact(&Json::Array(vec![tagged_variant_json(
+                        self, ctx, tagged, variant,
+                    )?])),
+                ));
+            }
+        } else {
+            lines.push(assignment_snippet(
+                "<key>",
+                compact(&example_value(item, "<key>")?),
+            ));
+        }
+        out.insert(COMMENT_PREFIX.into(), comment_value(lines));
+        Ok(())
+    }
+
+    fn tagged(
+        &mut self,
+        out: &mut Self::Out,
+        ctx: &(),
+        name: Option<&str>,
+        tagged: &crate::runtime::TaggedShape,
+    ) -> Result<(), FormatError> {
+        let mut lines = doc_lines(&tagged.doc);
+        for variant in &tagged.variants {
+            let example = compact(&tagged_variant_json(self, ctx, tagged, variant)?);
+            match name {
+                Some(name) => lines.push(assignment_snippet(name, example)),
+                None => lines.push(example),
+            }
+        }
+        let key = match name {
+            Some(name) => comment_key(name),
+            None => COMMENT_PREFIX.to_string(),
+        };
+        if !lines.is_empty() {
+            out.insert(key, comment_value(lines));
+        }
+        Ok(())
+    }
+}
+
+fn tagged_variant_json(
+    renderer: &mut JsonTemplate,
+    ctx: &(),
+    tagged: &crate::runtime::TaggedShape,
+    variant: &crate::runtime::TaggedVariant,
+) -> Result<Json, FormatError> {
+    let example = tagged_variant_example_schema(tagged, variant);
+    let mut obj = JsonMap::new();
+    walk_level(renderer, &example, ctx, &mut obj)?;
+    Ok(Json::Object(obj))
+}
+
+/// The tagged item of `Array { item: Tagged }`, if `shape` is that composition.
+fn tagged_array_item(shape: &Shape) -> Option<&crate::runtime::TaggedShape> {
+    match shape {
+        Shape::Array(array) => match array.item.as_ref() {
+            Shape::Tagged(tagged) => Some(tagged),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
 /// Example object for an array-of / map-of entry, shown inside a comment:
 /// defaults where declared, placeholders elsewhere. `context_key` names
-/// the field in conversion errors (non-finite float defaults).
+/// the field in conversion errors (non-finite float defaults). Field
+/// order follows the schema (not `BTreeMap` sort), so snippets stay
+/// byte-identical to declaration order.
 fn example_object(
     schema: &Schema,
     context_key: &str,
@@ -1010,30 +1126,52 @@ fn example_object(
                 message: reserved_key_message(&format!("'{}'", nf.name)),
             });
         }
-        let value = match &nf.field {
-            Field::Leaf(leaf) => match &leaf.default {
-                Some(default) => {
-                    let mut path = vec![PathSegment::Key(context_key.to_string())];
-                    value_to_json(default, &mut path)?
-                }
-                None => placeholder_value(&leaf.ty),
-            },
-            Field::Nested(child) => Json::Object(example_object(child, context_key)?),
-            Field::ArrayOf(child) => {
-                Json::Array(vec![Json::Object(example_object(child, context_key)?)])
-            }
-            Field::MapOf(child) => {
-                let mut entry = JsonMap::new();
-                entry.insert(
-                    "<key>".to_string(),
-                    Json::Object(example_object(child, context_key)?),
-                );
-                Json::Object(entry)
-            }
-        };
-        obj.insert(nf.name.clone(), value);
+        obj.insert(nf.name.clone(), example_value(&nf.field, context_key)?);
     }
     Ok(obj)
+}
+
+/// One example JSON value for a shape: a declared default when present,
+/// otherwise the shared leaf table
+/// ([`example_leaf_value`](super::template::example_leaf_value)) or a
+/// one-entry nested example (object / array / map). Tagged shapes use
+/// the first variant's complete object (callers that need every variant
+/// emit them as separate comments).
+fn example_value(shape: &Shape, context_key: &str) -> Result<Json, FormatError> {
+    match shape {
+        Shape::Leaf(leaf) => {
+            let value = leaf
+                .default
+                .clone()
+                .unwrap_or_else(|| example_leaf_value(&leaf.ty));
+            let mut path = vec![PathSegment::Key(context_key.to_string())];
+            value_to_json(&value, &mut path)
+        }
+        Shape::Object(child) => Ok(Json::Object(example_object(child, context_key)?)),
+        Shape::Array(array) => {
+            if let Some(default) = &array.default {
+                let mut path = vec![PathSegment::Key(context_key.to_string())];
+                return value_to_json(default, &mut path);
+            }
+            Ok(Json::Array(vec![example_value(&array.item, context_key)?]))
+        }
+        Shape::Map(map) => {
+            if let Some(default) = &map.default {
+                let mut path = vec![PathSegment::Key(context_key.to_string())];
+                return value_to_json(default, &mut path);
+            }
+            let mut entry = JsonMap::new();
+            entry.insert("<key>".to_string(), example_value(&map.item, context_key)?);
+            Ok(Json::Object(entry))
+        }
+        Shape::Tagged(tagged) => {
+            let Some(variant) = tagged.variants.first() else {
+                return Ok(Json::Object(JsonMap::new()));
+            };
+            let example = tagged_variant_example_schema(tagged, variant);
+            Ok(Json::Object(example_object(&example, context_key)?))
+        }
+    }
 }
 
 /// The comment key documenting `field_name` (`"//port"`).
@@ -1071,18 +1209,6 @@ fn compact(json: &Json) -> String {
 fn inline_json(value: &Value, key: &str) -> Result<String, FormatError> {
     let mut path = vec![PathSegment::Key(key.to_string())];
     Ok(compact(&value_to_json(value, &mut path)?))
-}
-
-/// Placeholder rendered in an assignment snippet for a leaf without a
-/// default, hinting the expected value shape: the shared table with JSON's
-/// quoted spellings for the string and datetime arms.
-fn placeholder_json(ty: &LeafType) -> &'static str {
-    super::template::placeholder(ty, "\"\"", "\"1970-01-01T00:00:00Z\"")
-}
-
-/// [`placeholder_json`] as a `serde_json::Value`, for example objects.
-fn placeholder_value(ty: &LeafType) -> Json {
-    serde_json::from_str(placeholder_json(ty)).expect("placeholders are valid JSON")
 }
 
 #[cfg(test)]
@@ -1777,7 +1903,9 @@ mod tests {
         let schema = RtSchema::object("App")
             .field("//weird", Field::string().default("x"))
             .build();
-        let err = JsonAdapter.template(&schema).unwrap_err();
+        let err = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap_err();
         assert!(err.detail().contains("reserved"), "{}", err.detail());
         assert!(err.detail().contains("//weird"), "{}", err.detail());
     }
@@ -1838,7 +1966,87 @@ mod tests {
   }
 }
 "#;
-        assert_eq!(JsonAdapter.template(&schema).unwrap(), golden);
+        assert_eq!(
+            JsonAdapter
+                .template(&Shape::Object(schema.clone()))
+                .unwrap(),
+            golden
+        );
+    }
+
+    fn uncomment_json_fields(template: &str, names: &[&str]) -> String {
+        let json: Json = serde_json::from_str(template).unwrap();
+        let obj = json.as_object().unwrap();
+        let mut snippets = Vec::new();
+        for name in names {
+            let comment = &obj[&format!("//{name}")];
+            let lines: Vec<&str> = match comment {
+                Json::String(s) => vec![s.as_str()],
+                Json::Array(items) => items.iter().filter_map(Json::as_str).collect(),
+                other => panic!("comment for {name} is not string/array: {other}"),
+            };
+            let encoded = compact(&Json::String((*name).to_string()));
+            let snippet = lines
+                .iter()
+                .rev()
+                .find(|line| line.starts_with(&encoded))
+                .unwrap_or_else(|| panic!("no assignment snippet for {name} in {lines:?}"));
+            snippets.push((*snippet).to_string());
+        }
+        format!("{{\n  {}\n}}\n", snippets.join(",\n  "))
+    }
+
+    #[test]
+    fn template_enum_placeholder_uses_format_encoder() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::{DocumentRoot, Field, Schema as RtSchema};
+        use crate::schema_walk::finalize_root;
+
+        let quoted = r#"a"b\c"#;
+        let broken = "line\nbreak";
+        let schema = RtSchema::object("App")
+            .field("ratio", Field::enum_of([1.5_f64]))
+            .field("label", Field::enum_of([quoted]))
+            .field("note", Field::enum_of([broken]))
+            .build();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        assert!(
+            text.contains("1.5"),
+            "float enum member must be serialized, not 0.0: {text}"
+        );
+        assert!(
+            !text.contains(r#""ratio": 0.0"#) && !text.contains(r#""ratio": 0"#),
+            "float enum must not collapse to unconstrained 0.0: {text}"
+        );
+        let uncommented = uncomment_json_fields(&text, &["ratio", "label", "note"]);
+        let parsed = JsonAdapter
+            .parse(&uncommented)
+            .unwrap_or_else(|e| {
+                panic!("uncommented enum placeholders must parse: {e}\n{text}\n{uncommented}")
+            })
+            .value;
+        let map = parsed.as_map().unwrap();
+        assert_eq!(map["ratio"], Value::Float(1.5), "{text}\n{uncommented}");
+        assert_eq!(
+            map["label"],
+            Value::String(quoted.into()),
+            "{text}\n{uncommented}"
+        );
+        assert_eq!(
+            map["note"],
+            Value::String(broken.into()),
+            "{text}\n{uncommented}"
+        );
+        finalize_root(
+            map.clone(),
+            &OriginMap::new(),
+            DocumentRoot::Object(&schema),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap_or_else(|e| panic!("uncommented examples must be allowed members: {e}\n{text}"));
     }
 
     #[test]
@@ -1857,7 +2065,9 @@ mod tests {
                 RtSchema::object("Server").field("host", Field::string().default("localhost")),
             )
             .build();
-        let text = JsonAdapter.template(&schema).unwrap();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
         let json: Json = serde_json::from_str(&text).unwrap();
         let obj = json.as_object().unwrap();
         // No real keys — absent array-of/map-of resolve to empty; the
@@ -1874,11 +2084,441 @@ mod tests {
     }
 
     #[test]
+    fn template_uses_nested_container_defaults_in_examples() {
+        use crate::runtime::{Field, LeafType, Schema as RtSchema};
+        let schema = RtSchema::object("App")
+            .array_of(
+                "plugins",
+                RtSchema::object("Plugin").field(
+                    "tags",
+                    Field::array_of_type(LeafType::String)
+                        .default(Value::Array(vec![Value::String("builtin".into())])),
+                ),
+            )
+            .map_of(
+                "servers",
+                RtSchema::object("Server").field(
+                    "labels",
+                    Field::map_of(LeafType::String).default({
+                        let mut m = Map::new();
+                        m.insert("role".into(), Value::String("web".into()));
+                        Value::Map(m)
+                    }),
+                ),
+            )
+            .build();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj["//plugins"], r#""plugins": [{"tags":["builtin"]}]"#);
+        assert_eq!(
+            obj["//servers"],
+            r#""servers": {"<key>":{"labels":{"role":"web"}}}"#
+        );
+    }
+
+    #[test]
+    fn template_recurses_through_nested_containers() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Item").field("timeout", Field::integer().default(30i64));
+        let schema = RtSchema::object("App")
+            .field("groups", Field::array_of_type(Field::map_of(item.clone())))
+            .field("batches", Field::map_of(Field::array_of_type(item)))
+            .build();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj["//groups"], r#""groups": [{"<key>":{"timeout":30}}]"#);
+        assert_eq!(obj["//batches"], r#""batches": {"<key>":[{"timeout":30}]}"#);
+    }
+
+    #[test]
+    fn template_nested_arrays_keep_every_layer() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Item").field("timeout", Field::integer().default(30i64));
+        let schema = RtSchema::object("App")
+            .field(
+                "matrix",
+                Field::array_of_type(Field::array_of_type(item.clone())),
+            )
+            .field(
+                "cube",
+                Field::array_of_type(Field::array_of_type(Field::array_of_type(item))),
+            )
+            .build();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let obj = json.as_object().unwrap();
+        let parse_snippet = |comment: &Json| {
+            let snippet = comment.as_str().expect("single-line comment snippet");
+            serde_json::from_str::<Json>(&format!("{{{snippet}}}"))
+                .unwrap_or_else(|e| panic!("snippet must parse as JSON object: {e}: {snippet}"))
+        };
+        assert_eq!(
+            parse_snippet(&obj["//matrix"]),
+            serde_json::json!({"matrix": [[{"timeout": 30}]]})
+        );
+        assert_eq!(
+            parse_snippet(&obj["//cube"]),
+            serde_json::json!({"cube": [[[{"timeout": 30}]]]})
+        );
+    }
+
+    #[test]
+    fn template_root_map_snippet_is_one_entry_not_an_extra_key_level() {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let item = RtSchema::object("Site")
+            .doc("One named site.")
+            .field("host", Field::string().default("localhost"))
+            .field("port", Field::integer().default(8080i64));
+        let shape = Shape::from(Shape::map("sites", item).doc("Named sites by key."));
+        let text = JsonAdapter.template(&shape).unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let comment = json
+            .as_object()
+            .unwrap()
+            .get("//")
+            .expect("root-map example rides the object comment");
+        let lines: Vec<&str> = match comment {
+            Json::String(s) => vec![s.as_str()],
+            Json::Array(items) => items.iter().filter_map(Json::as_str).collect(),
+            other => panic!("comment payload must be a string or array: {other}"),
+        };
+        assert!(
+            lines.iter().any(|l| l.contains("Named sites by key.")),
+            "root MapShape docs must appear in the JSON template: {text}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("One named site.")),
+            "item object docs must still appear: {text}"
+        );
+        let snippet = lines
+            .iter()
+            .find(|l| l.contains("\"<key>\""))
+            .expect("assignment snippet");
+        let parsed: Json = serde_json::from_str(&format!("{{{snippet}}}")).unwrap_or_else(|e| {
+            panic!("root-map snippet must parse as a JSON object: {e}: {snippet}")
+        });
+        let entry = parsed
+            .get("<key>")
+            .unwrap_or_else(|| panic!("snippet assigns <key>: {parsed}"));
+        assert!(
+            entry.get("<key>").is_none(),
+            "must not wrap the item in a second <key> object: {parsed}"
+        );
+        assert_eq!(entry["host"], "localhost");
+        assert_eq!(entry["port"], 8080);
+
+        let leaf = JsonAdapter
+            .template(&Shape::from(Shape::map("values", Field::string())))
+            .unwrap();
+        let leaf_json: Json = serde_json::from_str(&leaf).unwrap();
+        let leaf_comment = &leaf_json["//"];
+        let leaf_lines: Vec<&str> = match leaf_comment {
+            Json::String(s) => vec![s.as_str()],
+            Json::Array(items) => items.iter().filter_map(Json::as_str).collect(),
+            other => panic!("leaf comment payload must be a string or array: {other}"),
+        };
+        let leaf_snippet = leaf_lines
+            .iter()
+            .find(|l| l.contains("\"<key>\""))
+            .expect("leaf assignment snippet");
+        let leaf_parsed: Json = serde_json::from_str(&format!("{{{leaf_snippet}}}"))
+            .unwrap_or_else(|e| panic!("leaf snippet must parse: {e}: {leaf_snippet}"));
+        assert_eq!(leaf_parsed["<key>"], "");
+    }
+
+    fn tagged_block() -> crate::runtime::TaggedShape {
+        use crate::runtime::{Field, Schema as RtSchema};
+        crate::runtime::Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                RtSchema::object("Rust")
+                    .field("mount", Field::string())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                RtSchema::object("Payload")
+                    .field("mount", Field::string())
+                    .field("artifact", Field::string())
+                    .build(),
+            )
+            .build()
+    }
+
+    fn nested_tagged() -> crate::runtime::TaggedShape {
+        use crate::runtime::{Field, Schema as RtSchema};
+        let inner = crate::runtime::Shape::tagged("Inner", "kind")
+            .variant(
+                "alpha",
+                RtSchema::object("Alpha")
+                    .field("n", Field::integer())
+                    .build(),
+            )
+            .variant(
+                "beta",
+                RtSchema::object("Beta").field("s", Field::string()).build(),
+            )
+            .build();
+        crate::runtime::Shape::tagged("Outer", "mode")
+            .variant(
+                "wrap",
+                RtSchema::object("Wrap")
+                    .field("child", crate::runtime::Shape::from(inner))
+                    .build(),
+            )
+            .build()
+    }
+
+    fn comment_lines(comment: &Json) -> Vec<&str> {
+        match comment {
+            Json::String(s) => vec![s.as_str()],
+            Json::Array(items) => items.iter().filter_map(Json::as_str).collect(),
+            other => panic!("comment payload must be a string or array: {other}"),
+        }
+    }
+
+    fn array_of_tagged_schema() -> crate::runtime::Schema {
+        use crate::runtime::{Field, Schema as RtSchema};
+        RtSchema::object("App")
+            .field("blocks", Field::array_of_type(Shape::from(tagged_block())))
+            .build()
+    }
+
+    fn map_of_array_of_tagged_schema() -> crate::runtime::Schema {
+        use crate::runtime::{Field, Schema as RtSchema};
+        RtSchema::object("App")
+            .field(
+                "groups",
+                Field::map_of(Shape::array("blocks", Shape::from(tagged_block()))),
+            )
+            .build()
+    }
+
+    fn root_map_of_array_of_tagged() -> crate::runtime::MapShape {
+        Shape::map(
+            "groups",
+            Shape::array("blocks", Shape::from(tagged_block())),
+        )
+        .build()
+    }
+
+    fn snippet_object(line: &str) -> Json {
+        serde_json::from_str(&format!("{{{line}}}"))
+            .unwrap_or_else(|e| panic!("snippet must parse as a JSON object: {e}: {line}"))
+    }
+
+    #[test]
+    fn template_tagged_json_snippets_are_copyable_assignments() {
+        use crate::runtime::Schema as RtSchema;
+        let schema = RtSchema::object("App")
+            .field("block", Shape::from(tagged_block()))
+            .build();
+        let text = JsonAdapter.template(&Shape::Object(schema)).unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let lines = comment_lines(&json["//block"]);
+        assert_eq!(lines.len(), 2, "{text}");
+        for line in &lines {
+            assert!(
+                line.starts_with("\"block\":"),
+                "field snippet must be a JSON assignment, got {line}"
+            );
+            let parsed: Json = serde_json::from_str(&format!("{{{line}}}"))
+                .unwrap_or_else(|e| panic!("snippet must parse as a JSON object: {e}: {line}"));
+            assert!(parsed["block"].get("kind").is_some(), "{parsed}");
+        }
+    }
+
+    #[test]
+    fn template_tagged_root_json_snippets_are_complete_objects() {
+        let tagged = tagged_block();
+        let text = JsonAdapter
+            .template(&Shape::Tagged(tagged.clone()))
+            .unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let lines = comment_lines(&json["//"]);
+        assert_eq!(lines.len(), 2, "{text}");
+        for line in &lines {
+            let parsed: Json = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("root snippet must be a JSON object: {e}: {line}"));
+            assert!(parsed.get("kind").is_some(), "{parsed}");
+        }
+    }
+
+    #[test]
+    fn template_nested_tagged_example_is_a_complete_object() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let tagged = nested_tagged();
+        let text = JsonAdapter
+            .template(&Shape::Tagged(tagged.clone()))
+            .unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let lines = comment_lines(&json["//"]);
+        let snippet = lines
+            .iter()
+            .find(|l| l.contains("\"wrap\""))
+            .unwrap_or_else(|| panic!("wrap example missing: {text}"));
+        let map = match JsonAdapter.parse(snippet).unwrap().value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let child = map["child"].as_map().expect("child object");
+        assert_eq!(child["kind"], Value::String("alpha".into()));
+        finalize_root(
+            map,
+            &OriginMap::new(),
+            DocumentRoot::Tagged(&tagged),
+            &DiscoveryRecord::empty(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn template_array_of_tagged_snippets_parse_one_variant_at_a_time() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let schema = array_of_tagged_schema();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let lines = comment_lines(&json["//blocks"]);
+        for kind in ["rust", "payload"] {
+            let snippet = lines
+                .iter()
+                .find(|l| l.contains(&format!("\"{kind}\"")))
+                .unwrap_or_else(|| panic!("{kind} example missing: {text}"));
+            let parsed = snippet_object(snippet);
+            let blocks = parsed["blocks"].as_array().unwrap_or_else(|| {
+                panic!("array-of-tagged snippet must be an array, got {parsed}")
+            });
+            assert_eq!(blocks.len(), 1, "{snippet}");
+            assert_eq!(blocks[0]["kind"], kind);
+            let map = match JsonAdapter.parse(&format!("{{{snippet}}}")).unwrap().value {
+                Value::Map(map) => map,
+                other => panic!("expected map, got {other:?}"),
+            };
+            finalize_root(
+                map,
+                &OriginMap::new(),
+                DocumentRoot::Object(&schema),
+                &DiscoveryRecord::empty(),
+            )
+            .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{snippet}"));
+        }
+    }
+
+    #[test]
+    fn template_map_of_array_of_tagged_snippets_parse_one_variant_at_a_time() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let schema = map_of_array_of_tagged_schema();
+        let text = JsonAdapter
+            .template(&Shape::Object(schema.clone()))
+            .unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let lines = comment_lines(&json["//groups"]);
+        for kind in ["rust", "payload"] {
+            let snippet = lines
+                .iter()
+                .find(|l| l.contains(&format!("\"{kind}\"")))
+                .unwrap_or_else(|| panic!("{kind} example missing: {text}"));
+            let parsed = snippet_object(snippet);
+            let groups = parsed["groups"].as_object().unwrap_or_else(|| {
+                panic!("map-of-array-of-tagged snippet must be an object, got {parsed}")
+            });
+            let entry = groups
+                .get("<key>")
+                .or_else(|| groups.values().next())
+                .unwrap();
+            let items = entry
+                .as_array()
+                .unwrap_or_else(|| panic!("entry must be an array, got {entry} from {snippet}"));
+            assert_eq!(items.len(), 1, "{snippet}");
+            assert_eq!(items[0]["kind"], kind);
+            let map = match JsonAdapter.parse(&format!("{{{snippet}}}")).unwrap().value {
+                Value::Map(map) => map,
+                other => panic!("expected map, got {other:?}"),
+            };
+            finalize_root(
+                map,
+                &OriginMap::new(),
+                DocumentRoot::Object(&schema),
+                &DiscoveryRecord::empty(),
+            )
+            .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{snippet}"));
+        }
+    }
+
+    #[test]
+    fn template_root_map_of_array_of_tagged_snippets_parse_one_variant_at_a_time() {
+        use crate::error::DiscoveryRecord;
+        use crate::origin::OriginMap;
+        use crate::runtime::DocumentRoot;
+        use crate::schema_walk::finalize_root;
+
+        let root = root_map_of_array_of_tagged();
+        let text = JsonAdapter.template(&Shape::Map(root.clone())).unwrap();
+        let json: Json = serde_json::from_str(&text).unwrap();
+        let lines = comment_lines(&json["//"]);
+        for kind in ["rust", "payload"] {
+            let snippet = lines
+                .iter()
+                .find(|l| l.contains(&format!("\"{kind}\"")))
+                .unwrap_or_else(|| panic!("{kind} example missing: {text}"));
+            let assigned = snippet.replace("<key>", "core");
+            let parsed = snippet_object(&assigned);
+            let entry = parsed.get("core").unwrap_or_else(|| {
+                panic!("root-map snippet must assign core, got {parsed} from {snippet}")
+            });
+            assert!(
+                entry.get("core").is_none(),
+                "must not wrap the array item in a second key: {parsed}"
+            );
+            let items = entry.as_array().unwrap_or_else(|| {
+                panic!(
+                    "root Map<Array<Tagged>> snippet must be an array, got {entry} from {snippet}"
+                )
+            });
+            assert_eq!(items.len(), 1, "{snippet}");
+            assert_eq!(items[0]["kind"], kind);
+            let map = match JsonAdapter.parse(&format!("{{{assigned}}}")).unwrap().value {
+                Value::Map(map) => map,
+                other => panic!("expected map, got {other:?}"),
+            };
+            finalize_root(
+                map,
+                &OriginMap::new(),
+                DocumentRoot::Map(&root),
+                &DiscoveryRecord::empty(),
+            )
+            .unwrap_or_else(|e| panic!("load {kind} failed: {e}\n{snippet}"));
+        }
+    }
+
+    #[test]
     fn template_parses_clean_through_own_adapter() {
         // gen → parse: every comment key is stripped, every real key is a
         // schema key with its default value.
         use crate::fixtures::test::test_schema;
-        let text = JsonAdapter.template(&test_schema()).unwrap();
+        let text = JsonAdapter.template(&Shape::Object(test_schema())).unwrap();
         let value = JsonAdapter.parse(&text).unwrap().value;
         let map = value.as_map().unwrap();
         assert_eq!(
@@ -2116,7 +2756,7 @@ mod tests {
         use crate::fixtures::test::test_schema;
         let out = crate::persist::set_in_document(
             &JsonAdapter,
-            &test_schema(),
+            &Shape::Object(test_schema()),
             None,
             "port",
             "9090",

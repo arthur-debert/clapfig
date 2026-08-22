@@ -30,17 +30,18 @@ use crate::merge::deep_merge;
 use crate::normalize::{normalize_key, normalize_table_and_spans};
 use crate::origin::{Origin, OriginMap, origin_map_from_env, origin_map_from_file};
 use crate::overrides;
-use crate::runtime::Schema;
+use crate::runtime::DocumentRoot;
 use crate::schema_walk;
 use crate::strict::{CollectedUnknown, StrictnessOverrides, UnknownKeyHook};
 use crate::types::Layer;
-use crate::validate::{UnknownKeySource, ValidateContext, validate_unknown};
+use crate::validate::{UnknownKeySource, ValidateContext};
 use crate::value::{Map, Value};
 
 /// All pre-loaded data needed to resolve a config. No I/O happens here.
 pub(crate) struct ResolveInput<'a> {
     /// The schema every layer is validated and finalized against.
-    pub schema: &'a Schema,
+    /// Object, Map, and tagged document roots.
+    pub schema: DocumentRoot<'a>,
     /// Enabled format adapters — the routing seam every file parse goes
     /// through. Per-file adapter selection is by extension; extensionless
     /// files (rc-style names) fall back to the preferred
@@ -226,7 +227,7 @@ pub(crate) fn resolve(
                     .map_err(|c| c.into_error(path))?;
             }
             if cascade_active {
-                let mut per_file = validate_unknown(
+                let mut per_file = crate::validate::validate_unknown_root(
                     &table,
                     input.schema,
                     &UnknownKeySource::File {
@@ -275,7 +276,7 @@ pub(crate) fn resolve(
     // "1.5" for an integer field) don't fail validation — that's
     // still the job of the final-merge type check inside `finalize`.
     if cascade_active && let Some((env_table_ref, sources, _)) = env_layer.as_ref() {
-        let mut env_filtered = validate_unknown(
+        let mut env_filtered = crate::validate::validate_unknown_root(
             env_table_ref,
             input.schema,
             &UnknownKeySource::Env { sources },
@@ -336,9 +337,36 @@ pub(crate) fn resolve(
     // Schema-driven default injection: populate the table from the schema's
     // declared defaults so `finalize` only has to check required fields.
     // Default origins fill in the same walk (ADR-0004).
-    schema_walk::fill_defaults_into(&mut merged, &mut origins, input.schema);
+    schema_walk::fill_defaults_into_root(&mut merged, &mut origins, input.schema);
 
-    let output = schema_walk::finalize(merged, &origins, input.schema, &input.discovery)?;
+    // Selection is traced here — before phase 2 — so a valid discriminator
+    // that then fails on a branch-exclusive key still records that a
+    // variant was selected. Missing / mistyped / unknown tags emit nothing.
+    if crate::trace::trace_event_enabled() {
+        schema_walk::trace_selected_tagged_root(&merged, input.schema, &origins);
+    }
+
+    if cascade_active {
+        let mut exclusive = Vec::new();
+        schema_walk::collect_branch_exclusive_root(&merged, input.schema, &mut exclusive);
+        let phase2_overrides = input
+            .strict_overrides
+            .for_selected_branch(input.schema, &merged);
+        let phase2_ctx = ValidateContext {
+            overrides: &phase2_overrides,
+            default_strict: input.strict_default,
+            callback: input.unknown_key_hook.as_ref(),
+        };
+        let mut phase2 = crate::validate::filter_through_cascade(
+            &merged,
+            &UnknownKeySource::Merged { origins: &origins },
+            exclusive,
+            &phase2_ctx,
+        )?;
+        collected_unknowns.append(&mut phase2);
+    }
+
+    let output = schema_walk::finalize_root(merged, &origins, input.schema, &input.discovery)?;
     crate::trace::validation_complete();
     Ok((output, collected_unknowns))
 }
@@ -347,6 +375,7 @@ pub(crate) fn resolve(
 mod tests {
     use super::*;
     use crate::fixtures::test::test_schema;
+    use crate::runtime::Schema;
 
     fn test_spec() -> Schema {
         test_schema()
@@ -374,7 +403,7 @@ mod tests {
 
     fn empty_input(schema: &Schema) -> ResolveInput<'_> {
         ResolveInput {
-            schema,
+            schema: DocumentRoot::Object(schema),
             registry: toml_only_registry(),
             files: vec![],
             discovery: DiscoveryRecord::empty(),

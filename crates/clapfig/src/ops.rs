@@ -124,41 +124,39 @@ impl fmt::Display for ConfigResult {
     }
 }
 
-/// Recursively rewrite every field name in `schema` from snake_case to
-/// kebab-case, at every nesting depth (nested objects, array-of, map-of).
-///
-/// Only field NAMES change: docs, defaults, enum values, and leaf types
-/// pass through untouched, so prose and value text can never be
-/// accidentally rewritten. The renamed clone exists solely for template
-/// rendering — every adapter derives keys, section headers, comment keys,
-/// and assignment snippets from these names, which is what makes the
-/// rename format-agnostic where a textual rewrite could not be.
-fn kebab_renamed(schema: &crate::runtime::Schema) -> crate::runtime::Schema {
-    let mut renamed = schema.clone();
-    kebab_rename_fields(&mut renamed);
-    renamed
-}
-
 fn kebab_rename_fields(schema: &mut crate::runtime::Schema) {
-    use crate::runtime::Field;
     for nf in &mut schema.fields {
         if nf.name.contains('_') {
             nf.name = crate::normalize::kebab_key(&nf.name);
         }
-        match &mut nf.field {
-            Field::Nested(child) | Field::ArrayOf(child) | Field::MapOf(child) => {
-                kebab_rename_fields(child);
+        kebab_rename_shape(&mut nf.field);
+    }
+}
+
+fn kebab_rename_shape(shape: &mut crate::runtime::Shape) {
+    use crate::runtime::Shape;
+    match shape {
+        Shape::Object(child) => kebab_rename_fields(child),
+        Shape::Array(array) => kebab_rename_shape(&mut array.item),
+        Shape::Map(map) => kebab_rename_shape(&mut map.item),
+        Shape::Tagged(tagged) => {
+            if tagged.tag.contains('_') {
+                tagged.tag = crate::normalize::kebab_key(&tagged.tag);
             }
-            Field::Leaf(_) => {}
+            for variant in &mut tagged.variants {
+                kebab_rename_fields(&mut variant.schema);
+            }
         }
+        Shape::Leaf(_) => {}
     }
 }
 
 /// Template generator: renders the documented config template for a
 /// schema through the given format adapter. With `kebab` set, the schema's
 /// field names are structurally renamed to kebab-case first (see
-/// [`kebab_renamed`]) so the rendered keys — in any format — match what a
-/// `normalize_keys(true)` builder accepts.
+/// [`kebab_renamed_shape`]) so the rendered keys — in any format — match what a
+/// `normalize_keys(true)` builder accepts. Tagged unions rename the tag
+/// key and every variant field; discriminator *values* are unchanged.
 ///
 /// The template body — doc comments, `Allowed:` enum lines, commented
 /// placeholders for defaultless leaves — is the adapter's
@@ -167,14 +165,22 @@ fn kebab_rename_fields(schema: &mut crate::runtime::Schema) {
 /// file seeding) goes through.
 pub(crate) fn generate_template(
     adapter: &dyn FormatAdapter,
-    schema: &crate::runtime::Schema,
+    shape: &crate::runtime::Shape,
     kebab: bool,
 ) -> Result<String, ClapfigError> {
-    Ok(if kebab {
-        adapter.template(&kebab_renamed(schema))?
+    let shaped = if kebab {
+        kebab_renamed_shape(shape)
     } else {
-        adapter.template(schema)?
-    })
+        shape.clone()
+    };
+    Ok(adapter.template(&shaped)?)
+}
+
+/// Recursively rewrite field names in a document-root shape to kebab-case.
+fn kebab_renamed_shape(shape: &crate::runtime::Shape) -> crate::runtime::Shape {
+    let mut shaped = shape.clone();
+    kebab_rename_shape(&mut shaped);
+    shaped
 }
 
 /// List entries from a single scope's config file (raw file content, not merged).
@@ -315,7 +321,12 @@ mod tests {
     use crate::format::TomlAdapter;
 
     fn template_for(schema: &crate::runtime::Schema, kebab: bool) -> String {
-        generate_template(&TomlAdapter, schema, kebab).unwrap()
+        generate_template(
+            &TomlAdapter,
+            &crate::runtime::Shape::Object(schema.clone()),
+            kebab,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -382,7 +393,12 @@ mod tests {
                     .default("postgres://my_user@host"),
             )
             .build();
-        let template = generate_template(&TomlAdapter, &schema, true).unwrap();
+        let template = generate_template(
+            &TomlAdapter,
+            &crate::runtime::Shape::Object(schema.clone()),
+            true,
+        )
+        .unwrap();
         assert!(template.contains("db-url = "), "{template}");
         assert!(
             template.contains(r#""postgres://my_user@host""#),
@@ -405,7 +421,12 @@ mod tests {
                 RtSchema::object("Section").field("api_key", RtField::string()),
             )
             .build();
-        let template = generate_template(&TomlAdapter, &schema, true).unwrap();
+        let template = generate_template(
+            &TomlAdapter,
+            &crate::runtime::Shape::Object(schema.clone()),
+            true,
+        )
+        .unwrap();
         assert!(template.contains("[my-section]"), "{template}");
         assert!(template.contains("#api-key"), "{template}");
         assert!(!template.contains('_'), "no snake leak:\n{template}");
@@ -426,7 +447,12 @@ mod tests {
                 RtSchema::object("Section").field("pool_size", RtField::integer().default(5i64)),
             )
             .build();
-        let template = generate_template(&JsonAdapter, &schema, true).unwrap();
+        let template = generate_template(
+            &JsonAdapter,
+            &crate::runtime::Shape::Object(schema.clone()),
+            true,
+        )
+        .unwrap();
         assert!(template.contains(r#""//api-key""#), "{template}");
         assert!(
             template.contains(r#"\"api-key\": \"\""#),

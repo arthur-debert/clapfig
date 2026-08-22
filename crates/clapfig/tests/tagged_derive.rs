@@ -1,0 +1,472 @@
+//! SHP01-WS05: typed tagged unions and honest artifacts.
+//!
+//! `#[serde(tag = "kind")]` enums derive Schema, load, typed-deserialize,
+//! and export JSON Schema / templates that match load-time checks.
+
+#![cfg(feature = "derive")]
+
+use std::collections::BTreeMap;
+use std::fs;
+
+use clapfig::runtime::Shape;
+use clapfig::{Clapfig, Schema, SearchPath};
+use serde::{Deserialize, Serialize};
+use tempfile::TempDir;
+
+#[derive(Schema, Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct RustParams {
+    shape: String,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct PayloadParams {
+    artifact: String,
+    entry: String,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind")]
+enum Block {
+    #[serde(rename = "rust")]
+    Rust {
+        mount: String,
+        #[clapfig(optional)]
+        crate_path: Option<String>,
+        params: RustParams,
+    },
+    #[serde(rename = "payload")]
+    Payload {
+        mount: String,
+        params: PayloadParams,
+    },
+    #[serde(rename = "off")]
+    Off,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct App {
+    block: Block,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct Sites {
+    blocks: BTreeMap<String, Block>,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct Plugins {
+    plugins: Vec<Block>,
+}
+
+fn write_and_load_typed<C: clapfig::DocumentRoot + serde::de::DeserializeOwned>(
+    contents: &str,
+) -> Result<C, clapfig::ClapfigError> {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("app.toml"), contents).unwrap();
+    Clapfig::typed::<C>()
+        .app_name("app")
+        .file_name("app.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .load()
+}
+
+#[test]
+fn tagged_enum_two_variant_structs_load_and_typed_deserialize() {
+    let cfg: Block = write_and_load_typed(
+        "kind = \"rust\"\nmount = \".\"\n[params]\nshape = \"cli-plus-lib\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg,
+        Block::Rust {
+            mount: ".".into(),
+            crate_path: None,
+            params: RustParams {
+                shape: "cli-plus-lib".into(),
+            },
+        }
+    );
+}
+
+#[test]
+fn serde_deserialize_of_the_same_tree_succeeds() {
+    let table = {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.toml"),
+            "kind = \"payload\"\nmount = \"/data\"\n[params]\nartifact = \"out\"\nentry = \"start\"\n",
+        )
+        .unwrap();
+        Clapfig::builder(Block::shape())
+            .app_name("app")
+            .file_name("app.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .load()
+            .unwrap()
+    };
+    let via_serde: Block = clapfig::value::from_value(clapfig::value::Value::Map(table)).unwrap();
+    assert_eq!(
+        via_serde,
+        Block::Payload {
+            mount: "/data".into(),
+            params: PayloadParams {
+                artifact: "out".into(),
+                entry: "start".into(),
+            },
+        }
+    );
+}
+
+#[test]
+fn unit_variant_loads_as_tag_only() {
+    let cfg: Block = write_and_load_typed("kind = \"off\"\n").unwrap();
+    assert_eq!(cfg, Block::Off);
+}
+
+#[test]
+fn nested_tagged_field_loads() {
+    let cfg: App = write_and_load_typed(
+        "[block]\nkind = \"rust\"\nmount = \".\"\n[block.params]\nshape = \"cli\"\n",
+    )
+    .unwrap();
+    match cfg.block {
+        Block::Rust { mount, params, .. } => {
+            assert_eq!(mount, ".");
+            assert_eq!(params.shape, "cli");
+        }
+        other => panic!("expected rust, got {other:?}"),
+    }
+}
+
+#[test]
+fn map_of_tagged_loads() {
+    let cfg: Sites = write_and_load_typed(
+        "[blocks.core]\nkind = \"rust\"\nmount = \".\"\n[blocks.core.params]\nshape = \"cli\"\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.blocks.len(), 1);
+    match &cfg.blocks["core"] {
+        Block::Rust { mount, .. } => assert_eq!(mount, "."),
+        other => panic!("expected rust, got {other:?}"),
+    }
+}
+
+#[test]
+fn vec_of_tagged_enum_loads_two_entries_and_typed_deserializes() {
+    match &Plugins::schema().fields[0].field {
+        Shape::Array(array) => match array.item.as_ref() {
+            Shape::Tagged(tagged) => assert_eq!(tagged.tag, "kind"),
+            other => panic!("expected Tagged item, got {other:?}"),
+        },
+        other => panic!("expected Array, got {other:?}"),
+    }
+
+    let cfg: Plugins = write_and_load_typed(
+        "[[plugins]]\nkind = \"rust\"\nmount = \".\"\n[plugins.params]\nshape = \"cli\"\n\n[[plugins]]\nkind = \"payload\"\nmount = \"/data\"\n[plugins.params]\nartifact = \"out\"\nentry = \"start\"\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.plugins.len(), 2);
+    match &cfg.plugins[0] {
+        Block::Rust { mount, params, .. } => {
+            assert_eq!(mount, ".");
+            assert_eq!(params.shape, "cli");
+        }
+        other => panic!("expected rust, got {other:?}"),
+    }
+    match &cfg.plugins[1] {
+        Block::Payload { mount, params } => {
+            assert_eq!(mount, "/data");
+            assert_eq!(params.artifact, "out");
+            assert_eq!(params.entry, "start");
+        }
+        other => panic!("expected payload, got {other:?}"),
+    }
+}
+
+#[test]
+fn tagged_json_schema_is_oneof_with_const_no_openapi_discriminator() {
+    let s = clapfig::json_schema::generate_schema(Block::shape());
+    assert!(
+        s.get("discriminator").is_none(),
+        "OpenAPI discriminator is not JSON Schema: {s}"
+    );
+    assert!(
+        s.get("oneOf").is_some(),
+        "tagged document root must be oneOf through the public path: {s}"
+    );
+    assert!(
+        s.get("additionalProperties").is_none(),
+        "tagged root must not be an empty additionalProperties:false object: {s}"
+    );
+    let one_of = s["oneOf"].as_array().expect("oneOf");
+    assert_eq!(one_of.len(), 3);
+    let rust = &one_of[0];
+    assert_eq!(rust["properties"]["kind"]["const"], "rust");
+    assert_eq!(rust["properties"]["kind"]["type"], "string");
+    assert_eq!(rust["additionalProperties"], false);
+    assert_eq!(rust["patternProperties"]["^//"], serde_json::json!({}));
+    assert!(rust["properties"].get("params").is_some(), "{rust}");
+    assert_eq!(one_of[1]["properties"]["kind"]["const"], "payload");
+    assert_eq!(one_of[2]["properties"]["kind"]["const"], "off");
+}
+
+#[test]
+fn nested_and_map_of_tagged_json_schema_compose() {
+    let nested = clapfig::json_schema::generate_schema(App::shape());
+    assert_eq!(nested["patternProperties"]["^//"], serde_json::json!({}));
+    assert_eq!(nested["additionalProperties"], false);
+    let block = &nested["properties"]["block"];
+    assert!(block.get("discriminator").is_none(), "{block}");
+    assert_eq!(block["oneOf"][0]["properties"]["kind"]["const"], "rust");
+
+    let mapped = clapfig::json_schema::generate_schema(Sites::shape());
+    let entry = &mapped["properties"]["blocks"]["additionalProperties"];
+    assert!(entry.get("discriminator").is_none(), "{entry}");
+    assert_eq!(entry["oneOf"][0]["properties"]["kind"]["const"], "rust");
+    assert_eq!(
+        mapped["properties"]["blocks"]["patternProperties"]["^//"],
+        serde_json::json!({})
+    );
+
+    let listed = clapfig::json_schema::generate_schema(Plugins::shape());
+    let items = &listed["properties"]["plugins"]["items"];
+    assert!(items.get("discriminator").is_none(), "{items}");
+    assert_eq!(items["oneOf"][0]["properties"]["kind"]["const"], "rust");
+}
+
+#[test]
+fn tagged_field_paths_union_nested_descendants_of_shared_names() {
+    assert_eq!(
+        Block::field_paths(),
+        vec![
+            "kind".to_string(),
+            "mount".to_string(),
+            "crate_path".to_string(),
+            "params".to_string(),
+            "params.shape".to_string(),
+            "params.artifact".to_string(),
+            "params.entry".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn tagged_normalize_keys_renames_tag_and_variant_fields_not_discriminators() {
+    use clapfig::format::{FormatAdapter, JsonAdapter, TomlAdapter, YamlAdapter};
+    use clapfig::runtime::{Field, Schema as RtSchema};
+
+    let tagged = Shape::from(
+        Shape::tagged("Block", "block_kind")
+            .variant(
+                "rust",
+                RtSchema::object("Rust")
+                    .field("crate_path", Field::string())
+                    .build(),
+            )
+            .variant(
+                "payload",
+                RtSchema::object("Payload")
+                    .field("artifact_name", Field::string())
+                    .build(),
+            )
+            .build(),
+    );
+    let nested = Shape::from(
+        RtSchema::object("App")
+            .field("site_block", tagged.clone())
+            .build(),
+    );
+
+    for (adapter, tag_needle, field_needle, disc_needle) in [
+        (
+            &TomlAdapter as &dyn FormatAdapter,
+            "block-kind",
+            "crate-path",
+            "rust",
+        ),
+        (&YamlAdapter, "block-kind", "crate-path", "rust"),
+        (&JsonAdapter, "block-kind", "crate-path", "rust"),
+    ] {
+        for shape in [&tagged, &nested] {
+            let text = Clapfig::builder(shape.clone())
+                .app_name("demo")
+                .formats([adapter.name()])
+                .normalize_keys(true)
+                .no_env()
+                .handle(&clapfig::ConfigAction::Gen { output: None })
+                .unwrap();
+            let text = match text {
+                clapfig::ConfigResult::Template(t) => t,
+                other => panic!("expected Template, got {other:?}"),
+            };
+            assert!(
+                text.contains(tag_needle),
+                "{}: tag key should kebab: {text}",
+                adapter.name()
+            );
+            assert!(
+                text.contains(field_needle),
+                "{}: variant field should kebab: {text}",
+                adapter.name()
+            );
+            assert!(
+                text.contains(disc_needle),
+                "{}: discriminator values stay: {text}",
+                adapter.name()
+            );
+            assert!(
+                !text.contains("block_kind") && !text.contains("crate_path"),
+                "{}: snake keys must not remain: {text}",
+                adapter.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn tagged_config_get_returns_tag_documentation() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("app.toml"), "kind = \"off\"\n").unwrap();
+    let result = Clapfig::typed::<Block>()
+        .app_name("app")
+        .file_name("app.toml")
+        .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+        .no_env()
+        .handle(&clapfig::ConfigAction::Get {
+            key: "kind".into(),
+            scope: None,
+        })
+        .unwrap();
+    match result {
+        clapfig::ConfigResult::KeyValue { key, value, .. } => {
+            assert_eq!(key, "kind");
+            assert_eq!(value, "off");
+        }
+        other => panic!("expected KeyValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn tagged_config_gen_one_commented_example_per_variant() {
+    use clapfig::format::{FormatAdapter, TomlAdapter};
+
+    let text = TomlAdapter.template(&Block::shape()).unwrap();
+    assert!(
+        text.contains("#kind = \"rust\""),
+        "rust example must be commented: {text}"
+    );
+    assert!(
+        text.contains("#kind = \"payload\""),
+        "payload example must be commented: {text}"
+    );
+    assert!(
+        text.contains("#kind = \"off\""),
+        "off example must be commented: {text}"
+    );
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("kind") {
+            panic!("uncommented mixed-variant object is illegal: {text}");
+        }
+        if !trimmed.starts_with('#') && trimmed.contains('=') {
+            panic!("tagged gen must not emit uncommented assignments: {text}");
+        }
+    }
+}
+
+#[test]
+fn object_root_without_tagged_stays_byte_identical() {
+    use clapfig::format::{FormatAdapter, TomlAdapter};
+    use clapfig::runtime::{Field, Schema as RtSchema};
+
+    let schema = RtSchema::object("App")
+        .doc("Demo runtime schema")
+        .field("host", Field::string().doc("App host").default("localhost"))
+        .field("port", Field::integer().doc("Port number").default(8080i64))
+        .build();
+    let text = TomlAdapter.template(&Shape::Object(schema)).unwrap();
+    assert!(
+        text.contains("host = \"localhost\""),
+        "object-root defaults stay uncommented: {text}"
+    );
+    assert!(
+        !text.contains("kind ="),
+        "object-root must not invent a tagged example: {text}"
+    );
+}
+
+#[test]
+fn tagged_discriminators_may_contain_path_characters() {
+    #[derive(Schema, Serialize, Deserialize, Debug, Clone, PartialEq)]
+    #[serde(tag = "kind")]
+    enum Versioned {
+        #[serde(rename = "rust.v2")]
+        RustV2 { mount: String },
+        #[serde(rename = "[legacy]")]
+        Legacy { mount: String },
+    }
+
+    match Versioned::shape() {
+        Shape::Tagged(tagged) => {
+            let names: Vec<&str> = tagged
+                .variants
+                .iter()
+                .map(|v| v.discriminator.as_str())
+                .collect();
+            assert_eq!(names, ["rust.v2", "[legacy]"]);
+        }
+        other => panic!("expected Tagged, got {other:?}"),
+    }
+
+    let dotted: Versioned = write_and_load_typed("kind = \"rust.v2\"\nmount = \".\"\n").unwrap();
+    assert_eq!(dotted, Versioned::RustV2 { mount: ".".into() });
+    let bracket: Versioned =
+        write_and_load_typed("kind = \"[legacy]\"\nmount = \"/old\"\n").unwrap();
+    assert_eq!(
+        bracket,
+        Versioned::Legacy {
+            mount: "/old".into(),
+        }
+    );
+}
+
+#[test]
+#[should_panic(expected = "is a tagged union")]
+fn tagged_schema_accessor_fails_loudly() {
+    let _ = Block::schema();
+}
+
+#[test]
+fn derive_shape_is_tagged_with_closed_set() {
+    match Block::shape() {
+        Shape::Tagged(tagged) => {
+            assert_eq!(tagged.tag, "kind");
+            assert_eq!(tagged.name, "Block");
+            let names: Vec<&str> = tagged
+                .variants
+                .iter()
+                .map(|v| v.discriminator.as_str())
+                .collect();
+            assert_eq!(names, ["rust", "payload", "off"]);
+            assert!(
+                tagged.variants[0]
+                    .schema
+                    .fields
+                    .iter()
+                    .any(|f| f.name == "mount")
+            );
+            assert!(
+                !tagged.variants[0]
+                    .schema
+                    .fields
+                    .iter()
+                    .any(|f| f.name == "kind"),
+                "tag is not a variant field"
+            );
+            assert!(tagged.variants[2].schema.fields.is_empty());
+        }
+        other => panic!("expected Tagged, got {other:?}"),
+    }
+}

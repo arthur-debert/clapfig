@@ -1,6 +1,9 @@
 //! Builder API for configuring and loading layered configuration.
 //!
-//! Entry point: [`crate::Clapfig::builder(schema)`](crate::Clapfig::builder).
+//! Entry point: [`crate::Clapfig::builder(schema)`](crate::Clapfig::builder)
+//! (`impl Into<crate::runtime::Shape>`; a
+//! [`Schema`](crate::runtime::Schema) converts as
+//! [`crate::runtime::Shape::Object`]).
 //! The builder follows a "set what you need, load" pattern: `app_name`
 //! derives sensible defaults (file name, search paths, env prefix), and
 //! everything else is optional overrides — discovery, persistence, env,
@@ -23,7 +26,7 @@ use crate::ops::{self, ConfigResult};
 use crate::overrides;
 use crate::persist;
 use crate::resolve::{self, ResolveInput};
-use crate::runtime::Schema;
+use crate::runtime::{DocumentRoot, MapShape, Schema, Shape, TaggedShape};
 use crate::strict::{StrictnessOverrides, UnknownKeyHook};
 use crate::types::{ConfigAction, Layer, SearchMode, SearchPath};
 use crate::value::{Map, Value};
@@ -64,14 +67,45 @@ enum FileNaming {
 /// - **Persistence**: [`persist_scope()`](Self::persist_scope) — named
 ///   targets for writes.
 ///
-/// The schema is supplied as a value (via [`crate::Clapfig::builder`]) and
-/// the loaded output is a value [`Map`]. For typed output, derive
+/// The schema is supplied as a value (via [`crate::Clapfig::builder`],
+/// which takes `impl Into<crate::runtime::Shape>`) and the loaded output
+/// is a value [`Map`]. Object-root
+/// [`Schema`](crate::runtime::Schema) values convert as
+/// [`crate::runtime::Shape::Object`]. For typed output, derive
 /// [`Schema`](crate::Schema) and use
 /// [`Clapfig::typed`](crate::Clapfig::typed), whose
 /// [`TypedBuilder`](crate::TypedBuilder) forwards to this
 /// builder.
+/// Document root stored on the builder / resolver as a shared [`Arc<Shape>`].
+///
+/// [`Builder::from_shape`] retains the caller's Arc (typed `shape_arc`
+/// caches). Owned constructors wrap a newly allocated Arc.
+struct StoredRoot(Arc<Shape>);
+
+impl StoredRoot {
+    fn as_document(&self) -> DocumentRoot<'_> {
+        match self.0.as_ref() {
+            Shape::Object(schema) => DocumentRoot::Object(schema),
+            Shape::Map(map) => DocumentRoot::Map(map),
+            Shape::Tagged(tagged) => DocumentRoot::Tagged(tagged),
+            Shape::Leaf(_) | Shape::Array(_) => {
+                unreachable!("illegal document roots are rejected by require_document_root")
+            }
+        }
+    }
+
+    fn as_shape(&self) -> &Shape {
+        self.0.as_ref()
+    }
+
+    #[cfg(test)]
+    fn shares_arc(&self, other: &Arc<Shape>) -> bool {
+        Arc::ptr_eq(&self.0, other)
+    }
+}
+
 pub struct Builder {
-    schema: Arc<Schema>,
+    schema: StoredRoot,
     app_name: Option<String>,
     file_naming: Option<FileNaming>,
     formats: Option<Vec<String>>,
@@ -96,11 +130,31 @@ impl Builder {
         Self::from_arc(Arc::new(schema))
     }
 
-    /// Construct a builder reusing an already-`Arc<Schema>`-cached schema
-    /// (e.g. the per-type cache the `clapfig::Schema` derive maintains).
-    /// Skips the per-builder allocation of the schema tree that
-    /// [`new`](Self::new) performs.
+    /// Construct a builder from an owned object-root schema. Wraps it as
+    /// [`Shape::Object`] in a fresh Arc.
     pub(crate) fn from_arc(schema: Arc<Schema>) -> Self {
+        let schema = Arc::try_unwrap(schema).unwrap_or_else(|arc| (*arc).clone());
+        Self::from_shape(Arc::new(Shape::Object(schema)))
+    }
+
+    pub(crate) fn from_tagged(tagged: TaggedShape) -> Self {
+        Self::from_shape(Arc::new(Shape::Tagged(tagged)))
+    }
+
+    pub(crate) fn from_map(map: MapShape) -> Self {
+        Self::from_shape(Arc::new(Shape::Map(map)))
+    }
+
+    /// Construct a builder from an already-`Arc<Shape>`-cached document
+    /// root (typed HashMap/BTreeMap roots, or an object-root derive cache).
+    /// Retains `shape` so construction is clone-free at the tree — one
+    /// `Arc::clone` at the caller, not a deep clone of the schema.
+    pub(crate) fn from_shape(shape: Arc<Shape>) -> Self {
+        shape.require_document_root();
+        Self::from_root(StoredRoot(shape))
+    }
+
+    fn from_root(schema: StoredRoot) -> Self {
         Self {
             schema,
             app_name: None,
@@ -441,7 +495,7 @@ impl Builder {
     pub fn cli_overrides_from<S: Serialize>(mut self, source: &S) -> Self {
         let pairs = flatten::flatten(source)
             .expect("clapfig: failed to flatten CLI source for auto-matching");
-        let valid = overrides::valid_keys(&self.schema);
+        let valid = overrides::valid_keys_root(self.schema.as_document());
         for (key, value) in pairs {
             if let Some(v) = value
                 && valid.contains(&key)
@@ -580,10 +634,10 @@ impl Builder {
         // Validate `strict_at` paths against the schema and merge with the
         // schema's own per-node `strict` settings into a single cascade
         // map.
-        let strict_overrides = crate::strict::build_strict_overrides(
+        let strict_overrides = crate::strict::build_strict_overrides_root(
             &self.strict_at_overrides,
             self.normalize_keys,
-            &self.schema,
+            self.schema.as_document(),
         )?;
 
         Ok(Resolver {
@@ -781,7 +835,7 @@ impl Builder {
                         };
                         let template = ops::generate_template(
                             adapter.as_ref(),
-                            &self.schema,
+                            self.schema.as_shape(),
                             self.normalize_keys,
                         )?;
                         if let Some(parent) = path.parent() {
@@ -802,14 +856,17 @@ impl Builder {
                         let preferred = registry
                             .preferred()
                             .expect("effective_registry always registers an adapter");
-                        let template =
-                            ops::generate_template(preferred, &self.schema, self.normalize_keys)?;
+                        let template = ops::generate_template(
+                            preferred,
+                            self.schema.as_shape(),
+                            self.normalize_keys,
+                        )?;
                         Ok(ConfigResult::Template(template))
                     }
                 }
             }
             ConfigAction::Schema { output } => {
-                let value = crate::json_schema::generate_schema(&self.schema);
+                let value = crate::json_schema::generate_schema_ref(self.schema.as_shape());
                 let schema = serde_json::to_string_pretty(&value)
                     .expect("serde_json::Value serialization is infallible");
                 match output {
@@ -831,14 +888,16 @@ impl Builder {
             }
             ConfigAction::Get { key, scope } => match scope {
                 None => {
-                    let schema = Arc::clone(&self.schema);
+                    // Clone the Arc so `load()` can consume `self` while
+                    // `get_from_table` still borrows the shape.
+                    let shape = Arc::clone(&self.schema.0);
                     let normalize_keys = self.normalize_keys;
                     // Merged view: display renders in the preferred
                     // (first-enabled) format's spelling.
                     let registry = self.effective_registry()?;
                     let table = self.load()?;
                     get_from_table(
-                        &schema,
+                        shape.as_ref(),
                         &table,
                         key,
                         normalize_keys,
@@ -851,7 +910,7 @@ impl Builder {
                     let (path, adapter) = self.resolve_scope_persist_path(Some(name))?;
                     get_scope(
                         adapter.as_ref(),
-                        &self.schema,
+                        self.schema.as_shape(),
                         name,
                         &path,
                         key,
@@ -863,7 +922,7 @@ impl Builder {
                 let (path, adapter) = self.resolve_scope_persist_path(scope.as_deref())?;
                 persist::persist_value(
                     adapter.as_ref(),
-                    &self.schema,
+                    self.schema.as_shape(),
                     &path,
                     key,
                     value,
@@ -889,7 +948,7 @@ impl Builder {
 /// [crate-level "Tree-walk resolution" section](crate#tree-walk-resolution--the-resolver-handle)
 /// for the full design rationale.
 pub struct Resolver {
-    schema: Arc<Schema>,
+    schema: StoredRoot,
     app_name: String,
     naming: FileNaming,
     registry: FormatRegistry,
@@ -997,7 +1056,7 @@ impl Resolver {
         };
 
         let input = ResolveInput {
-            schema: self.schema.as_ref(),
+            schema: self.schema.as_document(),
             registry: &self.registry,
             files: loaded.files,
             discovery,
@@ -1263,7 +1322,7 @@ fn format_leaf_value(value: &Value) -> String {
 /// spelling; the display block is spelled by `adapter` (the active
 /// format).
 fn get_from_table(
-    schema: &Schema,
+    shape: &Shape,
     table: &Map,
     key: &str,
     normalize_keys: bool,
@@ -1276,9 +1335,9 @@ fn get_from_table(
     };
     let value = ops::table_get(table, &canonical).ok_or_else(|| ClapfigError::KeyNotFound {
         key: key.into(),
-        suggestion: crate::meta::nearest_key(schema, &canonical, normalize_keys),
+        suggestion: crate::meta::nearest_key_shape(shape, &canonical, normalize_keys),
     })?;
-    let doc = crate::meta::doc_for(schema, &canonical).unwrap_or_default();
+    let doc = crate::meta::doc_for_shape(shape, &canonical).unwrap_or_default();
     Ok(ConfigResult::key_value(
         adapter,
         key.into(),
@@ -1301,7 +1360,7 @@ fn get_from_table(
 /// the key may be perfectly valid; there is just nothing to read.
 fn get_scope(
     adapter: &dyn FormatAdapter,
-    schema: &Schema,
+    shape: &Shape,
     scope: &str,
     file_path: &std::path::Path,
     key: &str,
@@ -1354,9 +1413,9 @@ fn get_scope(
     };
     let value = value.ok_or_else(|| ClapfigError::KeyNotFound {
         key: key.into(),
-        suggestion: crate::meta::nearest_key(schema, &canonical, normalize_keys),
+        suggestion: crate::meta::nearest_key_shape(shape, &canonical, normalize_keys),
     })?;
-    let doc = crate::meta::doc_for(schema, &canonical).unwrap_or_default();
+    let doc = crate::meta::doc_for_shape(shape, &canonical).unwrap_or_default();
     Ok(ConfigResult::key_value(
         adapter,
         key.into(),
@@ -1398,6 +1457,41 @@ mod tests {
                     .field("pool_size", RtField::integer().default(5i64)),
             )
             .build()
+    }
+
+    #[test]
+    fn from_shape_retains_shared_object_arc() {
+        let cached = Arc::new(Shape::Object(demo_schema()));
+        // Extra clone so `Arc::try_unwrap` cannot succeed — the derive
+        // cache holds one Arc and `shape_arc()` hands out another.
+        let builder = Builder::from_shape(Arc::clone(&cached));
+        assert!(
+            builder.schema.shares_arc(&cached),
+            "from_shape must keep the caller's Arc, not deep-clone the Shape tree"
+        );
+    }
+
+    #[test]
+    fn from_shape_retains_shared_map_and_tagged_arcs() {
+        let map = Arc::new(Shape::Map(
+            Shape::map("blocks", crate::runtime::LeafType::String).build(),
+        ));
+        let map_builder = Builder::from_shape(Arc::clone(&map));
+        assert!(
+            map_builder.schema.shares_arc(&map),
+            "root-map from_shape must keep the caller's Arc"
+        );
+
+        let tagged = Arc::new(Shape::Tagged(
+            Shape::tagged("Block", "kind")
+                .variant("off", Schema::object("Off").build())
+                .build(),
+        ));
+        let tagged_builder = Builder::from_shape(Arc::clone(&tagged));
+        assert!(
+            tagged_builder.schema.shares_arc(&tagged),
+            "tagged from_shape must keep the caller's Arc"
+        );
     }
 
     // --- file + defaults ---
@@ -3123,7 +3217,15 @@ mod tests {
             let path = dir.path().join(name);
             fs::write(&path, content).unwrap();
             for key in ["db.pool-size", "db.pool_size"] {
-                let result = get_scope(adapter, &demo_schema(), "local", &path, key, true).unwrap();
+                let result = get_scope(
+                    adapter,
+                    &Shape::Object(demo_schema()),
+                    "local",
+                    &path,
+                    key,
+                    true,
+                )
+                .unwrap();
                 match result {
                     ConfigResult::KeyValue {
                         key: reported,
@@ -3150,8 +3252,15 @@ mod tests {
         let path = dir.path().join("demo.toml");
         fs::write(&path, "[db]\npool-size = 5\npool_size = 6\n").unwrap();
         for key in ["db.pool-size", "db.pool_size"] {
-            let err =
-                get_scope(&TomlAdapter, &demo_schema(), "local", &path, key, true).unwrap_err();
+            let err = get_scope(
+                &TomlAdapter,
+                &Shape::Object(demo_schema()),
+                "local",
+                &path,
+                key,
+                true,
+            )
+            .unwrap_err();
             match err {
                 ClapfigError::NormalizedKeyCollision {
                     path: reported,
@@ -3183,8 +3292,15 @@ mod tests {
             "host = \"h\"\n\n[db]\npool-size = 5\npool_size = 6\n",
         )
         .unwrap();
-        let err =
-            get_scope(&TomlAdapter, &demo_schema(), "local", &path, "host", true).unwrap_err();
+        let err = get_scope(
+            &TomlAdapter,
+            &Shape::Object(demo_schema()),
+            "local",
+            &path,
+            "host",
+            true,
+        )
+        .unwrap_err();
         match err {
             ClapfigError::NormalizedKeyCollision {
                 path: reported,
@@ -3209,8 +3325,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.toml");
         for key in ["db.pool-size", "db.pool_size"] {
-            let err =
-                get_scope(&TomlAdapter, &demo_schema(), "local", &path, key, true).unwrap_err();
+            let err = get_scope(
+                &TomlAdapter,
+                &Shape::Object(demo_schema()),
+                "local",
+                &path,
+                key,
+                true,
+            )
+            .unwrap_err();
             match err {
                 ClapfigError::ScopeFileMissing {
                     scope,

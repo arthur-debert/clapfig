@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use clapfig::runtime::{Field as RuntimeField, LeafType as RuntimeLeafType};
+use clapfig::runtime::Shape as RuntimeShape;
 use clapfig::value::Value;
 use clapfig::{Clapfig, ConfigAction, ConfigResult, Schema, SearchPath};
 use serde::{Deserialize, Serialize};
@@ -48,9 +48,9 @@ struct PerTargetLevels {
 fn map_of_unit_enum_flattens_to_map_of_enum_leaf() {
     let s = PerTargetLevels::schema();
     match &s.fields[0].field {
-        RuntimeField::Leaf(leaf) => match &leaf.ty {
-            RuntimeLeafType::Map(inner) => match inner.as_ref() {
-                RuntimeLeafType::Enum { values } => {
+        RuntimeShape::Map(map) => match map.item.as_ref() {
+            RuntimeShape::Leaf(leaf) => match &leaf.ty {
+                clapfig::runtime::LeafType::Enum { values } => {
                     assert_eq!(
                         values,
                         &vec![
@@ -62,9 +62,9 @@ fn map_of_unit_enum_flattens_to_map_of_enum_leaf() {
                 }
                 other => panic!("expected Enum inside Map, got {other:?}"),
             },
-            other => panic!("expected Map leaf type, got {other:?}"),
+            other => panic!("expected Leaf item, got {other:?}"),
         },
-        other => panic!("expected Leaf (map-of-enum flattened), got {other:?}"),
+        other => panic!("expected Map (map-of-enum flattened), got {other:?}"),
     }
 }
 
@@ -178,13 +178,13 @@ fn field_site_docs_survive_on_nested_enum_and_map_of_fields() {
     // the referenced type's own doc.
     let s = DocCarrier::schema();
     match &s.fields[0].field {
-        RuntimeField::Nested(inner) => {
+        RuntimeShape::Object(inner) => {
             assert_eq!(inner.doc, vec!["Primary database connection.".to_string()]);
         }
-        other => panic!("expected Nested, got {other:?}"),
+        other => panic!("expected Object, got {other:?}"),
     }
     match &s.fields[1].field {
-        RuntimeField::Leaf(leaf) => {
+        RuntimeShape::Leaf(leaf) => {
             assert_eq!(
                 leaf.doc,
                 vec!["Rendering mode for the main view.".to_string()]
@@ -193,13 +193,13 @@ fn field_site_docs_survive_on_nested_enum_and_map_of_fields() {
         other => panic!("expected Leaf (enum flattened), got {other:?}"),
     }
     match &s.fields[2].field {
-        RuntimeField::MapOf(entry) => {
+        RuntimeShape::Map(map) => {
             assert_eq!(
-                entry.doc,
+                map.doc,
                 vec!["Per-plugin settings, keyed by plugin name.".to_string()]
             );
         }
-        other => panic!("expected MapOf, got {other:?}"),
+        other => panic!("expected Map, got {other:?}"),
     }
 }
 
@@ -211,7 +211,7 @@ fn nested_field_without_field_doc_falls_back_to_type_doc() {
     }
     let s = NoFieldDoc::schema();
     match &s.fields[0].field {
-        RuntimeField::Nested(inner) => {
+        RuntimeShape::Object(inner) => {
             assert_eq!(
                 inner.doc,
                 vec!["Type-level doc on the nested struct.".to_string()]
@@ -358,12 +358,12 @@ fn vec_datetime_array_default_emits_datetime_elements() {
     // leaf rejected its own default at finalize.
     let s = DatetimeArray::schema();
     match &s.fields[0].field {
-        RuntimeField::Leaf(leaf) => match leaf.default.as_ref().unwrap() {
+        RuntimeShape::Array(array) => match array.default.as_ref().unwrap() {
             Value::Array(items) => {
                 assert!(matches!(items[0], Value::Datetime(_)));
             }
             other => panic!("expected Array default, got {other:?}"),
         },
-        other => panic!("expected Leaf, got {other:?}"),
+        other => panic!("expected Array, got {other:?}"),
     }
 }
