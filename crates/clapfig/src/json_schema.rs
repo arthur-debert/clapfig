@@ -18,6 +18,12 @@
 //!   materializes as the empty one), and a nested section is required
 //!   only if it transitively contains a required leaf. An external
 //!   validator therefore accepts exactly the documents clapfig loads.
+//! - **Key spelling**: whatever the handed-in shape declares. The
+//!   builder's `config schema` action and
+//!   [`Builder::artifacts`](crate::Builder::artifacts) hand over the
+//!   kebab-renamed shape under
+//!   [`normalize_keys(true)`](crate::Builder::normalize_keys), so the
+//!   document names the keys the generated template writes.
 //! - **Docs**: schema and field doc lines become `description`.
 //! - **Types**: converted recursively from each node's [`Shape`](crate::runtime::Shape)
 //!   / [`LeafType`]. String → `"string"`, integer → `"integer"` (with

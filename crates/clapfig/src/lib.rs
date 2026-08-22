@@ -565,7 +565,11 @@
 //! presentation: with `.normalize_keys(true)` on, `config gen` emits keys
 //! and section headers in kebab-case (`pool-size`, `[my-section]`) so the
 //! template matches what users will type. Doc comments and values are
-//! never touched.
+//! never touched. The generated JSON Schema ([`ConfigAction::Schema`] and
+//! [`Builder::artifacts`]) names the same kebab-case keys, so an external
+//! validator — an editor following a `#:schema` directive, say — accepts
+//! the template generated beside it instead of rejecting every key as
+//! unknown.
 //!
 //! The persistence path (`config set`/`unset`) and `config get` (merged
 //! and scoped alike) follow the same acceptance: the action key may be
@@ -742,6 +746,7 @@
 //! the file as a user types it:
 //!
 //! ```ignore
+//! use clapfig::Clapfig;
 //! use clapfig::artifacts::{ArtifactOptions, SchemaReference};
 //!
 //! let options = ArtifactOptions::new()

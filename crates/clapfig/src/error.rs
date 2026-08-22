@@ -390,7 +390,13 @@ pub enum ClapfigError {
     /// break or another control character, or has leading/trailing
     /// whitespace. The reference is otherwise opaque — this is not a
     /// "that path does not exist" or "that URL is unreachable" error.
-    #[error("Invalid schema reference '{reference}': {reason}")]
+    ///
+    /// The message quotes the rejected value through `Debug`, so the
+    /// control characters that got it rejected are escaped (`\n`,
+    /// `\u{1b}`) rather than replayed into a terminal or a log line. The
+    /// `reference` field still carries the raw value for callers that
+    /// want to inspect it.
+    #[error("Invalid schema reference {reference:?}: {reason}")]
     InvalidSchemaReference { reference: String, reason: String },
 
     /// Stem-based discovery found more than one same-stem config file in

@@ -9,7 +9,11 @@
 #   1. The generated template lints clean against the schema its own
 #      `#:schema` line names.
 #   2. A real block instance appended to it still lints clean, so the schema
-#      describes documents users actually write, not just an empty file.
+#      describes documents users actually write, not just an empty file. It
+#      includes the multiword `load-order` key: the example generates with
+#      `normalize_keys(true)`, so tombi checks that the schema declares the
+#      kebab spelling the template writes rather than the field's
+#      `load_order` name.
 #   3. An unknown key is REJECTED. This is the control: without it, a tombi
 #      that silently ignored the directive would pass checks 1 and 2.
 #
@@ -46,6 +50,7 @@ cat >>blocks.toml <<'EOF'
 [block.core]
 kind = "rust"
 mount = "crates/core"
+load-order = 10
 EOF
 tombi lint blocks.toml
 

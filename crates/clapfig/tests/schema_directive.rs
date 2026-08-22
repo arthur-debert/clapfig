@@ -6,7 +6,9 @@
 //! entry points (runtime `Shape` and `#[derive(Schema)]`) answer the same
 //! way, a template carrying the directive still loads as config, and
 //! omitting the reference leaves `config gen` / `config schema` output
-//! untouched byte for byte.
+//! untouched byte for byte. Under `normalize_keys(true)` both artifacts
+//! name the same kebab-case keys, since an editor validating the template
+//! against a schema spelling them differently would reject every key.
 
 use std::collections::BTreeMap;
 
@@ -189,6 +191,160 @@ fn kebab_normalization_reaches_the_body_not_the_directive() {
     assert!(pair.template.contains("pool-size"), "{}", pair.template);
 }
 
+/// A schema shaped to put a multiword key everywhere the renaming has to
+/// reach: the document root, a nested section, a map entry, and a tagged
+/// union's tag and variant fields.
+fn multiword_schema() -> RtSchema {
+    RtSchema::object("App")
+        .field("pool_size", Field::integer().default(5i64))
+        .nested(
+            "db_pool",
+            RtSchema::object("DbPool").field("max_idle", Field::integer().default(2i64)),
+        )
+        .map_of(
+            "named_blocks",
+            RtSchema::object("Block").field("mount_point", Field::string().default(".")),
+        )
+        .field(
+            "step_kind",
+            clapfig::runtime::Shape::tagged("StepKind", "step_type")
+                .variant(
+                    "shell",
+                    RtSchema::object("Shell")
+                        .field("run_line", Field::string().default("true"))
+                        .build(),
+                )
+                .build(),
+        )
+        .build()
+}
+
+/// Every property name the schema document declares, at any depth,
+/// paired with the JSON Pointer-ish trail that reached it — enough to
+/// assert on spelling without pinning the document's exact structure.
+fn declared_key_names(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (member, child) in map {
+                if member == "properties"
+                    && let Some(properties) = child.as_object()
+                {
+                    out.extend(properties.keys().cloned());
+                } else if member == "required"
+                    && let Some(names) = child.as_array()
+                {
+                    out.extend(names.iter().filter_map(|n| n.as_str().map(String::from)));
+                }
+                declared_key_names(child, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                declared_key_names(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn the_schema_names_the_keys_the_template_writes_under_normalization() {
+    // The pair's promise is that the schema describes the template beside
+    // it. Object schemas are closed (`additionalProperties: false`), so a
+    // schema still spelling `pool_size` would make an editor following the
+    // directive reject every key in the generated file.
+    let pair = Clapfig::builder(multiword_schema())
+        .app_name("app")
+        .normalize_keys(true)
+        .artifacts(&with_reference())
+        .unwrap();
+
+    let document: serde_json::Value = serde_json::from_str(&pair.schema).unwrap();
+    let mut declared = Vec::new();
+    declared_key_names(&document, &mut declared);
+
+    for kebab in [
+        "pool-size",
+        "db-pool",
+        "max-idle",
+        "named-blocks",
+        "mount-point",
+        "step-kind",
+        "step-type",
+        "run-line",
+    ] {
+        assert!(declared.contains(&kebab.to_string()), "{declared:?}");
+    }
+    let snake: Vec<&String> = declared.iter().filter(|name| name.contains('_')).collect();
+    assert!(
+        snake.is_empty(),
+        "schema still declares snake keys: {snake:?}"
+    );
+
+    // ...and the template writes exactly those.
+    for kebab in ["pool-size", "db-pool", "max-idle", "mount-point"] {
+        assert!(pair.template.contains(kebab), "{}", pair.template);
+    }
+}
+
+#[test]
+fn normalization_leaves_discriminator_values_alone() {
+    // Only key spellings are renamed. A discriminator is a value, so
+    // `two_step` stays as declared in both artifacts.
+    let schema = RtSchema::object("App")
+        .field(
+            "step_kind",
+            clapfig::runtime::Shape::tagged("StepKind", "step_type")
+                .variant(
+                    "two_step",
+                    RtSchema::object("TwoStep")
+                        .field("run_line", Field::string().default("true"))
+                        .build(),
+                )
+                .build(),
+        )
+        .build();
+    let pair = Clapfig::builder(schema)
+        .app_name("app")
+        .normalize_keys(true)
+        .artifacts(&ArtifactOptions::new())
+        .unwrap();
+    assert!(pair.schema.contains("two_step"), "{}", pair.schema);
+    assert!(!pair.schema.contains("two-step"), "{}", pair.schema);
+}
+
+#[test]
+fn the_standalone_schema_action_normalizes_the_same_way() {
+    // `config schema` and the pair must not describe the config file
+    // differently — the pair's schema IS that action's output.
+    let action = schema_of(
+        Clapfig::builder(multiword_schema())
+            .app_name("app")
+            .normalize_keys(true)
+            .handle(&ConfigAction::Schema { output: None })
+            .unwrap(),
+    );
+    let pair = Clapfig::builder(multiword_schema())
+        .app_name("app")
+        .normalize_keys(true)
+        .artifacts(&with_reference())
+        .unwrap();
+    assert_eq!(pair.schema, action);
+}
+
+#[test]
+fn without_normalization_the_declared_spelling_is_untouched() {
+    // The renaming is opt-in: default builders describe and render the
+    // schema's own snake_case keys.
+    let pair = Clapfig::builder(multiword_schema())
+        .app_name("app")
+        .artifacts(&with_reference())
+        .unwrap();
+    assert!(pair.schema.contains("pool_size"), "{}", pair.schema);
+    assert!(!pair.schema.contains("pool-size"), "{}", pair.schema);
+    assert!(pair.template.contains("pool_size"), "{}", pair.template);
+}
+
 // --- opt-out compatibility ---------------------------------------------
 
 #[test]
@@ -322,8 +478,56 @@ fn the_template_is_rendered_in_the_preferred_format() {
 
 #[test]
 fn generating_artifacts_needs_an_app_name() {
+    // With no file naming configured, the preferred format comes from the
+    // default `<app>.toml` naming — which needs the app name.
     let err = Clapfig::builder(blocks_schema())
         .artifacts(&with_reference())
         .unwrap_err();
     assert!(matches!(err, ClapfigError::AppNameRequired), "{err:?}");
+}
+
+#[test]
+fn explicit_file_naming_generates_artifacts_without_an_app_name() {
+    // The other half of that error contract: either naming call resolves
+    // the preferred format on its own, so `AppNameRequired` is not a
+    // blanket requirement of `artifacts()`.
+    for builder in [
+        Clapfig::builder(blocks_schema()).file_name("blocks.toml"),
+        Clapfig::builder(blocks_schema()).file_stem("blocks"),
+    ] {
+        let pair = builder.artifacts(&with_reference()).unwrap();
+        assert_eq!(
+            pair.template.lines().next().unwrap(),
+            format!("#:schema {REFERENCE}")
+        );
+        assert!(pair.schema.contains("\"BlocksFile\""), "{}", pair.schema);
+    }
+}
+
+// --- error rendering ----------------------------------------------------
+
+#[test]
+fn a_rejected_reference_is_escaped_in_the_error_message() {
+    // The value was rejected *for* carrying control characters, so
+    // replaying them raw would let a rejected reference forge log lines
+    // or emit terminal escapes. The message quotes it through `Debug`.
+    let newline = SchemaReference::new("./a.json\nport = 1")
+        .unwrap_err()
+        .to_string();
+    assert!(newline.contains("\\n"), "{newline}");
+    assert!(!newline.contains('\n'), "{newline}");
+
+    let escape = SchemaReference::new("./a\u{1b}[31m.json")
+        .unwrap_err()
+        .to_string();
+    assert!(escape.contains("\\u{1b}"), "{escape}");
+    assert!(!escape.contains('\u{1b}'), "{escape}");
+
+    // The raw value stays available to callers inspecting the error.
+    match SchemaReference::new("./a.json\nport = 1").unwrap_err() {
+        ClapfigError::InvalidSchemaReference { reference, .. } => {
+            assert_eq!(reference, "./a.json\nport = 1");
+        }
+        other => panic!("expected InvalidSchemaReference, got {other:?}"),
+    }
 }

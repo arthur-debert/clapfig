@@ -404,6 +404,11 @@ impl Builder {
     /// its `-` characters rewritten to `_` before validation, merging, and
     /// deserialization. snake_case keys continue to work unchanged; this is
     /// purely additive. Environment variables are unaffected.
+    ///
+    /// Everything clapfig *generates* switches to the kebab spelling with
+    /// it: the template `config gen` and file seeding render, and the JSON
+    /// Schema `config schema` and [`artifacts`](Self::artifacts) emit — the
+    /// two describe the same keys either way.
     pub fn normalize_keys(mut self, normalize: bool) -> Self {
         self.normalize_keys = normalize;
         self
@@ -733,9 +738,14 @@ impl Builder {
     ///
     /// # Errors
     ///
-    /// [`ClapfigError::AppNameRequired`] when `.app_name()` was not
-    /// called (the preferred format comes from the file-naming settings),
-    /// and the typed
+    /// [`ClapfigError::AppNameRequired`] when the preferred format
+    /// cannot be resolved: the file naming decides it, and with neither
+    /// [`file_name`](Self::file_name) nor [`file_stem`](Self::file_stem)
+    /// set the naming defaults to `<app>.toml`, which needs
+    /// [`app_name`](Self::app_name). Either explicit naming call is
+    /// enough on its own.
+    ///
+    /// The typed
     /// [`UnsupportedByFormat`](crate::format::UnsupportedByFormat) refusal
     /// — as [`ClapfigError::Format`] — when a reference is set and the
     /// preferred format declares no schema directive (YAML, JSON).
@@ -902,7 +912,13 @@ impl Builder {
                 }
             }
             ConfigAction::Schema { output } => {
-                let schema = crate::artifacts::schema_document(self.schema.as_shape());
+                // The same effective shape `config gen` renders, so under
+                // `normalize_keys(true)` the schema names the kebab keys
+                // the template writes instead of rejecting them.
+                let schema = crate::artifacts::schema_document(&crate::ops::effective_shape(
+                    self.schema.as_shape(),
+                    self.normalize_keys,
+                ));
                 match output {
                     Some(path) => {
                         if let Some(parent) = path.parent() {

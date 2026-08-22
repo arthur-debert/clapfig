@@ -16,6 +16,7 @@
 //! returns them together as [`ConfigArtifacts`].
 //!
 //! ```ignore
+//! use clapfig::Clapfig;
 //! use clapfig::artifacts::{ArtifactOptions, SchemaReference};
 //!
 //! let options = ArtifactOptions::new()
@@ -171,6 +172,11 @@ pub struct ConfigArtifacts {
 /// `config schema` emits and the one
 /// [`ConfigArtifacts::schema`] carries, so the pair and the standalone
 /// action cannot describe the schema differently.
+///
+/// `shape` must already be the
+/// [`effective_shape`](crate::ops::effective_shape): both call sites pass
+/// the kebab-renamed copy under `normalize_keys(true)`, so the schema
+/// names the keys the template writes.
 pub(crate) fn schema_document(shape: &Shape) -> String {
     serde_json::to_string_pretty(&crate::json_schema::generate_schema_ref(shape))
         .expect("serde_json::Value serialization is infallible")
@@ -181,17 +187,25 @@ pub(crate) fn schema_document(shape: &Shape) -> String {
 /// `adapter` is the format the template is rendered in (the builder's
 /// preferred format) and `kebab` is its
 /// [`normalize_keys`](crate::Builder::normalize_keys) setting, so the
-/// template body is exactly what `config gen` renders. A reference in
-/// `options` adds the adapter's schema directive as the first line,
-/// followed by the blank line that separates it from the body; a format
-/// declaring no directive refuses through the adapter.
+/// template body is exactly what `config gen` renders. Both artifacts are
+/// generated from the one
+/// [`effective_shape`](crate::ops::effective_shape) — under `kebab` a
+/// schema built from the declared shape would name `pool_size` while the
+/// template beside it wrote `pool-size`, and closed object schemas
+/// (`additionalProperties: false`) would make an editor reject the very
+/// template the directive pointed it at.
+///
+/// A reference in `options` adds the adapter's schema directive as the
+/// first line, followed by the blank line that separates it from the
+/// body; a format declaring no directive refuses through the adapter.
 pub(crate) fn generate(
     adapter: &dyn FormatAdapter,
     shape: &Shape,
     kebab: bool,
     options: &ArtifactOptions,
 ) -> Result<ConfigArtifacts, ClapfigError> {
-    let body = ops::generate_template(adapter, shape, kebab)?;
+    let shaped = ops::effective_shape(shape, kebab);
+    let body = ops::render_template(adapter, &shaped)?;
     let template = match options.reference() {
         None => body,
         Some(reference) => {
@@ -201,7 +215,7 @@ pub(crate) fn generate(
     };
     Ok(ConfigArtifacts {
         template,
-        schema: schema_document(shape),
+        schema: schema_document(&shaped),
     })
 }
 

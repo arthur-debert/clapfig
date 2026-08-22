@@ -9,7 +9,9 @@
 //!
 //! The schema here is shaped like edward's `.edward/blocks.toml` — a
 //! table of user-named block instances, each naming its kind and mount —
-//! because that is the consumer the artifact pair was built for.
+//! because that is the consumer the artifact pair was built for. It runs
+//! with `normalize_keys(true)`, so the multiword `load_order` field is
+//! written `load-order` in both artifacts.
 //!
 //! ## Running
 //!
@@ -48,6 +50,14 @@ struct BlockDecl {
     /// Skip this block when provisioning.
     #[clapfig(default = false)]
     disabled: bool,
+
+    // Multiword on purpose: under the `normalize_keys(true)` below, the
+    // template writes `load-order`, so the schema beside it has to declare
+    // that same spelling or an editor following the directive rejects the
+    // generated file. Doc comments reach users, so this note is not one.
+    /// Order this block is provisioned in, lowest first.
+    #[clapfig(default = 0)]
+    load_order: i64,
 }
 
 /// The file name the schema document is written under, and the reference
@@ -69,6 +79,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pair = Clapfig::typed::<BlocksFile>()
         .app_name("edward")
         .file_name(TEMPLATE_FILE)
+        // Kebab-case keys in the generated file — and, because the pair
+        // is generated from one shape, in the schema describing it.
+        .normalize_keys(true)
         .artifacts(&options)?;
 
     let template_path = dir.join(TEMPLATE_FILE);

@@ -3,11 +3,13 @@
 //! Provides the logic behind `config list`, `config gen`, `config get`, and the
 //! `ConfigResult` enum that callers use to display results.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::error::ClapfigError;
 use crate::format::FormatAdapter;
+use crate::runtime::Shape;
 use crate::value::{Map, Value};
 
 /// Result of a config operation. Returned to the caller for display.
@@ -133,8 +135,7 @@ fn kebab_rename_fields(schema: &mut crate::runtime::Schema) {
     }
 }
 
-fn kebab_rename_shape(shape: &mut crate::runtime::Shape) {
-    use crate::runtime::Shape;
+fn kebab_rename_shape(shape: &mut Shape) {
     match shape {
         Shape::Object(child) => kebab_rename_fields(child),
         Shape::Array(array) => kebab_rename_shape(&mut array.item),
@@ -151,12 +152,33 @@ fn kebab_rename_shape(shape: &mut crate::runtime::Shape) {
     }
 }
 
+/// The shape every generated artifact describes: `shape` as declared, or
+/// a recursively kebab-renamed copy of it when `kebab` (the builder's
+/// [`normalize_keys`](crate::Builder::normalize_keys) setting) is on, so
+/// generated keys — in any format — are spelled the way a
+/// `normalize_keys(true)` builder writes them. Tagged unions rename the
+/// tag key and every variant field; discriminator *values* are unchanged.
+///
+/// Every generator that describes the config document goes through this,
+/// so the template (`config gen`, file seeding) and the JSON Schema
+/// (`config schema`, [`ConfigArtifacts::schema`](crate::artifacts::ConfigArtifacts::schema))
+/// name the same keys. Generating one from the renamed shape and the
+/// other from the declared one would emit a schema that rejects the
+/// template beside it, since object schemas are closed
+/// (`additionalProperties: false`).
+pub(crate) fn effective_shape(shape: &Shape, kebab: bool) -> Cow<'_, Shape> {
+    if kebab {
+        let mut shaped = shape.clone();
+        kebab_rename_shape(&mut shaped);
+        Cow::Owned(shaped)
+    } else {
+        Cow::Borrowed(shape)
+    }
+}
+
 /// Template generator: renders the documented config template for a
-/// schema through the given format adapter. With `kebab` set, the schema's
-/// field names are structurally renamed to kebab-case first (see
-/// [`kebab_renamed_shape`]) so the rendered keys — in any format — match what a
-/// `normalize_keys(true)` builder accepts. Tagged unions rename the tag
-/// key and every variant field; discriminator *values* are unchanged.
+/// schema through the given format adapter, kebab-renaming its fields
+/// first when `kebab` is set (see [`effective_shape`]).
 ///
 /// The template body — doc comments, `Allowed:` enum lines, commented
 /// placeholders for defaultless leaves — is the adapter's
@@ -165,22 +187,22 @@ fn kebab_rename_shape(shape: &mut crate::runtime::Shape) {
 /// file seeding) goes through.
 pub(crate) fn generate_template(
     adapter: &dyn FormatAdapter,
-    shape: &crate::runtime::Shape,
+    shape: &Shape,
     kebab: bool,
 ) -> Result<String, ClapfigError> {
-    let shaped = if kebab {
-        kebab_renamed_shape(shape)
-    } else {
-        shape.clone()
-    };
-    Ok(adapter.template(&shaped)?)
+    render_template(adapter, &effective_shape(shape, kebab))
 }
 
-/// Recursively rewrite field names in a document-root shape to kebab-case.
-fn kebab_renamed_shape(shape: &crate::runtime::Shape) -> crate::runtime::Shape {
-    let mut shaped = shape.clone();
-    kebab_rename_shape(&mut shaped);
-    shaped
+/// Render `shape` — already the [`effective_shape`] — through `adapter`.
+///
+/// Split out for callers that need the same effective shape for a second
+/// generator (the artifact pair renders the template and the JSON Schema
+/// from one shape).
+pub(crate) fn render_template(
+    adapter: &dyn FormatAdapter,
+    shape: &Shape,
+) -> Result<String, ClapfigError> {
+    Ok(adapter.template(shape)?)
 }
 
 /// List entries from a single scope's config file (raw file content, not merged).

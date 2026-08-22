@@ -257,6 +257,10 @@ myapp config schema
 myapp config schema --output myapp-schema.json
 ```
 
+The document names keys the way `config gen` writes them: with
+`normalize_keys(true)` on, both are kebab-case, so a validator reading the
+schema accepts the template.
+
 To generate the template and the JSON Schema **together** — bound by the
 `#:schema` directive a TOML editor reads to validate the file as the user
 types — call `artifacts()` on the builder instead of dispatching two

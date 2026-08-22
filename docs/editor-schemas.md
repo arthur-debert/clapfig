@@ -18,6 +18,7 @@ JSON Schema it points at — from one schema, through `artifacts()`.
 ## Generating the pair
 
 ```rust
+use clapfig::Clapfig;
 use clapfig::artifacts::{ArtifactOptions, SchemaReference};
 
 let options = ArtifactOptions::new()
@@ -82,6 +83,19 @@ a reference, every format generates the pair.
 The template is rendered in the builder's **preferred format** (the first
 entry of `formats(...)`, TOML unless you enable others) — the same rule
 `config gen` follows when it writes to stdout.
+
+## Key spelling follows `normalize_keys`
+
+With `.normalize_keys(true)`, the template renders keys and section headers
+in kebab-case (`pool-size`, `[my-section]`) — and the JSON Schema names those
+same kebab keys. The two have to agree: object schemas are closed
+(`additionalProperties: false`), so a schema describing `pool_size` would
+make the editor flag every key in the template it is bound to. Tagged-union
+tag keys and variant fields follow the same renaming; discriminator *values*
+are left alone, as are doc comments and defaults.
+
+`config schema` on its own emits that same document, so the standalone action
+and `artifacts()` never describe the config file differently.
 
 ## The directive is a comment
 
