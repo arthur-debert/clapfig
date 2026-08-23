@@ -575,11 +575,12 @@
 //!
 //! A schema that *declares* a key already holding a `-` cannot be paired
 //! with normalization at all — the rewrite puts the key out of reach of
-//! every spelling, so loading fails whatever the user writes. `config
-//! gen`, `config schema`, and [`Builder::artifacts`] refuse such a
-//! builder with
+//! every spelling, so loading fails whatever the user writes. Everything
+//! that would generate under those names refuses such a builder with
 //! [`ClapfigError::UnreachableNormalizedKey`]
-//! rather than generate under names it would then reject.
+//! instead: `config gen`, `config schema`, [`Builder::artifacts`], and
+//! `config set` against a scope file that does not exist yet, which seeds
+//! that file from the same template (refused before anything is written).
 //!
 //! The persistence path (`config set`/`unset`) and `config get` (merged
 //! and scoped alike) follow the same acceptance: the action key may be
@@ -587,8 +588,9 @@
 //! snake_case field for validation), edits land on the spelling already
 //! present in the file (so setting `pool_size` against a kebab-case file
 //! edits `pool-size` rather than creating a colliding duplicate), and
-//! paths not yet present — including whole files seeded by `config set` —
-//! are emitted kebab-case, matching `config gen` output. A file already
+//! paths not yet present — including whole files seeded by `config set`,
+//! which is why seeding shares the refusal above — are emitted
+//! kebab-case, matching `config gen` output. A file already
 //! holding both equivalent spellings of a key — anywhere, even at a key
 //! the operation does not touch — is ambiguous: `set`, `unset`, and
 //! scoped `get` fail with the same collision error loading it reports,

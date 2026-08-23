@@ -28,7 +28,9 @@
 //!   and the declared snake_case one — because the runtime loads either.
 //!   Both refuse a schema whose declared keys already hold a `-`, which
 //!   normalization puts out of reach of any spelling
-//!   ([`UnreachableNormalizedKey`](crate::error::ClapfigError::UnreachableNormalizedKey)).
+//!   ([`UnreachableNormalizedKey`](crate::error::ClapfigError::UnreachableNormalizedKey))
+//!   — as do `config gen` and the missing-file seeding `config set`
+//!   does, which render the template from that same shape.
 //! - **Docs**: schema and field doc lines become `description`.
 //! - **Types**: converted recursively from each node's [`Shape`](crate::runtime::Shape)
 //!   / [`LeafType`]. String → `"string"`, integer → `"integer"` (with

@@ -343,10 +343,15 @@ pub enum ClapfigError {
     /// `MissingRequired`. The two features are mutually exclusive.
     ///
     /// Raised where clapfig would otherwise GENERATE under those names —
-    /// `config gen`, `config schema`, and
-    /// [`artifacts`](crate::Builder::artifacts) — so a template or JSON
-    /// Schema is never emitted spelling keys the same builder's loader
-    /// rejects. Loading itself keeps refusing key by key, unchanged. Fix
+    /// `config gen`, `config schema`,
+    /// [`artifacts`](crate::Builder::artifacts), and `config set` against
+    /// a scope file that does not exist yet, which seeds that file from
+    /// the same template — so a template or JSON Schema is never emitted
+    /// spelling keys the same builder's loader rejects. The refused
+    /// `config set` writes nothing: the check runs before the edit, so
+    /// no file is left behind. Loading itself keeps refusing key by key,
+    /// unchanged; a `config set` that only edits an EXISTING file never
+    /// generates and so never raises this. Fix
     /// by declaring the key in its normalized spelling (templates then
     /// still WRITE the kebab one) or by dropping `.normalize_keys(true)`.
     #[error(

@@ -402,8 +402,9 @@ impl Builder {
     /// When enabled, every key crossing the boundary into clapfig — TOML
     /// table keys, dotted CLI override keys, URL query parameter keys — has
     /// its `-` characters rewritten to `_` before validation, merging, and
-    /// deserialization. snake_case keys continue to work unchanged; this is
-    /// purely additive. Environment variables are unaffected.
+    /// deserialization. snake_case keys continue to work unchanged, so for
+    /// a snake_case schema this only widens what is accepted. Environment
+    /// variables are unaffected.
     ///
     /// Everything clapfig *writes* switches to the kebab spelling with
     /// it: the template `config gen` and file seeding render, and the
@@ -414,6 +415,22 @@ impl Builder {
     /// template clapfig generated and a snake_case file a user wrote by
     /// hand alike, and — as the load path does — refuses a document
     /// holding both spellings of one key.
+    ///
+    /// # The one schema this cannot be paired with
+    ///
+    /// A schema that *declares* a key already holding a `-` — from
+    /// `rename_all = "kebab-case"`, from `SCREAMING-KEBAB-CASE`, or from
+    /// an explicit rename — is unreachable under this setting: the
+    /// rewrite turns every written spelling into something the schema
+    /// does not declare, so loading fails whatever the user writes.
+    /// Everything that would GENERATE under those names refuses instead,
+    /// with
+    /// [`UnreachableNormalizedKey`](ClapfigError::UnreachableNormalizedKey):
+    /// `config gen`, `config schema`, [`artifacts`](Self::artifacts), and
+    /// `config set` against a scope file that does not exist yet (which
+    /// seeds that file from the same template, and is refused before
+    /// anything is written). Declare the key in its snake_case spelling —
+    /// generated templates still write the kebab one — or leave this off.
     pub fn normalize_keys(mut self, normalize: bool) -> Self {
         self.normalize_keys = normalize;
         self
@@ -754,6 +771,12 @@ impl Builder {
     /// [`UnsupportedByFormat`](crate::format::UnsupportedByFormat) refusal
     /// — as [`ClapfigError::Format`] — when a reference is set and the
     /// preferred format declares no schema directive (YAML, JSON).
+    ///
+    /// [`ClapfigError::UnreachableNormalizedKey`] when
+    /// [`normalize_keys(true)`](Self::normalize_keys) is paired with a
+    /// schema declaring a key that already holds a `-`: normalization
+    /// puts that key out of reach of every written spelling, so neither
+    /// artifact may name it.
     pub fn artifacts(&self, options: &ArtifactOptions) -> Result<ConfigArtifacts, ClapfigError> {
         let registry = self.effective_registry()?;
         let preferred = registry

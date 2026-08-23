@@ -95,7 +95,8 @@ pub(crate) struct UnreachableKey {
 impl UnreachableKey {
     /// Wrap into [`ClapfigError::UnreachableNormalizedKey`], computing
     /// the name the key actually arrives under. Every surfacing site —
-    /// template generation, JSON Schema generation, the artifact pair —
+    /// template generation (`config gen` and the missing-file seeding
+    /// `config set` does), JSON Schema generation, the artifact pair —
     /// goes through this one constructor.
     ///
     /// [`ClapfigError::UnreachableNormalizedKey`]: crate::error::ClapfigError::UnreachableNormalizedKey
@@ -116,6 +117,8 @@ impl UnreachableKey {
 /// refuses a document whose keys miss such a field, key by key; this
 /// refuses the artifacts — template, JSON Schema, or the pair — that
 /// would otherwise be generated under names that same loader rejects.
+/// Template generation is the seam `config set` seeds a missing scope
+/// file through, so the refusal reaches persistence too.
 /// Callers that do not normalize skip it: a declared `listen-port` is
 /// matched literally and is perfectly reachable then.
 pub(crate) fn check_shape_reachable(shape: &Shape) -> Result<(), UnreachableKey> {

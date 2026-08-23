@@ -343,8 +343,9 @@ struct KebabSection {
 }
 
 /// The generation side of the same incompatibility: `config gen`,
-/// `config schema`, and `artifacts()` refuse rather than emit keys this
-/// very builder's loader would reject.
+/// `config schema`, `artifacts()`, and the missing-file seeding `config
+/// set` does all refuse rather than emit keys this very builder's loader
+/// would reject.
 ///
 /// Without the refusal each one lies in its own direction. The template
 /// writer leaves an already-kebab name alone, so it writes `listen-port`
@@ -415,6 +416,38 @@ fn a_kebab_key_in_a_nested_section_is_refused_with_its_path() {
             .handle(&ConfigAction::Schema { output: None }),
         "timeout-ms",
         "section",
+    );
+}
+
+#[test]
+fn kebab_schema_with_normalize_keys_refuses_to_seed_a_missing_file() {
+    // `config set` against a scope file that does not exist yet seeds it
+    // from the same template generator, so the refusal reaches
+    // persistence too: seeding under this pairing would write a file the
+    // very next load rejects.
+    //
+    // The key being set (`host`) is a reachable one, so the set clears
+    // key validation and gets as far as seeding; the unreachable name is
+    // one section down, which is what the template would have written.
+    // Nothing is written — the check runs before the edit.
+    let dir = TempDir::new().unwrap();
+    expect_unreachable(
+        Clapfig::typed::<NestedKebabApp>()
+            .app_name("test")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .normalize_keys(true)
+            .handle(&ConfigAction::Set {
+                key: "host".into(),
+                value: "example.test".into(),
+                scope: None,
+            }),
+        "timeout-ms",
+        "section",
+    );
+    assert!(
+        !dir.path().join("test.toml").exists(),
+        "the refused set must leave no seeded file behind"
     );
 }
 

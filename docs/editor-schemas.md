@@ -139,12 +139,15 @@ a file writing `listen-port` arrives as `listen_port`, which the schema does
 not declare. No spelling reaches the field, and a required one fails every
 load.
 
-So `config gen`, `config schema`, and `artifacts()` refuse that combination
-with `ClapfigError::UnreachableNormalizedKey` rather than emit a template or a
-schema spelling keys the same builder's loader rejects. Declare the key
-`listen_port` (generated templates still *write* `listen-port`), or drop
-`.normalize_keys(true)` — a kebab-declared schema without it is a supported
-pairing, and its template loads back unchanged.
+So everything that generates under those names refuses that combination with
+`ClapfigError::UnreachableNormalizedKey` rather than emit a template or a
+schema spelling keys the same builder's loader rejects: `config gen`, `config
+schema`, `artifacts()`, and `config set` against a scope file that does not
+exist yet — that set seeds the file from the same template, and is refused
+before it writes anything. Declare the key `listen_port` (generated templates
+still *write* `listen-port`), or drop `.normalize_keys(true)` — a
+kebab-declared schema without it is a supported pairing, and its template
+loads back unchanged.
 
 ## The directive is a comment
 
