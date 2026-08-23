@@ -3,6 +3,7 @@
 - **The node is `Shape`.** Unknown-key, defaults, finalize, strictness, JSON Schema, templates, persist, and metadata walk [`Shape`](https://docs.rs/clapfig/latest/clapfig/runtime/enum.Shape.html). An object's field value is a `Shape`; there is no second field-node enum.
 - **One map constructor, one array constructor.** `LeafType::Map` / `LeafType::Array` and `Field::MapOf` / `Field::ArrayOf` / `Field::Nested` / `Field::Leaf` collapse: a map of leaves and a map of objects are [`Shape::Map`](https://docs.rs/clapfig/latest/clapfig/runtime/enum.Shape.html) with a different item (same for Array). `SchemaBuilder::map_of` / `array_of` / `nested` / `field` and `Field::map_of` / `array_of_type` still construct; they store `Shape`.
 - **Unit enums stay `Shape::Leaf(Enum)`.** `Vec<UnitEnum>` / `HashMap<String, UnitEnum>` are `Shape::Array` / `Shape::Map` of that leaf.
+- **Template example values satisfy their own leaf** ([#180](https://github.com/arthur-debert/clapfig/issues/180)). One example-value table drives every placeholder, so an enum leaf's example is a member of its allowed set in every position — including inline nested-array examples (`Array<Array<Object>>` with an enum leaf uncomments and re-loads) — and integer examples sit inside declared bounds. Object-root templates stay byte-identical.
 
 **Migration (hard cut, per project policy):**
 
