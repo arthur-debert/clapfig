@@ -332,6 +332,43 @@ pub enum ClapfigError {
         originals: Vec<String>,
     },
 
+    /// With `.normalize_keys(true)` enabled, the schema declares a key
+    /// that canonicalization can never produce, so no config document can
+    /// reach it: normalization rewrites `-` to `_` on every incoming key,
+    /// and this key holds a `-` (a `rename_all = "kebab-case"` schema, a
+    /// `SCREAMING-KEBAB-CASE` one, or an explicit rename). Written under
+    /// its declared spelling the key arrives normalized and lands in
+    /// `UnknownKeys`; written under the normalized spelling it is not
+    /// what the schema declares — and a required field then also fails
+    /// `MissingRequired`. The two features are mutually exclusive.
+    ///
+    /// Raised where clapfig would otherwise GENERATE under those names —
+    /// `config gen`, `config schema`,
+    /// [`artifacts`](crate::Builder::artifacts), and `config set` against
+    /// a scope file that does not exist yet, which seeds that file from
+    /// the same template — so a template or JSON Schema is never emitted
+    /// spelling keys the same builder's loader rejects. The refused
+    /// `config set` writes nothing: the check runs before the edit, so
+    /// no file is left behind. Loading itself keeps refusing key by key,
+    /// unchanged; a `config set` that only edits an EXISTING file never
+    /// generates and so never raises this. Fix
+    /// by declaring the key in its normalized spelling (templates then
+    /// still WRITE the kebab one) or by dropping `.normalize_keys(true)`.
+    #[error(
+        "Schema key '{key}'{} cannot be reached with normalize_keys(true): every incoming key has '-' rewritten to '_' before validation, so a document writing '{key}' arrives as '{normalized}', which the schema does not declare. Declare the key as '{normalized}' (generated templates still write '{key}'), or drop .normalize_keys(true)",
+        if section.is_empty() { String::new() } else { format!(" (under [{section}])") },
+    )]
+    UnreachableNormalizedKey {
+        /// Dotted path to the section declaring the key. Empty for the
+        /// document root.
+        section: String,
+        /// The declared name, as the schema spells it.
+        key: String,
+        /// What that name becomes under canonicalization — the spelling
+        /// the loader looks for and does not find.
+        normalized: String,
+    },
+
     /// A required field declared by the [`Schema`](crate::runtime::Schema)
     /// was not supplied by any layer and has no default.
     ///
@@ -383,6 +420,21 @@ pub enum ClapfigError {
     /// the same file twice and misreport it as ambiguous).
     #[error("Invalid formats list: {reason}")]
     InvalidFormats { reason: String },
+
+    /// A schema-document reference handed to
+    /// [`SchemaReference::new`](crate::artifacts::SchemaReference::new) is
+    /// not a single line: it is empty or whitespace-only, carries a line
+    /// break or another control character, or has leading/trailing
+    /// whitespace. The reference is otherwise opaque — this is not a
+    /// "that path does not exist" or "that URL is unreachable" error.
+    ///
+    /// The message quotes the rejected value through `Debug`, so the
+    /// control characters that got it rejected are escaped (`\n`,
+    /// `\u{1b}`) rather than replayed into a terminal or a log line. The
+    /// `reference` field still carries the raw value for callers that
+    /// want to inspect it.
+    #[error("Invalid schema reference {reference:?}: {reason}")]
+    InvalidSchemaReference { reference: String, reason: String },
 
     /// Stem-based discovery found more than one same-stem config file in
     /// one directory (e.g. `myapp.toml` AND `myapp.yaml`). The spec pins

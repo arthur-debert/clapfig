@@ -18,6 +18,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::artifacts::{ArtifactOptions, ConfigArtifacts};
 use crate::builder::{Builder, Resolver};
 use crate::error::ClapfigError;
 use crate::ops::ConfigResult;
@@ -273,6 +274,15 @@ impl<C: DocumentRoot + DeserializeOwned> TypedBuilder<C> {
             post_validate: self.post_validate,
             _phantom: PhantomData,
         })
+    }
+
+    /// Render this type's config template and JSON Schema document
+    /// together. See
+    /// [`Builder::artifacts`](crate::Builder::artifacts) — this forwards
+    /// to it, so the derive path and the runtime path generate the same
+    /// pair from the same [`Shape`](crate::runtime::Shape).
+    pub fn artifacts(&self, options: &ArtifactOptions) -> Result<ConfigArtifacts, ClapfigError> {
+        self.inner.artifacts(options)
     }
 
     /// Dispatch a [`ConfigAction`] and return the rendered output.

@@ -5,7 +5,12 @@
 //! ([`FormatAdapter::edit`]) — for TOML that is lossless
 //! comment-preserving editing. This module owns the format-agnostic half:
 //! key/type validation against the schema, template seeding for missing
-//! files, classifying each set request onto its capability-matrix row
+//! files (through [`ops::generate_template`](crate::ops), so a
+//! [`normalize_keys`](crate::Builder::normalize_keys) builder over a
+//! schema declaring kebab keys is refused here with
+//! [`UnreachableNormalizedKey`](crate::error::ClapfigError::UnreachableNormalizedKey)
+//! before anything is written, rather than seeding a file the next load
+//! rejects), classifying each set request onto its capability-matrix row
 //! ([`SetTarget`] — replace vs create-key vs create-file, so refusals
 //! name the operation actually attempted), emitting `debug` persist events
 //! (path and key; never the assigned value), key-spelling resolution under
@@ -170,7 +175,9 @@ pub fn set_in_document(
         _ => {
             // Missing file: require the matrix row before template
             // seeding, so the refusal names the attempted operation
-            // rather than template generation.
+            // rather than template generation. Seeding can itself refuse
+            // — an unreachable key under `normalize_keys` — and does so
+            // before any edit, leaving no file behind.
             adapter
                 .require(Operation::EditCreateFile)
                 .map_err(crate::format::FormatError::from)

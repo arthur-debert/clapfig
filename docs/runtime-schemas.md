@@ -132,6 +132,9 @@ off the schema:
 - `meta::doc_for(&schema, "db.pool_size")` reads doc-comment
   lines from the schema; derive users pass `C::schema()` for the same
   lookup.
+- `artifacts(&options)` renders those two together, optionally bound by
+  a `#:schema` directive — see
+  [Editor-Discoverable Config Files](./editor-schemas.md).
 
 ## What's not yet supported
 

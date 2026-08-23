@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
+use crate::artifacts::{ArtifactOptions, ConfigArtifacts};
 use crate::error::{ClapfigError, DiscoveryRecord, FileProbe, ProbeOutcome};
 use crate::file;
 use crate::flatten;
@@ -401,8 +402,35 @@ impl Builder {
     /// When enabled, every key crossing the boundary into clapfig — TOML
     /// table keys, dotted CLI override keys, URL query parameter keys — has
     /// its `-` characters rewritten to `_` before validation, merging, and
-    /// deserialization. snake_case keys continue to work unchanged; this is
-    /// purely additive. Environment variables are unaffected.
+    /// deserialization. snake_case keys continue to work unchanged, so for
+    /// a snake_case schema this only widens what is accepted. Environment
+    /// variables are unaffected.
+    ///
+    /// Everything clapfig *writes* switches to the kebab spelling with
+    /// it: the template `config gen` and file seeding render, and the
+    /// keys the persistence path adds. What it *accepts* stays wider, and
+    /// the generated JSON Schema (`config schema` and
+    /// [`artifacts`](Self::artifacts)) says so: it names a multiword key
+    /// under both spellings, so an external validator takes the kebab
+    /// template clapfig generated and a snake_case file a user wrote by
+    /// hand alike, and — as the load path does — refuses a document
+    /// holding both spellings of one key.
+    ///
+    /// # The one schema this cannot be paired with
+    ///
+    /// A schema that *declares* a key already holding a `-` — from
+    /// `rename_all = "kebab-case"`, from `SCREAMING-KEBAB-CASE`, or from
+    /// an explicit rename — is unreachable under this setting: the
+    /// rewrite turns every written spelling into something the schema
+    /// does not declare, so loading fails whatever the user writes.
+    /// Everything that would GENERATE under those names refuses instead,
+    /// with
+    /// [`UnreachableNormalizedKey`](ClapfigError::UnreachableNormalizedKey):
+    /// `config gen`, `config schema`, [`artifacts`](Self::artifacts), and
+    /// `config set` against a scope file that does not exist yet (which
+    /// seeds that file from the same template, and is refused before
+    /// anything is written). Declare the key in its snake_case spelling —
+    /// generated templates still write the kebab one — or leave this off.
     pub fn normalize_keys(mut self, normalize: bool) -> Self {
         self.normalize_keys = normalize;
         self
@@ -716,6 +744,52 @@ impl Builder {
         self.handle(action).map(|r| r.to_string())
     }
 
+    /// Render this schema's config template and JSON Schema document
+    /// together, from the one [`Shape`] the builder holds.
+    ///
+    /// The template is rendered in the preferred (first-enabled) format —
+    /// the same body `config gen` writes to stdout, byte for byte, when
+    /// `options` carries no schema reference. With a reference, the
+    /// format's editor schema directive (TOML: `#:schema <reference>`) is
+    /// the template's first line and a blank line separates it from the
+    /// body. The JSON Schema text is what `config schema` emits.
+    ///
+    /// Nothing is written: the caller chooses both paths and writes the
+    /// two files. See the [`artifacts`](crate::artifacts) module for what
+    /// clapfig owns here and what the caller does.
+    ///
+    /// # Errors
+    ///
+    /// [`ClapfigError::AppNameRequired`] when the preferred format
+    /// cannot be resolved: the file naming decides it, and with neither
+    /// [`file_name`](Self::file_name) nor [`file_stem`](Self::file_stem)
+    /// set the naming defaults to `<app>.toml`, which needs
+    /// [`app_name`](Self::app_name). Either explicit naming call is
+    /// enough on its own.
+    ///
+    /// The typed
+    /// [`UnsupportedByFormat`](crate::format::UnsupportedByFormat) refusal
+    /// — as [`ClapfigError::Format`] — when a reference is set and the
+    /// preferred format declares no schema directive (YAML, JSON).
+    ///
+    /// [`ClapfigError::UnreachableNormalizedKey`] when
+    /// [`normalize_keys(true)`](Self::normalize_keys) is paired with a
+    /// schema declaring a key that already holds a `-`: normalization
+    /// puts that key out of reach of every written spelling, so neither
+    /// artifact may name it.
+    pub fn artifacts(&self, options: &ArtifactOptions) -> Result<ConfigArtifacts, ClapfigError> {
+        let registry = self.effective_registry()?;
+        let preferred = registry
+            .preferred()
+            .expect("effective_registry always registers an adapter");
+        crate::artifacts::generate(
+            preferred,
+            self.schema.as_shape(),
+            self.normalize_keys,
+            options,
+        )
+    }
+
     /// Resolve the file path AND format adapter for a named persist
     /// scope.
     ///
@@ -866,9 +940,12 @@ impl Builder {
                 }
             }
             ConfigAction::Schema { output } => {
-                let value = crate::json_schema::generate_schema_ref(self.schema.as_shape());
-                let schema = serde_json::to_string_pretty(&value)
-                    .expect("serde_json::Value serialization is infallible");
+                // Spelled for the same acceptance `config gen`'s template
+                // is written for: under `normalize_keys(true)` the schema
+                // names both the kebab keys the template writes and the
+                // declared snake_case ones, instead of rejecting either.
+                let schema =
+                    crate::artifacts::schema_document(self.schema.as_shape(), self.normalize_keys)?;
                 match output {
                     Some(path) => {
                         if let Some(parent) = path.parent() {

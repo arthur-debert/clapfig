@@ -257,6 +257,21 @@ myapp config schema
 myapp config schema --output myapp-schema.json
 ```
 
+The document names the keys the builder accepts. With `normalize_keys(true)`
+on, that is both spellings of every multiword key — the kebab-case one
+`config gen` writes and the declared snake_case one — so a validator reading
+the schema takes the generated template and a hand-written config alike. A
+schema that *declares* kebab-case keys is the exception: normalization
+rewrites them out of reach, so `config gen`, `config schema`, `artifacts()`,
+and the missing-file seeding `config set` does all refuse that builder rather
+than generate under unreachable names.
+
+To generate the template and the JSON Schema **together** — bound by the
+`#:schema` directive a TOML editor reads to validate the file as the user
+types — call `artifacts()` on the builder instead of dispatching two
+actions. See the [Editor-Discoverable Config Files](editor-schemas.md)
+guide.
+
 ## Persist scopes
 
 Scopes name where `config set` and `config unset` write. The first scope

@@ -103,7 +103,8 @@
 //! module), one
 //! per format — TOML, YAML, JSON — behind a single contract
 //! ([`format::FormatAdapter`]) that parses text into `Value`, renders
-//! documented templates, serializes, and edits files.
+//! documented templates (and the editor schema directive that binds one
+//! to its JSON Schema), serializes, and edits files.
 //!
 //! The consequences you can observe:
 //!
@@ -564,7 +565,22 @@
 //! presentation: with `.normalize_keys(true)` on, `config gen` emits keys
 //! and section headers in kebab-case (`pool-size`, `[my-section]`) so the
 //! template matches what users will type. Doc comments and values are
-//! never touched.
+//! never touched. The generated JSON Schema ([`ConfigAction::Schema`] and
+//! [`Builder::artifacts`]) describes what is ACCEPTED rather than what is
+//! written, so it names each multiword key under both spellings — and,
+//! as loading does, refuses a document holding both at once. An external
+//! validator (an editor following a `#:schema` directive, say) then takes
+//! the kebab-case template generated beside it and a snake_case file
+//! written by hand alike, instead of rejecting one of them key by key.
+//!
+//! A schema that *declares* a key already holding a `-` cannot be paired
+//! with normalization at all — the rewrite puts the key out of reach of
+//! every spelling, so loading fails whatever the user writes. Everything
+//! that would generate under those names refuses such a builder with
+//! [`ClapfigError::UnreachableNormalizedKey`]
+//! instead: `config gen`, `config schema`, [`Builder::artifacts`], and
+//! `config set` against a scope file that does not exist yet, which seeds
+//! that file from the same template (refused before anything is written).
 //!
 //! The persistence path (`config set`/`unset`) and `config get` (merged
 //! and scoped alike) follow the same acceptance: the action key may be
@@ -572,8 +588,9 @@
 //! snake_case field for validation), edits land on the spelling already
 //! present in the file (so setting `pool_size` against a kebab-case file
 //! edits `pool-size` rather than creating a colliding duplicate), and
-//! paths not yet present — including whole files seeded by `config set` —
-//! are emitted kebab-case, matching `config gen` output. A file already
+//! paths not yet present — including whole files seeded by `config set`,
+//! which is why seeding shares the refusal above — are emitted
+//! kebab-case, matching `config gen` output. A file already
 //! holding both equivalent spellings of a key — anywhere, even at a key
 //! the operation does not touch — is ambiguous: `set`, `unset`, and
 //! scoped `get` fail with the same collision error loading it reports,
@@ -732,6 +749,30 @@
 //! `config set` creates a new file, it seeds it from this template so the
 //! user gets a documented starting point.
 //!
+//! # Editor-discoverable artifacts
+//!
+//! [`artifacts()`](Builder::artifacts) renders the config template and its
+//! JSON Schema document together, from the one schema the builder holds,
+//! and can prefix the template with the editor schema directive
+//! (TOML: `#:schema <reference>`) a TOML language server reads to validate
+//! the file as a user types it:
+//!
+//! ```ignore
+//! use clapfig::Clapfig;
+//! use clapfig::artifacts::{ArtifactOptions, SchemaReference};
+//!
+//! let options = ArtifactOptions::new()
+//!     .schema_reference(SchemaReference::new("./blocks.schema.json")?);
+//! let pair = Clapfig::typed::<BlocksFile>().app_name("edward").artifacts(&options)?;
+//! std::fs::write(".edward/blocks.toml", &pair.template)?;
+//! std::fs::write(".edward/blocks.schema.json", &pair.schema)?;
+//! ```
+//!
+//! Clapfig generates the two contents; the caller chooses the reference,
+//! the paths, and when to write. Without a reference the template is
+//! byte-for-byte `config gen` output. See the
+//! [`artifacts`](mod@artifacts) module.
+//!
 //! # Metadata accessors
 //!
 //! Tools that build help text, tooltips, settings UIs, or `--describe`
@@ -804,6 +845,7 @@
 //! prerequisites reference the builder method to call. See the [`error`]
 //! module for the full set.
 
+pub mod artifacts;
 pub mod error;
 pub mod format;
 pub mod json_schema;

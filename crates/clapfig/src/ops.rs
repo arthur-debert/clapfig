@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::ClapfigError;
 use crate::format::FormatAdapter;
+use crate::runtime::Shape;
 use crate::value::{Map, Value};
 
 /// Result of a config operation. Returned to the caller for display.
@@ -133,8 +134,7 @@ fn kebab_rename_fields(schema: &mut crate::runtime::Schema) {
     }
 }
 
-fn kebab_rename_shape(shape: &mut crate::runtime::Shape) {
-    use crate::runtime::Shape;
+fn kebab_rename_shape(shape: &mut Shape) {
     match shape {
         Shape::Object(child) => kebab_rename_fields(child),
         Shape::Array(array) => kebab_rename_shape(&mut array.item),
@@ -158,6 +158,18 @@ fn kebab_rename_shape(shape: &mut crate::runtime::Shape) {
 /// `normalize_keys(true)` builder accepts. Tagged unions rename the tag
 /// key and every variant field; discriminator *values* are unchanged.
 ///
+/// The renaming decides only what clapfig WRITES. What it ACCEPTS is
+/// wider — either spelling of a multiword key — and describing that is
+/// `json_schema::KeySpelling`'s job, not this one's.
+///
+/// With `kebab` set the shape must first be reachable under
+/// normalization ([`check_shape_reachable`](crate::normalize::check_shape_reachable)):
+/// a schema declaring a key that already holds a `-` gets
+/// [`UnreachableNormalizedKey`](ClapfigError::UnreachableNormalizedKey)
+/// rather than a template whose keys this builder's own loader would
+/// reject. Without `kebab` the shape renders as declared and is passed
+/// through borrowed — no rename, so no copy.
+///
 /// The template body — doc comments, `Allowed:` enum lines, commented
 /// placeholders for defaultless leaves — is the adapter's
 /// [`template`](crate::format::FormatAdapter::template) output; this
@@ -165,19 +177,19 @@ fn kebab_rename_shape(shape: &mut crate::runtime::Shape) {
 /// file seeding) goes through.
 pub(crate) fn generate_template(
     adapter: &dyn FormatAdapter,
-    shape: &crate::runtime::Shape,
+    shape: &Shape,
     kebab: bool,
 ) -> Result<String, ClapfigError> {
-    let shaped = if kebab {
-        kebab_renamed_shape(shape)
-    } else {
-        shape.clone()
-    };
-    Ok(adapter.template(&shaped)?)
+    if !kebab {
+        return Ok(adapter.template(shape)?);
+    }
+    crate::normalize::check_shape_reachable(shape)
+        .map_err(crate::normalize::UnreachableKey::into_error)?;
+    Ok(adapter.template(&kebab_renamed_shape(shape))?)
 }
 
 /// Recursively rewrite field names in a document-root shape to kebab-case.
-fn kebab_renamed_shape(shape: &crate::runtime::Shape) -> crate::runtime::Shape {
+fn kebab_renamed_shape(shape: &Shape) -> Shape {
     let mut shaped = shape.clone();
     kebab_rename_shape(&mut shaped);
     shaped

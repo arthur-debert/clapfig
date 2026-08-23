@@ -10,6 +10,9 @@
 //! - [`template`](TomlAdapter::template): the commented config template
 //!   (doc comments, `# Allowed:` enum lines, commented placeholders for
 //!   defaultless leaves) that `config gen` and file seeding emit.
+//! - [`schema_directive`](TomlAdapter::schema_directive): the
+//!   `#:schema <reference>` line editor toolchains read to find the JSON
+//!   Schema a generated file is described by.
 //! - [`edit`](TomlAdapter::edit): comment-preserving `toml_edit` set/unset
 //!   against existing source text.
 
@@ -47,6 +50,7 @@ impl FormatAdapter for TomlAdapter {
         &[
             Operation::Parse,
             Operation::Template,
+            Operation::SchemaDirective,
             Operation::Serialize,
             Operation::EditSet,
             Operation::EditCreateKey,
@@ -106,6 +110,17 @@ impl FormatAdapter for TomlAdapter {
         }
         walk_root(&mut TomlTemplate, shape, &String::new(), &mut out)?;
         Ok(out)
+    }
+
+    /// TOML's editor schema directive: `#:schema <reference>`, the
+    /// spelling tombi and the TOML language servers that follow it read.
+    /// It is an ordinary TOML comment, so a template carrying it parses
+    /// as the same document without it.
+    fn schema_directive(
+        &self,
+        reference: &crate::artifacts::SchemaReference,
+    ) -> Result<String, FormatError> {
+        Ok(format!("#:schema {reference}"))
     }
 
     fn edit(&self, source: &str, edit: FileEdit<'_>) -> Result<String, FormatError> {

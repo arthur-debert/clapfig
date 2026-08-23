@@ -12,6 +12,7 @@
 
 #![cfg(feature = "derive")]
 
+use clapfig::artifacts::ArtifactOptions;
 use clapfig::{Clapfig, ClapfigError, ConfigAction, ConfigResult, Schema, SearchPath};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -323,6 +324,162 @@ fn kebab_schema_with_normalize_keys_rejects_kebab_spelling() {
         other => panic!(
             "expected UnknownKeys(listen_port) for normalize_keys + kebab schema, got {other:?}"
         ),
+    }
+}
+
+/// A kebab-renamed key does not have to sit at the document root for the
+/// pairing to be incompatible — the refusal walks the whole shape.
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
+struct NestedKebabApp {
+    host: String,
+    section: KebabSection,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+struct KebabSection {
+    #[clapfig(default = 250)]
+    timeout_ms: u32,
+}
+
+/// The generation side of the same incompatibility: `config gen`,
+/// `config schema`, `artifacts()`, and the missing-file seeding `config
+/// set` does all refuse rather than emit keys this very builder's loader
+/// would reject.
+///
+/// Without the refusal each one lies in its own direction. The template
+/// writer leaves an already-kebab name alone, so it writes `listen-port`
+/// — which normalization turns into `listen_port` before validation, the
+/// spelling the pinned rejection test above shows failing. The JSON
+/// Schema names `listen-port` as an accepted property, and its objects
+/// are closed, so an external validator accepts exactly the document
+/// clapfig refuses and refuses the ones it would take.
+fn expect_unreachable(result: Result<ConfigResult, ClapfigError>, key: &str, section: &str) {
+    match result {
+        Err(ClapfigError::UnreachableNormalizedKey {
+            key: got_key,
+            section: got_section,
+            normalized,
+        }) => {
+            assert_eq!(got_key, key);
+            assert_eq!(got_section, section);
+            assert_eq!(normalized, key.replace('-', "_"));
+        }
+        other => panic!("expected UnreachableNormalizedKey({key}), got {other:?}"),
+    }
+}
+
+#[test]
+fn kebab_schema_with_normalize_keys_refuses_to_generate() {
+    for action in [
+        ConfigAction::Gen { output: None },
+        ConfigAction::Schema { output: None },
+    ] {
+        expect_unreachable(
+            Clapfig::typed::<KebabApp>()
+                .app_name("test")
+                .no_env()
+                .normalize_keys(true)
+                .handle(&action),
+            "listen-port",
+            "",
+        );
+    }
+}
+
+#[test]
+fn kebab_schema_with_normalize_keys_refuses_the_artifact_pair() {
+    // The pair goes through both generators, so it cannot slip past by
+    // whichever one it happens to call first.
+    let result = Clapfig::typed::<KebabApp>()
+        .app_name("test")
+        .no_env()
+        .normalize_keys(true)
+        .artifacts(&ArtifactOptions::new());
+    match result {
+        Err(ClapfigError::UnreachableNormalizedKey { key, .. }) => {
+            assert_eq!(key, "listen-port");
+        }
+        other => panic!("expected UnreachableNormalizedKey, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_kebab_key_in_a_nested_section_is_refused_with_its_path() {
+    // Root keys (`host`, `section`) are clean; the offending name is one
+    // level down, and the error names the section that declares it.
+    expect_unreachable(
+        Clapfig::typed::<NestedKebabApp>()
+            .app_name("test")
+            .no_env()
+            .normalize_keys(true)
+            .handle(&ConfigAction::Schema { output: None }),
+        "timeout-ms",
+        "section",
+    );
+}
+
+#[test]
+fn kebab_schema_with_normalize_keys_refuses_to_seed_a_missing_file() {
+    // `config set` against a scope file that does not exist yet seeds it
+    // from the same template generator, so the refusal reaches
+    // persistence too: seeding under this pairing would write a file the
+    // very next load rejects.
+    //
+    // The key being set (`host`) is a reachable one, so the set clears
+    // key validation and gets as far as seeding; the unreachable name is
+    // one section down, which is what the template would have written.
+    // Nothing is written — the check runs before the edit.
+    let dir = TempDir::new().unwrap();
+    expect_unreachable(
+        Clapfig::typed::<NestedKebabApp>()
+            .app_name("test")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .normalize_keys(true)
+            .handle(&ConfigAction::Set {
+                key: "host".into(),
+                value: "example.test".into(),
+                scope: None,
+            }),
+        "timeout-ms",
+        "section",
+    );
+    assert!(
+        !dir.path().join("test.toml").exists(),
+        "the refused set must leave no seeded file behind"
+    );
+}
+
+#[test]
+fn the_supported_pairings_still_generate() {
+    // The refusal is scoped to the incompatible combination, not to
+    // kebab schemas or to normalization. A kebab schema without
+    // normalization generates both artifacts (it is the pairing
+    // `kebab_schema_without_normalize_keys_is_the_supported_pairing`
+    // loads), and normalization over a snake_case schema is what the
+    // aliased JSON Schema exists for.
+    for action in [
+        ConfigAction::Gen { output: None },
+        ConfigAction::Schema { output: None },
+    ] {
+        assert!(
+            Clapfig::typed::<KebabApp>()
+                .app_name("test")
+                .no_env()
+                .handle(&action)
+                .is_ok(),
+            "kebab schema, no normalization"
+        );
+        assert!(
+            Clapfig::typed::<ExplicitWins>()
+                .app_name("test")
+                .no_env()
+                .normalize_keys(true)
+                .handle(&action)
+                .is_ok(),
+            "snake_case schema, normalization on"
+        );
     }
 }
 
