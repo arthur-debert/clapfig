@@ -6,9 +6,11 @@
 //! entry points (runtime `Shape` and `#[derive(Schema)]`) answer the same
 //! way, a template carrying the directive still loads as config, and
 //! omitting the reference leaves `config gen` / `config schema` output
-//! untouched byte for byte. Under `normalize_keys(true)` both artifacts
-//! name the same kebab-case keys, since an editor validating the template
-//! against a schema spelling them differently would reject every key.
+//! untouched byte for byte. Under `normalize_keys(true)` the template
+//! writes kebab-case keys and the schema accepts both that spelling and
+//! the declared snake_case one, since that builder loads either — an
+//! editor validating against a schema naming only one of them would flag
+//! a file clapfig reads without complaint.
 
 use std::collections::BTreeMap;
 
@@ -219,40 +221,69 @@ fn multiword_schema() -> RtSchema {
         .build()
 }
 
-/// Every property name the schema document declares, at any depth,
-/// paired with the JSON Pointer-ish trail that reached it — enough to
-/// assert on spelling without pinning the document's exact structure.
-fn declared_key_names(value: &serde_json::Value, out: &mut Vec<String>) {
+/// Every property name the schema document declares, at any depth —
+/// enough to assert on spelling without pinning the document's exact
+/// structure.
+fn property_names(value: &serde_json::Value, out: &mut Vec<String>) {
+    collect_member(value, "properties", &mut |child| {
+        if let Some(properties) = child.as_object() {
+            out.extend(properties.keys().cloned());
+        }
+    });
+}
+
+fn collect_member(
+    value: &serde_json::Value,
+    member: &str,
+    take: &mut impl FnMut(&serde_json::Value),
+) {
     match value {
         serde_json::Value::Object(map) => {
-            for (member, child) in map {
-                if member == "properties"
-                    && let Some(properties) = child.as_object()
-                {
-                    out.extend(properties.keys().cloned());
-                } else if member == "required"
-                    && let Some(names) = child.as_array()
-                {
-                    out.extend(names.iter().filter_map(|n| n.as_str().map(String::from)));
+            for (name, child) in map {
+                if name == member {
+                    take(child);
                 }
-                declared_key_names(child, out);
+                collect_member(child, member, take);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                declared_key_names(item, out);
+                collect_member(item, member, take);
             }
         }
         _ => {}
     }
 }
 
+/// The alias rules an object schema carries, in declaration order.
+fn alias_rules(object: &serde_json::Value) -> Vec<serde_json::Value> {
+    object
+        .get("allOf")
+        .and_then(|rules| rules.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The schema document a `normalize_keys(true)` builder over `schema`
+/// generates, parsed.
+fn normalized_document(schema: RtSchema) -> serde_json::Value {
+    let pair = Clapfig::builder(schema)
+        .app_name("app")
+        .normalize_keys(true)
+        .artifacts(&with_reference())
+        .unwrap();
+    serde_json::from_str(&pair.schema).unwrap()
+}
+
 #[test]
-fn the_schema_names_the_keys_the_template_writes_under_normalization() {
-    // The pair's promise is that the schema describes the template beside
-    // it. Object schemas are closed (`additionalProperties: false`), so a
-    // schema still spelling `pool_size` would make an editor following the
-    // directive reject every key in the generated file.
+fn the_schema_names_both_spellings_of_every_key_under_normalization() {
+    // The pair's promise is that the schema describes the documents the
+    // builder beside it loads. That builder normalizes, so it loads a
+    // multiword key written either way, and object schemas are closed
+    // (`additionalProperties: false`) — naming only one spelling would
+    // make an editor reject a file clapfig reads. The kebab half is what
+    // the generated template writes; the snake half is what the schema
+    // declares and what a user who never saw the template writes.
     let pair = Clapfig::builder(multiword_schema())
         .app_name("app")
         .normalize_keys(true)
@@ -261,30 +292,124 @@ fn the_schema_names_the_keys_the_template_writes_under_normalization() {
 
     let document: serde_json::Value = serde_json::from_str(&pair.schema).unwrap();
     let mut declared = Vec::new();
-    declared_key_names(&document, &mut declared);
+    property_names(&document, &mut declared);
 
-    for kebab in [
-        "pool-size",
-        "db-pool",
-        "max-idle",
-        "named-blocks",
-        "mount-point",
-        "step-kind",
-        "step-type",
-        "run-line",
+    for (written, alias) in [
+        ("pool-size", "pool_size"),
+        ("db-pool", "db_pool"),
+        ("max-idle", "max_idle"),
+        ("named-blocks", "named_blocks"),
+        ("mount-point", "mount_point"),
+        ("step-kind", "step_kind"),
+        ("step-type", "step_type"),
+        ("run-line", "run_line"),
     ] {
-        assert!(declared.contains(&kebab.to_string()), "{declared:?}");
+        assert!(declared.contains(&written.to_string()), "{declared:?}");
+        assert!(declared.contains(&alias.to_string()), "{declared:?}");
     }
-    let snake: Vec<&String> = declared.iter().filter(|name| name.contains('_')).collect();
-    assert!(
-        snake.is_empty(),
-        "schema still declares snake keys: {snake:?}"
-    );
 
-    // ...and the template writes exactly those.
-    for kebab in ["pool-size", "db-pool", "max-idle", "mount-point"] {
-        assert!(pair.template.contains(kebab), "{}", pair.template);
+    // The template still writes exactly one spelling: the kebab one.
+    for (written, alias) in [
+        ("pool-size", "pool_size"),
+        ("db-pool", "db_pool"),
+        ("max-idle", "max_idle"),
+        ("mount-point", "mount_point"),
+    ] {
+        assert!(pair.template.contains(written), "{}", pair.template);
+        assert!(!pair.template.contains(alias), "{}", pair.template);
     }
+}
+
+#[test]
+fn a_multiword_key_carries_the_same_subschema_under_both_spellings() {
+    // Two names for one field, so an editor gives the same type, doc, and
+    // default whichever the user typed.
+    let document = normalized_document(multiword_schema());
+    let properties = &document["properties"];
+    assert_eq!(properties["pool-size"], properties["pool_size"]);
+    assert_eq!(properties["db-pool"], properties["db_pool"]);
+    assert!(properties["pool-size"].is_object());
+}
+
+#[test]
+fn a_required_multiword_key_is_satisfied_by_either_spelling() {
+    // `required: ["api-key"]` would reject the snake spelling and
+    // `required: ["api-key", "api_key"]` would demand both, which the
+    // load path refuses. `oneOf` over the two says what the runtime
+    // means: exactly one of them.
+    let schema = RtSchema::object("App")
+        .field("api_key", Field::string())
+        .build();
+    let document = normalized_document(schema);
+
+    // The object requires the key through its alias rule, so it carries
+    // no `required` array of its own to name one spelling in.
+    assert!(document.get("required").is_none(), "{document}");
+    assert_eq!(
+        alias_rules(&document),
+        vec![serde_json::json!({
+            "oneOf": [{ "required": ["api-key"] }, { "required": ["api_key"] }]
+        })]
+    );
+}
+
+#[test]
+fn an_optional_multiword_key_may_be_written_under_at_most_one_spelling() {
+    // `pool_size` has a default, so absence is fine — but a table holding
+    // both spellings is the collision the load path refuses rather than
+    // picking a winner by key order, and the schema refuses it too.
+    let schema = RtSchema::object("App")
+        .field("pool_size", Field::integer().default(5i64))
+        .build();
+    let document = normalized_document(schema);
+
+    assert_eq!(
+        alias_rules(&document),
+        vec![serde_json::json!({
+            "not": { "required": ["pool-size", "pool_size"] }
+        })]
+    );
+}
+
+#[test]
+fn a_single_word_key_gets_one_name_and_a_plain_required_entry() {
+    // Nothing to alias: normalization only ever rewrites `_`, so these
+    // keys are spelled the one way in both artifacts and stay in
+    // `required`, where a validator's message names the missing key.
+    let schema = RtSchema::object("App")
+        .field("host", Field::string())
+        .build();
+    let document = normalized_document(schema);
+
+    let mut declared = Vec::new();
+    property_names(&document, &mut declared);
+    assert_eq!(declared, vec!["host".to_string()]);
+    assert_eq!(document["required"], serde_json::json!(["host"]));
+    assert!(alias_rules(&document).is_empty());
+}
+
+#[test]
+fn a_multiword_union_tag_is_required_under_either_spelling() {
+    // The tag is a key like any other. The discriminator is a value and
+    // keeps its declared spelling on both branches.
+    let document = normalized_document(multiword_schema());
+    let branch = &document["properties"]["step-kind"]["oneOf"][0];
+
+    assert_eq!(
+        branch["properties"]["step-type"],
+        serde_json::json!({ "type": "string", "const": "shell" })
+    );
+    assert_eq!(
+        branch["properties"]["step_type"],
+        branch["properties"]["step-type"]
+    );
+    assert!(branch.get("required").is_none(), "{branch}");
+    assert_eq!(
+        alias_rules(branch).first().unwrap(),
+        &serde_json::json!({
+            "oneOf": [{ "required": ["step-type"] }, { "required": ["step_type"] }]
+        })
+    );
 }
 
 #[test]
@@ -343,6 +468,12 @@ fn without_normalization_the_declared_spelling_is_untouched() {
     assert!(pair.schema.contains("pool_size"), "{}", pair.schema);
     assert!(!pair.schema.contains("pool-size"), "{}", pair.schema);
     assert!(pair.template.contains("pool_size"), "{}", pair.template);
+
+    // No second spelling to reconcile, so no alias rules either.
+    let document: serde_json::Value = serde_json::from_str(&pair.schema).unwrap();
+    let mut rules = Vec::new();
+    collect_member(&document, "allOf", &mut |child| rules.push(child.clone()));
+    assert!(rules.is_empty(), "{rules:?}");
 }
 
 // --- opt-out compatibility ---------------------------------------------

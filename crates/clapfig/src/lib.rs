@@ -566,10 +566,12 @@
 //! and section headers in kebab-case (`pool-size`, `[my-section]`) so the
 //! template matches what users will type. Doc comments and values are
 //! never touched. The generated JSON Schema ([`ConfigAction::Schema`] and
-//! [`Builder::artifacts`]) names the same kebab-case keys, so an external
-//! validator — an editor following a `#:schema` directive, say — accepts
-//! the template generated beside it instead of rejecting every key as
-//! unknown.
+//! [`Builder::artifacts`]) describes what is ACCEPTED rather than what is
+//! written, so it names each multiword key under both spellings — and,
+//! as loading does, refuses a document holding both at once. An external
+//! validator (an editor following a `#:schema` directive, say) then takes
+//! the kebab-case template generated beside it and a snake_case file
+//! written by hand alike, instead of rejecting one of them key by key.
 //!
 //! The persistence path (`config set`/`unset`) and `config get` (merged
 //! and scoped alike) follow the same acceptance: the action key may be

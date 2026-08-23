@@ -232,8 +232,11 @@ The generated template (`config gen`) follows the same presentation: with
 `.normalize_keys(true)`, keys and section headers are emitted in
 kebab-case so the template matches what your users will type. Doc
 comments and values are never rewritten. The generated JSON Schema
-(`config schema`, `artifacts()`) declares those same kebab-case keys, so
-an external validator accepts the template generated beside it.
+(`config schema`, `artifacts()`) declares both spellings of each multiword
+key, matching what the loader accepts: an external validator takes the
+kebab-case template generated beside it and the snake_case file a user
+wrote by hand, and — as loading does — refuses a document holding both
+spellings of one key.
 
 Environment variables are unaffected — shells dislike `-` in variable names,
 and the env layer already lower-cases segments and treats `__` as the nesting

@@ -87,12 +87,43 @@ entry of `formats(...)`, TOML unless you enable others) — the same rule
 ## Key spelling follows `normalize_keys`
 
 With `.normalize_keys(true)`, the template renders keys and section headers
-in kebab-case (`pool-size`, `[my-section]`) — and the JSON Schema names those
-same kebab keys. The two have to agree: object schemas are closed
-(`additionalProperties: false`), so a schema describing `pool_size` would
-make the editor flag every key in the template it is bound to. Tagged-union
-tag keys and variant fields follow the same renaming; discriminator *values*
-are left alone, as are doc comments and defaults.
+in kebab-case (`pool-size`, `[my-section]`) — the spelling clapfig *writes*.
+What it *reads* is wider: that builder rewrites `-` to `_` on the way in, so
+it loads `pool-size` and `pool_size` alike. The JSON Schema describes the
+wider set, naming each multiword key twice:
+
+```json
+"properties": {
+  "pool-size": { "type": "integer", "default": 5 },
+  "pool_size": { "type": "integer", "default": 5 }
+},
+"allOf": [
+  { "not": { "required": ["pool-size", "pool_size"] } }
+]
+```
+
+Both names carry the same subschema, so the editor gives the same type, doc,
+and default whichever one is typed. The rule beside them keeps the pair
+honest: a key may appear under **at most one** spelling, which is how the
+loader behaves — a document holding both is a collision it refuses rather
+than picking a winner by key order. A *required* multiword key uses `oneOf`
+over the two spellings instead, since it must appear under exactly one.
+
+Naming a single spelling would not do. Object schemas here are closed
+(`additionalProperties: false`), so a `pool_size`-only document makes the
+editor flag every key in the kebab template it is bound to, and a
+`pool-size`-only document flags a snake_case config file a user wrote by
+hand — one clapfig loads without complaint.
+
+Tagged-union tag keys and variant fields are keys, and get the same pair of
+names; discriminator *values* are left alone, as are doc comments and
+defaults. Single-word keys have nothing to alias and appear once.
+
+Two names, not every name: a key of three or more words also loads
+hand-mixed (`max-retry_count`), and the schema does not describe that.
+Spelling out the combinations would multiply such a key's properties by
+`2^(words - 1)`, and an editor's completion list with them, to describe a
+form neither clapfig nor any convention writes.
 
 `config schema` on its own emits that same document, so the standalone action
 and `artifacts()` never describe the config file differently.
@@ -109,7 +140,8 @@ nothing downstream has to know about it.
 `bin/tombi-proof.sh` generates an
 [edward](https://github.com/arthur-debert/edward)-shaped pair through the
 `schema_directive` example and runs tombi against it: the generated template
-validates, a filled-in block instance validates, and an unknown key is
+validates, a filled-in block instance validates under either spelling of its
+multiword key, both spellings at once are rejected, and an unknown key is
 rejected — the last one being the control that shows the directive is
 actually resolved. tombi runs from a pinned `uvx` release, so the check needs
 nothing installed globally.

@@ -11,7 +11,8 @@
 //! table of user-named block instances, each naming its kind and mount —
 //! because that is the consumer the artifact pair was built for. It runs
 //! with `normalize_keys(true)`, so the multiword `load_order` field is
-//! written `load-order` in both artifacts.
+//! written `load-order` in the template and accepted under either
+//! spelling by the schema.
 //!
 //! ## Running
 //!
@@ -52,9 +53,10 @@ struct BlockDecl {
     disabled: bool,
 
     // Multiword on purpose: under the `normalize_keys(true)` below, the
-    // template writes `load-order`, so the schema beside it has to declare
-    // that same spelling or an editor following the directive rejects the
-    // generated file. Doc comments reach users, so this note is not one.
+    // template writes `load-order` while the loader still takes
+    // `load_order`, so the schema beside it has to name both or an editor
+    // following the directive rejects a file clapfig reads. Doc comments
+    // reach users, so this note is not one.
     /// Order this block is provisioned in, lowest first.
     #[clapfig(default = 0)]
     load_order: i64,
@@ -80,7 +82,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .app_name("edward")
         .file_name(TEMPLATE_FILE)
         // Kebab-case keys in the generated file — and, because the pair
-        // is generated from one shape, in the schema describing it.
+        // is generated from one shape, a schema that accepts them (along
+        // with the declared snake_case spellings the loader also takes).
         .normalize_keys(true)
         .artifacts(&options)?;
 

@@ -405,10 +405,15 @@ impl Builder {
     /// deserialization. snake_case keys continue to work unchanged; this is
     /// purely additive. Environment variables are unaffected.
     ///
-    /// Everything clapfig *generates* switches to the kebab spelling with
-    /// it: the template `config gen` and file seeding render, and the JSON
-    /// Schema `config schema` and [`artifacts`](Self::artifacts) emit — the
-    /// two describe the same keys either way.
+    /// Everything clapfig *writes* switches to the kebab spelling with
+    /// it: the template `config gen` and file seeding render, and the
+    /// keys the persistence path adds. What it *accepts* stays wider, and
+    /// the generated JSON Schema (`config schema` and
+    /// [`artifacts`](Self::artifacts)) says so: it names a multiword key
+    /// under both spellings, so an external validator takes the kebab
+    /// template clapfig generated and a snake_case file a user wrote by
+    /// hand alike, and — as the load path does — refuses a document
+    /// holding both spellings of one key.
     pub fn normalize_keys(mut self, normalize: bool) -> Self {
         self.normalize_keys = normalize;
         self
@@ -912,13 +917,12 @@ impl Builder {
                 }
             }
             ConfigAction::Schema { output } => {
-                // The same effective shape `config gen` renders, so under
-                // `normalize_keys(true)` the schema names the kebab keys
-                // the template writes instead of rejecting them.
-                let schema = crate::artifacts::schema_document(&crate::ops::effective_shape(
-                    self.schema.as_shape(),
-                    self.normalize_keys,
-                ));
+                // Spelled for the same acceptance `config gen`'s template
+                // is written for: under `normalize_keys(true)` the schema
+                // names both the kebab keys the template writes and the
+                // declared snake_case ones, instead of rejecting either.
+                let schema =
+                    crate::artifacts::schema_document(self.schema.as_shape(), self.normalize_keys);
                 match output {
                     Some(path) => {
                         if let Some(parent) = path.parent() {

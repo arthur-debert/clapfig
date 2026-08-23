@@ -18,12 +18,14 @@
 //!   materializes as the empty one), and a nested section is required
 //!   only if it transitively contains a required leaf. An external
 //!   validator therefore accepts exactly the documents clapfig loads.
-//! - **Key spelling**: whatever the handed-in shape declares. The
-//!   builder's `config schema` action and
-//!   [`Builder::artifacts`](crate::Builder::artifacts) hand over the
-//!   kebab-renamed shape under
-//!   [`normalize_keys(true)`](crate::Builder::normalize_keys), so the
-//!   document names the keys the generated template writes.
+//! - **Key spelling**: [`KeySpelling`]. By default, whatever the
+//!   handed-in shape declares. The builder's `config schema` action and
+//!   [`Builder::artifacts`](crate::Builder::artifacts) ask for
+//!   [`KeySpelling::Normalized`] under
+//!   [`normalize_keys(true)`](crate::Builder::normalize_keys), which
+//!   names a multiword field twice — the kebab-case spelling the
+//!   template writes and the declared snake_case one — because the
+//!   runtime loads either.
 //! - **Docs**: schema and field doc lines become `description`.
 //! - **Types**: converted recursively from each node's [`Shape`](crate::runtime::Shape)
 //!   / [`LeafType`]. String → `"string"`, integer → `"integer"` (with
@@ -130,6 +132,93 @@ fn comment_key_allowlist() -> Value {
     json!({ COMMENT_KEY_PATTERN: {} })
 }
 
+/// Which spellings of a multiword key the generated document accepts.
+///
+/// A `normalize_keys(true)` builder rewrites `-` to `_` on every key
+/// crossing into clapfig, so it loads a field declared `pool_size`
+/// written either `pool_size` or `pool-size`, and it renders the kebab
+/// spelling into templates and into files it seeds. Object schemas here
+/// are closed (`additionalProperties: false`), so naming only one of the
+/// two spellings would make an external validator reject documents
+/// clapfig accepts — the kebab-case template beside the schema, or a
+/// hand-written snake_case config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeySpelling {
+    /// One name per key: the one the shape declares. What a builder
+    /// without [`normalize_keys`](crate::Builder::normalize_keys) both
+    /// accepts and writes.
+    Declared,
+    /// Two names for every key holding a `_`: the kebab-case spelling
+    /// clapfig writes, plus the declared snake_case one as an alias. The
+    /// two carry the same subschema, and an [alias rule](alias_rule)
+    /// keeps the pair's presence honest — a required key must appear
+    /// under exactly one spelling, an optional one under at most one,
+    /// matching the runtime's refusal to load a table holding both
+    /// (`ClapfigError::NormalizedKeyCollision`).
+    ///
+    /// Two names, not every name: a key of three or more words also
+    /// loads hand-mixed (`max-retry_count`), and the document does not
+    /// describe that. Spelling out the combinations would multiply such
+    /// a key's properties by `2^(words - 1)` — and lengthen an editor's
+    /// completion list by as much — to describe a form neither clapfig
+    /// nor any convention produces.
+    Normalized,
+}
+
+impl KeySpelling {
+    /// The spelling policy for a builder whose
+    /// [`normalize_keys`](crate::Builder::normalize_keys) is `normalize`.
+    pub(crate) fn for_normalize(normalize: bool) -> Self {
+        if normalize {
+            KeySpelling::Normalized
+        } else {
+            KeySpelling::Declared
+        }
+    }
+
+    /// Split a declared key into the name the document lists first — the
+    /// one clapfig writes — and the alias it also accepts, if the two
+    /// differ.
+    ///
+    /// Under [`Normalized`](Self::Normalized) that is
+    /// [`kebab_key`](crate::normalize::kebab_key) of the declared name,
+    /// the same rewrite the template renderer applies, with the declared
+    /// name as the alias. A single-word key (and any key the renderer
+    /// leaves alone) has no alias.
+    fn split(self, declared: &str) -> (String, Option<String>) {
+        match self {
+            KeySpelling::Declared => (declared.to_string(), None),
+            KeySpelling::Normalized => {
+                let written = crate::normalize::kebab_key(declared);
+                if written == declared {
+                    (written, None)
+                } else {
+                    (written, Some(declared.to_string()))
+                }
+            }
+        }
+    }
+}
+
+/// The presence constraint for one key carrying both spellings.
+///
+/// A required key gets `oneOf` over the two: written under neither
+/// spelling no branch matches, written under both every branch matches
+/// and `oneOf` demands exactly one — so the key must be present, once.
+/// An optional key needs only that second half, as `not` over requiring
+/// both.
+///
+/// Mirrors the load path's collision rule, which refuses a table holding
+/// two keys that normalize to the same name rather than picking one by
+/// iteration order.
+fn alias_rule(written: &str, alias: &str, required: bool) -> Value {
+    if required {
+        json!({ "oneOf": [ { "required": [written] }, { "required": [alias] } ] })
+    } else {
+        json!({ "not": { "required": [written, alias] } })
+    }
+}
+
 /// Generate a JSON Schema document from a document-root [`Shape`].
 ///
 /// Accepts `impl Into<Shape>`. Object-root callers pass a [`Schema`]
@@ -147,16 +236,18 @@ fn comment_key_allowlist() -> Value {
 /// Returns a `serde_json::Value` — the caller serializes it to a string,
 /// writes it to a file, or embeds it wherever needed.
 pub fn generate_schema(shape: impl Into<Shape>) -> Value {
-    generate_schema_ref(&shape.into())
+    generate_schema_ref(&shape.into(), KeySpelling::Declared)
 }
 
-/// Borrowed walk for crate-internal holders of `&Shape`. Public callers
-/// go through [`generate_schema`].
-pub(crate) fn generate_schema_ref(shape: &Shape) -> Value {
+/// Borrowed walk for crate-internal holders of `&Shape`, spelling keys
+/// per `spelling`. Public callers go through [`generate_schema`], which
+/// has no builder to read a normalization setting off and so describes
+/// the shape as declared.
+pub(crate) fn generate_schema_ref(shape: &Shape, spelling: KeySpelling) -> Value {
     let mut root = match shape {
-        Shape::Object(schema) => schema_to_object(schema),
-        Shape::Map(map) => map_root_to_object(map),
-        Shape::Tagged(tagged) => tagged_to_schema(tagged),
+        Shape::Object(schema) => schema_to_object(schema, spelling),
+        Shape::Map(map) => map_root_to_object(map, spelling),
+        Shape::Tagged(tagged) => tagged_to_schema(tagged, spelling),
         Shape::Leaf(_) | Shape::Array(_) => panic!(
             "clapfig: a Leaf or Array is not a legal document root (legal roots: Object, Map, Tagged)"
         ),
@@ -169,7 +260,7 @@ pub(crate) fn generate_schema_ref(shape: &Shape) -> Value {
 
 /// JSON Schema for a root homogeneous map: `type: object` plus
 /// `additionalProperties` of the item, at the document root.
-fn map_root_to_object(map: &crate::runtime::MapShape) -> Value {
+fn map_root_to_object(map: &crate::runtime::MapShape, spelling: KeySpelling) -> Value {
     let mut obj = Map::new();
     obj.insert("type".into(), Value::String("object".into()));
     if !map.name.is_empty() {
@@ -179,14 +270,14 @@ fn map_root_to_object(map: &crate::runtime::MapShape) -> Value {
         obj.insert("description".into(), Value::String(join_doc(&map.doc)));
     }
     obj.insert("patternProperties".into(), comment_key_allowlist());
-    if let Some(entry) = shape_to_schema(&map.item) {
+    if let Some(entry) = shape_to_schema(&map.item, spelling) {
         obj.insert("additionalProperties".into(), entry);
     }
     Value::Object(obj)
 }
 
 /// Convert a schema node into a JSON Schema object.
-fn schema_to_object(schema: &Schema) -> Value {
+fn schema_to_object(schema: &Schema, spelling: KeySpelling) -> Value {
     let mut obj = Map::new();
     obj.insert("type".into(), Value::String("object".into()));
     obj.insert("title".into(), Value::String(schema.name.clone()));
@@ -196,18 +287,35 @@ fn schema_to_object(schema: &Schema) -> Value {
 
     let mut properties = Map::new();
     let mut required = Vec::new();
+    let mut alias_rules = Vec::new();
 
     for field in &schema.fields {
-        let (name, prop, is_required) = field_to_property(field);
-        if is_required {
-            required.push(Value::String(name.clone()));
+        let (prop, is_required) = field_to_property(field, spelling);
+        match spelling.split(&field.name) {
+            // One spelling: `required` names it directly.
+            (name, None) => {
+                if is_required {
+                    required.push(Value::String(name.clone()));
+                }
+                properties.insert(name, prop);
+            }
+            // Two spellings of one field: both properties carry the same
+            // subschema, and the alias rule — not `required` — says how
+            // many of them a document may hold.
+            (written, Some(alias)) => {
+                alias_rules.push(alias_rule(&written, &alias, is_required));
+                properties.insert(written, prop.clone());
+                properties.insert(alias, prop);
+            }
         }
-        properties.insert(name, prop);
     }
 
     obj.insert("properties".into(), Value::Object(properties));
     if !required.is_empty() {
         obj.insert("required".into(), Value::Array(required));
+    }
+    if !alias_rules.is_empty() {
+        obj.insert("allOf".into(), Value::Array(alias_rules));
     }
     obj.insert("patternProperties".into(), comment_key_allowlist());
     obj.insert("additionalProperties".into(), Value::Bool(false));
@@ -215,7 +323,9 @@ fn schema_to_object(schema: &Schema) -> Value {
     Value::Object(obj)
 }
 
-/// Convert a [`NamedField`] into a `(name, schema, required)` triple.
+/// Convert a [`NamedField`] into a `(schema, required)` pair. Naming is
+/// the caller's ([`KeySpelling::split`]), since a field can be listed
+/// under more than one spelling.
 ///
 /// `required` mirrors the runtime's absence rules: `true` for a
 /// [`Shape::Leaf`] that is non-optional AND defaultless, and for a nested
@@ -223,11 +333,11 @@ fn schema_to_object(schema: &Schema) -> Value {
 /// ([`schema_requires_presence`]). [`Shape::Array`] and [`Shape::Map`]
 /// are never required — an absent non-optional array/map materializes as
 /// the empty array/map.
-fn field_to_property(field: &NamedField) -> (String, Value, bool) {
+fn field_to_property(field: &NamedField, spelling: KeySpelling) -> (Value, bool) {
     match &field.field {
         Shape::Object(nested) => {
-            let schema = schema_to_object(nested);
-            (field.name.clone(), schema, schema_requires_presence(nested))
+            let schema = schema_to_object(nested, spelling);
+            (schema, schema_requires_presence(nested))
         }
         Shape::Array(array) => {
             // JSON Schema for an array field: `type: array` with
@@ -242,11 +352,11 @@ fn field_to_property(field: &NamedField) -> (String, Value, bool) {
                 prop.insert("description".into(), Value::String(join_doc(&array.doc)));
             }
             prop.insert("type".into(), Value::String("array".into()));
-            if let Some(items) = shape_to_schema(&array.item) {
+            if let Some(items) = shape_to_schema(&array.item, spelling) {
                 prop.insert("items".into(), items);
             }
             populate_container_attrs(&mut prop, array.default.as_ref(), array.env.as_deref());
-            (field.name.clone(), Value::Object(prop), false)
+            (Value::Object(prop), false)
         }
         Shape::Map(map) => {
             // TOML `[name.<key>]` / homogeneous map: `type: object` with
@@ -259,11 +369,11 @@ fn field_to_property(field: &NamedField) -> (String, Value, bool) {
             // Comment keys inside a map instance are comments, not
             // entries — allowlist them so they escape the entry schema.
             prop.insert("patternProperties".into(), comment_key_allowlist());
-            if let Some(entry) = shape_to_schema(&map.item) {
+            if let Some(entry) = shape_to_schema(&map.item, spelling) {
                 prop.insert("additionalProperties".into(), entry);
             }
             populate_container_attrs(&mut prop, map.default.as_ref(), map.env.as_deref());
-            (field.name.clone(), Value::Object(prop), false)
+            (Value::Object(prop), false)
         }
         Shape::Leaf(leaf) => {
             let mut prop = Map::new();
@@ -272,24 +382,24 @@ fn field_to_property(field: &NamedField) -> (String, Value, bool) {
             }
             populate_leaf(&mut prop, leaf);
             let required = !leaf.optional && leaf.default.is_none();
-            (field.name.clone(), Value::Object(prop), required)
+            (Value::Object(prop), required)
         }
         Shape::Tagged(tagged) => {
             // Absent tagged object → empty table → MissingRequired on the
             // tag, so the property is required on the parent.
-            (field.name.clone(), tagged_to_schema(tagged), true)
+            (tagged_to_schema(tagged, spelling), true)
         }
     }
 }
 
-fn shape_to_schema(shape: &Shape) -> Option<Value> {
+fn shape_to_schema(shape: &Shape, spelling: KeySpelling) -> Option<Value> {
     match shape {
-        Shape::Object(schema) => Some(schema_to_object(schema)),
+        Shape::Object(schema) => Some(schema_to_object(schema, spelling)),
         Shape::Leaf(leaf) => leaf_type_to_schema(&leaf.ty).map(Value::Object),
         Shape::Array(array) => {
             let mut obj = Map::new();
             obj.insert("type".into(), Value::String("array".into()));
-            if let Some(items) = shape_to_schema(&array.item) {
+            if let Some(items) = shape_to_schema(&array.item, spelling) {
                 obj.insert("items".into(), items);
             }
             Some(Value::Object(obj))
@@ -298,19 +408,19 @@ fn shape_to_schema(shape: &Shape) -> Option<Value> {
             let mut obj = Map::new();
             obj.insert("type".into(), Value::String("object".into()));
             obj.insert("patternProperties".into(), comment_key_allowlist());
-            if let Some(entry) = shape_to_schema(&map.item) {
+            if let Some(entry) = shape_to_schema(&map.item, spelling) {
                 obj.insert("additionalProperties".into(), entry);
             }
             Some(Value::Object(obj))
         }
-        Shape::Tagged(tagged) => Some(tagged_to_schema(tagged)),
+        Shape::Tagged(tagged) => Some(tagged_to_schema(tagged, spelling)),
     }
 }
 
 /// JSON Schema for an internally tagged union: `oneOf` of variant objects,
 /// each with the tag as a required `{ "const": "<discriminator>" }`
 /// property. No OpenAPI `discriminator`.
-fn tagged_to_schema(tagged: &TaggedShape) -> Value {
+fn tagged_to_schema(tagged: &TaggedShape, spelling: KeySpelling) -> Value {
     let mut obj = Map::new();
     if !tagged.name.is_empty() {
         obj.insert("title".into(), Value::String(tagged.name.clone()));
@@ -321,7 +431,7 @@ fn tagged_to_schema(tagged: &TaggedShape) -> Value {
     let branches = tagged
         .variants
         .iter()
-        .map(|variant| tagged_branch_schema(tagged, variant))
+        .map(|variant| tagged_branch_schema(tagged, variant, spelling))
         .collect();
     obj.insert("oneOf".into(), Value::Array(branches));
     Value::Object(obj)
@@ -329,32 +439,54 @@ fn tagged_to_schema(tagged: &TaggedShape) -> Value {
 
 /// One `oneOf` branch: the variant object plus the tag field as a
 /// required string `const`.
-fn tagged_branch_schema(tagged: &TaggedShape, variant: &TaggedVariant) -> Value {
-    let mut object = schema_to_object(&variant.schema);
+///
+/// The tag is a key like any other, so it follows `spelling`: under
+/// [`KeySpelling::Normalized`] a multiword tag is listed under both
+/// spellings and required through the branch's
+/// [alias rule](alias_rule) instead of the plain `required` array. The
+/// discriminator is a *value* and is never respelled.
+fn tagged_branch_schema(
+    tagged: &TaggedShape,
+    variant: &TaggedVariant,
+    spelling: KeySpelling,
+) -> Value {
+    let mut object = schema_to_object(&variant.schema, spelling);
     let Value::Object(map) = &mut object else {
         return object;
     };
     let tag_schema = json!({ "type": "string", "const": variant.discriminator });
+    let (tag, tag_alias) = spelling.split(&tagged.tag);
     if let Some(Value::Object(props)) = map.get_mut("properties") {
         let mut ordered = Map::new();
-        ordered.insert(tagged.tag.clone(), tag_schema);
+        ordered.insert(tag.clone(), tag_schema.clone());
+        if let Some(alias) = &tag_alias {
+            ordered.insert(alias.clone(), tag_schema);
+        }
         for (key, value) in props.clone() {
             ordered.insert(key, value);
         }
         *props = ordered;
     }
-    match map.get_mut("required") {
-        Some(Value::Array(req)) => {
-            if !req
-                .iter()
-                .any(|value| value.as_str() == Some(tagged.tag.as_str()))
-            {
-                req.insert(0, Value::String(tagged.tag.clone()));
+    match &tag_alias {
+        Some(alias) => {
+            let rule = alias_rule(&tag, alias, true);
+            match map.get_mut("allOf") {
+                Some(Value::Array(rules)) => rules.insert(0, rule),
+                _ => {
+                    map.insert("allOf".into(), Value::Array(vec![rule]));
+                }
             }
         }
-        _ => {
-            map.insert("required".into(), json!([tagged.tag]));
-        }
+        None => match map.get_mut("required") {
+            Some(Value::Array(req)) => {
+                if !req.iter().any(|value| value.as_str() == Some(tag.as_str())) {
+                    req.insert(0, Value::String(tag));
+                }
+            }
+            _ => {
+                map.insert("required".into(), json!([tag]));
+            }
+        },
     }
     object
 }
@@ -578,9 +710,56 @@ mod tests {
     }
 
     #[test]
+    fn the_public_entry_point_spells_keys_as_declared() {
+        // `generate_schema` takes a shape and nothing else — no builder to
+        // read a normalization setting off — so it describes the schema as
+        // written, one name per key. Aliasing is the builder's call.
+        let shape = Shape::from(
+            Schema::object("App")
+                .field("pool_size", crate::runtime::Field::integer().default(5i64))
+                .build(),
+        );
+        let declared = generate_schema(shape.clone());
+        assert!(declared["properties"].get("pool_size").is_some());
+        assert!(declared["properties"].get("pool-size").is_none());
+        assert!(declared.get("allOf").is_none());
+
+        let normalized = generate_schema_ref(&shape, KeySpelling::Normalized);
+        assert_eq!(
+            normalized["properties"]["pool-size"],
+            normalized["properties"]["pool_size"]
+        );
+    }
+
+    #[test]
+    fn map_entry_keys_are_aliased_through_the_entry_schema() {
+        // A map's keys are user data and are never respelled, but the
+        // entry object's own fields are keys like any other.
+        let shape = Shape::from(
+            Schema::object("App")
+                .map_of(
+                    "blocks",
+                    Schema::object("Block")
+                        .field("mount_point", crate::runtime::Field::string().default(".")),
+                )
+                .build(),
+        );
+        let document = generate_schema_ref(&shape, KeySpelling::Normalized);
+        let entry = &document["properties"]["blocks"]["additionalProperties"];
+        assert_eq!(
+            entry["properties"]["mount-point"],
+            entry["properties"]["mount_point"]
+        );
+        assert_eq!(
+            entry["allOf"],
+            json!([{ "not": { "required": ["mount-point", "mount_point"] } }])
+        );
+    }
+
+    #[test]
     fn generate_schema_ref_matches_owned_wrapper() {
         assert_eq!(
-            generate_schema_ref(&Shape::from(test_schema())),
+            generate_schema_ref(&Shape::from(test_schema()), KeySpelling::Declared),
             generate_schema(test_schema()),
         );
     }
