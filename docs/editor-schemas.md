@@ -128,6 +128,24 @@ form neither clapfig nor any convention writes.
 `config schema` on its own emits that same document, so the standalone action
 and `artifacts()` never describe the config file differently.
 
+### A kebab-*declared* schema is the one thing normalization cannot pair with
+
+Everything above assumes the schema declares its keys in snake_case and
+normalization widens what reaches them. Declare a key with a `-` already in
+it — from `#[serde(rename_all = "kebab-case")]`, from `SCREAMING-KEBAB-CASE`,
+or from an explicit rename — and `.normalize_keys(true)` puts it out of reach
+instead: every incoming key has its `-` rewritten to `_` before validation, so
+a file writing `listen-port` arrives as `listen_port`, which the schema does
+not declare. No spelling reaches the field, and a required one fails every
+load.
+
+So `config gen`, `config schema`, and `artifacts()` refuse that combination
+with `ClapfigError::UnreachableNormalizedKey` rather than emit a template or a
+schema spelling keys the same builder's loader rejects. Declare the key
+`listen_port` (generated templates still *write* `listen-port`), or drop
+`.normalize_keys(true)` — a kebab-declared schema without it is a supported
+pairing, and its template loads back unchanged.
+
 ## The directive is a comment
 
 `#:schema …` is an ordinary TOML comment, so a generated file carrying it

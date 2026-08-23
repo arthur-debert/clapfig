@@ -260,7 +260,11 @@ myapp config schema --output myapp-schema.json
 The document names the keys the builder accepts. With `normalize_keys(true)`
 on, that is both spellings of every multiword key — the kebab-case one
 `config gen` writes and the declared snake_case one — so a validator reading
-the schema takes the generated template and a hand-written config alike.
+the schema takes the generated template and a hand-written config alike. A
+schema that *declares* kebab-case keys is the exception: normalization
+rewrites them out of reach, so `config gen`, `config schema`, and
+`artifacts()` refuse that builder rather than generate under unreachable
+names.
 
 To generate the template and the JSON Schema **together** — bound by the
 `#:schema` directive a TOML editor reads to validate the file as the user

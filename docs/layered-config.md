@@ -238,6 +238,14 @@ kebab-case template generated beside it and the snake_case file a user
 wrote by hand, and — as loading does — refuses a document holding both
 spellings of one key.
 
+One schema shape cannot be paired with normalization at all: one that
+*declares* a key with a `-` in it (a `rename_all = "kebab-case"` struct, say).
+Normalization rewrites that `-` to `_` on the way in, so no written spelling
+reaches the field. `config gen`, `config schema`, and `artifacts()` refuse
+such a builder with `ClapfigError::UnreachableNormalizedKey` instead of
+generating under names it would then reject; declare the key in snake_case
+(the template still writes kebab), or leave `normalize_keys` off.
+
 Environment variables are unaffected — shells dislike `-` in variable names,
 and the env layer already lower-cases segments and treats `__` as the nesting
 separator.

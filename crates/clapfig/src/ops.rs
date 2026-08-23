@@ -162,6 +162,14 @@ fn kebab_rename_shape(shape: &mut Shape) {
 /// wider — either spelling of a multiword key — and describing that is
 /// `json_schema::KeySpelling`'s job, not this one's.
 ///
+/// With `kebab` set the shape must first be reachable under
+/// normalization ([`check_shape_reachable`](crate::normalize::check_shape_reachable)):
+/// a schema declaring a key that already holds a `-` gets
+/// [`UnreachableNormalizedKey`](ClapfigError::UnreachableNormalizedKey)
+/// rather than a template whose keys this builder's own loader would
+/// reject. Without `kebab` the shape renders as declared and is passed
+/// through borrowed — no rename, so no copy.
+///
 /// The template body — doc comments, `Allowed:` enum lines, commented
 /// placeholders for defaultless leaves — is the adapter's
 /// [`template`](crate::format::FormatAdapter::template) output; this
@@ -172,12 +180,12 @@ pub(crate) fn generate_template(
     shape: &Shape,
     kebab: bool,
 ) -> Result<String, ClapfigError> {
-    let shaped = if kebab {
-        kebab_renamed_shape(shape)
-    } else {
-        shape.clone()
-    };
-    Ok(adapter.template(&shaped)?)
+    if !kebab {
+        return Ok(adapter.template(shape)?);
+    }
+    crate::normalize::check_shape_reachable(shape)
+        .map_err(crate::normalize::UnreachableKey::into_error)?;
+    Ok(adapter.template(&kebab_renamed_shape(shape))?)
 }
 
 /// Recursively rewrite field names in a document-root shape to kebab-case.

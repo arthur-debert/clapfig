@@ -332,6 +332,38 @@ pub enum ClapfigError {
         originals: Vec<String>,
     },
 
+    /// With `.normalize_keys(true)` enabled, the schema declares a key
+    /// that canonicalization can never produce, so no config document can
+    /// reach it: normalization rewrites `-` to `_` on every incoming key,
+    /// and this key holds a `-` (a `rename_all = "kebab-case"` schema, a
+    /// `SCREAMING-KEBAB-CASE` one, or an explicit rename). Written under
+    /// its declared spelling the key arrives normalized and lands in
+    /// `UnknownKeys`; written under the normalized spelling it is not
+    /// what the schema declares — and a required field then also fails
+    /// `MissingRequired`. The two features are mutually exclusive.
+    ///
+    /// Raised where clapfig would otherwise GENERATE under those names —
+    /// `config gen`, `config schema`, and
+    /// [`artifacts`](crate::Builder::artifacts) — so a template or JSON
+    /// Schema is never emitted spelling keys the same builder's loader
+    /// rejects. Loading itself keeps refusing key by key, unchanged. Fix
+    /// by declaring the key in its normalized spelling (templates then
+    /// still WRITE the kebab one) or by dropping `.normalize_keys(true)`.
+    #[error(
+        "Schema key '{key}'{} cannot be reached with normalize_keys(true): every incoming key has '-' rewritten to '_' before validation, so a document writing '{key}' arrives as '{normalized}', which the schema does not declare. Declare the key as '{normalized}' (generated templates still write '{key}'), or drop .normalize_keys(true)",
+        if section.is_empty() { String::new() } else { format!(" (under [{section}])") },
+    )]
+    UnreachableNormalizedKey {
+        /// Dotted path to the section declaring the key. Empty for the
+        /// document root.
+        section: String,
+        /// The declared name, as the schema spells it.
+        key: String,
+        /// What that name becomes under canonicalization — the spelling
+        /// the loader looks for and does not find.
+        normalized: String,
+    },
+
     /// A required field declared by the [`Schema`](crate::runtime::Schema)
     /// was not supplied by any layer and has no default.
     ///

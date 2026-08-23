@@ -18,14 +18,17 @@
 //!   materializes as the empty one), and a nested section is required
 //!   only if it transitively contains a required leaf. An external
 //!   validator therefore accepts exactly the documents clapfig loads.
-//! - **Key spelling**: [`KeySpelling`]. By default, whatever the
-//!   handed-in shape declares. The builder's `config schema` action and
-//!   [`Builder::artifacts`](crate::Builder::artifacts) ask for
-//!   [`KeySpelling::Normalized`] under
-//!   [`normalize_keys(true)`](crate::Builder::normalize_keys), which
-//!   names a multiword field twice — the kebab-case spelling the
-//!   template writes and the declared snake_case one — because the
-//!   runtime loads either.
+//! - **Key spelling**: [`generate_schema`] names every key exactly as the
+//!   handed-in shape declares it — a shape is all it takes, so there is no
+//!   normalization setting for it to read. The builder's `config schema`
+//!   action and [`Builder::artifacts`](crate::Builder::artifacts) do know
+//!   that setting: under
+//!   [`normalize_keys(true)`](crate::Builder::normalize_keys) they name a
+//!   multiword field twice — the kebab-case spelling the template writes
+//!   and the declared snake_case one — because the runtime loads either.
+//!   Both refuse a schema whose declared keys already hold a `-`, which
+//!   normalization puts out of reach of any spelling
+//!   ([`UnreachableNormalizedKey`](crate::error::ClapfigError::UnreachableNormalizedKey)).
 //! - **Docs**: schema and field doc lines become `description`.
 //! - **Types**: converted recursively from each node's [`Shape`](crate::runtime::Shape)
 //!   / [`LeafType`]. String → `"string"`, integer → `"integer"` (with
@@ -458,9 +461,14 @@ fn tagged_branch_schema(
     let (tag, tag_alias) = spelling.split(&tagged.tag);
     if let Some(Value::Object(props)) = map.get_mut("properties") {
         let mut ordered = Map::new();
-        ordered.insert(tag.clone(), tag_schema.clone());
-        if let Some(alias) = &tag_alias {
-            ordered.insert(alias.clone(), tag_schema);
+        match &tag_alias {
+            Some(alias) => {
+                ordered.insert(tag.clone(), tag_schema.clone());
+                ordered.insert(alias.clone(), tag_schema);
+            }
+            None => {
+                ordered.insert(tag.clone(), tag_schema);
+            }
         }
         for (key, value) in props.clone() {
             ordered.insert(key, value);

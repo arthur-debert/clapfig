@@ -21,6 +21,7 @@
 use std::collections::BTreeMap;
 
 use crate::format::{ConfigPath, PathSegment, SpanEntry};
+use crate::runtime::{Schema, Shape};
 use crate::value::{Map, Value};
 
 /// Two distinct keys in the same table collapsed to the same normalized form.
@@ -68,6 +69,102 @@ pub fn normalize_key(key: &str) -> String {
 /// writes for paths not already present in a document).
 pub fn kebab_key(key: &str) -> String {
     key.replace('_', "-")
+}
+
+/// A declared schema key that input canonicalization can never produce.
+///
+/// [`normalize_key`] rewrites every `-` to `_`, so a key reaching
+/// validation never holds a `-`. A field declared with one — from
+/// `rename_all = "kebab-case"`, from `SCREAMING-KEBAB-CASE`, or from an
+/// explicit rename — is therefore unreachable under
+/// [`normalize_keys(true)`](crate::Builder::normalize_keys): whatever
+/// spelling a user writes normalizes to something else, so the loader
+/// answers with `UnknownKeys` for the key it did get and, if the field
+/// is required, `MissingRequired` for the one it did not. Surfaced from
+/// [`check_shape_reachable`] and wrapped via
+/// [`UnreachableKey::into_error`].
+#[derive(Debug, Clone)]
+pub(crate) struct UnreachableKey {
+    /// Dotted path to the section declaring the key. Empty for the
+    /// document root.
+    pub section: String,
+    /// The declared name no written spelling normalizes to.
+    pub key: String,
+}
+
+impl UnreachableKey {
+    /// Wrap into [`ClapfigError::UnreachableNormalizedKey`], computing
+    /// the name the key actually arrives under. Every surfacing site —
+    /// template generation, JSON Schema generation, the artifact pair —
+    /// goes through this one constructor.
+    ///
+    /// [`ClapfigError::UnreachableNormalizedKey`]: crate::error::ClapfigError::UnreachableNormalizedKey
+    pub(crate) fn into_error(self) -> crate::error::ClapfigError {
+        crate::error::ClapfigError::UnreachableNormalizedKey {
+            normalized: normalize_key(&self.key),
+            section: self.section,
+            key: self.key,
+        }
+    }
+}
+
+/// Whole-shape reachability check for a `normalize_keys(true)` builder:
+/// every key the shape declares, at every depth, must be stable under
+/// [`normalize_key`] — otherwise nothing a user can write reaches it.
+///
+/// The generation-side counterpart to [`check_collisions`]. Load already
+/// refuses a document whose keys miss such a field, key by key; this
+/// refuses the artifacts — template, JSON Schema, or the pair — that
+/// would otherwise be generated under names that same loader rejects.
+/// Callers that do not normalize skip it: a declared `listen-port` is
+/// matched literally and is perfectly reachable then.
+pub(crate) fn check_shape_reachable(shape: &Shape) -> Result<(), UnreachableKey> {
+    reachable_at(shape, "")
+}
+
+fn reachable_at(shape: &Shape, section: &str) -> Result<(), UnreachableKey> {
+    match shape {
+        Shape::Leaf(_) => Ok(()),
+        Shape::Object(schema) => reachable_fields(schema, section),
+        // An array element is addressed by index and a map entry by a
+        // user-chosen key; normalization respells neither. Only the
+        // item's own declared fields are schema keys.
+        Shape::Array(array) => reachable_at(&array.item, section),
+        Shape::Map(map) => reachable_at(&map.item, section),
+        Shape::Tagged(tagged) => {
+            // The tag is a key like any other. Discriminators are
+            // *values* and are never normalized.
+            reachable_key(&tagged.tag, section)?;
+            for variant in &tagged.variants {
+                reachable_fields(&variant.schema, section)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn reachable_fields(schema: &Schema, section: &str) -> Result<(), UnreachableKey> {
+    for field in &schema.fields {
+        reachable_key(&field.name, section)?;
+        let nested = if section.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{section}.{}", field.name)
+        };
+        reachable_at(&field.field, &nested)?;
+    }
+    Ok(())
+}
+
+fn reachable_key(key: &str, section: &str) -> Result<(), UnreachableKey> {
+    if normalize_key(key) == key {
+        Ok(())
+    } else {
+        Err(UnreachableKey {
+            section: section.to_string(),
+            key: key.to_string(),
+        })
+    }
 }
 
 /// Resolve one canonical snake_case path segment against a table's keys
@@ -214,6 +311,127 @@ mod tests {
 
     fn table(toml_str: &str) -> Map {
         crate::fixtures::test::parse_toml(toml_str)
+    }
+
+    // -- Reachability under normalization ---------------------------------
+    //
+    // `check_shape_reachable` answers one question per declared key: can
+    // anything a user writes normalize to it? The walk has to reach every
+    // key position a document can address — object fields at any depth,
+    // an array element's fields, a map entry's fields, and a tagged
+    // union's tag and per-variant fields — because a schema is refused or
+    // accepted as a whole.
+
+    fn kebab_field_object() -> crate::runtime::Schema {
+        crate::runtime::Schema::object("Inner")
+            .field("listen-port", crate::runtime::Field::integer())
+            .build()
+    }
+
+    fn unreachable(shape: &Shape) -> UnreachableKey {
+        check_shape_reachable(shape).expect_err("kebab-declared key must be refused")
+    }
+
+    #[test]
+    fn a_shape_declaring_only_normalized_keys_is_reachable() {
+        // Every name here survives `-` → `_` unchanged, so each has a
+        // written spelling that reaches it. camelCase included: it holds
+        // no `-`, so normalization leaves it alone.
+        let shape = Shape::from(
+            crate::runtime::Schema::object("App")
+                .field("host", crate::runtime::Field::string())
+                .field("pool_size", crate::runtime::Field::integer())
+                .field("maxRetries", crate::runtime::Field::integer())
+                .build(),
+        );
+        assert!(check_shape_reachable(&shape).is_ok());
+    }
+
+    #[test]
+    fn a_root_field_holding_a_dash_is_unreachable() {
+        let shape = Shape::from(
+            crate::runtime::Schema::object("App")
+                .field("listen-port", crate::runtime::Field::integer())
+                .build(),
+        );
+        let err = unreachable(&shape);
+        assert_eq!(err.key, "listen-port");
+        assert_eq!(err.section, "", "a root key has no section");
+        assert!(
+            err.into_error().to_string().contains("listen_port"),
+            "the message names the spelling the loader actually looks for"
+        );
+    }
+
+    #[test]
+    fn the_walk_descends_into_nested_objects_arrays_and_maps() {
+        // Same offending key, reached three different ways — and each
+        // reports the dotted path to the section that declares it.
+        for (label, field) in [
+            ("nested", Shape::Object(kebab_field_object())),
+            (
+                "array",
+                Shape::from(crate::runtime::Field::array_of_type(kebab_field_object())),
+            ),
+            (
+                "map",
+                Shape::from(crate::runtime::Field::map_of(kebab_field_object())),
+            ),
+        ] {
+            let shape = Shape::from(
+                crate::runtime::Schema::object("App")
+                    .field("section", field)
+                    .build(),
+            );
+            let err = unreachable(&shape);
+            assert_eq!(err.key, "listen-port", "{label}");
+            assert_eq!(err.section, "section", "{label}");
+        }
+    }
+
+    #[test]
+    fn a_tagged_union_checks_its_tag_and_every_variant_field() {
+        // The tag is a key, so a multiword kebab tag is unreachable...
+        let tagged_tag = Shape::tagged("Block", "block-kind")
+            .variant(
+                "rust",
+                crate::runtime::Schema::object("Rust")
+                    .field("mount", crate::runtime::Field::string())
+                    .build(),
+            )
+            .build();
+        let err = unreachable(&Shape::Tagged(tagged_tag));
+        assert_eq!(err.key, "block-kind");
+
+        // ...and so is a kebab field inside any one variant, even when
+        // the tag and the other variants are clean.
+        let tagged_field = Shape::tagged("Block", "kind")
+            .variant(
+                "rust",
+                crate::runtime::Schema::object("Rust")
+                    .field("mount", crate::runtime::Field::string())
+                    .build(),
+            )
+            .variant("payload", kebab_field_object())
+            .build();
+        let err = unreachable(&Shape::Tagged(tagged_field));
+        assert_eq!(err.key, "listen-port");
+    }
+
+    #[test]
+    fn map_and_array_positions_are_not_themselves_keys() {
+        // A map's entry keys are user data and an array's positions are
+        // indices; neither is a declared name, so a map of plain strings
+        // is reachable however its entries end up spelled.
+        let shape = Shape::from(
+            crate::runtime::Schema::object("App")
+                .field(
+                    "labels",
+                    crate::runtime::Field::map_of(crate::runtime::Field::string()),
+                )
+                .build(),
+        );
+        assert!(check_shape_reachable(&shape).is_ok());
     }
 
     #[test]

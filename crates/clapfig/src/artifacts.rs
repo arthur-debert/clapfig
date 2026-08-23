@@ -12,7 +12,7 @@
 //!
 //! [`Builder::artifacts`](crate::Builder::artifacts) (and its typed twin,
 //! [`TypedBuilder::artifacts`](crate::TypedBuilder::artifacts)) renders both
-//! from the one [`Shape`](crate::runtime::Shape) the builder holds and
+//! from the one [`Shape`] the builder holds and
 //! returns them together as [`ConfigArtifacts`].
 //!
 //! ```ignore
@@ -179,10 +179,25 @@ pub struct ConfigArtifacts {
 /// ([`KeySpelling`](crate::json_schema::KeySpelling)) — which, when it is
 /// on, is both the kebab spelling the template writes and the declared
 /// snake_case one.
-pub(crate) fn schema_document(shape: &Shape, normalize_keys: bool) -> String {
+///
+/// Normalizing narrows what a schema may declare, so this is fallible
+/// where the standalone walk is not: a declared name already holding a
+/// `-` is unreachable once every incoming key is canonicalized, and
+/// naming it in the document would promise an acceptance the loader does
+/// not honor. That shape gets
+/// [`UnreachableNormalizedKey`](ClapfigError::UnreachableNormalizedKey),
+/// the same refusal [`ops::generate_template`] answers with — so the
+/// action, the pair, and the loader agree about one schema.
+pub(crate) fn schema_document(shape: &Shape, normalize_keys: bool) -> Result<String, ClapfigError> {
+    if normalize_keys {
+        crate::normalize::check_shape_reachable(shape)
+            .map_err(crate::normalize::UnreachableKey::into_error)?;
+    }
     let spelling = crate::json_schema::KeySpelling::for_normalize(normalize_keys);
-    serde_json::to_string_pretty(&crate::json_schema::generate_schema_ref(shape, spelling))
-        .expect("serde_json::Value serialization is infallible")
+    Ok(
+        serde_json::to_string_pretty(&crate::json_schema::generate_schema_ref(shape, spelling))
+            .expect("serde_json::Value serialization is infallible"),
+    )
 }
 
 /// Render the template and JSON Schema for `shape` together.
@@ -216,7 +231,7 @@ pub(crate) fn generate(
     };
     Ok(ConfigArtifacts {
         template,
-        schema: schema_document(shape, kebab),
+        schema: schema_document(shape, kebab)?,
     })
 }
 

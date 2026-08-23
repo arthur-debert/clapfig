@@ -573,6 +573,14 @@
 //! the kebab-case template generated beside it and a snake_case file
 //! written by hand alike, instead of rejecting one of them key by key.
 //!
+//! A schema that *declares* a key already holding a `-` cannot be paired
+//! with normalization at all — the rewrite puts the key out of reach of
+//! every spelling, so loading fails whatever the user writes. `config
+//! gen`, `config schema`, and [`Builder::artifacts`] refuse such a
+//! builder with
+//! [`ClapfigError::UnreachableNormalizedKey`]
+//! rather than generate under names it would then reject.
+//!
 //! The persistence path (`config set`/`unset`) and `config get` (merged
 //! and scoped alike) follow the same acceptance: the action key may be
 //! written in either spelling (it is normalized to the canonical

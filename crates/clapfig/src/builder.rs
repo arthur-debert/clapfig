@@ -922,7 +922,7 @@ impl Builder {
                 // names both the kebab keys the template writes and the
                 // declared snake_case ones, instead of rejecting either.
                 let schema =
-                    crate::artifacts::schema_document(self.schema.as_shape(), self.normalize_keys);
+                    crate::artifacts::schema_document(self.schema.as_shape(), self.normalize_keys)?;
                 match output {
                     Some(path) => {
                         if let Some(parent) = path.parent() {
