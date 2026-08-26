@@ -20,10 +20,15 @@ win. This is the minimal adoption path for Clapfig 0.23.
 ```toml
 [dependencies]
 clapfig = "0.23"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 ```
 
 The default features include `derive` (`#[derive(clapfig::Schema)]`) and
-`clap` (the `config` subcommand integration).
+`clap` (the `config` subcommand integration). `clap` and `serde` are direct
+dependencies of your crate too: the example below derives `Parser` and
+`Serialize`/`Deserialize` on your own types, and Cargo does not expose
+clapfig's transitive dependencies to your code.
 
 ## 2. Define the config structs — nested, in their owning modules
 
@@ -85,9 +90,12 @@ override per run:
 ```rust
 // src/main.rs
 use clap::{Parser, Subcommand};
-use clapfig::{Clapfig, ConfigArgs, SearchPath, TypedBuilder};
+use clapfig::{Clapfig, ClapfigError, ConfigArgs, SearchPath, TypedBuilder};
 
 use crate::config::AppConfig;
+
+mod config;
+mod server;
 
 #[derive(Parser)]
 #[command(name = "myapp")]
@@ -119,7 +127,7 @@ fn make_builder(cli: &Cli) -> TypedBuilder<AppConfig> {
         .cli_override("server.port", cli.port.map(i64::from))
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), ClapfigError> {
     let cli = Cli::parse();
     let builder = make_builder(&cli);
 
@@ -143,16 +151,19 @@ keys still need explicit `cli_override("section.key", ...)` calls.
 ## 4. The two override behaviors users get
 
 **Persistent** — `config set` writes the value into the user settings file,
-so it applies to every future run:
+so every future load reads it — though env vars and CLI flags are higher
+layers and still win for that key when set:
 
 ```sh
 myapp config set server.port 9090   # persists to the "user" scope file
-myapp run                           # runs on 9090 from now on
-myapp config unset server.port      # back to the default
+myapp run                           # loads 9090 from now on
+myapp config unset server.port      # back to the next layer that supplies
+                                    # the key — another file, an env var —
+                                    # or the compiled default
 ```
 
 **One-run** — the clap flag overrides the key for this process only, on top
-of whatever the file says; nothing is written:
+of every lower layer; nothing is written:
 
 ```sh
 myapp --port 9090 run               # this run only
