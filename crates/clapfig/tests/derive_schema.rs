@@ -167,6 +167,13 @@ struct BoundedIntegerConfig {
     debt: i64,
 }
 
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct I64MinConfig {
+    /// Lowest signed 64-bit value.
+    #[clapfig(default = -9223372036854775808, min = -9223372036854775808)]
+    floor: i64,
+}
+
 #[test]
 fn json_schema_emits_type_for_required_fields_without_defaults() {
     let result = Clapfig::typed::<RequiredFieldsConfig>()
@@ -225,6 +232,28 @@ fn integer_min_max_attrs_feed_runtime_and_json_schema_bounds() {
     assert_eq!(v["properties"]["workers"]["maximum"], 12);
     assert_eq!(v["properties"]["debt"]["minimum"], -10);
     assert_eq!(v["properties"]["debt"]["maximum"], -1);
+}
+
+#[test]
+fn i64_min_literal_is_valid_for_bounds_and_defaults() {
+    let runtime = I64MinConfig::schema();
+    let floor = runtime
+        .fields
+        .iter()
+        .find(|field| field.name == "floor")
+        .expect("floor field");
+    match &floor.field {
+        clapfig::runtime::Shape::Leaf(leaf) => {
+            assert_eq!(leaf.default, Some(clapfig::value::Value::Integer(i64::MIN)));
+            match &leaf.ty {
+                clapfig::runtime::LeafType::Integer { min, max } => {
+                    assert_eq!((*min, *max), (Some(i64::MIN), None));
+                }
+                other => panic!("expected bounded integer, got {other:?}"),
+            }
+        }
+        other => panic!("expected leaf, got {other:?}"),
+    }
 }
 
 // -- Gap #2 + #3: enum metadata via `#[clapfig(allowed = [...])]` -----------

@@ -191,10 +191,10 @@ fn every_scalar_type_maps_to_expected_leaf_type() {
         })
         .collect();
     assert!(matches!(by_name["s"], LeafTypeStatic::String));
-    // Sized widths carry their exact bounds; i64 is unbounded; isize
-    // emits isize::MIN/MAX (full i64 range on 64-bit); u64 is min 0
-    // with an open top; usize is min 0 with a max only when
-    // usize::BITS < 64.
+    // Sized widths carry their exact bounds; i64 is unbounded. isize and
+    // usize evaluate pointer-width bounds in the target crate, so 64-bit
+    // targets stay open where the TOML value model already covers every
+    // representable value.
     assert!(matches!(
         by_name["i8v"],
         LeafTypeStatic::Integer {
@@ -264,14 +264,58 @@ fn every_scalar_type_maps_to_expected_leaf_type() {
     }
     match by_name["isz"] {
         LeafTypeStatic::Integer { min, max } => {
-            assert_eq!(*min, Some(isize::MIN as i64));
-            assert_eq!(*max, Some(isize::MAX as i64));
+            if isize::BITS < 64 {
+                assert_eq!(*min, Some(isize::MIN as i64));
+                assert_eq!(*max, Some(isize::MAX as i64));
+            } else {
+                assert_eq!(*min, None);
+                assert_eq!(*max, None);
+            }
         }
         other => panic!("expected Integer for isz, got {other:?}"),
     }
     assert!(matches!(by_name["f32v"], LeafTypeStatic::Float));
     assert!(matches!(by_name["f64v"], LeafTypeStatic::Float));
     assert!(matches!(by_name["bv"], LeafTypeStatic::Bool));
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct PointerBounded {
+    #[clapfig(min = 1, max = 500)]
+    usz: usize,
+    #[clapfig(min = -500, max = 500)]
+    isz: isize,
+}
+
+#[test]
+fn pointer_width_integer_bounds_intersect_on_target() {
+    let s = <PointerBounded as Schema>::STATIC;
+    let by_name: std::collections::HashMap<&str, &LeafTypeStatic> = s
+        .fields
+        .iter()
+        .map(|f| {
+            let leaf = match &f.field {
+                FieldStatic::Leaf(l) => l,
+                _ => panic!("non-leaf where leaf expected"),
+            };
+            (f.name, &leaf.ty)
+        })
+        .collect();
+
+    assert!(matches!(
+        by_name["usz"],
+        LeafTypeStatic::Integer {
+            min: Some(1),
+            max: Some(500)
+        }
+    ));
+    assert!(matches!(
+        by_name["isz"],
+        LeafTypeStatic::Integer {
+            min: Some(-500),
+            max: Some(500)
+        }
+    ));
 }
 
 // -- Negative-literal defaults --------------------------------------------

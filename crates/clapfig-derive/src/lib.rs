@@ -1503,6 +1503,14 @@ enum ScalarKind {
 struct IntegerBounds {
     min: Option<i64>,
     max: Option<i64>,
+    target: IntegerTarget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntegerTarget {
+    Fixed,
+    Isize,
+    Usize,
 }
 
 impl ScalarKind {
@@ -1683,12 +1691,9 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
         // Every Rust integer maps to TOML's single Integer width, carrying
         // the source width's bounds so out-of-range values fail the schema
         // check with the key path (and export as JSON Schema
-        // `minimum`/`maximum`). `i64` is unbounded; `isize` emits
-        // `isize::MIN/MAX as i64` (full value-model range on 64-bit,
-        // signed 32-bit range on 32-bit). `u64` is min 0 with an open
-        // top; `usize` is min 0 with a maximum only when
-        // `usize::BITS < 64` (`usize::MAX as i64` wraps to -1 on
-        // 64-bit) — documented on `LeafTypeStatic::Integer`.
+        // `minimum`/`maximum`). Pointer-width integers emit target-side
+        // expressions so cross-compilation uses the target's `isize` /
+        // `usize` limits.
         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
             let bounds = integer_bounds(&name);
             let (min, max) = integer_bounds_tokens(bounds);
@@ -1717,75 +1722,139 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
     Ok(TypeShape::Nested(nested))
 }
 
-/// The `(min, max)` bound tokens for a Rust integer type name, as
-/// `Option<i64>` expressions for `LeafTypeStatic::Integer`.
+/// Macro-time bounds for a Rust integer type name.
 ///
-/// Fixed-width types emit their exact range via `as i64` casts on the
-/// width's own `MIN`/`MAX` consts (evaluated in the emitted code, so they
-/// are always faithful). `i64` is unbounded. `isize` emits
-/// `isize::MIN/MAX as i64` so a 32-bit target rejects values the `i64`
-/// value model can hold but `isize` cannot. `u64` is min 0 with an open
-/// top (`u64::MAX` exceeds `i64`). `usize` is min 0 with a maximum only
-/// when `usize::BITS < 64`; on 64-bit, `usize::MAX as i64` wraps to -1
-/// so the top stays open.
+/// Fixed-width types use their exact ranges. Pointer-width integers use
+/// their widest possible target range here, then `integer_bounds_tokens`
+/// emits target-side expressions that intersect with the actual target.
 fn integer_bounds(name: &str) -> IntegerBounds {
     match name {
         "i8" => IntegerBounds {
             min: Some(i8::MIN as i64),
             max: Some(i8::MAX as i64),
+            target: IntegerTarget::Fixed,
         },
         "i16" => IntegerBounds {
             min: Some(i16::MIN as i64),
             max: Some(i16::MAX as i64),
+            target: IntegerTarget::Fixed,
         },
         "i32" => IntegerBounds {
             min: Some(i32::MIN as i64),
             max: Some(i32::MAX as i64),
+            target: IntegerTarget::Fixed,
         },
         "i64" => IntegerBounds {
             min: None,
             max: None,
+            target: IntegerTarget::Fixed,
         },
         "isize" => IntegerBounds {
-            min: Some(isize::MIN as i64),
-            max: Some(isize::MAX as i64),
+            min: None,
+            max: None,
+            target: IntegerTarget::Isize,
         },
         "u8" => IntegerBounds {
             min: Some(0),
             max: Some(u8::MAX as i64),
+            target: IntegerTarget::Fixed,
         },
         "u16" => IntegerBounds {
             min: Some(0),
             max: Some(u16::MAX as i64),
+            target: IntegerTarget::Fixed,
         },
         "u32" => IntegerBounds {
             min: Some(0),
             max: Some(u32::MAX as i64),
+            target: IntegerTarget::Fixed,
         },
         "u64" => IntegerBounds {
             min: Some(0),
             max: None,
+            target: IntegerTarget::Fixed,
         },
         "usize" => IntegerBounds {
             min: Some(0),
-            max: if usize::BITS < 64 {
-                Some(usize::MAX as i64)
-            } else {
-                None
-            },
+            max: None,
+            target: IntegerTarget::Usize,
         },
         other => unreachable!("integer_bounds called for non-integer {other}"),
     }
 }
 
 fn integer_bounds_tokens(bounds: IntegerBounds) -> (TokenStream2, TokenStream2) {
-    (option_i64_tokens(bounds.min), option_i64_tokens(bounds.max))
+    match bounds.target {
+        IntegerTarget::Fixed => (option_i64_tokens(bounds.min), option_i64_tokens(bounds.max)),
+        IntegerTarget::Isize => {
+            let target_min = quote! {
+                if isize::BITS < 64 { Some(isize::MIN as i64) } else { None }
+            };
+            let target_max = quote! {
+                if isize::BITS < 64 { Some(isize::MAX as i64) } else { None }
+            };
+            pointer_bounds_tokens(target_min, target_max, bounds.min, bounds.max)
+        }
+        IntegerTarget::Usize => {
+            let target_min = quote! { Some(0) };
+            let target_max = quote! {
+                if usize::BITS < 64 { Some(usize::MAX as i64) } else { None }
+            };
+            pointer_bounds_tokens(target_min, target_max, bounds.min, bounds.max)
+        }
+    }
 }
 
 fn option_i64_tokens(value: Option<i64>) -> TokenStream2 {
     match value {
         Some(value) => quote! { Some(#value) },
         None => quote! { None },
+    }
+}
+
+fn pointer_bounds_tokens(
+    target_min: TokenStream2,
+    target_max: TokenStream2,
+    declared_min: Option<i64>,
+    declared_max: Option<i64>,
+) -> (TokenStream2, TokenStream2) {
+    let min = intersect_min_tokens(target_min.clone(), declared_min);
+    let max = intersect_max_tokens(target_max.clone(), declared_max);
+    let asserted_min = quote! {{
+        let min = #min;
+        let max = #max;
+        if let (Some(min), Some(max)) = (min, max) {
+            assert!(
+                min <= max,
+                "`min`/`max` contradict the Rust integer type's representable range on this target"
+            );
+        }
+        min
+    }};
+    (asserted_min, max)
+}
+
+fn intersect_min_tokens(target_min: TokenStream2, declared_min: Option<i64>) -> TokenStream2 {
+    match declared_min {
+        Some(declared) => quote! {
+            match #target_min {
+                Some(target) if target > #declared => Some(target),
+                _ => Some(#declared),
+            }
+        },
+        None => target_min,
+    }
+}
+
+fn intersect_max_tokens(target_max: TokenStream2, declared_max: Option<i64>) -> TokenStream2 {
+    match declared_max {
+        Some(declared) => quote! {
+            match #target_max {
+                Some(target) if target < #declared => Some(target),
+                _ => Some(#declared),
+            }
+        },
+        None => target_max,
     }
 }
 
@@ -2128,6 +2197,12 @@ fn expand_field(field: &syn::Field, rename_all: Option<&str>) -> syn::Result<Exp
         _ => None,
     };
     if let Some(inner_expr) = nested_inner_expr {
+        if has_range_attrs(&attrs) {
+            return Err(syn::Error::new(
+                field.span(),
+                "`min` and `max` are only valid on integer fields",
+            ));
+        }
         // `Option<T>` at the field type carries the same "leaf may be
         // absent" signal as an explicit `#[clapfig(optional)]` attr —
         // fold them both into one flag so the rest of the path checks a
@@ -2219,11 +2294,12 @@ fn expand_field(field: &syn::Field, rename_all: Option<&str>) -> syn::Result<Exp
         if attrs.default.is_some()
             || attrs.env.is_some()
             || attrs.allowed.is_some()
+            || has_range_attrs(&attrs)
             || attrs.optional
         {
             return Err(syn::Error::new(
                 field.span(),
-                "leaf attributes (default, env, allowed, optional) are not \
+                "leaf attributes (default, env, allowed, min, max, optional) are not \
                  valid on map-of-nested-struct fields — entry presence is \
                  already user-controlled, and a single per-field default \
                  has no meaning across an arbitrary set of entry keys.",
@@ -2262,11 +2338,12 @@ fn expand_field(field: &syn::Field, rename_all: Option<&str>) -> syn::Result<Exp
         if attrs.default.is_some()
             || attrs.env.is_some()
             || attrs.allowed.is_some()
+            || has_range_attrs(&attrs)
             || attrs.optional
         {
             return Err(syn::Error::new(
                 field.span(),
-                "leaf attributes (default, env, allowed, optional) are not \
+                "leaf attributes (default, env, allowed, min, max, optional) are not \
                  valid on array-of-nested-schema fields — array entries are \
                  user-supplied (an absent array is the empty array), and a \
                  per-field scalar attribute has no meaning across a list of \
@@ -2487,7 +2564,9 @@ fn parse_lit_value(expr: &Expr) -> Option<LitValue> {
     match expr {
         Expr::Lit(ExprLit { lit, .. }) => match lit {
             Lit::Str(s) => Some(LitValue::Str(s.value())),
-            Lit::Int(i) => i.base10_parse().ok().map(LitValue::Int),
+            Lit::Int(i) => parse_signed_integer_literal(i, false)
+                .ok()
+                .map(LitValue::Int),
             Lit::Float(f) => f.base10_parse().ok().map(LitValue::Float),
             Lit::Bool(b) => Some(LitValue::Bool(b.value)),
             _ => None,
@@ -2496,10 +2575,16 @@ fn parse_lit_value(expr: &Expr) -> Option<LitValue> {
             op: syn::UnOp::Neg(_),
             expr: inner,
             ..
-        }) => match parse_lit_value(inner)? {
-            LitValue::Int(i) => i.checked_neg().map(LitValue::Int),
-            LitValue::Float(f) => Some(LitValue::Float(-f)),
-            _ => None,
+        }) => match inner.as_ref() {
+            Expr::Lit(ExprLit {
+                lit: Lit::Int(i), ..
+            }) => parse_signed_integer_literal(i, true)
+                .ok()
+                .map(LitValue::Int),
+            _ => match parse_lit_value(inner)? {
+                LitValue::Float(f) => Some(LitValue::Float(-f)),
+                _ => None,
+            },
         },
         _ => None,
     }
@@ -2593,6 +2678,10 @@ fn leaf_type_for_shape(
     inner_leaf_type(shape)
 }
 
+fn has_range_attrs(attrs: &FieldAttrs) -> bool {
+    attrs.min.is_some() || attrs.max.is_some()
+}
+
 fn integer_bounds_for_shape(
     shape: &TypeShape,
     span: proc_macro2::Span,
@@ -2651,7 +2740,11 @@ fn declared_integer_bounds(
             "`min`/`max` contradict the Rust integer type's representable range",
         ));
     }
-    Ok(IntegerBounds { min, max })
+    Ok(IntegerBounds {
+        min,
+        max,
+        target: inferred.target,
+    })
 }
 
 fn integer_bound_from_expr(expr: &Expr) -> syn::Result<i64> {
@@ -2945,23 +3038,7 @@ fn lit_to_value_static(lit: &Lit, span: proc_macro2::Span) -> syn::Result<TokenS
 fn negated_lit_to_value_static(lit: &Lit, span: proc_macro2::Span) -> syn::Result<TokenStream2> {
     match lit {
         Lit::Int(i) => {
-            // Parse the magnitude as `u64`, then negate through `i128`
-            // before fitting back into `i64`. Required for `i64::MIN`:
-            // the user writes `-9223372036854775808` and the inner token
-            // is the positive `9223372036854775808`, which overflows
-            // `i64::MAX` (the lexer doesn't know the unary `-` is part
-            // of the value). `u64` holds it, and `-(value as i128)`
-            // exactly equals `i64::MIN` for that input.
-            let raw: u64 = i
-                .base10_parse()
-                .map_err(|e| syn::Error::new(span, format!("integer literal: {e}")))?;
-            let neg_i128 = -(raw as i128);
-            let neg: i64 = i64::try_from(neg_i128).map_err(|_| {
-                syn::Error::new(
-                    span,
-                    "negated integer literal exceeds the i64 range (TOML's integer width)",
-                )
-            })?;
+            let neg = parse_signed_integer_literal(i, true)?;
             Ok(quote! { ::clapfig::static_schema::ValueStatic::Integer(#neg) })
         }
         Lit::Float(f) => {
@@ -2974,4 +3051,22 @@ fn negated_lit_to_value_static(lit: &Lit, span: proc_macro2::Span) -> syn::Resul
             "unary `-` is only valid on integer or float literals",
         )),
     }
+}
+
+fn parse_signed_integer_literal(lit: &syn::LitInt, negative: bool) -> syn::Result<i64> {
+    if !negative {
+        return lit
+            .base10_parse()
+            .map_err(|e| syn::Error::new(lit.span(), e));
+    }
+    let raw: u64 = lit
+        .base10_parse()
+        .map_err(|e| syn::Error::new(lit.span(), format!("integer literal: {e}")))?;
+    let neg_i128 = -(raw as i128);
+    i64::try_from(neg_i128).map_err(|_| {
+        syn::Error::new(
+            lit.span(),
+            "negated integer literal exceeds the i64 range (TOML's integer width)",
+        )
+    })
 }

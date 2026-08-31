@@ -869,9 +869,11 @@ impl Builder {
     /// here, so downstream rendering / printing code is shared. Merged
     /// `list`/`get` actions run structural resolution but skip
     /// `post_validate`, letting users inspect and repair
-    /// policy-invalid configurations. `set`/`unset` prepare the
-    /// would-be file contents, resolve with that candidate substituted,
-    /// run `post_validate`, and write only after validation succeeds.
+    /// policy-invalid configurations. `set` and existing-file `unset`
+    /// prepare the would-be file contents, resolve with that candidate
+    /// substituted, run `post_validate`, and write only after validation
+    /// succeeds. Missing-file `unset` validates the current resolved
+    /// configuration without substituting a synthetic empty file.
     pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError> {
         match action {
             ConfigAction::List { scope } => match scope {
@@ -994,7 +996,7 @@ impl Builder {
                     self.normalize_keys,
                 )
                 .map_err(|e| persist::stamp_collision_path(e, &path))?;
-                self.validate_persist_candidate(&path, &new_content)?;
+                self.validate_persist_candidate(&path, Some(&new_content))?;
                 write_persisted_content(&path, &new_content)?;
                 crate::trace::persist_set(&path, key);
                 Ok(ConfigResult::value_set(
@@ -1033,16 +1035,14 @@ impl Builder {
                         ),
                     });
                 }
-                let new_content = match content.as_deref() {
-                    Some(c) => {
+                if let Some(c) = content.as_deref() {
+                    let new_content =
                         persist::unset_in_document(adapter.as_ref(), c, key, self.normalize_keys)
-                            .map_err(|e| persist::stamp_collision_path(e, &path))?
-                    }
-                    None => String::new(),
-                };
-                self.validate_persist_candidate(&path, &new_content)?;
-                if content.is_some() {
+                            .map_err(|e| persist::stamp_collision_path(e, &path))?;
+                    self.validate_persist_candidate(&path, Some(&new_content))?;
                     write_persisted_content(&path, &new_content)?;
+                } else {
+                    self.validate_persist_candidate(&path, None)?;
                 }
                 crate::trace::persist_unset(&path, key);
                 Ok(ConfigResult::ValueUnset { key: key.into() })
@@ -1060,7 +1060,11 @@ impl Builder {
             .map(|(table, _)| table)
     }
 
-    fn validate_persist_candidate(self, path: &Path, content: &str) -> Result<(), ClapfigError> {
+    fn validate_persist_candidate(
+        self,
+        path: &Path,
+        content: Option<&str>,
+    ) -> Result<(), ClapfigError> {
         let start_dir = std::env::current_dir().map_err(|e| ClapfigError::IoError {
             path: PathBuf::from("."),
             source: e,
@@ -1117,23 +1121,6 @@ fn write_generated_file(path: &Path, content: &str, force: bool) -> Result<(), C
     })
 }
 
-fn equivalent_paths(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-    normalize_compare_path(left) == normalize_compare_path(right)
-}
-
-fn normalize_compare_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    }
-}
-
 /// Reusable resolution handle for tree-walk use cases.
 ///
 /// Built once via [`Builder::build_resolver`], then called
@@ -1180,8 +1167,8 @@ struct DirProbe {
 }
 
 struct CandidateFile<'a> {
-    path: &'a Path,
-    content: &'a str,
+    identity: PathBuf,
+    content: Option<&'a str>,
 }
 
 impl Resolver {
@@ -1218,9 +1205,13 @@ impl Resolver {
         &self,
         start_dir: &std::path::Path,
         path: &Path,
-        content: &str,
+        content: Option<&str>,
     ) -> Result<(Map, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
-        self.resolve_at_inner(start_dir, true, Some(CandidateFile { path, content }))
+        let identity = file::path_identity(path).map_err(|e| ClapfigError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        self.resolve_at_inner(start_dir, true, Some(CandidateFile { identity, content }))
     }
 
     fn resolve_at_inner(
@@ -1472,21 +1463,25 @@ impl Resolver {
         path: &std::path::Path,
         candidate: Option<&CandidateFile<'_>>,
     ) -> Result<Option<String>, ClapfigError> {
+        let identity = file::path_identity(path).map_err(|e| ClapfigError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
         if let Some(candidate) = candidate
-            && equivalent_paths(path, candidate.path)
+            && identity == candidate.identity
         {
-            return Ok(Some(candidate.content.to_owned()));
+            return Ok(candidate.content.map(ToOwned::to_owned));
         }
         {
             let cache = self.file_cache.lock().expect("file_cache mutex poisoned");
-            if let Some(cached) = cache.get(path) {
+            if let Some(cached) = cache.get(&identity) {
                 return Ok(Some(cached.clone()));
             }
         }
         match std::fs::read_to_string(path) {
             Ok(contents) => {
                 let mut cache = self.file_cache.lock().expect("file_cache mutex poisoned");
-                cache.insert(path.to_path_buf(), contents.clone());
+                cache.insert(identity, contents.clone());
                 Ok(Some(contents))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -2566,6 +2561,105 @@ mod tests {
             })
             .handle(&ConfigAction::Unset {
                 key: "port".into(),
+                scope: None,
+            });
+
+        assert!(matches!(result, Err(ClapfigError::PostValidationFailed(_))));
+        assert_eq!(fs::read_to_string(path).unwrap(), "port = 10\n");
+    }
+
+    #[test]
+    fn handle_unset_absent_first_match_validates_real_fallback() {
+        let low = TempDir::new().unwrap();
+        let high = TempDir::new().unwrap();
+        fs::write(low.path().join("demo.toml"), "port = 10\n").unwrap();
+
+        let result = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![
+                SearchPath::Path(low.path().to_path_buf()),
+                SearchPath::Path(high.path().to_path_buf()),
+            ])
+            .search_mode(SearchMode::FirstMatch)
+            .persist_scope("local", SearchPath::Path(high.path().to_path_buf()))
+            .no_env()
+            .post_validate(|table| {
+                if table.get("port").and_then(crate::value::Value::as_integer) == Some(8080) {
+                    Err("port default is not acceptable here".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .handle(&ConfigAction::Unset {
+                key: "port".into(),
+                scope: None,
+            })
+            .unwrap();
+
+        assert!(matches!(result, ConfigResult::ValueUnset { .. }));
+        assert!(!high.path().join("demo.toml").exists());
+    }
+
+    #[test]
+    fn handle_set_candidate_matches_cleaned_path_alias() {
+        let dir = TempDir::new().unwrap();
+        let config_dir = dir.path().join("config");
+        fs::create_dir(&config_dir).unwrap();
+        let path = config_dir.join("demo.toml");
+        fs::write(&path, "port = 10\n").unwrap();
+        let search_alias = config_dir.join(".").join("child").join("..");
+
+        let result = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(search_alias)])
+            .persist_scope("local", SearchPath::Path(config_dir))
+            .no_env()
+            .post_validate(|table| {
+                if table.get("port").and_then(crate::value::Value::as_integer) == Some(0) {
+                    Err("port must be greater than zero".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "0".into(),
+                scope: None,
+            });
+
+        assert!(matches!(result, Err(ClapfigError::PostValidationFailed(_))));
+        assert_eq!(fs::read_to_string(path).unwrap(), "port = 10\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_set_candidate_matches_symlink_alias() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let path = real.join("demo.toml");
+        fs::write(&path, "port = 10\n").unwrap();
+
+        let result = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(link)])
+            .persist_scope("local", SearchPath::Path(real))
+            .no_env()
+            .post_validate(|table| {
+                if table.get("port").and_then(crate::value::Value::as_integer) == Some(0) {
+                    Err("port must be greater than zero".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "0".into(),
                 scope: None,
             });
 
