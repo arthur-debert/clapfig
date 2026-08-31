@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- **Config writes validate before changing files** ([#194](https://github.com/arthur-debert/clapfig/issues/194), [#195](https://github.com/arthur-debert/clapfig/pull/195)) — `config set` and `config unset` now check the prospective merged configuration before writing: schema validation, typed deserialization, and `post_validate` must all pass. Merged `config get` and `config list` remain available for diagnosis when semantic `post_validate` fails, so users can inspect the invalid merged value.
+  - File identity checks canonicalize existing paths and normalize missing paths through their nearest existing ancestor, so `.`, `..`, and symlink aliases compare consistently. This is a path-identity check, not protection against a target changing after the comparison.
+  - `config gen --output` and `config schema --output` refuse to replace an existing file unless `--force` is passed.
+- **Derived integer bounds** ([#195](https://github.com/arthur-debert/clapfig/pull/195)) — `#[clapfig(min = ...)]` and `#[clapfig(max = ...)]` constrain integer fields, including defaults and target-correct `isize` / `usize` limits.
+- **Clapfig 0.23 adoption guide** ([#192](https://github.com/arthur-debert/clapfig/issues/192), [#193](https://github.com/arthur-debert/clapfig/pull/193)) — the repository now includes a quick-adoption skill with compiled examples that match the current `Clapfig::typed`, `ConfigArgs`, `persist_scope`, search-path, and layered-configuration APIs.
+
 ## 0.23.0 - 2026-08-24
 
 - **Derive arrays: `Vec<T>` of schema types is `Shape::Array`** ([#106](https://github.com/arthur-debert/clapfig/issues/106), [#132](https://github.com/arthur-debert/clapfig/issues/132), DER01-WS03) — `#[derive(clapfig::Schema)]` now supports arrays of nested schema types end to end; the old compile-time rejection ("Vec\<NestedStruct\> is not yet supported") is gone.
