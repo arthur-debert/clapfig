@@ -27,6 +27,7 @@ use crate::format::{ConfigPath, FileEdit, FormatAdapter, Operation, SetTarget};
 use crate::normalize::{
     KeyCollision, check_collisions, kebab_key, normalize_key, resolve_table_key,
 };
+#[cfg(test)]
 use crate::ops::ConfigResult;
 use crate::value::Value;
 
@@ -215,7 +216,7 @@ pub fn set_in_document(
 /// Stamp `file_path` onto a collision error raised by a document-level
 /// (pure, pathless) persist function, so the reported error names the
 /// file actually edited — the same shape the load path reports.
-fn stamp_collision_path(err: ClapfigError, file_path: &Path) -> ClapfigError {
+pub(crate) fn stamp_collision_path(err: ClapfigError, file_path: &Path) -> ClapfigError {
     match err {
         ClapfigError::NormalizedKeyCollision {
             path,
@@ -232,11 +233,22 @@ fn stamp_collision_path(err: ClapfigError, file_path: &Path) -> ClapfigError {
     }
 }
 
+/// Return whether `key` resolves to a persist-addressable schema key.
+pub(crate) fn is_schema_key(
+    shape: &crate::runtime::Shape,
+    key: &str,
+    normalize_keys: bool,
+) -> bool {
+    let canonical = canonical_key(key, normalize_keys);
+    crate::overrides::valid_keys_shape(shape).contains(&canonical)
+}
+
 /// Wrapper around [`set_in_document`] with file I/O: reads the file
 /// (if it exists), patches it, writes back. Creates parent directories if
 /// needed. Collision errors from the document layer get this file's path.
 /// A successful write emits a `debug` persist event naming the file and
 /// key, never the assigned value.
+#[cfg(test)]
 pub fn persist_value(
     adapter: &dyn FormatAdapter,
     shape: &crate::runtime::Shape,
@@ -329,10 +341,30 @@ pub fn unset_in_document(
         .map_err(ClapfigError::from)
 }
 
+/// Return whether `key` resolves to an existing path in `content`.
+///
+/// This intentionally checks the document independently from the schema:
+/// `config unset` may remove a typo or obsolete key that strict loading
+/// would otherwise reject, but a key absent from both schema and document
+/// still reports [`ClapfigError::KeyNotFound`].
+pub(crate) fn document_contains_key(
+    adapter: &dyn FormatAdapter,
+    content: &str,
+    key: &str,
+    normalize_keys: bool,
+) -> Result<bool, ClapfigError> {
+    let tree = adapter.parse(content).map_err(ClapfigError::from)?.value;
+    let canonical = canonical_key(key, normalize_keys);
+    let (_, exists) = resolve_document_path(&tree, &canonical, normalize_keys)
+        .map_err(|c| c.into_error(Path::new("")))?;
+    Ok(exists)
+}
+
 /// I/O wrapper: reads file, removes the key, writes back.
 /// If the file doesn't exist, succeeds silently (nothing to unset).
 /// A successful unset (including the missing-file no-op) emits a `debug`
 /// persist event naming the file and key.
+#[cfg(test)]
 pub fn unset_value(
     adapter: &dyn FormatAdapter,
     file_path: &Path,

@@ -185,6 +185,11 @@ use syn::{
 ///   leaf. Works on `String`, integer, float, and `bool` fields; each
 ///   listed literal must match the field's TOML type, and at least one
 ///   value is required. Negative integer/float literals are accepted.
+/// - `#[clapfig(min = <integer>)]` / `#[clapfig(max = <integer>)]` —
+///   tighten an integer field's accepted range. The declared range is
+///   intersected with the Rust integer type's range (`u8` still caps at
+///   `255`), contradictory bounds are derive-time errors, and integer
+///   defaults must fall inside the resulting range.
 /// - `#[clapfig(optional)]` — force `optional = true` on a non-`Option<T>`
 ///   field (rarely needed; `Option<T>` is the usual spelling)
 ///
@@ -1346,6 +1351,8 @@ struct FieldAttrs {
     rename: Option<String>,
     force_value: bool,
     allowed: Option<Vec<Expr>>,
+    min: Option<Expr>,
+    max: Option<Expr>,
     optional: bool,
 }
 
@@ -1387,10 +1394,18 @@ fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
                 };
                 out.allowed = Some(items);
                 Ok(())
+            } else if meta.path.is_ident("min") {
+                let value: Expr = meta.value()?.parse()?;
+                out.min = Some(value);
+                Ok(())
+            } else if meta.path.is_ident("max") {
+                let value: Expr = meta.value()?.parse()?;
+                out.max = Some(value);
+                Ok(())
             } else {
                 Err(meta.error(format!(
                     "unsupported #[clapfig(...)] field attribute: `{}`. \
-                     Supported: default, env, rename, value, optional, allowed",
+                     Supported: default, env, rename, value, optional, allowed, min, max",
                     meta.path
                         .get_ident()
                         .map(|i| i.to_string())
@@ -1434,7 +1449,7 @@ enum TypeShape {
     /// the compile-time `ScalarKind` discriminant. The kind lets attribute
     /// validators (e.g. `#[clapfig(allowed = [...])]`) check that each
     /// allowed literal's TOML type matches the field's scalar kind.
-    Scalar(ScalarKind, TokenStream2),
+    Scalar(ScalarKind, TokenStream2, Option<IntegerBounds>),
     /// `Option<T>` where T is itself a TypeShape; the inner shape is folded
     /// and `optional` is set.
     Optional(Box<TypeShape>),
@@ -1482,6 +1497,12 @@ enum ScalarKind {
     Float,
     Bool,
     DateTime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IntegerBounds {
+    min: Option<i64>,
+    max: Option<i64>,
 }
 
 impl ScalarKind {
@@ -1542,7 +1563,7 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
         // `Schema` (trait-resolved support, not a syntactic guess).
         let inner_shape = classify_type(inner)?;
         return match inner_shape {
-            TypeShape::Scalar(kind, tok) => Ok(TypeShape::Array(kind, tok)),
+            TypeShape::Scalar(kind, tok, _) => Ok(TypeShape::Array(kind, tok)),
             TypeShape::Nested(expr) => Ok(TypeShape::ArrayOfNested(expr)),
             TypeShape::Optional(_) => Err(syn::Error::new(
                 inner.span(),
@@ -1585,7 +1606,7 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
         }
         let value_shape = classify_type(value_ty)?;
         return match value_shape {
-            TypeShape::Scalar(_, tok) => Ok(TypeShape::Map(tok)),
+            TypeShape::Scalar(_, tok, _) => Ok(TypeShape::Map(tok)),
             TypeShape::Value => Ok(TypeShape::Map(
                 quote! { ::clapfig::static_schema::LeafTypeStatic::Value },
             )),
@@ -1629,6 +1650,7 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
         return Ok(TypeShape::Scalar(
             ScalarKind::DateTime,
             quote! { ::clapfig::static_schema::LeafTypeStatic::DateTime },
+            None,
         ));
     }
 
@@ -1651,10 +1673,12 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
         "String" => Some((
             ScalarKind::String,
             quote! { ::clapfig::static_schema::LeafTypeStatic::String },
+            None,
         )),
         "bool" => Some((
             ScalarKind::Bool,
             quote! { ::clapfig::static_schema::LeafTypeStatic::Bool },
+            None,
         )),
         // Every Rust integer maps to TOML's single Integer width, carrying
         // the source width's bounds so out-of-range values fail the schema
@@ -1666,20 +1690,23 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
         // `usize::BITS < 64` (`usize::MAX as i64` wraps to -1 on
         // 64-bit) — documented on `LeafTypeStatic::Integer`.
         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
-            let (min, max) = integer_bounds_tokens(&name);
+            let bounds = integer_bounds(&name);
+            let (min, max) = integer_bounds_tokens(bounds);
             Some((
                 ScalarKind::Integer,
                 quote! { ::clapfig::static_schema::LeafTypeStatic::Integer { min: #min, max: #max } },
+                Some(bounds),
             ))
         }
         "f32" | "f64" => Some((
             ScalarKind::Float,
             quote! { ::clapfig::static_schema::LeafTypeStatic::Float },
+            None,
         )),
         _ => None,
     };
-    if let Some((kind, tok)) = scalar {
-        return Ok(TypeShape::Scalar(kind, tok));
+    if let Some((kind, tok, bounds)) = scalar {
+        return Ok(TypeShape::Scalar(kind, tok, bounds));
     }
 
     // Default: treat as a nested struct that also implements clapfig::Schema.
@@ -1701,40 +1728,64 @@ fn classify_type(ty: &Type) -> syn::Result<TypeShape> {
 /// top (`u64::MAX` exceeds `i64`). `usize` is min 0 with a maximum only
 /// when `usize::BITS < 64`; on 64-bit, `usize::MAX as i64` wraps to -1
 /// so the top stays open.
-fn integer_bounds_tokens(name: &str) -> (TokenStream2, TokenStream2) {
+fn integer_bounds(name: &str) -> IntegerBounds {
     match name {
-        "i8" => (
-            quote! { Some(i8::MIN as i64) },
-            quote! { Some(i8::MAX as i64) },
-        ),
-        "i16" => (
-            quote! { Some(i16::MIN as i64) },
-            quote! { Some(i16::MAX as i64) },
-        ),
-        "i32" => (
-            quote! { Some(i32::MIN as i64) },
-            quote! { Some(i32::MAX as i64) },
-        ),
-        "i64" => (quote! { None }, quote! { None }),
-        "isize" => (
-            quote! { Some(isize::MIN as i64) },
-            quote! { Some(isize::MAX as i64) },
-        ),
-        "u8" => (quote! { Some(0) }, quote! { Some(u8::MAX as i64) }),
-        "u16" => (quote! { Some(0) }, quote! { Some(u16::MAX as i64) }),
-        "u32" => (quote! { Some(0) }, quote! { Some(u32::MAX as i64) }),
-        "u64" => (quote! { Some(0) }, quote! { None }),
-        "usize" => (
-            quote! { Some(0) },
-            quote! {
-                if usize::BITS < 64 {
-                    Some(usize::MAX as i64)
-                } else {
-                    None
-                }
+        "i8" => IntegerBounds {
+            min: Some(i8::MIN as i64),
+            max: Some(i8::MAX as i64),
+        },
+        "i16" => IntegerBounds {
+            min: Some(i16::MIN as i64),
+            max: Some(i16::MAX as i64),
+        },
+        "i32" => IntegerBounds {
+            min: Some(i32::MIN as i64),
+            max: Some(i32::MAX as i64),
+        },
+        "i64" => IntegerBounds {
+            min: None,
+            max: None,
+        },
+        "isize" => IntegerBounds {
+            min: Some(isize::MIN as i64),
+            max: Some(isize::MAX as i64),
+        },
+        "u8" => IntegerBounds {
+            min: Some(0),
+            max: Some(u8::MAX as i64),
+        },
+        "u16" => IntegerBounds {
+            min: Some(0),
+            max: Some(u16::MAX as i64),
+        },
+        "u32" => IntegerBounds {
+            min: Some(0),
+            max: Some(u32::MAX as i64),
+        },
+        "u64" => IntegerBounds {
+            min: Some(0),
+            max: None,
+        },
+        "usize" => IntegerBounds {
+            min: Some(0),
+            max: if usize::BITS < 64 {
+                Some(usize::MAX as i64)
+            } else {
+                None
             },
-        ),
-        other => unreachable!("integer_bounds_tokens called for non-integer {other}"),
+        },
+        other => unreachable!("integer_bounds called for non-integer {other}"),
+    }
+}
+
+fn integer_bounds_tokens(bounds: IntegerBounds) -> (TokenStream2, TokenStream2) {
+    (option_i64_tokens(bounds.min), option_i64_tokens(bounds.max))
+}
+
+fn option_i64_tokens(value: Option<i64>) -> TokenStream2 {
+    match value {
+        Some(value) => quote! { Some(#value) },
+        None => quote! { None },
     }
 }
 
@@ -2106,6 +2157,7 @@ fn expand_field(field: &syn::Field, rename_all: Option<&str>) -> syn::Result<Exp
                         &TypeShape::Scalar(
                             ScalarKind::String,
                             quote! { ::clapfig::static_schema::LeafTypeStatic::String },
+                            None,
                         ),
                     )?;
                     quote! { Some(#v) }
@@ -2324,6 +2376,18 @@ fn expand_field(field: &syn::Field, rename_all: Option<&str>) -> syn::Result<Exp
              of the listed values.",
         ));
     }
+    if let Some(default) = &attrs.default
+        && let Some(LitValue::Int(value)) = parse_lit_value(default)
+        && let Ok((bounds, _)) = integer_bounds_for_shape(&shape, field.span())
+    {
+        let bounds = declared_integer_bounds(&attrs, bounds, field.span())?;
+        if bounds.min.is_some_and(|min| value < min) || bounds.max.is_some_and(|max| value > max) {
+            return Err(syn::Error::new(
+                default.span(),
+                "`default = ...` is outside the field's integer range",
+            ));
+        }
+    }
 
     let env_expr = match &attrs.env {
         Some(s) => quote! { Some(#s) },
@@ -2457,6 +2521,12 @@ fn leaf_type_for_shape(
                 "`value` and `allowed` are mutually exclusive on the same field",
             ));
         }
+        if attrs.min.is_some() || attrs.max.is_some() {
+            return Err(syn::Error::new(
+                span,
+                "`min` and `max` are only valid on integer fields, not `#[clapfig(value)]` fields",
+            ));
+        }
         let (_, optional_from_type) = inner_leaf_type(shape)?;
         return Ok((
             quote! { ::clapfig::static_schema::LeafTypeStatic::Value },
@@ -2464,6 +2534,12 @@ fn leaf_type_for_shape(
         ));
     }
     if let Some(allowed) = &attrs.allowed {
+        if attrs.min.is_some() || attrs.max.is_some() {
+            return Err(syn::Error::new(
+                span,
+                "`allowed` cannot be combined with `min` or `max`; `allowed` emits an enum leaf, not a range-bounded integer leaf",
+            ));
+        }
         // `allowed` constrains the field to a scalar-enum set. Permitting
         // it on Vec/Map/Value leaves would emit a schema that can never
         // validate or deserialize correctly (the value shape and the enum
@@ -2505,7 +2581,87 @@ fn leaf_type_for_shape(
             optional_from_type,
         ));
     }
+    if attrs.min.is_some() || attrs.max.is_some() {
+        let (bounds, optional_from_type) = integer_bounds_for_shape(shape, span)?;
+        let bounds = declared_integer_bounds(attrs, bounds, span)?;
+        let (min, max) = integer_bounds_tokens(bounds);
+        return Ok((
+            quote! { ::clapfig::static_schema::LeafTypeStatic::Integer { min: #min, max: #max } },
+            optional_from_type,
+        ));
+    }
     inner_leaf_type(shape)
+}
+
+fn integer_bounds_for_shape(
+    shape: &TypeShape,
+    span: proc_macro2::Span,
+) -> syn::Result<(IntegerBounds, bool)> {
+    match shape {
+        TypeShape::Scalar(ScalarKind::Integer, _, Some(bounds)) => Ok((*bounds, false)),
+        TypeShape::Optional(inner) => {
+            let (bounds, _) = integer_bounds_for_shape(inner, span)?;
+            Ok((bounds, true))
+        }
+        _ => Err(syn::Error::new(
+            span,
+            "`min` and `max` are only valid on integer fields",
+        )),
+    }
+}
+
+fn declared_integer_bounds(
+    attrs: &FieldAttrs,
+    inferred: IntegerBounds,
+    span: proc_macro2::Span,
+) -> syn::Result<IntegerBounds> {
+    let declared_min = attrs
+        .min
+        .as_ref()
+        .map(integer_bound_from_expr)
+        .transpose()?;
+    let declared_max = attrs
+        .max
+        .as_ref()
+        .map(integer_bound_from_expr)
+        .transpose()?;
+    if let (Some(min), Some(max)) = (declared_min, declared_max)
+        && min > max
+    {
+        return Err(syn::Error::new(
+            span,
+            "`min` must be less than or equal to `max`",
+        ));
+    }
+    let min = match (inferred.min, declared_min) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    let max = match (inferred.max, declared_max) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    if let (Some(min), Some(max)) = (min, max)
+        && min > max
+    {
+        return Err(syn::Error::new(
+            span,
+            "`min`/`max` contradict the Rust integer type's representable range",
+        ));
+    }
+    Ok(IntegerBounds { min, max })
+}
+
+fn integer_bound_from_expr(expr: &Expr) -> syn::Result<i64> {
+    match parse_lit_value(expr) {
+        Some(LitValue::Int(value)) => Ok(value),
+        _ => Err(syn::Error::new(
+            expr.span(),
+            "`min` and `max` require integer literals",
+        )),
+    }
 }
 
 /// `allowed = [...]` is only meaningful on scalar leaves; otherwise the
@@ -2513,7 +2669,7 @@ fn leaf_type_for_shape(
 /// on a Vec field, etc.).
 fn shape_accepts_allowed(shape: &TypeShape) -> bool {
     match shape {
-        TypeShape::Scalar(_, _) => true,
+        TypeShape::Scalar(_, _, _) => true,
         TypeShape::Optional(inner) => shape_accepts_allowed(inner),
         TypeShape::Array(_, _)
         | TypeShape::ArrayOfNested(_)
@@ -2526,7 +2682,7 @@ fn shape_accepts_allowed(shape: &TypeShape) -> bool {
 
 fn inner_leaf_type(shape: &TypeShape) -> syn::Result<(TokenStream2, bool)> {
     match shape {
-        TypeShape::Scalar(_, tok) => Ok((tok.clone(), false)),
+        TypeShape::Scalar(_, tok, _) => Ok((tok.clone(), false)),
         TypeShape::Optional(inner) => {
             let (inner_tok, _) = inner_leaf_type(inner)?;
             Ok((inner_tok, true))
@@ -2556,7 +2712,7 @@ fn inner_leaf_type(shape: &TypeShape) -> syn::Result<(TokenStream2, bool)> {
 /// validation to check that literal types match the field's TOML kind.
 fn scalar_kind_of(shape: &TypeShape) -> Option<ScalarKind> {
     match shape {
-        TypeShape::Scalar(k, _) => Some(*k),
+        TypeShape::Scalar(k, _, _) => Some(*k),
         TypeShape::Optional(inner) => scalar_kind_of(inner),
         _ => None,
     }
@@ -2669,7 +2825,7 @@ fn expr_to_value_static(expr: &Expr, shape: &TypeShape) -> syn::Result<TokenStre
         s => s,
     };
     match shape {
-        TypeShape::Scalar(kind, _) => scalar_default_to_value_static(expr, *kind),
+        TypeShape::Scalar(kind, _, _) => scalar_default_to_value_static(expr, *kind),
         TypeShape::Array(elem_kind, _) => match expr {
             Expr::Array(a) => {
                 let items: Vec<TokenStream2> = a

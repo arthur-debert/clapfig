@@ -194,7 +194,10 @@ fn vec_of_struct_json_schema_emits_items_schema_and_is_not_required() {
     let result = Clapfig::typed::<AppCfg>()
         .app_name("t")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -221,7 +224,10 @@ fn vec_of_struct_template_renders_commented_array_of_tables_example() {
     let result = Clapfig::typed::<AppCfg>()
         .app_name("t")
         .no_env()
-        .handle(&ConfigAction::Gen { output: None })
+        .handle(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let t = match result {
         ConfigResult::Template(t) => t,
@@ -316,7 +322,10 @@ fn vec_of_unit_enum_json_schema_emits_items_enum_and_is_not_required() {
     let result = Clapfig::typed::<PrintCfg>()
         .app_name("t")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -344,7 +353,10 @@ fn vec_of_unit_enum_template_emits_allowed_line() {
     let result = Clapfig::typed::<PrintCfg>()
         .app_name("t")
         .no_env()
-        .handle(&ConfigAction::Gen { output: None })
+        .handle(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let t = match result {
         ConfigResult::Template(t) => t,

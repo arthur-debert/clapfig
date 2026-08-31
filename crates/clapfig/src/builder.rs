@@ -866,7 +866,12 @@ impl Builder {
     /// Dispatch a [`ConfigAction`] against the schema.
     ///
     /// Returns a [`ConfigResult`]; the typed path's `handle` delegates
-    /// here, so downstream rendering / printing code is shared.
+    /// here, so downstream rendering / printing code is shared. Merged
+    /// `list`/`get` actions run structural resolution but skip
+    /// `post_validate`, letting users inspect and repair
+    /// policy-invalid configurations. `set`/`unset` prepare the
+    /// would-be file contents, resolve with that candidate substituted,
+    /// run `post_validate`, and write only after validation succeeds.
     pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError> {
         match action {
             ConfigAction::List { scope } => match scope {
@@ -874,7 +879,7 @@ impl Builder {
                     // The merged view spans formats; display renders in
                     // the preferred (first-enabled) format's spelling.
                     let registry = self.effective_registry()?;
-                    let table = self.load()?;
+                    let table = self.load_for_handle_read()?;
                     Ok(list_from_table(
                         &table,
                         registry
@@ -887,7 +892,7 @@ impl Builder {
                     ops::list_scope_file(adapter.as_ref(), &path)
                 }
             },
-            ConfigAction::Gen { output } => {
+            ConfigAction::Gen { output, force } => {
                 let registry = self.effective_registry()?;
                 match output {
                     Some(path) => {
@@ -912,16 +917,7 @@ impl Builder {
                             self.schema.as_shape(),
                             self.normalize_keys,
                         )?;
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
-                                path: parent.to_path_buf(),
-                                source: e,
-                            })?;
-                        }
-                        std::fs::write(path, &template).map_err(|e| ClapfigError::IoError {
-                            path: path.clone(),
-                            source: e,
-                        })?;
+                        write_generated_file(path, &template, *force)?;
                         Ok(ConfigResult::TemplateWritten { path: path.clone() })
                     }
                     None => {
@@ -939,7 +935,7 @@ impl Builder {
                     }
                 }
             }
-            ConfigAction::Schema { output } => {
+            ConfigAction::Schema { output, force } => {
                 // Spelled for the same acceptance `config gen`'s template
                 // is written for: under `normalize_keys(true)` the schema
                 // names both the kebab keys the template writes and the
@@ -948,16 +944,7 @@ impl Builder {
                     crate::artifacts::schema_document(self.schema.as_shape(), self.normalize_keys)?;
                 match output {
                     Some(path) => {
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
-                                path: parent.to_path_buf(),
-                                source: e,
-                            })?;
-                        }
-                        std::fs::write(path, &schema).map_err(|e| ClapfigError::IoError {
-                            path: path.clone(),
-                            source: e,
-                        })?;
+                        write_generated_file(path, &schema, *force)?;
                         Ok(ConfigResult::SchemaWritten { path: path.clone() })
                     }
                     None => Ok(ConfigResult::Schema(schema)),
@@ -972,7 +959,7 @@ impl Builder {
                     // Merged view: display renders in the preferred
                     // (first-enabled) format's spelling.
                     let registry = self.effective_registry()?;
-                    let table = self.load()?;
+                    let table = self.load_for_handle_read()?;
                     get_from_table(
                         shape.as_ref(),
                         &table,
@@ -997,20 +984,153 @@ impl Builder {
             },
             ConfigAction::Set { key, value, scope } => {
                 let (path, adapter) = self.resolve_scope_persist_path(scope.as_deref())?;
-                persist::persist_value(
+                let content = read_optional_config(&path)?;
+                let new_content = persist::set_in_document(
                     adapter.as_ref(),
                     self.schema.as_shape(),
-                    &path,
+                    content.as_deref(),
                     key,
                     value,
                     self.normalize_keys,
                 )
+                .map_err(|e| persist::stamp_collision_path(e, &path))?;
+                self.validate_persist_candidate(&path, &new_content)?;
+                write_persisted_content(&path, &new_content)?;
+                crate::trace::persist_set(&path, key);
+                Ok(ConfigResult::value_set(
+                    adapter.as_ref(),
+                    key.into(),
+                    value.into(),
+                ))
             }
             ConfigAction::Unset { key, scope } => {
                 let (path, adapter) = self.resolve_scope_persist_path(scope.as_deref())?;
-                crate::persist::unset_value(adapter.as_ref(), &path, key, self.normalize_keys)
+                let content = read_optional_config(&path)?;
+                let known_schema_key =
+                    persist::is_schema_key(self.schema.as_shape(), key, self.normalize_keys);
+                let existing_document_key = match content.as_deref() {
+                    Some(c) => persist::document_contains_key(
+                        adapter.as_ref(),
+                        c,
+                        key,
+                        self.normalize_keys,
+                    )
+                    .map_err(|e| persist::stamp_collision_path(e, &path))?,
+                    None => false,
+                };
+                if !known_schema_key && !existing_document_key {
+                    let canonical = if self.normalize_keys {
+                        crate::normalize::normalize_key(key)
+                    } else {
+                        key.to_owned()
+                    };
+                    return Err(ClapfigError::KeyNotFound {
+                        key: key.into(),
+                        suggestion: crate::meta::nearest_key_shape(
+                            self.schema.as_shape(),
+                            &canonical,
+                            self.normalize_keys,
+                        ),
+                    });
+                }
+                let new_content = match content.as_deref() {
+                    Some(c) => {
+                        persist::unset_in_document(adapter.as_ref(), c, key, self.normalize_keys)
+                            .map_err(|e| persist::stamp_collision_path(e, &path))?
+                    }
+                    None => String::new(),
+                };
+                self.validate_persist_candidate(&path, &new_content)?;
+                if content.is_some() {
+                    write_persisted_content(&path, &new_content)?;
+                }
+                crate::trace::persist_unset(&path, key);
+                Ok(ConfigResult::ValueUnset { key: key.into() })
             }
         }
+    }
+
+    fn load_for_handle_read(self) -> Result<Map, ClapfigError> {
+        let start_dir = std::env::current_dir().map_err(|e| ClapfigError::IoError {
+            path: PathBuf::from("."),
+            source: e,
+        })?;
+        self.build_resolver()?
+            .resolve_at_inner_with_post_validate(&start_dir, false)
+            .map(|(table, _)| table)
+    }
+
+    fn validate_persist_candidate(self, path: &Path, content: &str) -> Result<(), ClapfigError> {
+        let start_dir = std::env::current_dir().map_err(|e| ClapfigError::IoError {
+            path: PathBuf::from("."),
+            source: e,
+        })?;
+        self.build_resolver()?
+            .resolve_at_inner_with_candidate(&start_dir, path, content)?;
+        Ok(())
+    }
+}
+
+fn read_optional_config(path: &Path) -> Result<Option<String>, ClapfigError> {
+    match std::fs::read_to_string(path) {
+        Ok(c) => Ok(Some(c)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ClapfigError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        }),
+    }
+}
+
+fn write_persisted_content(path: &Path, content: &str) -> Result<(), ClapfigError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    std::fs::write(path, content).map_err(|e| ClapfigError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
+fn write_generated_file(path: &Path, content: &str, force: bool) -> Result<(), ClapfigError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ClapfigError::IoError {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    let result = if force {
+        std::fs::write(path, content)
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, content.as_bytes()))
+    };
+    result.map_err(|e| ClapfigError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
+fn equivalent_paths(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    normalize_compare_path(left) == normalize_compare_path(right)
+}
+
+fn normalize_compare_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
     }
 }
 
@@ -1059,9 +1179,14 @@ struct DirProbe {
     probes: Vec<FileProbe>,
 }
 
+struct CandidateFile<'a> {
+    path: &'a Path,
+    content: &'a str,
+}
+
 impl Resolver {
     pub fn resolve_at(&self, start_dir: impl AsRef<std::path::Path>) -> Result<Map, ClapfigError> {
-        self.resolve_at_inner(start_dir.as_ref())
+        self.resolve_at_inner_with_post_validate(start_dir.as_ref(), true)
             .map(|(table, _unknowns)| table)
     }
 
@@ -1072,7 +1197,7 @@ impl Resolver {
         &self,
         start_dir: impl AsRef<std::path::Path>,
     ) -> Result<(Map, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
-        self.resolve_at_inner(start_dir.as_ref())
+        self.resolve_at_inner_with_post_validate(start_dir.as_ref(), true)
     }
 
     /// Shared implementation behind [`resolve_at`](Self::resolve_at) and
@@ -1081,9 +1206,28 @@ impl Resolver {
     /// post-validate hook, so the two public surfaces stay thin wrappers
     /// that only differ in whether the collected-unknowns list is kept
     /// or dropped.
+    fn resolve_at_inner_with_post_validate(
+        &self,
+        start_dir: &std::path::Path,
+        run_post_validate: bool,
+    ) -> Result<(Map, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
+        self.resolve_at_inner(start_dir, run_post_validate, None)
+    }
+
+    fn resolve_at_inner_with_candidate(
+        &self,
+        start_dir: &std::path::Path,
+        path: &Path,
+        content: &str,
+    ) -> Result<(Map, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
+        self.resolve_at_inner(start_dir, true, Some(CandidateFile { path, content }))
+    }
+
     fn resolve_at_inner(
         &self,
         start_dir: &std::path::Path,
+        run_post_validate: bool,
+        candidate: Option<CandidateFile<'_>>,
     ) -> Result<(Map, Vec<crate::strict::CollectedUnknown>), ClapfigError> {
         let absolute = if start_dir.is_absolute() {
             start_dir.to_path_buf()
@@ -1109,7 +1253,7 @@ impl Resolver {
         // as Env.
         let loaded = if order.contains(&Layer::Files) {
             let dirs = file::expand_search_paths(&self.search_paths, &self.app_name, &normalized);
-            self.load_files_cached(&dirs)?
+            self.load_files_cached(&dirs, candidate)?
         } else {
             DiscoveryLoad {
                 files: Vec::new(),
@@ -1150,7 +1294,7 @@ impl Resolver {
         };
 
         let (table, unknowns) = resolve::resolve(input)?;
-        if let Some(hook) = self.post_validate.as_ref() {
+        if run_post_validate && let Some(hook) = self.post_validate.as_ref() {
             hook(&table)?;
         }
         Ok((table, unknowns))
@@ -1164,7 +1308,11 @@ impl Resolver {
     /// [`ClapfigError::MissingRequired`] can name the search. FirstMatch
     /// still stops *reading* at the first hit; unvisited candidates are
     /// enumerated as [`ProbeOutcome::NotProbed`] without I/O.
-    fn load_files_cached(&self, dirs: &[PathBuf]) -> Result<DiscoveryLoad, ClapfigError> {
+    fn load_files_cached(
+        &self,
+        dirs: &[PathBuf],
+        candidate: Option<CandidateFile<'_>>,
+    ) -> Result<DiscoveryLoad, ClapfigError> {
         match self.search_mode {
             SearchMode::Merge => {
                 let mut files = Vec::new();
@@ -1173,7 +1321,7 @@ impl Resolver {
                     let DirProbe {
                         loaded,
                         probes: dir_probes,
-                    } = self.probe_dir(dir)?;
+                    } = self.probe_dir(dir, candidate.as_ref())?;
                     probes.extend(dir_probes);
                     if let Some(found) = loaded {
                         files.push(found);
@@ -1193,7 +1341,7 @@ impl Resolver {
                     let DirProbe {
                         loaded,
                         probes: dir_probes,
-                    } = self.probe_dir(dir)?;
+                    } = self.probe_dir(dir, candidate.as_ref())?;
                     probes[i] = dir_probes;
                     if let Some(found) = loaded {
                         files.push(found);
@@ -1243,11 +1391,15 @@ impl Resolver {
     /// than one hit in the same directory is the spec's hard
     /// [`AmbiguousConfigFiles`](ClapfigError::AmbiguousConfigFiles) error
     /// (no silent precedence, no merging of same-stem siblings).
-    fn probe_dir(&self, dir: &Path) -> Result<DirProbe, ClapfigError> {
+    fn probe_dir(
+        &self,
+        dir: &Path,
+        candidate: Option<&CandidateFile<'_>>,
+    ) -> Result<DirProbe, ClapfigError> {
         match &self.naming {
             FileNaming::Exact(name) => {
                 let path = dir.join(name);
-                match self.read_cached(&path)? {
+                match self.read_cached(&path, candidate)? {
                     Some(contents) => Ok(DirProbe {
                         loaded: Some((path.clone(), contents)),
                         probes: vec![FileProbe {
@@ -1270,7 +1422,7 @@ impl Resolver {
                 for adapter in self.registry.iter() {
                     for ext in adapter.extensions() {
                         let path = dir.join(format!("{stem}.{ext}"));
-                        match self.read_cached(&path)? {
+                        match self.read_cached(&path, candidate)? {
                             Some(contents) => {
                                 probes.push(FileProbe {
                                     path: path.clone(),
@@ -1315,7 +1467,16 @@ impl Resolver {
             .len()
     }
 
-    fn read_cached(&self, path: &std::path::Path) -> Result<Option<String>, ClapfigError> {
+    fn read_cached(
+        &self,
+        path: &std::path::Path,
+        candidate: Option<&CandidateFile<'_>>,
+    ) -> Result<Option<String>, ClapfigError> {
+        if let Some(candidate) = candidate
+            && equivalent_paths(path, candidate.path)
+        {
+            return Ok(Some(candidate.content.to_owned()));
+        }
         {
             let cache = self.file_cache.lock().expect("file_cache mutex poisoned");
             if let Some(cached) = cache.get(path) {
@@ -1864,7 +2025,10 @@ mod tests {
         let result = Clapfig::builder(schema)
             .app_name("demo")
             .no_env()
-            .handle(&ConfigAction::Gen { output: None })
+            .handle(&ConfigAction::Gen {
+                output: None,
+                force: false,
+            })
             .unwrap();
         let t = match result {
             ConfigResult::Template(t) => t,
@@ -1890,7 +2054,10 @@ mod tests {
         let result = Clapfig::builder(demo_schema())
             .app_name("demo")
             .no_env()
-            .handle(&ConfigAction::Gen { output: None })
+            .handle(&ConfigAction::Gen {
+                output: None,
+                force: false,
+            })
             .unwrap();
 
         match result {
@@ -1921,7 +2088,10 @@ mod tests {
         let result = Clapfig::builder(schema)
             .app_name("demo")
             .no_env()
-            .handle(&ConfigAction::Gen { output: None })
+            .handle(&ConfigAction::Gen {
+                output: None,
+                force: false,
+            })
             .unwrap();
         match result {
             ConfigResult::Template(t) => {
@@ -1944,7 +2114,10 @@ mod tests {
         let result = Clapfig::builder(schema)
             .app_name("demo")
             .no_env()
-            .handle(&ConfigAction::Schema { output: None })
+            .handle(&ConfigAction::Schema {
+                output: None,
+                force: false,
+            })
             .unwrap();
         match result {
             ConfigResult::Schema(s) => {
@@ -2011,7 +2184,10 @@ mod tests {
         let result = Clapfig::builder(schema)
             .app_name("demo")
             .no_env()
-            .handle(&ConfigAction::Schema { output: None })
+            .handle(&ConfigAction::Schema {
+                output: None,
+                force: false,
+            })
             .unwrap();
         match result {
             ConfigResult::Schema(s) => {
@@ -2171,7 +2347,10 @@ mod tests {
         let result = Clapfig::builder(map_of_schema())
             .app_name("demo")
             .no_env()
-            .handle(&ConfigAction::Schema { output: None })
+            .handle(&ConfigAction::Schema {
+                output: None,
+                force: false,
+            })
             .unwrap();
         match result {
             ConfigResult::Schema(s) => {
@@ -2257,7 +2436,10 @@ mod tests {
         let result = Clapfig::builder(demo_schema())
             .app_name("demo")
             .no_env()
-            .handle(&ConfigAction::Schema { output: None })
+            .handle(&ConfigAction::Schema {
+                output: None,
+                force: false,
+            })
             .unwrap();
 
         match result {
@@ -2334,6 +2516,116 @@ mod tests {
         let content = fs::read_to_string(dir.path().join("demo.toml")).unwrap();
         assert!(!content.contains("port"));
         assert!(content.contains("host = \"x\""));
+    }
+
+    #[test]
+    fn handle_set_runs_post_validate_before_writing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("demo.toml");
+        fs::write(&path, "port = 10\n").unwrap();
+
+        let result = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .post_validate(|table| {
+                if table.get("port").and_then(crate::value::Value::as_integer) == Some(0) {
+                    Err("port must be greater than zero".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .handle(&ConfigAction::Set {
+                key: "port".into(),
+                value: "0".into(),
+                scope: None,
+            });
+
+        assert!(matches!(result, Err(ClapfigError::PostValidationFailed(_))));
+        assert_eq!(fs::read_to_string(path).unwrap(), "port = 10\n");
+    }
+
+    #[test]
+    fn handle_unset_validates_candidate_before_writing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("demo.toml");
+        fs::write(&path, "port = 10\n").unwrap();
+
+        let result = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .post_validate(|table| {
+                if table.get("port").and_then(crate::value::Value::as_integer) == Some(8080) {
+                    Err("port default is not acceptable here".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .handle(&ConfigAction::Unset {
+                key: "port".into(),
+                scope: None,
+            });
+
+        assert!(matches!(result, Err(ClapfigError::PostValidationFailed(_))));
+        assert_eq!(fs::read_to_string(path).unwrap(), "port = 10\n");
+    }
+
+    #[test]
+    fn handle_unset_absent_unknown_key_errors() {
+        let dir = TempDir::new().unwrap();
+
+        let result = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Unset {
+                key: "does_not_exist".into(),
+                scope: None,
+            });
+
+        assert!(matches!(result, Err(ClapfigError::KeyNotFound { .. })));
+    }
+
+    #[test]
+    fn handle_unset_existing_unknown_key_allows_strict_typo_repair() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("demo.toml");
+        fs::write(&path, "prto = 10\nport = 11\n").unwrap();
+
+        let result = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+            .no_env()
+            .handle(&ConfigAction::Unset {
+                key: "prto".into(),
+                scope: None,
+            })
+            .unwrap();
+
+        assert!(matches!(result, ConfigResult::ValueUnset { .. }));
+        assert_eq!(fs::read_to_string(path).unwrap(), "port = 11\n");
+    }
+
+    #[test]
+    fn handle_list_skips_post_validate_for_policy_invalid_config() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("demo.toml"), "port = 0\n").unwrap();
+
+        let result = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .post_validate(|_| Err("policy rejects this config".into()))
+            .handle(&ConfigAction::List { scope: None })
+            .unwrap();
+
+        assert!(matches!(result, ConfigResult::Listing { .. }));
     }
 
     // --- cli_overrides_from auto-matching ---
@@ -3529,7 +3821,10 @@ mod tests {
             .app_name("demo")
             .no_env()
             .normalize_keys(true)
-            .handle(&ConfigAction::Gen { output: None })
+            .handle(&ConfigAction::Gen {
+                output: None,
+                force: false,
+            })
             .unwrap();
 
         match result {
@@ -3554,7 +3849,10 @@ mod tests {
         let result = Clapfig::builder(demo_schema())
             .app_name("demo")
             .no_env()
-            .handle(&ConfigAction::Gen { output: None })
+            .handle(&ConfigAction::Gen {
+                output: None,
+                force: false,
+            })
             .unwrap();
 
         match result {
@@ -3576,6 +3874,7 @@ mod tests {
             .no_env()
             .handle(&ConfigAction::Gen {
                 output: Some(out_path.clone()),
+                force: false,
             })
             .unwrap();
 
@@ -3583,6 +3882,44 @@ mod tests {
         let content = fs::read_to_string(&out_path).unwrap();
         assert!(content.contains("host"));
         assert!(content.contains("port"));
+    }
+
+    #[test]
+    fn handle_gen_output_refuses_existing_file_without_force() {
+        let dir = TempDir::new().unwrap();
+        let out_path = dir.path().join("generated.toml");
+        fs::write(&out_path, "custom = true\n").unwrap();
+
+        let result = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .no_env()
+            .handle(&ConfigAction::Gen {
+                output: Some(out_path.clone()),
+                force: false,
+            });
+
+        assert!(matches!(result, Err(ClapfigError::IoError { .. })));
+        assert_eq!(fs::read_to_string(out_path).unwrap(), "custom = true\n");
+    }
+
+    #[test]
+    fn handle_schema_output_overwrites_existing_file_with_force() {
+        let dir = TempDir::new().unwrap();
+        let out_path = dir.path().join("schema.json");
+        fs::write(&out_path, "old\n").unwrap();
+
+        Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .no_env()
+            .handle(&ConfigAction::Schema {
+                output: Some(out_path.clone()),
+                force: true,
+            })
+            .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(out_path).unwrap())
+            .expect("forced schema output should replace old content");
+        assert_eq!(value["title"], "App");
     }
 
     #[test]
@@ -3595,6 +3932,7 @@ mod tests {
             .no_env()
             .handle(&ConfigAction::Schema {
                 output: Some(out_path.clone()),
+                force: false,
             })
             .unwrap();
 
@@ -4294,6 +4632,7 @@ mod tests {
             .no_env()
             .handle(&ConfigAction::Gen {
                 output: Some(out_path.clone()),
+                force: false,
             })
             .unwrap_err();
         assert!(

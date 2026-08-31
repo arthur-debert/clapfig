@@ -90,7 +90,11 @@ format**, independent of the enabled-formats list:
 myapp config gen --output myapp.toml
 myapp config gen --output myapp.yaml   # YAML template
 myapp config gen --output myapp.json   # JSON template
+myapp config gen --output myapp.toml --force
 ```
+
+Output files are created exclusively. If the target exists, `gen` returns an
+I/O error and leaves it unchanged; pass `--force` to replace it.
 
 YAML templates use native comments, same shape as the TOML one. JSON has no
 comment syntax, so JSON templates carry documentation as **`"//"` comment
@@ -151,6 +155,9 @@ $ myapp config list --scope local
 port = 9090
 ```
 
+The merged view runs structural validation but skips `post_validate`, so a
+policy-invalid configuration can still be inspected.
+
 ### `config get <key>`
 
 Shows a single key's value along with its doc comment:
@@ -160,6 +167,9 @@ $ myapp config get database.pool_size
 # Connection pool size.
 database.pool_size = 10
 ```
+
+Like `list`, merged `get` skips `post_validate` while still enforcing the
+schema's structural checks.
 
 ### `config set <key> <value>`
 
@@ -179,6 +189,10 @@ $ myapp config set port hello
 $ myapp config set host 123        # host is a String field
 Set host = 123                     # persists as the string "123"
 ```
+
+Before writing, `set` resolves the configuration as it would look after the
+edit, including all configured layers and any registered `post_validate`
+hook. A validation failure leaves the target file unchanged.
 
 Array and map leaves take TOML inline syntax — the value model's baseline
 vocabulary, whatever format the target file uses; the parsed value is
@@ -248,6 +262,12 @@ $ myapp config unset port
 Unset port
 ```
 
+When the key is absent from the target document, `unset` validates it against
+the schema and reports `KeyNotFound` for typos. When the key exists in the
+document, `unset` may remove it even if strict loading would reject it as
+unknown, so users can repair obsolete or mistyped keys. The candidate result
+is resolved and post-validated before the file is written.
+
 ### `config schema`
 
 Generates a JSON Schema (Draft 2020-12) describing the config struct:
@@ -255,7 +275,11 @@ Generates a JSON Schema (Draft 2020-12) describing the config struct:
 ```sh
 myapp config schema
 myapp config schema --output myapp-schema.json
+myapp config schema --output myapp-schema.json --force
 ```
+
+Like `gen --output`, `schema --output` refuses to overwrite an existing file
+unless `--force` is passed.
 
 The document names the keys the builder accepts. With `normalize_keys(true)`
 on, that is both spellings of every multiword key — the kebab-case one

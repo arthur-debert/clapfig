@@ -353,7 +353,10 @@ fn env_attribute_propagates_to_runtime_schema_leaf() {
     let result = Clapfig::typed::<EnvConfig>()
         .app_name("t")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -425,7 +428,10 @@ fn allowed_integer_enum_is_carried_through_to_json_schema() {
     let result = Clapfig::typed::<IntEnum>()
         .app_name("t")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -548,6 +554,37 @@ fn handle_set_rejects_invalid_enum_via_macro_schema() {
         "out-of-set enum value must fail validation at Set time, before write"
     );
     assert!(!dir.path().join("t.toml").exists());
+}
+
+#[test]
+fn handle_set_runs_typed_post_validate_before_writing() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.toml");
+    std::fs::write(&path, "port = 2\n").unwrap();
+
+    let result = Clapfig::typed::<PersistConfig>()
+        .app_name("test")
+        .file_name("test.toml")
+        .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+        .no_env()
+        .post_validate(|cfg: &PersistConfig| {
+            if cfg.port == 0 {
+                Err("port must be greater than zero".into())
+            } else {
+                Ok(())
+            }
+        })
+        .handle(&ConfigAction::Set {
+            key: "port".into(),
+            value: "0".into(),
+            scope: None,
+        });
+
+    assert!(matches!(
+        result,
+        Err(clapfig::ClapfigError::PostValidationFailed(_))
+    ));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "port = 2\n");
 }
 
 // -- Strictness cascade through three nested levels -----------------------
@@ -767,7 +804,10 @@ fn allowed_accepts_negative_integer_literals() {
     let result = Clapfig::typed::<AllowedNegativeInts>()
         .app_name("t")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -1150,7 +1190,10 @@ fn handle_to_string_produces_template_text() {
     let s = Clapfig::typed::<DefaultedForHook>()
         .app_name("t")
         .no_env()
-        .handle_to_string(&ConfigAction::Gen { output: None })
+        .handle_to_string(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     assert!(s.contains("port = 8080"), "got: {s}");
 }

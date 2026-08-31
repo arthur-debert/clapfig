@@ -635,6 +635,11 @@
 //! before [`load()`](TypedBuilder::load) returns. Rejections become
 //! [`ClapfigError::PostValidationFailed`],
 //! which renders with the same error pipeline as every other clapfig error.
+//! `config set` and `config unset` use the same hook as a write guard:
+//! they resolve the candidate configuration first and write only after
+//! the hook accepts it. Merged `config get` and `config list` skip this
+//! semantic hook so users can inspect a policy-invalid configuration and
+//! decide what to repair.
 //!
 //! Design notes:
 //!
@@ -748,6 +753,9 @@
 //! template passes strict validation as-is. When
 //! `config set` creates a new file, it seeds it from this template so the
 //! user gets a documented starting point.
+//! `config gen --output <path>` and `config schema --output <path>` use
+//! exclusive creation by default and require `--force` to replace an
+//! existing file.
 //!
 //! # Editor-discoverable artifacts
 //!

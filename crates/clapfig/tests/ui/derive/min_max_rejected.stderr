@@ -1,0 +1,29 @@
+error: `min` must be less than or equal to `max`
+ --> tests/ui/derive/min_max_rejected.rs:5:5
+  |
+5 |     #[clapfig(min = 10, max = 1)]
+  |     ^
+
+error: `min`/`max` contradict the Rust integer type's representable range
+  --> tests/ui/derive/min_max_rejected.rs:11:5
+   |
+11 |     #[clapfig(min = 300)]
+   |     ^
+
+error: `default = ...` is outside the field's integer range
+  --> tests/ui/derive/min_max_rejected.rs:17:25
+   |
+17 |     #[clapfig(default = 0, min = 1)]
+   |                         ^
+
+error: `default = ...` is outside the field's integer range
+  --> tests/ui/derive/min_max_rejected.rs:23:25
+   |
+23 |     #[clapfig(default = 300)]
+   |                         ^^^
+
+error: `min` and `max` are only valid on integer fields
+  --> tests/ui/derive/min_max_rejected.rs:29:5
+   |
+29 |     #[clapfig(min = 1)]
+   |     ^

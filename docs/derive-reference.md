@@ -61,7 +61,8 @@ Accepts string, integer, float, bool, and unary-negated numeric literals
 (`-9223372036854775808i64` works for `i64::MIN`). On `Vec<T>` of scalars,
 also an array literal of literals. Literals are **kind-checked** at derive
 time against the field's type (per element for arrays); a default outside
-the field's `allowed = [...]` set is a derive error.
+the field's `allowed = [...]` set or integer `min`/`max` range is a derive
+error.
 
 Defaults are **rejected** on map-typed fields and on arrays of nested
 schema types — entries are user-supplied. An absent map or array loads as
@@ -126,6 +127,25 @@ closed set that is also a Rust type, prefer a unit-only enum (below) over
 
 `allowed` is a derive error on `Vec`, nested structs, and map-of-nested
 fields, and it cannot share a field with `value`.
+
+### `min` / `max`
+
+Tighten an integer leaf's accepted range:
+
+```rust
+#[clapfig(min = 1, max = 12, default = 4)]
+workers: u8,
+```
+
+The declared bounds are intersected with the Rust integer type's own range,
+so `u8` still exports `maximum: 255` unless a smaller `max` is declared.
+Contradictory ranges (`min > max`, or `min = 300` on `u8`) are derive-time
+errors. Defaults must fit inside the final range. JSON Schema exports the
+result as `minimum` / `maximum`, and `config set` refuses out-of-range
+values before writing.
+
+`min` and `max` are only valid on integer fields, including `Option<i64>`.
+They cannot be combined with `allowed` or `value`.
 
 ### `value`
 
@@ -443,8 +463,9 @@ newtypes, type aliases, third-party maps (the `Schema` trait's
 `on_unimplemented` diagnostic names the `#[clapfig(value)]` escape
 hatch); Datetime/Value lookalikes; unknown clapfig metas; `name`/`strict`
 on unit-only enums; kind-mismatched or empty `allowed`; `value` +
-`allowed`; `allowed` on nested-struct fields; leaf attrs
-(`default`/`env`/`allowed`/`optional`) on map-of-nested and
+`allowed`; invalid or contradictory integer `min`/`max`; `allowed` on
+nested-struct fields; leaf attrs
+(`default`/`env`/`allowed`/`min`/`max`/`optional`) on map-of-nested and
 array-of-nested fields; defaults on maps and array-of-nested fields;
 invalid or colliding renames; serde attributes the schema does not honor.
 

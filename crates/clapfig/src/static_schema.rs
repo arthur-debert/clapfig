@@ -153,9 +153,11 @@ pub enum LeafTypeStatic {
     ///
     /// The derive macro maps every Rust integer type, including the
     /// unsigned ones (`u8`/`u16`/`u32`/`u64`/`usize`) and `isize`, to
-    /// this variant, emitting the width's bounds (`u8` → `0..=255`).
-    /// `i64` is unbounded. `isize` carries `isize::MIN/MAX as i64` so a
-    /// 32-bit target rejects values the `i64` value model can hold but
+    /// this variant, emitting the width's bounds (`u8` → `0..=255`) and
+    /// intersecting them with any field-site `#[clapfig(min = ...)]` /
+    /// `#[clapfig(max = ...)]` attributes. `i64` is unbounded until an
+    /// attribute tightens it. `isize` carries `isize::MIN/MAX as i64` so
+    /// a 32-bit target rejects values the `i64` value model can hold but
     /// `isize` cannot (on 64-bit those bounds equal the value-model
     /// range). `u64` carries `min: Some(0)` with an open upper end —
     /// values that exceed `i64::MAX` (e.g. a `u64` holding 2^63)

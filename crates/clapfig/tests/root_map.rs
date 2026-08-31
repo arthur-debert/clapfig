@@ -198,7 +198,10 @@ fn template_has_commented_example_entry_not_parent_table() {
     let result = Clapfig::builder(root_map())
         .app_name("demo")
         .no_env()
-        .handle(&ConfigAction::Gen { output: None })
+        .handle(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     match result {
         ConfigResult::Template(text) => {
@@ -227,12 +230,18 @@ fn object_root_template_unchanged() {
     let as_schema = Clapfig::builder(object.clone())
         .app_name("demo")
         .no_env()
-        .handle(&ConfigAction::Gen { output: None })
+        .handle(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let as_shape = Clapfig::builder(Shape::Object(object))
         .app_name("demo")
         .no_env()
-        .handle(&ConfigAction::Gen { output: None })
+        .handle(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     match (as_schema, as_shape) {
         (ConfigResult::Template(a), ConfigResult::Template(b)) => assert_eq!(a, b),
@@ -280,7 +289,10 @@ fn template_root_map_of_leaves_is_commented_assignment() {
     let result = Clapfig::builder(Shape::from(Shape::map("values", Field::string())))
         .app_name("demo")
         .no_env()
-        .handle(&ConfigAction::Gen { output: None })
+        .handle(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     match result {
         ConfigResult::Template(text) => {

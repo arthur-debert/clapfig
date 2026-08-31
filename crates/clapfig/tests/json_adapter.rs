@@ -46,7 +46,10 @@ fn builder(schema: Schema, dir: &TempDir, file_name: &str) -> clapfig::Builder {
 fn generated_json_template_resolves_green_under_default_strict() {
     let dir = TempDir::new().unwrap();
     let template = builder(parity_schema(), &dir, "app.json")
-        .handle_to_string(&ConfigAction::Gen { output: None })
+        .handle_to_string(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     // The rendered template is real JSON with "//" comment keys.
     assert!(
@@ -83,7 +86,10 @@ fn generated_json_template_honors_normalize_keys_and_resolves_green() {
     let dir = TempDir::new().unwrap();
     let template = builder(schema(), &dir, "app.json")
         .normalize_keys(true)
-        .handle_to_string(&ConfigAction::Gen { output: None })
+        .handle_to_string(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     assert!(template.contains(r#""//api-key""#), "{template}");
     assert!(
@@ -207,11 +213,17 @@ fn same_mistake_produces_identical_validation_error() {
 fn exported_json_schema_is_format_independent() {
     let toml_dir = TempDir::new().unwrap();
     let via_toml = builder(parity_schema(), &toml_dir, "app.toml")
-        .handle_to_string(&ConfigAction::Schema { output: None })
+        .handle_to_string(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let json_dir = TempDir::new().unwrap();
     let via_json = builder(parity_schema(), &json_dir, "app.json")
-        .handle_to_string(&ConfigAction::Schema { output: None })
+        .handle_to_string(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     assert_eq!(via_toml, via_json);
 }
@@ -333,10 +345,16 @@ fn validate(instance: &serde_json::Value, schema: &serde_json::Value) -> Result<
 fn exported_schema_validates_the_generated_template() {
     let dir = TempDir::new().unwrap();
     let template = builder(parity_schema(), &dir, "app.json")
-        .handle_to_string(&ConfigAction::Gen { output: None })
+        .handle_to_string(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let schema_text = builder(parity_schema(), &dir, "app.json")
-        .handle_to_string(&ConfigAction::Schema { output: None })
+        .handle_to_string(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
 
     let instance: serde_json::Value = serde_json::from_str(&template).unwrap();
