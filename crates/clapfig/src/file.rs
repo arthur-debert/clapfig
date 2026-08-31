@@ -215,11 +215,17 @@ fn build_path(root: &Path, parts: &[OsString]) -> PathBuf {
 }
 
 fn join_clean_suffix(mut base: PathBuf, suffix: &[OsString]) -> PathBuf {
+    let anchor_depth = base
+        .components()
+        .take_while(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+        .count();
     for part in suffix {
         match Path::new(part).components().next() {
             Some(Component::CurDir) => {}
             Some(Component::ParentDir) => {
-                base.pop();
+                if base.components().count() > anchor_depth {
+                    base.pop();
+                }
             }
             _ => base.push(part),
         }
@@ -382,6 +388,37 @@ mod tests {
         assert_eq!(
             path_identity(&alias).unwrap(),
             path_identity(&direct).unwrap()
+        );
+    }
+
+    #[test]
+    fn join_clean_suffix_does_not_traverse_above_root() {
+        let root = Path::new(std::path::MAIN_SEPARATOR_STR).to_path_buf();
+        let suffix = [
+            OsString::from(".."),
+            OsString::from(".."),
+            OsString::from("config.toml"),
+        ];
+
+        assert_eq!(
+            join_clean_suffix(root.clone(), &suffix),
+            root.join("config.toml")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn join_clean_suffix_does_not_traverse_above_windows_drive_root() {
+        let root = PathBuf::from(r"C:\");
+        let suffix = [
+            OsString::from(".."),
+            OsString::from(".."),
+            OsString::from("config.toml"),
+        ];
+
+        assert_eq!(
+            join_clean_suffix(root.clone(), &suffix),
+            root.join("config.toml")
         );
     }
 

@@ -1834,6 +1834,42 @@ fn pointer_bounds_tokens(
     (asserted_min, max)
 }
 
+fn pointer_default_assertion_tokens(
+    shape: &TypeShape,
+    attrs: &FieldAttrs,
+    default: &Expr,
+    span: proc_macro2::Span,
+) -> syn::Result<TokenStream2> {
+    let Some(LitValue::Int(default_value)) = parse_lit_value(default) else {
+        return Ok(quote! {});
+    };
+    let Ok((inferred, _)) = integer_bounds_for_shape(shape, span) else {
+        return Ok(quote! {});
+    };
+    let bounds = declared_integer_bounds(attrs, inferred, span)?;
+    if bounds.target == IntegerTarget::Fixed {
+        return Ok(quote! {});
+    }
+
+    let (min, max) = integer_bounds_tokens(bounds);
+    Ok(quote! {
+        let min = #min;
+        let max = #max;
+        if let Some(min) = min {
+            assert!(
+                #default_value >= min,
+                "`default = ...` is outside the field's integer range on this target"
+            );
+        }
+        if let Some(max) = max {
+            assert!(
+                #default_value <= max,
+                "`default = ...` is outside the field's integer range on this target"
+            );
+        }
+    })
+}
+
 fn intersect_min_tokens(target_min: TokenStream2, declared_min: Option<i64>) -> TokenStream2 {
     match declared_min {
         Some(declared) => quote! {
@@ -2421,7 +2457,12 @@ fn expand_field(field: &syn::Field, rename_all: Option<&str>) -> syn::Result<Exp
     let default_expr = match &attrs.default {
         Some(expr) => {
             let v = expr_to_value_static(expr, &shape)?;
-            quote! { Some(#v) }
+            let target_assertion =
+                pointer_default_assertion_tokens(&shape, &attrs, expr, field.span())?;
+            quote! {{
+                #target_assertion
+                Some(#v)
+            }}
         }
         // Bare (non-`Option`) map-typed leaves carry no default, yet an
         // absent map still loads as the empty map: `fill_defaults`
