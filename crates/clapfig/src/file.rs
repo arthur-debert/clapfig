@@ -17,7 +17,7 @@
 //!
 //! After directories are expanded, each one is checked for `{dir}/{file_name}`:
 //!
-//! - [`SearchMode::Merge`] — all found files are returned in priority order. The
+//! - [`SearchMode::Merge`] — all found config files are returned in priority order. The
 //!   caller (the resolve pipeline) deep-merges them so later files override earlier.
 //!   Misses are recorded as [`ProbeOutcome::Missing`](crate::ProbeOutcome::Missing).
 //! - [`SearchMode::FirstMatch`] — the list is searched from the **highest-priority
@@ -35,7 +35,8 @@
 //! It rejects [`Ancestors`](SearchPath::Ancestors) because that variant expands
 //! to multiple directories — a write target must be unambiguous.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::ClapfigError;
 use crate::types::{Boundary, SearchPath};
@@ -161,6 +162,75 @@ pub fn resolve_persist_path(
             .map(|dir| dir.join(file_name))
             .ok_or(ClapfigError::NoPersistPath),
     }
+}
+
+/// Filesystem identity key for discovery/cache comparisons.
+///
+/// Existing paths use the filesystem's canonical path. Missing paths are
+/// normalized by canonicalizing the nearest existing ancestor, then applying
+/// the missing suffix lexically. This keeps `./`, `..`, and symlink aliases
+/// aligned without claiming to close time-of-check/time-of-use races.
+pub(crate) fn path_identity(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        return Ok(canonical);
+    }
+
+    let (root, parts) = absolute_parts(&absolute);
+    for prefix_len in (0..=parts.len()).rev() {
+        let prefix = build_path(&root, &parts[..prefix_len]);
+        if let Ok(canonical_prefix) = std::fs::canonicalize(&prefix) {
+            return Ok(join_clean_suffix(canonical_prefix, &parts[prefix_len..]));
+        }
+    }
+
+    Ok(join_clean_suffix(root, &parts))
+}
+
+fn absolute_parts(path: &Path) -> (PathBuf, Vec<OsString>) {
+    let mut root = PathBuf::new();
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+            Component::RootDir => root.push(component.as_os_str()),
+            Component::CurDir | Component::ParentDir | Component::Normal(_) => {
+                parts.push(component.as_os_str().to_os_string());
+            }
+        }
+    }
+    (root, parts)
+}
+
+fn build_path(root: &Path, parts: &[OsString]) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for part in parts {
+        path.push(part);
+    }
+    path
+}
+
+fn join_clean_suffix(mut base: PathBuf, suffix: &[OsString]) -> PathBuf {
+    let anchor_depth = base
+        .components()
+        .take_while(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+        .count();
+    for part in suffix {
+        match Path::new(part).components().next() {
+            Some(Component::CurDir) => {}
+            Some(Component::ParentDir) => {
+                if base.components().count() > anchor_depth {
+                    base.pop();
+                }
+            }
+            _ => base.push(part),
+        }
+    }
+    base
 }
 
 #[cfg(test)]
@@ -304,6 +374,68 @@ mod tests {
             result,
             Err(ClapfigError::AncestorsNotAllowedAsPersistPath)
         ));
+    }
+
+    #[test]
+    fn path_identity_cleans_missing_suffix_from_existing_ancestor() {
+        let dir = TempDir::new().unwrap();
+        let existing = dir.path().join("config");
+        fs::create_dir(&existing).unwrap();
+
+        let direct = existing.join("demo.toml");
+        let alias = existing.join("missing").join("..").join("demo.toml");
+
+        assert_eq!(
+            path_identity(&alias).unwrap(),
+            path_identity(&direct).unwrap()
+        );
+    }
+
+    #[test]
+    fn join_clean_suffix_does_not_traverse_above_root() {
+        let root = Path::new(std::path::MAIN_SEPARATOR_STR).to_path_buf();
+        let suffix = [
+            OsString::from(".."),
+            OsString::from(".."),
+            OsString::from("config.toml"),
+        ];
+
+        assert_eq!(
+            join_clean_suffix(root.clone(), &suffix),
+            root.join("config.toml")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn join_clean_suffix_does_not_traverse_above_windows_drive_root() {
+        let root = PathBuf::from(r"C:\");
+        let suffix = [
+            OsString::from(".."),
+            OsString::from(".."),
+            OsString::from("config.toml"),
+        ];
+
+        assert_eq!(
+            join_clean_suffix(root.clone(), &suffix),
+            root.join("config.toml")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_canonicalizes_existing_symlink_alias() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        fs::write(real.join("demo.toml"), "port = 10\n").unwrap();
+
+        assert_eq!(
+            path_identity(&link.join("demo.toml")).unwrap(),
+            path_identity(&real.join("demo.toml")).unwrap()
+        );
     }
 
     // End-to-end "load files via Ancestors walk" coverage lives in

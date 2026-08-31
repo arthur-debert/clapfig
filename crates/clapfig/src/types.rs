@@ -217,11 +217,21 @@ pub enum ConfigAction {
         scope: Option<String>,
     },
     Gen {
+        /// Write to a file instead of returning the template, or `None`
+        /// for stdout-style rendering.
         output: Option<PathBuf>,
+        /// Overwrite an existing `output` file. Ignored when `output` is
+        /// `None`.
+        force: bool,
     },
     /// Emit a JSON Schema document describing the config struct.
     Schema {
+        /// Write to a file instead of returning the schema, or `None`
+        /// for stdout-style rendering.
         output: Option<PathBuf>,
+        /// Overwrite an existing `output` file. Ignored when `output` is
+        /// `None`.
+        force: bool,
     },
     /// Show a single config key's value.
     Get {

@@ -67,12 +67,18 @@ pub enum ConfigSubcommand {
         /// Write to a file instead of stdout.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Overwrite an existing output file.
+        #[arg(long)]
+        force: bool,
     },
     /// Emit a JSON Schema document describing the config struct.
     Schema {
         /// Write to a file instead of stdout.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Overwrite an existing output file.
+        #[arg(long)]
+        force: bool,
     },
     /// Show the resolved value and documentation for a config key.
     Get {
@@ -98,13 +104,15 @@ impl ConfigArgs {
     ///
     /// Bare `config` (no subcommand) and explicit `config list` both map to
     /// `ConfigAction::List`. The `--scope` flag is threaded through to all
-    /// variants except `Gen`.
+    /// variants except `Gen` and `Schema`.
     pub fn into_action(self) -> ConfigAction {
         let scope = self.scope;
         match self.action {
             None | Some(ConfigSubcommand::List) => ConfigAction::List { scope },
-            Some(ConfigSubcommand::Gen { output }) => ConfigAction::Gen { output },
-            Some(ConfigSubcommand::Schema { output }) => ConfigAction::Schema { output },
+            Some(ConfigSubcommand::Gen { output, force }) => ConfigAction::Gen { output, force },
+            Some(ConfigSubcommand::Schema { output, force }) => {
+                ConfigAction::Schema { output, force }
+            }
             Some(ConfigSubcommand::Get { key }) => ConfigAction::Get { key, scope },
             Some(ConfigSubcommand::Set { key, value }) => ConfigAction::Set { key, value, scope },
             Some(ConfigSubcommand::Unset { key }) => ConfigAction::Unset { key, scope },
@@ -246,17 +254,25 @@ impl ConfigCommand {
             }
             arg
         };
+        let build_force_arg = || {
+            Arg::new("force")
+                .long("force")
+                .help("Overwrite an existing output file.")
+                .action(clap::ArgAction::SetTrue)
+        };
 
         let list_cmd = Command::new(self.list_name.clone())
             .about("Show all resolved configuration key-value pairs.");
 
         let gen_cmd = Command::new(self.gen_name.clone())
             .about("Generate a commented sample configuration file.")
-            .arg(build_output_arg());
+            .arg(build_output_arg())
+            .arg(build_force_arg());
 
         let schema_cmd = Command::new(self.schema_name.clone())
             .about("Emit a JSON Schema document describing the config struct.")
-            .arg(build_output_arg());
+            .arg(build_output_arg())
+            .arg(build_force_arg());
 
         let get_cmd = Command::new(self.get_name.clone())
             .about("Show the resolved value and documentation for a config key.")
@@ -307,11 +323,13 @@ impl ConfigCommand {
             Some((name, _)) if name == self.list_name => Ok(ConfigAction::List { scope }),
             Some((name, sub)) if name == self.gen_name => {
                 let output = sub.get_one::<PathBuf>("output").cloned();
-                Ok(ConfigAction::Gen { output })
+                let force = sub.get_flag("force");
+                Ok(ConfigAction::Gen { output, force })
             }
             Some((name, sub)) if name == self.schema_name => {
                 let output = sub.get_one::<PathBuf>("output").cloned();
-                Ok(ConfigAction::Schema { output })
+                let force = sub.get_flag("force");
+                Ok(ConfigAction::Schema { output, force })
             }
             Some((name, sub)) if name == self.get_name => {
                 let key = sub.get_one::<String>("key").unwrap().clone();
@@ -351,7 +369,13 @@ mod tests {
     fn parse_gen_no_output() {
         let args = parse(&["test", "gen"]);
         let action = args.into_action();
-        assert_eq!(action, ConfigAction::Gen { output: None });
+        assert_eq!(
+            action,
+            ConfigAction::Gen {
+                output: None,
+                force: false
+            }
+        );
     }
 
     #[test]
@@ -361,7 +385,21 @@ mod tests {
         assert_eq!(
             action,
             ConfigAction::Gen {
-                output: Some(PathBuf::from("out.toml"))
+                output: Some(PathBuf::from("out.toml")),
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_gen_with_force() {
+        let args = parse(&["test", "gen", "--output", "out.toml", "--force"]);
+        let action = args.into_action();
+        assert_eq!(
+            action,
+            ConfigAction::Gen {
+                output: Some(PathBuf::from("out.toml")),
+                force: true,
             }
         );
     }
@@ -370,7 +408,13 @@ mod tests {
     fn parse_schema_no_output() {
         let args = parse(&["test", "schema"]);
         let action = args.into_action();
-        assert_eq!(action, ConfigAction::Schema { output: None });
+        assert_eq!(
+            action,
+            ConfigAction::Schema {
+                output: None,
+                force: false
+            }
+        );
     }
 
     #[test]
@@ -380,7 +424,21 @@ mod tests {
         assert_eq!(
             action,
             ConfigAction::Schema {
-                output: Some(PathBuf::from("schema.json"))
+                output: Some(PathBuf::from("schema.json")),
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_schema_with_force() {
+        let args = parse(&["test", "schema", "--output", "schema.json", "--force"]);
+        let action = args.into_action();
+        assert_eq!(
+            action,
+            ConfigAction::Schema {
+                output: Some(PathBuf::from("schema.json")),
+                force: true,
             }
         );
     }
@@ -392,7 +450,8 @@ mod tests {
         assert_eq!(
             action,
             ConfigAction::Gen {
-                output: Some(PathBuf::from("/etc/myapp.toml"))
+                output: Some(PathBuf::from("/etc/myapp.toml")),
+                force: false,
             }
         );
     }
@@ -589,7 +648,10 @@ mod tests {
         let cmd = ConfigCommand::new();
         assert_eq!(
             cmd_parse(&cmd, &["test", "config", "gen"]),
-            ConfigAction::Gen { output: None }
+            ConfigAction::Gen {
+                output: None,
+                force: false
+            }
         );
     }
 
@@ -599,7 +661,8 @@ mod tests {
         assert_eq!(
             cmd_parse(&cmd, &["test", "config", "gen", "-o", "out.toml"]),
             ConfigAction::Gen {
-                output: Some(PathBuf::from("out.toml"))
+                output: Some(PathBuf::from("out.toml")),
+                force: false,
             }
         );
     }
@@ -610,7 +673,23 @@ mod tests {
         assert_eq!(
             cmd_parse(&cmd, &["test", "config", "gen", "--output", "out.toml"]),
             ConfigAction::Gen {
-                output: Some(PathBuf::from("out.toml"))
+                output: Some(PathBuf::from("out.toml")),
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cmd_default_gen_with_force() {
+        let cmd = ConfigCommand::new();
+        assert_eq!(
+            cmd_parse(
+                &cmd,
+                &["test", "config", "gen", "--output", "out.toml", "--force"]
+            ),
+            ConfigAction::Gen {
+                output: Some(PathBuf::from("out.toml")),
+                force: true,
             }
         );
     }
@@ -620,7 +699,10 @@ mod tests {
         let cmd = ConfigCommand::new();
         assert_eq!(
             cmd_parse(&cmd, &["test", "config", "schema"]),
-            ConfigAction::Schema { output: None }
+            ConfigAction::Schema {
+                output: None,
+                force: false
+            }
         );
     }
 
@@ -630,7 +712,30 @@ mod tests {
         assert_eq!(
             cmd_parse(&cmd, &["test", "config", "schema", "-o", "schema.json"]),
             ConfigAction::Schema {
-                output: Some(PathBuf::from("schema.json"))
+                output: Some(PathBuf::from("schema.json")),
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cmd_default_schema_with_force() {
+        let cmd = ConfigCommand::new();
+        assert_eq!(
+            cmd_parse(
+                &cmd,
+                &[
+                    "test",
+                    "config",
+                    "schema",
+                    "--output",
+                    "schema.json",
+                    "--force"
+                ]
+            ),
+            ConfigAction::Schema {
+                output: Some(PathBuf::from("schema.json")),
+                force: true,
             }
         );
     }
@@ -640,7 +745,10 @@ mod tests {
         let cmd = ConfigCommand::new().schema_name("json-schema");
         assert_eq!(
             cmd_parse(&cmd, &["test", "config", "json-schema"]),
-            ConfigAction::Schema { output: None }
+            ConfigAction::Schema {
+                output: None,
+                force: false
+            }
         );
     }
 
@@ -749,7 +857,10 @@ mod tests {
         let cmd = ConfigCommand::new().gen_name("template");
         assert_eq!(
             cmd_parse(&cmd, &["test", "config", "template"]),
-            ConfigAction::Gen { output: None }
+            ConfigAction::Gen {
+                output: None,
+                force: false
+            }
         );
     }
 
@@ -776,7 +887,8 @@ mod tests {
         assert_eq!(
             cmd_parse(&cmd, &["test", "config", "gen", "--file", "out.toml"]),
             ConfigAction::Gen {
-                output: Some(PathBuf::from("out.toml"))
+                output: Some(PathBuf::from("out.toml")),
+                force: false,
             }
         );
     }
@@ -787,7 +899,8 @@ mod tests {
         assert_eq!(
             cmd_parse(&cmd, &["test", "config", "gen", "-f", "out.toml"]),
             ConfigAction::Gen {
-                output: Some(PathBuf::from("out.toml"))
+                output: Some(PathBuf::from("out.toml")),
+                force: false,
             }
         );
     }
@@ -799,7 +912,8 @@ mod tests {
         assert_eq!(
             cmd_parse(&cmd, &["test", "config", "gen", "--output", "out.toml"]),
             ConfigAction::Gen {
-                output: Some(PathBuf::from("out.toml"))
+                output: Some(PathBuf::from("out.toml")),
+                force: false,
             }
         );
         // Short form should fail
@@ -889,7 +1003,8 @@ mod tests {
         assert_eq!(
             cmd.parse(sub).unwrap(),
             ConfigAction::Gen {
-                output: Some(PathBuf::from("out.toml"))
+                output: Some(PathBuf::from("out.toml")),
+                force: false,
             }
         );
     }

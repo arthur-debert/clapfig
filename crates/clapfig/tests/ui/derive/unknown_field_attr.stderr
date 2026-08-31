@@ -1,4 +1,4 @@
-error: unsupported #[clapfig(...)] field attribute: `nope`. Supported: default, env, rename, value, optional, allowed
+error: unsupported #[clapfig(...)] field attribute: `nope`. Supported: default, env, rename, value, optional, allowed, min, max
  --> tests/ui/derive/unknown_field_attr.rs:5:15
   |
 5 |     #[clapfig(nope = 1)]

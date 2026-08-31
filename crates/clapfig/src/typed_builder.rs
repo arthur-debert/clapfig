@@ -289,12 +289,14 @@ impl<C: DocumentRoot + DeserializeOwned> TypedBuilder<C> {
     ///
     /// The action surface is identical to the Map-out path —
     /// `gen | schema | get | list | set | unset` all delegate. A typed
-    /// [`post_validate`](Self::post_validate) hook still guards the
-    /// merged `get`/`list` views: it is bridged into the Map-out builder
-    /// (deserializing a `C` to run it) since no typed value is returned
-    /// here. A deserialize failure on that throwaway `C` stays
-    /// [`ClapfigError::InvalidValue`]; only the hook's own rejection
-    /// becomes [`ClapfigError::PostValidationFailed`].
+    /// [`post_validate`](Self::post_validate) hook guards `set`/`unset`
+    /// by validating the would-be merged configuration before the file
+    /// is written. Merged `get`/`list` actions intentionally skip the
+    /// semantic hook so callers can inspect a policy-invalid
+    /// configuration. A deserialize failure on the throwaway `C` used
+    /// for write validation stays [`ClapfigError::InvalidValue`]; only
+    /// the hook's own rejection becomes
+    /// [`ClapfigError::PostValidationFailed`].
     pub fn handle(self, action: &ConfigAction) -> Result<ConfigResult, ClapfigError>
     where
         C: 'static,
@@ -320,11 +322,12 @@ impl<C: DocumentRoot + DeserializeOwned> TypedBuilder<C> {
     }
 
     /// Collapse into the Map-out builder for `handle` dispatch, bridging
-    /// any typed hook into a Map-level one (the merged `get`/`list` views
-    /// resolve through the Map pipeline, which cannot call a typed
-    /// closure directly). Deserialize failures stay
-    /// [`ClapfigError::InvalidValue`]; only the typed hook's own
-    /// rejection becomes [`ClapfigError::PostValidationFailed`].
+    /// any typed hook into a Map-level one for write validation.
+    /// `Builder::handle` decides which actions run that hook:
+    /// `set`/`unset` do, merged `get`/`list` do not. Deserialize
+    /// failures stay [`ClapfigError::InvalidValue`]; only the typed
+    /// hook's own rejection becomes
+    /// [`ClapfigError::PostValidationFailed`].
     fn into_inner(self) -> Builder
     where
         C: 'static,

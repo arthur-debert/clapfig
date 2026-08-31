@@ -209,7 +209,10 @@ fn kebab_schema_template_emits_converted_keys() {
     let result = Clapfig::typed::<KebabApp>()
         .app_name("test")
         .no_env()
-        .handle(&ConfigAction::Gen { output: None })
+        .handle(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let t = match result {
         ConfigResult::Template(t) => t,
@@ -244,7 +247,10 @@ fn kebab_schema_json_schema_uses_converted_names() {
     let result = Clapfig::typed::<KebabApp>()
         .app_name("test")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -280,7 +286,10 @@ fn kebab_schema_without_normalize_keys_is_the_supported_pairing() {
     let result = Clapfig::typed::<KebabApp>()
         .app_name("test")
         .no_env()
-        .handle(&ConfigAction::Gen { output: None })
+        .handle(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let ConfigResult::Template(t) = result else {
         panic!("expected Template");
@@ -372,8 +381,14 @@ fn expect_unreachable(result: Result<ConfigResult, ClapfigError>, key: &str, sec
 #[test]
 fn kebab_schema_with_normalize_keys_refuses_to_generate() {
     for action in [
-        ConfigAction::Gen { output: None },
-        ConfigAction::Schema { output: None },
+        ConfigAction::Gen {
+            output: None,
+            force: false,
+        },
+        ConfigAction::Schema {
+            output: None,
+            force: false,
+        },
     ] {
         expect_unreachable(
             Clapfig::typed::<KebabApp>()
@@ -413,7 +428,10 @@ fn a_kebab_key_in_a_nested_section_is_refused_with_its_path() {
             .app_name("test")
             .no_env()
             .normalize_keys(true)
-            .handle(&ConfigAction::Schema { output: None }),
+            .handle(&ConfigAction::Schema {
+                output: None,
+                force: false,
+            }),
         "timeout-ms",
         "section",
     );
@@ -460,8 +478,14 @@ fn the_supported_pairings_still_generate() {
     // loads), and normalization over a snake_case schema is what the
     // aliased JSON Schema exists for.
     for action in [
-        ConfigAction::Gen { output: None },
-        ConfigAction::Schema { output: None },
+        ConfigAction::Gen {
+            output: None,
+            force: false,
+        },
+        ConfigAction::Schema {
+            output: None,
+            force: false,
+        },
     ] {
         assert!(
             Clapfig::typed::<KebabApp>()

@@ -105,7 +105,10 @@ fn directive_is_the_first_line_followed_by_a_blank_separator() {
     // The third line is where the un-prefixed template body starts.
     let body = template_of(
         runtime_builder()
-            .handle(&ConfigAction::Gen { output: None })
+            .handle(&ConfigAction::Gen {
+                output: None,
+                force: false,
+            })
             .unwrap(),
     );
     assert_eq!(lines.next(), body.lines().next());
@@ -118,7 +121,10 @@ fn directive_only_prefixes_the_gen_template() {
     let pair = runtime_builder().artifacts(&with_reference()).unwrap();
     let body = template_of(
         runtime_builder()
-            .handle(&ConfigAction::Gen { output: None })
+            .handle(&ConfigAction::Gen {
+                output: None,
+                force: false,
+            })
             .unwrap(),
     );
     assert_eq!(
@@ -446,7 +452,10 @@ fn the_standalone_schema_action_normalizes_the_same_way() {
         Clapfig::builder(multiword_schema())
             .app_name("app")
             .normalize_keys(true)
-            .handle(&ConfigAction::Schema { output: None })
+            .handle(&ConfigAction::Schema {
+                output: None,
+                force: false,
+            })
             .unwrap(),
     );
     let pair = Clapfig::builder(multiword_schema())
@@ -485,12 +494,18 @@ fn without_a_reference_the_artifacts_match_the_standalone_actions() {
         .unwrap();
     let generated = template_of(
         runtime_builder()
-            .handle(&ConfigAction::Gen { output: None })
+            .handle(&ConfigAction::Gen {
+                output: None,
+                force: false,
+            })
             .unwrap(),
     );
     let schema = schema_of(
         runtime_builder()
-            .handle(&ConfigAction::Schema { output: None })
+            .handle(&ConfigAction::Schema {
+                output: None,
+                force: false,
+            })
             .unwrap(),
     );
     assert_eq!(pair.template, generated);
@@ -530,13 +545,19 @@ fn derive_path_without_a_reference_matches_its_standalone_actions() {
     let generated = template_of(
         Clapfig::typed::<BlocksFile>()
             .app_name("edward")
-            .handle(&ConfigAction::Gen { output: None })
+            .handle(&ConfigAction::Gen {
+                output: None,
+                force: false,
+            })
             .unwrap(),
     );
     let schema = schema_of(
         Clapfig::typed::<BlocksFile>()
             .app_name("edward")
-            .handle(&ConfigAction::Schema { output: None })
+            .handle(&ConfigAction::Schema {
+                output: None,
+                force: false,
+            })
             .unwrap(),
     );
     assert_eq!(pair.template, generated);

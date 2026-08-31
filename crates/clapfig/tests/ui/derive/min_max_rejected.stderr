@@ -1,0 +1,65 @@
+error: `min` must be less than or equal to `max`
+ --> tests/ui/derive/min_max_rejected.rs:6:5
+  |
+6 |     #[clapfig(min = 10, max = 1)]
+  |     ^
+
+error: `min`/`max` contradict the Rust integer type's representable range
+  --> tests/ui/derive/min_max_rejected.rs:12:5
+   |
+12 |     #[clapfig(min = 300)]
+   |     ^
+
+error: `default = ...` is outside the field's integer range
+  --> tests/ui/derive/min_max_rejected.rs:18:25
+   |
+18 |     #[clapfig(default = 0, min = 1)]
+   |                         ^
+
+error: `default = ...` is outside the field's integer range
+  --> tests/ui/derive/min_max_rejected.rs:24:25
+   |
+24 |     #[clapfig(default = 300)]
+   |                         ^^^
+
+error: `min` and `max` are only valid on integer fields
+  --> tests/ui/derive/min_max_rejected.rs:30:5
+   |
+30 |     #[clapfig(min = 1)]
+   |     ^
+
+error: `min` and `max` are only valid on integer fields
+  --> tests/ui/derive/min_max_rejected.rs:41:5
+   |
+41 |     #[clapfig(min = 1)]
+   |     ^
+
+error: `min` and `max` are only valid on integer fields
+  --> tests/ui/derive/min_max_rejected.rs:47:5
+   |
+47 |     #[clapfig(max = 10)]
+   |     ^
+
+error: leaf attributes (default, env, allowed, min, max, optional) are not valid on map-of-nested-struct fields — entry presence is already user-controlled, and a single per-field default has no meaning across an arbitrary set of entry keys.
+  --> tests/ui/derive/min_max_rejected.rs:53:5
+   |
+53 |     #[clapfig(min = 1)]
+   |     ^
+
+error: leaf attributes (default, env, allowed, min, max, optional) are not valid on array-of-nested-schema fields — array entries are user-supplied (an absent array is the empty array), and a per-field scalar attribute has no meaning across a list of entries. For an optional list of a unit-only enum, use `Option<Vec<T>>`.
+  --> tests/ui/derive/min_max_rejected.rs:59:5
+   |
+59 |     #[clapfig(max = 10)]
+   |     ^
+
+error: `min` and `max` are only valid on integer fields
+  --> tests/ui/derive/min_max_rejected.rs:71:5
+   |
+71 |     #[clapfig(min = 1)]
+   |     ^
+
+error: `default = ...` is outside the field's integer range
+  --> tests/ui/derive/min_max_rejected.rs:77:25
+   |
+77 |     #[clapfig(default = -9223372036854775808, min = -10)]
+   |                         ^

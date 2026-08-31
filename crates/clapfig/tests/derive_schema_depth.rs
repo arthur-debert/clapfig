@@ -191,10 +191,10 @@ fn every_scalar_type_maps_to_expected_leaf_type() {
         })
         .collect();
     assert!(matches!(by_name["s"], LeafTypeStatic::String));
-    // Sized widths carry their exact bounds; i64 is unbounded; isize
-    // emits isize::MIN/MAX (full i64 range on 64-bit); u64 is min 0
-    // with an open top; usize is min 0 with a max only when
-    // usize::BITS < 64.
+    // Sized widths carry their exact bounds; i64 is unbounded. isize and
+    // usize evaluate pointer-width bounds in the target crate, so 64-bit
+    // targets stay open where the TOML value model already covers every
+    // representable value.
     assert!(matches!(
         by_name["i8v"],
         LeafTypeStatic::Integer {
@@ -264,14 +264,58 @@ fn every_scalar_type_maps_to_expected_leaf_type() {
     }
     match by_name["isz"] {
         LeafTypeStatic::Integer { min, max } => {
-            assert_eq!(*min, Some(isize::MIN as i64));
-            assert_eq!(*max, Some(isize::MAX as i64));
+            if isize::BITS < 64 {
+                assert_eq!(*min, Some(isize::MIN as i64));
+                assert_eq!(*max, Some(isize::MAX as i64));
+            } else {
+                assert_eq!(*min, None);
+                assert_eq!(*max, None);
+            }
         }
         other => panic!("expected Integer for isz, got {other:?}"),
     }
     assert!(matches!(by_name["f32v"], LeafTypeStatic::Float));
     assert!(matches!(by_name["f64v"], LeafTypeStatic::Float));
     assert!(matches!(by_name["bv"], LeafTypeStatic::Bool));
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct PointerBounded {
+    #[clapfig(min = 1, max = 500)]
+    usz: usize,
+    #[clapfig(min = -500, max = 500)]
+    isz: isize,
+}
+
+#[test]
+fn pointer_width_integer_bounds_intersect_on_target() {
+    let s = <PointerBounded as Schema>::STATIC;
+    let by_name: std::collections::HashMap<&str, &LeafTypeStatic> = s
+        .fields
+        .iter()
+        .map(|f| {
+            let leaf = match &f.field {
+                FieldStatic::Leaf(l) => l,
+                _ => panic!("non-leaf where leaf expected"),
+            };
+            (f.name, &leaf.ty)
+        })
+        .collect();
+
+    assert!(matches!(
+        by_name["usz"],
+        LeafTypeStatic::Integer {
+            min: Some(1),
+            max: Some(500)
+        }
+    ));
+    assert!(matches!(
+        by_name["isz"],
+        LeafTypeStatic::Integer {
+            min: Some(-500),
+            max: Some(500)
+        }
+    ));
 }
 
 // -- Negative-literal defaults --------------------------------------------
@@ -353,7 +397,10 @@ fn env_attribute_propagates_to_runtime_schema_leaf() {
     let result = Clapfig::typed::<EnvConfig>()
         .app_name("t")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -425,7 +472,10 @@ fn allowed_integer_enum_is_carried_through_to_json_schema() {
     let result = Clapfig::typed::<IntEnum>()
         .app_name("t")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -548,6 +598,37 @@ fn handle_set_rejects_invalid_enum_via_macro_schema() {
         "out-of-set enum value must fail validation at Set time, before write"
     );
     assert!(!dir.path().join("t.toml").exists());
+}
+
+#[test]
+fn handle_set_runs_typed_post_validate_before_writing() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.toml");
+    std::fs::write(&path, "port = 2\n").unwrap();
+
+    let result = Clapfig::typed::<PersistConfig>()
+        .app_name("test")
+        .file_name("test.toml")
+        .persist_scope("local", SearchPath::Path(dir.path().to_path_buf()))
+        .no_env()
+        .post_validate(|cfg: &PersistConfig| {
+            if cfg.port == 0 {
+                Err("port must be greater than zero".into())
+            } else {
+                Ok(())
+            }
+        })
+        .handle(&ConfigAction::Set {
+            key: "port".into(),
+            value: "0".into(),
+            scope: None,
+        });
+
+    assert!(matches!(
+        result,
+        Err(clapfig::ClapfigError::PostValidationFailed(_))
+    ));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "port = 2\n");
 }
 
 // -- Strictness cascade through three nested levels -----------------------
@@ -767,7 +848,10 @@ fn allowed_accepts_negative_integer_literals() {
     let result = Clapfig::typed::<AllowedNegativeInts>()
         .app_name("t")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -1150,7 +1234,10 @@ fn handle_to_string_produces_template_text() {
     let s = Clapfig::typed::<DefaultedForHook>()
         .app_name("t")
         .no_env()
-        .handle_to_string(&ConfigAction::Gen { output: None })
+        .handle_to_string(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     assert!(s.contains("port = 8080"), "got: {s}");
 }

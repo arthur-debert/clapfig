@@ -85,10 +85,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{rendered}");
         }
         "gen" => {
-            make_builder().handle_and_print(&ConfigAction::Gen { output: None })?;
+            make_builder().handle_and_print(&ConfigAction::Gen {
+                output: None,
+                force: false,
+            })?;
         }
         "schema" => {
-            make_builder().handle_and_print(&ConfigAction::Schema { output: None })?;
+            make_builder().handle_and_print(&ConfigAction::Schema {
+                output: None,
+                force: false,
+            })?;
         }
         "list" => {
             make_builder().handle_and_print(&ConfigAction::List { scope: None })?;

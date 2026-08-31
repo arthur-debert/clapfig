@@ -294,8 +294,12 @@ let config: AppConfig = Clapfig::typed::<AppConfig>()
     .load()?;
 ```
 
-The hook runs after all layers have been merged and type-validated. Rejections
-become `ClapfigError::PostValidationFailed`.
+The hook runs after all layers have been merged and type-validated during
+`load()` and resolver calls. `config set` and `config unset` also run it
+against the candidate merged configuration and write only after it accepts
+the result. Merged `config get` and `config list` skip the semantic hook so
+users can inspect a policy-invalid configuration before repairing it.
+Rejections become `ClapfigError::PostValidationFailed`.
 
 ## Common patterns
 

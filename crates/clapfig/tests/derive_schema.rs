@@ -156,12 +156,33 @@ struct RequiredFieldsConfig {
     port: u32,
 }
 
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct BoundedIntegerConfig {
+    /// Worker count.
+    #[clapfig(default = 4, min = 1, max = 12)]
+    workers: u8,
+
+    /// Signed budget delta.
+    #[clapfig(min = -10, max = -1)]
+    debt: i64,
+}
+
+#[derive(Schema, Serialize, Deserialize, Debug)]
+struct I64MinConfig {
+    /// Lowest signed 64-bit value.
+    #[clapfig(default = -9223372036854775808, min = -9223372036854775808)]
+    floor: i64,
+}
+
 #[test]
 fn json_schema_emits_type_for_required_fields_without_defaults() {
     let result = Clapfig::typed::<RequiredFieldsConfig>()
         .app_name("test")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -174,6 +195,65 @@ fn json_schema_emits_type_for_required_fields_without_defaults() {
         "gap #1: required leaf without default must still get a JSON Schema `type`. Got: {props}"
     );
     assert_eq!(props["port"]["type"], "integer", "gap #1 (port)");
+}
+
+#[test]
+fn integer_min_max_attrs_feed_runtime_and_json_schema_bounds() {
+    let runtime = BoundedIntegerConfig::schema();
+    let workers = runtime
+        .fields
+        .iter()
+        .find(|field| field.name == "workers")
+        .expect("workers field");
+    match &workers.field {
+        clapfig::runtime::Shape::Leaf(leaf) => match &leaf.ty {
+            clapfig::runtime::LeafType::Integer { min, max } => {
+                assert_eq!((*min, *max), (Some(1), Some(12)));
+            }
+            other => panic!("expected bounded integer, got {other:?}"),
+        },
+        other => panic!("expected leaf, got {other:?}"),
+    }
+
+    let result = Clapfig::typed::<BoundedIntegerConfig>()
+        .app_name("bounded")
+        .no_env()
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
+        .unwrap();
+    let schema = match result {
+        ConfigResult::Schema(schema) => schema,
+        other => panic!("expected Schema, got {other:?}"),
+    };
+    let v: serde_json::Value = serde_json::from_str(&schema).unwrap();
+    assert_eq!(v["properties"]["workers"]["minimum"], 1);
+    assert_eq!(v["properties"]["workers"]["maximum"], 12);
+    assert_eq!(v["properties"]["debt"]["minimum"], -10);
+    assert_eq!(v["properties"]["debt"]["maximum"], -1);
+}
+
+#[test]
+fn i64_min_literal_is_valid_for_bounds_and_defaults() {
+    let runtime = I64MinConfig::schema();
+    let floor = runtime
+        .fields
+        .iter()
+        .find(|field| field.name == "floor")
+        .expect("floor field");
+    match &floor.field {
+        clapfig::runtime::Shape::Leaf(leaf) => {
+            assert_eq!(leaf.default, Some(clapfig::value::Value::Integer(i64::MIN)));
+            match &leaf.ty {
+                clapfig::runtime::LeafType::Integer { min, max } => {
+                    assert_eq!((*min, *max), (Some(i64::MIN), None));
+                }
+                other => panic!("expected bounded integer, got {other:?}"),
+            }
+        }
+        other => panic!("expected leaf, got {other:?}"),
+    }
 }
 
 // -- Gap #2 + #3: enum metadata via `#[clapfig(allowed = [...])]` -----------
@@ -190,7 +270,10 @@ fn json_schema_emits_enum_for_allowed_constrained_leaf() {
     let result = Clapfig::typed::<EnumConfig>()
         .app_name("test")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -209,7 +292,10 @@ fn template_emits_allowed_line_for_enum_leaf() {
     let result = Clapfig::typed::<EnumConfig>()
         .app_name("test")
         .no_env()
-        .handle(&ConfigAction::Gen { output: None })
+        .handle(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let t = match result {
         ConfigResult::Template(t) => t,
@@ -240,7 +326,10 @@ fn template_emits_placeholder_for_required_leaf_without_default() {
     let result = Clapfig::typed::<RequiredFieldsConfig>()
         .app_name("test")
         .no_env()
-        .handle(&ConfigAction::Gen { output: None })
+        .handle(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let t = match result {
         ConfigResult::Template(t) => t,
@@ -266,7 +355,10 @@ fn doc_comments_become_descriptions() {
     let result = Clapfig::typed::<AppConfig>()
         .app_name("test")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,
@@ -585,7 +677,10 @@ fn unit_enum_template_emits_allowed_hint() {
     let result = Clapfig::typed::<PdfDoc>()
         .app_name("test")
         .no_env()
-        .handle(&ConfigAction::Gen { output: None })
+        .handle(&ConfigAction::Gen {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let t = match result {
         ConfigResult::Template(t) => t,
@@ -627,7 +722,10 @@ fn unit_enum_json_schema_carries_enum_array() {
     let result = Clapfig::typed::<PdfDoc>()
         .app_name("test")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,

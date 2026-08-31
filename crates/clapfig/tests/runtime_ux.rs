@@ -10,15 +10,16 @@
 //! - an out-of-range integer for a sized width fails naming the key
 //!   path, never the opaque `<merged>` placeholder;
 //! - a deserialize failure inside a typed `post_validate` hook surfaces
-//!   as the type error it is, not as a hook rejection — on `load` and
-//!   on merged `config get`/`list` via `handle`;
+//!   as the type error it is, not as a hook rejection during `load`;
+//! - merged `config get`/`list` via `handle` skip typed hook validation
+//!   so policy-invalid configs remain inspectable;
 //! - the exported JSON Schema's `required` arrays list exactly the
 //!   absences the runtime rejects, and its leaf schemas carry integer
 //!   bounds and the four-form datetime `anyOf`.
 
 #![cfg(feature = "derive")]
 
-use clapfig::{Clapfig, ClapfigError, ConfigAction, Schema, SearchPath};
+use clapfig::{Clapfig, ClapfigError, ConfigAction, ConfigResult, Schema, SearchPath};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use tempfile::TempDir;
@@ -110,7 +111,7 @@ fn post_validate_deserialize_failure_is_a_type_error_not_a_hook_rejection() {
 }
 
 #[test]
-fn handle_get_list_deserialize_failure_is_a_type_error_not_a_hook_rejection() {
+fn handle_get_list_skip_typed_post_validate_deserialize() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("uxdemo.toml"), "rule = 5\n").unwrap();
     let builder = || {
@@ -120,23 +121,18 @@ fn handle_get_list_deserialize_failure_is_a_type_error_not_a_hook_rejection() {
             .no_env()
             .post_validate(|_cfg| Ok(()))
     };
-    for action in [
-        ConfigAction::Get {
+    let got = builder()
+        .handle(&ConfigAction::Get {
             key: "rule".into(),
             scope: None,
-        },
-        ConfigAction::List { scope: None },
-    ] {
-        let err = builder().handle(&action).unwrap_err();
-        match &err {
-            ClapfigError::InvalidValue { .. } => {}
-            other => panic!("expected InvalidValue for {action:?}, got {other:?}"),
-        }
-        assert!(
-            !err.to_string().contains("Configuration validation failed"),
-            "must not wear the post_validate rejection prefix: {err}"
-        );
-    }
+        })
+        .unwrap();
+    assert!(matches!(got, ConfigResult::KeyValue { .. }));
+
+    let listed = builder()
+        .handle(&ConfigAction::List { scope: None })
+        .unwrap();
+    assert!(matches!(listed, ConfigResult::Listing { .. }));
 }
 
 #[derive(Schema, Serialize, Deserialize, Debug)]

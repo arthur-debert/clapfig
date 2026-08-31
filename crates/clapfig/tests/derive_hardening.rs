@@ -337,7 +337,10 @@ fn map_leaf_is_not_required_in_json_schema() {
     let result = Clapfig::typed::<PerTargetLevels>()
         .app_name("t")
         .no_env()
-        .handle(&ConfigAction::Schema { output: None })
+        .handle(&ConfigAction::Schema {
+            output: None,
+            force: false,
+        })
         .unwrap();
     let s = match result {
         ConfigResult::Schema(s) => s,

@@ -65,7 +65,7 @@ of objects are the same `Shape::Map` / `Shape::Array` constructor with a
 different item.
 
 - **`Field::string()`, `Field::integer()`, `Field::float()`, `Field::boolean()`, `Field::datetime()`** — TOML primitive leaves.
-- **`Field::integer_in(min, max)`** — range-bounded integer (`None` leaves an end open). Both ends set with `min > max` panics when the field is built (an authoring error, same class as a duplicate field name). Out-of-range values fail validation naming the key, and `config schema` exports the bounds as `minimum`/`maximum` — the runtime counterpart of the width bounds the derive macro emits for sized integer fields (`u8` → `0..=255`).
+- **`Field::integer_in(min, max)`** — range-bounded integer (`None` leaves an end open). Both ends set with `min > max` panics when the field is built (an authoring error, same class as a duplicate field name). Out-of-range values fail validation naming the key, and `config schema` exports the bounds as `minimum`/`maximum` — the runtime counterpart of the width bounds the derive macro emits for sized integer fields (`u8` → `0..=255`) and the derive field attributes `#[clapfig(min = ...)]` / `#[clapfig(max = ...)]`.
 - **`Field::array_of_type(item)`** — homogeneous array (`Shape::Array`). `item` is `impl Into<Shape>` (a `LeafType` still converts). An array of objects uses `Schema::object(...).array_of(name, item_schema)` — same constructor, object item.
 - **`Field::map_of(item)`** — string-keyed homogeneous map (`Shape::Map`). Same `impl Into<Shape>` item. A map of objects uses `Schema::object(...).map_of(name, item_schema)`.
 - **`Field::enum_of(values)`** — constrained value: must be one of the listed TOML primitives. Used for log levels, output formats, modes.

@@ -295,7 +295,10 @@ fn tagged_normalize_keys_renames_tag_and_variant_fields_not_discriminators() {
                 .formats([adapter.name()])
                 .normalize_keys(true)
                 .no_env()
-                .handle(&clapfig::ConfigAction::Gen { output: None })
+                .handle(&clapfig::ConfigAction::Gen {
+                    output: None,
+                    force: false,
+                })
                 .unwrap();
             let text = match text {
                 clapfig::ConfigResult::Template(t) => t,
