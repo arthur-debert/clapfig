@@ -1543,19 +1543,6 @@ fn flatten_table(table: &Map, prefix: &str, out: &mut Vec<(String, Value)>) {
     }
 }
 
-pub(crate) fn format_leaf_value(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        Value::Integer(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Datetime(d) => crate::value::lexical_string(d),
-        // Containers render in the value model's deterministic inline
-        // notation.
-        Value::Array(_) | Value::Map(_) => value.to_string(),
-    }
-}
-
 /// `config get` against the merged table. The merged table's keys are
 /// canonical snake_case (the load path normalized them), so with
 /// `normalize_keys` the action key is normalized before lookup — a kebab

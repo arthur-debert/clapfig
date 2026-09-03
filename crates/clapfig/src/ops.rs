@@ -6,7 +6,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::builder::format_leaf_value;
 use crate::error::ClapfigError;
 use crate::format::FormatAdapter;
 use crate::runtime::Shape;
@@ -104,6 +103,19 @@ impl ConfigResult {
             .collect::<Vec<_>>()
             .join("\n");
         ConfigResult::Listing { entries, rendered }
+    }
+}
+
+fn format_leaf_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Datetime(d) => crate::value::lexical_string(d),
+        // Containers render in the value model's deterministic inline
+        // notation.
+        Value::Array(_) | Value::Map(_) => value.to_string(),
     }
 }
 
