@@ -380,6 +380,11 @@ match result {
 }
 ```
 
+`KeyValue.value` and each `Listing` entry carry a typed `Value` (an integer
+stays an integer), so a host can render them structurally; `rendered` is the
+same data spelled in the active file format. `ValueSet.value` is the string the
+user submitted, before parsing.
+
 The `KeyValue`, `Listing`, and `ValueSet` variants also carry a
 `rendered` field — the display block spelled in the **active format**
 (the scope file's format for scoped operations, the preferred format for
