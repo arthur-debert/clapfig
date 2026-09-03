@@ -1,13 +1,11 @@
-//! JSON format adapter — owned parse walk; `serde_json` for serialize/edit.
+//! JSON format adapter — owned parse walk; `serde_json` for serialize.
 //!
 //! This file is the ONLY place in the crate that gives `serde_json` a
 //! *format* role (the crate also serves JSON Schema export, which is not a
 //! config format). Parse is a clapfig-owned walk (ADR-0007): `serde_json`
 //! has no byte offsets, and a second locate-keys pass is the desync
-//! ADR-0005 forbids. `serde_json` stays for serialize and edit
-//! (order-preserving pretty-print, comments-as-data). The file implements
-//! the full ADR-0002 matrix row set for JSON, with no known
-//! operation-level refusals:
+//! ADR-0005 forbids. The file implements the full ADR-0002 matrix row set
+//! for JSON, with no known operation-level refusals:
 //!
 //! - [`parse`](JsonAdapter::parse): one walk over the source emits the
 //!   owned [`Value`] tree and the path → [`SpanEntry`](super::SpanEntry)
@@ -125,30 +123,30 @@ impl FormatAdapter for JsonAdapter {
     fn serialize(&self, value: &Value) -> Result<String, FormatError> {
         let mut path = Vec::new();
         let json = value_to_json(value, &mut path)?;
-        Ok(render(&json))
+        Ok(render(&Doc::from(json)))
     }
 
     fn template(&self, shape: &Shape) -> Result<String, FormatError> {
         let mut object = JsonMap::new();
         walk_root(&mut JsonTemplate, shape, &(), &mut object)?;
-        Ok(render(&Json::Object(object)))
+        Ok(render(&Doc::from(Json::Object(object))))
     }
 
     fn edit(&self, source: &str, edit: FileEdit<'_>) -> Result<String, FormatError> {
         // A missing file is seeded from the template before the edit
         // reaches this adapter, but direct callers may hand an empty
         // document — start those from the empty object.
-        let mut doc: Json = if source.trim().is_empty() {
-            Json::Object(JsonMap::new())
+        let mut doc = if source.trim().is_empty() {
+            Doc::Object(Vec::new())
         } else {
-            serde_json::from_str(source).map_err(|e| syntax_error(source, &e))?
+            parse_raw_document(source)?
         };
         match edit {
             FileEdit::Set { path, value, .. } => {
                 let keys = key_segments(path)?;
                 let mut value_path: Vec<PathSegment> = path.segments().to_vec();
                 let json_value = value_to_json(value, &mut value_path)?;
-                super::edit::write_at_path(&mut doc, &keys, json_value)?;
+                super::edit::write_at_path(&mut doc, &keys, Doc::from(json_value))?;
             }
             FileEdit::Unset { path } => {
                 let keys = key_segments(path)?;
@@ -162,11 +160,56 @@ impl FormatAdapter for JsonAdapter {
 /// Pretty-print a JSON document the way every entry point emits text:
 /// two-space indent plus a trailing newline. This is the formatting
 /// normalization the edit capability documents.
-fn render(json: &Json) -> String {
-    let mut out =
-        serde_json::to_string_pretty(json).expect("serde_json::Value serialization is infallible");
+fn render(doc: &Doc) -> String {
+    let mut out = String::new();
+    write_doc(doc, 0, &mut out);
     out.push('\n');
     out
+}
+
+fn write_doc(doc: &Doc, depth: usize, out: &mut String) {
+    match doc {
+        Doc::Null => out.push_str("null"),
+        Doc::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Doc::Number(lexeme) => out.push_str(lexeme),
+        Doc::String(s) => write_string(s, out),
+        Doc::Array(items) if items.is_empty() => out.push_str("[]"),
+        Doc::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                out.push_str(if i == 0 { "\n" } else { ",\n" });
+                write_indent(depth + 1, out);
+                write_doc(item, depth + 1, out);
+            }
+            out.push('\n');
+            write_indent(depth, out);
+            out.push(']');
+        }
+        Doc::Object(members) if members.is_empty() => out.push_str("{}"),
+        Doc::Object(members) => {
+            out.push('{');
+            for (i, (key, value)) in members.iter().enumerate() {
+                out.push_str(if i == 0 { "\n" } else { ",\n" });
+                write_indent(depth + 1, out);
+                write_string(key, out);
+                out.push_str(": ");
+                write_doc(value, depth + 1, out);
+            }
+            out.push('\n');
+            write_indent(depth, out);
+            out.push('}');
+        }
+    }
+}
+
+fn write_indent(depth: usize, out: &mut String) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+fn write_string(s: &str, out: &mut String) {
+    out.push_str(&serde_json::to_string(s).expect("serializing a string to JSON cannot fail"));
 }
 
 /// The refusal message for a `//`-prefixed name at an outgoing boundary
@@ -177,41 +220,6 @@ fn reserved_key_message(at: &str) -> String {
     format!(
         "key {at} is in the reserved JSON comment namespace: a `//`-prefixed member is comment syntax (ADR-0002) and would be stripped at the next parse — rename the key"
     )
-}
-
-/// Wrap a `serde_json` syntax error as the typed parse error, translating
-/// its line/column position into a byte [`Span`] so renderers can draw
-/// snippets.
-fn syntax_error(text: &str, error: &serde_json::Error) -> FormatError {
-    FormatError::Parse {
-        format: FORMAT,
-        message: error.to_string(),
-        span: span_at(text, error.line(), error.column()),
-    }
-}
-
-/// Byte span for a one-based line/column position in `text`. Returns
-/// `None` when the position cannot be located (e.g. line 0).
-///
-/// `serde_json` reports the column as a one-based BYTE offset into the
-/// line, so it is used as such — clamped to the line, then snapped to
-/// UTF-8 character boundaries so slicing `text[span.start..span.end]`
-/// can never split a multi-byte character.
-fn span_at(text: &str, line: usize, column: usize) -> Option<Span> {
-    if line == 0 {
-        return None;
-    }
-    let mut offset = 0usize;
-    for (i, line_text) in text.split_inclusive('\n').enumerate() {
-        if i + 1 == line {
-            let byte_in_line = column.saturating_sub(1).min(line_text.len());
-            let start = text.floor_char_boundary(offset + byte_in_line);
-            let end = text.ceil_char_boundary(start + 1);
-            return Some(Span { start, end });
-        }
-        offset += line_text.len();
-    }
-    None
 }
 
 // --- owned parse walk (ADR-0007) -----------------------------------------
@@ -240,6 +248,16 @@ fn parse_document(text: &str) -> Result<Parsed, FormatError> {
         value,
         spans: parser.spans,
     })
+}
+
+fn parse_raw_document(text: &str) -> Result<Doc, FormatError> {
+    let mut parser = Parser::new(text);
+    let doc = parser.parse_raw()?;
+    parser.skip_ws();
+    if parser.pos < text.len() {
+        return parser.fail("unexpected trailing content after JSON value");
+    }
+    Ok(doc)
 }
 
 /// Byte-offset walker over one JSON document.
@@ -400,7 +418,7 @@ impl<'a> Parser<'a> {
             if key.starts_with(COMMENT_PREFIX) {
                 // Comment syntax, not configuration: consume the value
                 // without baseline mapping and without indexing it.
-                self.skip_json()?;
+                self.parse_raw()?;
             } else {
                 self.path.push(PathSegment::Key(key.clone()));
                 if map.contains_key(&key) {
@@ -454,57 +472,59 @@ impl<'a> Parser<'a> {
         Ok(Value::Array(items))
     }
 
-    /// Consume one JSON value without applying clapfig mapping rules.
+    /// Parse one JSON value without applying clapfig mapping rules.
     /// Used for `//`-prefixed comment members, whose payload may be
     /// null or an out-of-range integer and must not trip those errors.
-    fn skip_json(&mut self) -> Result<(), FormatError> {
+    fn parse_raw(&mut self) -> Result<Doc, FormatError> {
         self.skip_ws();
         match self.peek() {
-            Some(b'{') => self.skip_object(),
-            Some(b'[') => self.skip_array(),
-            Some(b'"') => {
-                self.parse_string()?;
-                Ok(())
-            }
+            Some(b'{') => self.parse_raw_object(),
+            Some(b'[') => self.parse_raw_array(),
+            Some(b'"') => Ok(Doc::String(self.parse_string()?.0)),
             Some(b't') => {
                 self.expect_literal("true")?;
-                Ok(())
+                Ok(Doc::Bool(true))
             }
             Some(b'f') => {
                 self.expect_literal("false")?;
-                Ok(())
+                Ok(Doc::Bool(false))
             }
             Some(b'n') => {
                 self.expect_literal("null")?;
-                Ok(())
+                Ok(Doc::Null)
             }
             Some(b'-' | b'0'..=b'9') => {
-                self.lex_number()?;
-                Ok(())
+                let (span, _) = self.lex_number()?;
+                Ok(Doc::Number(self.text[span.start..span.end].to_string()))
             }
             Some(_) => self.fail("expected a JSON value"),
             None => self.fail("unexpected end of JSON input"),
         }
     }
 
-    fn skip_object(&mut self) -> Result<(), FormatError> {
+    fn parse_raw_object(&mut self) -> Result<Doc, FormatError> {
         self.enter()?;
         self.expect(b'{')?;
         self.skip_ws();
+        let mut members: Vec<(String, Doc)> = Vec::new();
         if self.peek() == Some(b'}') {
             self.pos += 1;
             self.leave();
-            return Ok(());
+            return Ok(Doc::Object(members));
         }
         loop {
             self.skip_ws();
             if self.peek() != Some(b'"') {
                 return self.fail("expected a string key");
             }
-            self.parse_string()?;
+            let (key, _) = self.parse_string()?;
             self.skip_ws();
             self.expect(b':')?;
-            self.skip_json()?;
+            let value = self.parse_raw()?;
+            match members.iter_mut().find(|(k, _)| *k == key) {
+                Some(member) => member.1 = value,
+                None => members.push((key, value)),
+            }
             self.skip_ws();
             match self.peek() {
                 Some(b',') => self.pos += 1,
@@ -516,20 +536,21 @@ impl<'a> Parser<'a> {
             }
         }
         self.leave();
-        Ok(())
+        Ok(Doc::Object(members))
     }
 
-    fn skip_array(&mut self) -> Result<(), FormatError> {
+    fn parse_raw_array(&mut self) -> Result<Doc, FormatError> {
         self.enter()?;
         self.expect(b'[')?;
         self.skip_ws();
+        let mut items = Vec::new();
         if self.peek() == Some(b']') {
             self.pos += 1;
             self.leave();
-            return Ok(());
+            return Ok(Doc::Array(items));
         }
         loop {
-            self.skip_json()?;
+            items.push(self.parse_raw()?);
             self.skip_ws();
             match self.peek() {
                 Some(b',') => self.pos += 1,
@@ -541,7 +562,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.leave();
-        Ok(())
+        Ok(Doc::Array(items))
     }
 
     fn expect_literal(&mut self, literal: &str) -> Result<Span, FormatError> {
@@ -817,11 +838,46 @@ fn key_segments(path: &ConfigPath) -> Result<Vec<&str>, FormatError> {
     Ok(keys)
 }
 
+enum Doc {
+    Null,
+    Bool(bool),
+    Number(String),
+    String(String),
+    Array(Vec<Doc>),
+    Object(Vec<(String, Doc)>),
+}
+
+impl From<Json> for Doc {
+    fn from(json: Json) -> Self {
+        match json {
+            Json::Null => Doc::Null,
+            Json::Bool(b) => Doc::Bool(b),
+            Json::Number(n) => Doc::Number(n.to_string()),
+            Json::String(s) => Doc::String(s),
+            Json::Array(items) => Doc::Array(items.into_iter().map(Doc::from).collect()),
+            Json::Object(obj) => Doc::Object(
+                obj.into_iter()
+                    .map(|(key, value)| (key, Doc::from(value)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl Doc {
+    fn members_mut(&mut self) -> Option<&mut Vec<(String, Doc)>> {
+        match self {
+            Doc::Object(members) => Some(members),
+            _ => None,
+        }
+    }
+}
+
 /// The JSON document tree behind the shared edit walkers (`format::edit`)
 /// — the same conflict contract as the TOML adapter (a pre-existing
 /// on-disk shape the schema never saw refuses typed).
-impl super::edit::EditDoc for Json {
-    type Value = Json;
+impl super::edit::EditDoc for Doc {
+    type Value = Doc;
 
     const FORMAT: &'static str = FORMAT;
     const CONTAINER: &'static str = "object";
@@ -829,53 +885,53 @@ impl super::edit::EditDoc for Json {
     const SOURCE: &'static str = "document";
 
     fn is_container(&self) -> bool {
-        self.is_object()
+        matches!(self, Doc::Object(_))
     }
 
     fn has_child(&self, key: &str) -> bool {
-        self.get(key).is_some()
+        match self {
+            Doc::Object(members) => members.iter().any(|(k, _)| k == key),
+            _ => false,
+        }
     }
 
     fn child_mut(&mut self, key: &str) -> Option<&mut Self> {
-        self.get_mut(key)
+        self.members_mut()?
+            .iter_mut()
+            .find(|(k, _)| k == key)
+            .map(|(_, value)| value)
     }
 
     fn insert_container(&mut self, key: &str) {
-        self.as_object_mut()
-            .expect("callers guarantee a container")
-            .insert(key.to_string(), Json::Object(JsonMap::new()));
+        let members = self.members_mut().expect("callers guarantee a container");
+        insert_adjacent_to_comment(members, key, Doc::Object(Vec::new()));
     }
 
-    fn insert_value(&mut self, key: &str, value: Json) {
-        let obj = self.as_object_mut().expect("callers guarantee a container");
-        insert_adjacent_to_comment(obj, key, value);
+    fn insert_value(&mut self, key: &str, value: Doc) {
+        let members = self.members_mut().expect("callers guarantee a container");
+        insert_adjacent_to_comment(members, key, value);
     }
 
     fn remove_key(&mut self, key: &str) -> bool {
-        self.as_object_mut()
-            .is_some_and(|obj| obj.remove(key).is_some())
+        let Some(members) = self.members_mut() else {
+            return false;
+        };
+        let before = members.len();
+        members.retain(|(k, _)| k != key);
+        members.len() != before
     }
 }
 
-/// Insert `leaf` into `obj`, keeping comment keys adjacent to the fields
-/// they document: replacing an existing member keeps its position
-/// (`preserve_order`), and a NEW member whose `"//leaf"` comment already
-/// exists (a generated template documents defaultless fields this way)
-/// lands immediately after that comment instead of at the end of the
-/// object. Without a comment, a new member appends.
-fn insert_adjacent_to_comment(obj: &mut JsonMap<String, Json>, leaf: &str, value: Json) {
+/// A new member whose `"//name"` comment already exists lands right after that comment; an existing member keeps its position.
+fn insert_adjacent_to_comment(members: &mut Vec<(String, Doc)>, leaf: &str, value: Doc) {
+    if let Some(member) = members.iter_mut().find(|(k, _)| k == leaf) {
+        member.1 = value;
+        return;
+    }
     let comment = comment_key(leaf);
-    if !obj.contains_key(leaf) && obj.contains_key(&comment) {
-        let mut pending = Some(value);
-        for (key, entry) in std::mem::take(obj) {
-            let is_comment = key == comment;
-            obj.insert(key, entry);
-            if is_comment && let Some(v) = pending.take() {
-                obj.insert(leaf.to_string(), v);
-            }
-        }
-    } else {
-        obj.insert(leaf.to_string(), value);
+    match members.iter().position(|(k, _)| *k == comment) {
+        Some(at) => members.insert(at + 1, (leaf.to_string(), value)),
+        None => members.push((leaf.to_string(), value)),
     }
 }
 
@@ -2650,6 +2706,36 @@ mod tests {
     }
 
     #[test]
+    fn edit_set_created_container_lands_adjacent_to_its_comment() {
+        let source = concat!(
+            "{\n",
+            "  \"//services\": [\"Named services.\", \"\\\"services\\\": {\\\"<key>\\\": \\\"\\\"}\"],\n",
+            "  \"host\": \"x\"\n",
+            "}\n"
+        );
+        let path = ConfigPath::new().key("services").key("web");
+        let value = Value::from("nginx");
+        let out = JsonAdapter
+            .edit(
+                source,
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap();
+        let comment_at = out.find("\"//services\"").expect("comment survives");
+        let services_at = out.find("\"services\": {").expect("container created");
+        let web_at = out.find("\"web\": \"nginx\"").expect("entry written");
+        let host_at = out.find("\"host\": \"x\"").expect("untouched key survives");
+        assert!(
+            comment_at < services_at && services_at < web_at && web_at < host_at,
+            "new container sits right after its comment: {out}"
+        );
+    }
+
+    #[test]
     fn edit_set_creates_missing_path() {
         let path = ConfigPath::new().key("database").key("url");
         let value = Value::from("pg://x");
@@ -2746,6 +2832,87 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, FormatError::Serialize { .. }));
+    }
+
+    #[test]
+    fn edit_output_matches_serde_json_pretty_print() {
+        let source = concat!(
+            "{\"//\": \"prose\", \"host\": \"x \\\"q\\\" \\n é\", \"port\": 8080, ",
+            "\"neg\": -3, \"ratio\": 1.25, \"on\": true, \"off\": false, \"none\": null, ",
+            "\"empty\": {}, \"nothing\": [], \"list\": [1, [2, 3], {\"k\": \"v\"}], ",
+            "\"db\": {\"url\": \"pg://x\", \"pool\": {\"size\": 9}}}"
+        );
+        let missing = ConfigPath::new().key("nope");
+        let out = JsonAdapter
+            .edit(source, FileEdit::Unset { path: &missing })
+            .unwrap();
+        let expected: serde_json::Value = serde_json::from_str(source).unwrap();
+        assert_eq!(out, serde_json::to_string_pretty(&expected).unwrap() + "\n");
+    }
+
+    #[test]
+    fn edit_keeps_untouched_number_lexemes_verbatim() {
+        let source = r#"{"ratio": 1.50, "big": 1e3, "port": 1}"#;
+        let path = ConfigPath::new().key("port");
+        let value = Value::Integer(2);
+        let out = JsonAdapter
+            .edit(
+                source,
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::ExistingValue,
+                },
+            )
+            .unwrap();
+        assert!(out.contains(r#""ratio": 1.50"#), "{out}");
+        assert!(out.contains(r#""big": 1e3"#), "{out}");
+        assert!(out.contains(r#""port": 2"#), "{out}");
+    }
+
+    #[test]
+    fn edit_duplicate_keys_keep_last_value_at_first_position() {
+        let source = r#"{"a": 1, "b": 2, "a": 3}"#;
+        let missing = ConfigPath::new().key("nope");
+        let out = JsonAdapter
+            .edit(source, FileEdit::Unset { path: &missing })
+            .unwrap();
+        assert_eq!(out, "{\n  \"a\": 3,\n  \"b\": 2\n}\n");
+    }
+
+    #[test]
+    fn edit_keeps_null_comment_payloads() {
+        let source = r#"{"//": null, "//port": [null], "port": 1}"#;
+        let path = ConfigPath::new().key("port");
+        let value = Value::Integer(2);
+        let out = JsonAdapter
+            .edit(
+                source,
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::ExistingValue,
+                },
+            )
+            .unwrap();
+        assert!(out.contains(r#""//": null"#), "{out}");
+        assert!(out.contains("[\n    null\n  ]"), "{out}");
+        assert!(out.contains(r#""port": 2"#), "{out}");
+    }
+
+    #[test]
+    fn edit_syntax_error_is_typed_parse_error_with_span() {
+        let source = "{\"port\": }";
+        let missing = ConfigPath::new().key("nope");
+        let err = JsonAdapter
+            .edit(source, FileEdit::Unset { path: &missing })
+            .unwrap_err();
+        let FormatError::Parse { format, span, .. } = err else {
+            panic!("expected Parse");
+        };
+        assert_eq!(format, "json");
+        let span = span.expect("syntax errors carry a span");
+        assert_eq!(&source[span.start..span.end], "}");
     }
 
     #[test]

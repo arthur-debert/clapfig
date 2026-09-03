@@ -371,3 +371,14 @@ fn exported_schema_validates_the_generated_template() {
         .insert("not_in_schema".into(), serde_json::Value::Bool(true));
     assert!(validate(&broken, &schema).is_err());
 }
+
+// --- serde_json feature hygiene (#202) ------------------------------------
+
+#[test]
+fn serde_json_numbers_serialize_plainly_through_other_serializers() {
+    let value = serde_json::json!({"port": 8080, "ratio": 1.25});
+    assert_eq!(
+        serde_norway::to_string(&value).unwrap(),
+        "port: 8080\nratio: 1.25\n"
+    );
+}
