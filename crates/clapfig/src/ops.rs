@@ -6,6 +6,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::builder::format_leaf_value;
 use crate::error::ClapfigError;
 use crate::format::FormatAdapter;
 use crate::runtime::Shape;
@@ -36,7 +37,7 @@ pub enum ConfigResult {
     /// A key's resolved value and its doc comment.
     KeyValue {
         key: String,
-        value: String,
+        value: Value,
         doc: Vec<String>,
         /// The display block (comment lines + assignment) in the active
         /// format's spelling; what `Display` prints.
@@ -53,7 +54,7 @@ pub enum ConfigResult {
     ValueUnset { key: String },
     /// All resolved configuration key-value pairs.
     Listing {
-        entries: Vec<(String, String)>,
+        entries: Vec<(String, Value)>,
         /// One assignment line per entry in the active format's spelling,
         /// newline-joined; what `Display` prints.
         rendered: String,
@@ -66,7 +67,7 @@ impl ConfigResult {
     pub(crate) fn key_value(
         adapter: &dyn FormatAdapter,
         key: String,
-        value: String,
+        value: Value,
         doc: Vec<String>,
     ) -> Self {
         let mut rendered = String::new();
@@ -74,7 +75,7 @@ impl ConfigResult {
             rendered.push_str(&adapter.display_comment(line));
             rendered.push('\n');
         }
-        rendered.push_str(&adapter.display_entry(&key, &value));
+        rendered.push_str(&adapter.display_entry(&key, &format_leaf_value(&value)));
         ConfigResult::KeyValue {
             key,
             value,
@@ -96,10 +97,10 @@ impl ConfigResult {
 
     /// Build a [`ConfigResult::Listing`], rendering one assignment line
     /// per entry through `adapter`.
-    pub(crate) fn listing(adapter: &dyn FormatAdapter, entries: Vec<(String, String)>) -> Self {
+    pub(crate) fn listing(adapter: &dyn FormatAdapter, entries: Vec<(String, Value)>) -> Self {
         let rendered = entries
             .iter()
-            .map(|(key, value)| adapter.display_entry(key, value))
+            .map(|(key, value)| adapter.display_entry(key, &format_leaf_value(value)))
             .collect::<Vec<_>>()
             .join("\n");
         ConfigResult::Listing { entries, rendered }
@@ -243,7 +244,7 @@ pub(crate) fn list_scope_file(
 }
 
 /// Recursively flatten a value map into dotted key-value pairs.
-fn flatten_value_map(table: &Map, prefix: &str, entries: &mut Vec<(String, String)>) {
+fn flatten_value_map(table: &Map, prefix: &str, entries: &mut Vec<(String, Value)>) {
     for (key, value) in table {
         let full_key = if prefix.is_empty() {
             key.clone()
@@ -252,7 +253,7 @@ fn flatten_value_map(table: &Map, prefix: &str, entries: &mut Vec<(String, Strin
         };
         match value {
             Value::Map(t) => flatten_value_map(t, &full_key, entries),
-            _ => entries.push((full_key, format_value(value))),
+            _ => entries.push((full_key, value.clone())),
         }
     }
 }
@@ -315,17 +316,6 @@ pub(crate) fn table_get<'a>(table: &'a Map, dotted_key: &str) -> Option<&'a Valu
 }
 
 /// Format a config value for display in listings and `config get` output.
-fn format_value(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        Value::Integer(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Datetime(d) => crate::value::lexical_string(d),
-        Value::Array(_) | Value::Map(_) => value.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,8 +553,8 @@ mod tests {
         match result {
             ConfigResult::Listing { entries, .. } => {
                 assert_eq!(entries.len(), 2);
-                assert!(entries.contains(&("host".into(), "localhost".into())));
-                assert!(entries.contains(&("port".into(), "3000".into())));
+                assert!(entries.contains(&("host".into(), Value::String("localhost".into()))));
+                assert!(entries.contains(&("port".into(), Value::Integer(3000))));
             }
             other => panic!("Expected Listing, got {other:?}"),
         }
@@ -579,8 +569,8 @@ mod tests {
         let result = list_scope_file(&TomlAdapter, &path).unwrap();
         match result {
             ConfigResult::Listing { entries, .. } => {
-                assert!(entries.contains(&("database.pool_size".into(), "10".into())));
-                assert!(entries.contains(&("database.url".into(), "pg://".into())));
+                assert!(entries.contains(&("database.pool_size".into(), Value::Integer(10))));
+                assert!(entries.contains(&("database.url".into(), Value::String("pg://".into()))));
             }
             other => panic!("Expected Listing, got {other:?}"),
         }

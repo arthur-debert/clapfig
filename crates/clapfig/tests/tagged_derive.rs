@@ -345,7 +345,7 @@ fn tagged_config_get_returns_tag_documentation() {
     match result {
         clapfig::ConfigResult::KeyValue { key, value, .. } => {
             assert_eq!(key, "kind");
-            assert_eq!(value, "off");
+            assert_eq!(value, clapfig::value::Value::String("off".into()));
         }
         other => panic!("expected KeyValue, got {other:?}"),
     }

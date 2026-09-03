@@ -1,7 +1,7 @@
 ---
 name: clapfig-quick-howto
 description: |
-  Quick, copyable path for adopting Clapfig 0.23 in a Rust CLI project. Use when:
+  Quick, copyable path for adopting Clapfig 0.25 in a Rust CLI project. Use when:
   (1) Adding layered configuration (defaults, config file, env vars, CLI flags)
       to a clap-based Rust app
   (2) Wiring the `config gen|list|get|set|unset|schema` command family
@@ -13,13 +13,13 @@ description: |
 
 Clapfig turns plain Rust structs into layered configuration: compiled
 defaults, then config files, then env vars, then CLI flags — later layers
-win. This is the minimal adoption path for Clapfig 0.23.
+win. This is the minimal adoption path for Clapfig 0.25.
 
 ## 1. Install
 
 ```toml
 [dependencies]
-clapfig = "0.23"
+clapfig = "0.25"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 ```

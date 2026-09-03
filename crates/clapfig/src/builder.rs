@@ -41,7 +41,7 @@ use crate::value::{Map, Value};
 /// from failures *around* the user's closure — the typed path's
 /// `Map → C` deserialize step categorizes its failure as the
 /// [`ClapfigError::InvalidValue`] type error it is.
-pub(crate) type PostValidateHook = Box<dyn Fn(&Map) -> Result<(), ClapfigError> + Send + Sync>;
+pub(crate) type PostValidateHook = Arc<dyn Fn(&Map) -> Result<(), ClapfigError> + Send + Sync>;
 
 /// How config files are discovered inside each search directory — the
 /// file-name half of the builder's file contract.
@@ -81,6 +81,7 @@ enum FileNaming {
 ///
 /// [`Builder::from_shape`] retains the caller's Arc (typed `shape_arc`
 /// caches). Owned constructors wrap a newly allocated Arc.
+#[derive(Clone)]
 struct StoredRoot(Arc<Shape>);
 
 impl StoredRoot {
@@ -105,6 +106,7 @@ impl StoredRoot {
     }
 }
 
+#[derive(Clone)]
 pub struct Builder {
     schema: StoredRoot,
     app_name: Option<String>,
@@ -465,7 +467,7 @@ impl Builder {
     where
         F: Fn(&Map) -> Result<(), String> + Send + Sync + 'static,
     {
-        self.post_validate = Some(Box::new(move |t: &Map| {
+        self.post_validate = Some(Arc::new(move |t: &Map| {
             f(t).map_err(ClapfigError::PostValidationFailed)
         }));
         self
@@ -481,7 +483,7 @@ impl Builder {
         mut self,
         hook: impl Fn(&Map) -> Result<(), ClapfigError> + Send + Sync + 'static,
     ) -> Self {
-        self.post_validate = Some(Box::new(hook));
+        self.post_validate = Some(Arc::new(hook));
         self
     }
 
@@ -508,6 +510,12 @@ impl Builder {
         if let Some(v) = value {
             self.cli_overrides.push((key.to_string(), v.into()));
         }
+        self
+    }
+
+    pub fn cli_override_str(mut self, key: &str, raw: &str) -> Self {
+        self.cli_overrides
+            .push((key.to_string(), crate::env::parse_env_value(raw)));
         self
     }
 
@@ -685,7 +693,7 @@ impl Builder {
             url_overrides: self.url_overrides,
             cli_overrides: self.cli_overrides,
             layer_order,
-            post_validate: self.post_validate.map(Arc::new),
+            post_validate: self.post_validate,
             file_cache: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -1148,7 +1156,7 @@ pub struct Resolver {
     url_overrides: Vec<(String, Value)>,
     cli_overrides: Vec<(String, Value)>,
     layer_order: Option<Vec<Layer>>,
-    post_validate: Option<Arc<PostValidateHook>>,
+    post_validate: Option<PostValidateHook>,
     file_cache: Mutex<std::collections::HashMap<PathBuf, String>>,
 }
 
@@ -1521,7 +1529,7 @@ fn list_from_table(table: &Map, adapter: &dyn FormatAdapter) -> ConfigResult {
     ConfigResult::listing(adapter, entries)
 }
 
-fn flatten_table(table: &Map, prefix: &str, out: &mut Vec<(String, String)>) {
+fn flatten_table(table: &Map, prefix: &str, out: &mut Vec<(String, Value)>) {
     for (key, value) in table {
         let full = if prefix.is_empty() {
             key.clone()
@@ -1530,12 +1538,12 @@ fn flatten_table(table: &Map, prefix: &str, out: &mut Vec<(String, String)>) {
         };
         match value {
             Value::Map(t) => flatten_table(t, &full, out),
-            _ => out.push((full, format_leaf_value(value))),
+            _ => out.push((full, value.clone())),
         }
     }
 }
 
-fn format_leaf_value(value: &Value) -> String {
+pub(crate) fn format_leaf_value(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         Value::Integer(i) => i.to_string(),
@@ -1574,7 +1582,7 @@ fn get_from_table(
     Ok(ConfigResult::key_value(
         adapter,
         key.into(),
-        format_leaf_value(value),
+        value.clone(),
         doc,
     ))
 }
@@ -1652,7 +1660,7 @@ fn get_scope(
     Ok(ConfigResult::key_value(
         adapter,
         key.into(),
-        format_leaf_value(value),
+        value.clone(),
         doc,
     ))
 }
@@ -1804,6 +1812,47 @@ mod tests {
             .load()
             .unwrap();
         assert_eq!(table.get("port"), Some(&Value::Integer(11111)));
+    }
+
+    #[test]
+    fn cli_override_str_parses_with_env_scalar_rule() {
+        let dir = TempDir::new().unwrap();
+        let table = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .cli_override_str("port", "8080")
+            .cli_override_str("host", "x")
+            .load()
+            .unwrap();
+        assert_eq!(table.get("port"), Some(&Value::Integer(8080)));
+        assert_eq!(table.get("host"), Some(&Value::String("x".into())));
+    }
+
+    #[test]
+    fn cloned_builder_loads_same_result_and_runs_hooks() {
+        let dir = TempDir::new().unwrap();
+        let calls = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&calls);
+        let builder = Clapfig::builder(demo_schema())
+            .app_name("demo")
+            .file_name("demo.toml")
+            .search_paths(vec![SearchPath::Path(dir.path().to_path_buf())])
+            .no_env()
+            .cli_override("port", Some(11111i64))
+            .post_validate(move |_| {
+                *counter.lock().unwrap() += 1;
+                Ok(())
+            });
+        let clone = builder.clone();
+
+        let original = builder.load().unwrap();
+        let cloned = clone.load().unwrap();
+
+        assert_eq!(original, cloned);
+        assert_eq!(cloned.get("port"), Some(&Value::Integer(11111)));
+        assert_eq!(*calls.lock().unwrap(), 2);
     }
 
     // --- search-path composition (guards from the FIXME.md audit) ---
@@ -2467,7 +2516,7 @@ mod tests {
 
         match result {
             ConfigResult::KeyValue { value, doc, .. } => {
-                assert_eq!(value, "8080");
+                assert_eq!(value, Value::Integer(8080));
                 assert!(doc.iter().any(|l| l.contains("Port number")));
             }
             other => panic!("expected KeyValue, got {other:?}"),
@@ -3695,7 +3744,7 @@ mod tests {
                         value,
                         ..
                     } => {
-                        assert_eq!(value, "42", "{name} / {key}");
+                        assert_eq!(value, Value::Integer(42), "{name} / {key}");
                         assert_eq!(reported, key, "reported key keeps the caller's spelling");
                     }
                     other => panic!("expected KeyValue, got {other:?}"),
@@ -3899,7 +3948,7 @@ mod tests {
             .unwrap();
 
         match result {
-            ConfigResult::KeyValue { value, .. } => assert_eq!(value, "42"),
+            ConfigResult::KeyValue { value, .. } => assert_eq!(value, Value::Integer(42)),
             other => panic!("expected KeyValue, got {other:?}"),
         }
     }
@@ -4134,7 +4183,7 @@ mod tests {
         match result {
             ConfigResult::Listing { entries, .. } => {
                 assert_eq!(entries.len(), 1);
-                assert_eq!(entries[0], ("port".into(), "3000".into()));
+                assert_eq!(entries[0], ("port".into(), Value::Integer(3000)));
             }
             other => panic!("Expected Listing, got {other:?}"),
         }
@@ -4157,7 +4206,7 @@ mod tests {
             .unwrap();
 
         match result {
-            ConfigResult::KeyValue { value, .. } => assert_eq!(value, "3000"),
+            ConfigResult::KeyValue { value, .. } => assert_eq!(value, Value::Integer(3000)),
             other => panic!("Expected KeyValue, got {other:?}"),
         }
     }
@@ -4212,7 +4261,11 @@ mod tests {
             .unwrap();
         match local_list {
             ConfigResult::Listing { entries, .. } => {
-                assert!(entries.iter().any(|(k, v)| k == "port" && v == "3000"));
+                assert!(
+                    entries
+                        .iter()
+                        .any(|(k, v)| k == "port" && *v == Value::Integer(3000))
+                );
             }
             other => panic!("Expected Listing, got {other:?}"),
         }
