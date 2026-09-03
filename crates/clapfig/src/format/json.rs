@@ -903,9 +903,8 @@ impl super::edit::EditDoc for Doc {
     }
 
     fn insert_container(&mut self, key: &str) {
-        self.members_mut()
-            .expect("callers guarantee a container")
-            .push((key.to_string(), Doc::Object(Vec::new())));
+        let members = self.members_mut().expect("callers guarantee a container");
+        insert_adjacent_to_comment(members, key, Doc::Object(Vec::new()));
     }
 
     fn insert_value(&mut self, key: &str, value: Doc) {
@@ -926,9 +925,11 @@ impl super::edit::EditDoc for Doc {
 /// Insert `leaf` into `members`, keeping comment keys adjacent to the
 /// fields they document: replacing an existing member keeps its position,
 /// and a NEW member whose `"//leaf"` comment already exists (a generated
-/// template documents defaultless fields this way) lands immediately
-/// after that comment instead of at the end of the object. Without a
-/// comment, a new member appends.
+/// template documents defaultless leaves, `map_of` and `array_of` fields
+/// this way) lands immediately after that comment instead of at the end
+/// of the object. Both the leaf value and the empty object the edit
+/// walker creates for a missing parent segment go through here. Without
+/// a comment, a new member appends.
 fn insert_adjacent_to_comment(members: &mut Vec<(String, Doc)>, leaf: &str, value: Doc) {
     if let Some(member) = members.iter_mut().find(|(k, _)| k == leaf) {
         member.1 = value;
@@ -2708,6 +2709,41 @@ mod tests {
         assert!(
             comment_at < name_at && name_at < host_at,
             "re-set key returns to its documented slot: {out}"
+        );
+    }
+
+    #[test]
+    fn edit_set_created_container_lands_adjacent_to_its_comment() {
+        // A template documents a map-of field as a "//field" comment with
+        // no real key (entry keys are user-supplied). Setting an entry
+        // inside it creates the container object on the way down; that
+        // object must land right after its comment too, not at the end
+        // of the document past every other member.
+        let source = concat!(
+            "{\n",
+            "  \"//services\": [\"Named services.\", \"\\\"services\\\": {\\\"<key>\\\": \\\"\\\"}\"],\n",
+            "  \"host\": \"x\"\n",
+            "}\n"
+        );
+        let path = ConfigPath::new().key("services").key("web");
+        let value = Value::from("nginx");
+        let out = JsonAdapter
+            .edit(
+                source,
+                FileEdit::Set {
+                    path: &path,
+                    value: &value,
+                    target: SetTarget::MissingKey,
+                },
+            )
+            .unwrap();
+        let comment_at = out.find("\"//services\"").expect("comment survives");
+        let services_at = out.find("\"services\": {").expect("container created");
+        let web_at = out.find("\"web\": \"nginx\"").expect("entry written");
+        let host_at = out.find("\"host\": \"x\"").expect("untouched key survives");
+        assert!(
+            comment_at < services_at && services_at < web_at && web_at < host_at,
+            "new container sits right after its comment: {out}"
         );
     }
 
