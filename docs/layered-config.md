@@ -193,6 +193,11 @@ builder.cli_overrides_from(&cli_struct)
 `cli_overrides_from` is useful with clap: pass your entire CLI args struct and
 non-config fields are silently ignored.
 
+`.cli_override_str(key, raw)` takes a raw string and parses it with the same
+scalar rule the environment layer uses (bool, then integer, then float, then
+string), for a `--set key=value` style flag. `.cli_override()` takes a typed
+value and never parses.
+
 ## Key naming — kebab-case keys
 
 By default, keys in config files and overrides must match the Rust field name

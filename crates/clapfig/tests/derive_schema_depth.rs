@@ -541,7 +541,7 @@ fn handle_set_then_get_roundtrips_through_macro_path() {
         .unwrap();
     match got {
         ConfigResult::KeyValue { value, doc, .. } => {
-            assert_eq!(value, "3000");
+            assert_eq!(value, clapfig::value::Value::Integer(3000));
             assert!(doc.iter().any(|l| l.contains("Listener port")));
         }
         other => panic!("expected KeyValue, got {other:?}"),

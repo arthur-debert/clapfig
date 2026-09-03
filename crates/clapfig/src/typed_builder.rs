@@ -43,6 +43,16 @@ pub struct TypedBuilder<C: DocumentRoot> {
     _phantom: PhantomData<fn() -> C>,
 }
 
+impl<C: DocumentRoot> Clone for TypedBuilder<C> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            post_validate: self.post_validate.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
 /// The typed post-validate callback, shared between [`TypedBuilder`] and
 /// the [`TypedResolver`] it builds.
 type TypedHook<C> = Arc<dyn Fn(&C) -> Result<(), String> + Send + Sync>;
@@ -194,6 +204,11 @@ impl<C: DocumentRoot> TypedBuilder<C> {
     /// Add a single CLI override.
     pub fn cli_override<V: Into<Value>>(mut self, key: &str, value: Option<V>) -> Self {
         self.inner = self.inner.cli_override(key, value);
+        self
+    }
+
+    pub fn cli_override_str(mut self, key: &str, raw: &str) -> Self {
+        self.inner = self.inner.cli_override_str(key, raw);
         self
     }
 

@@ -9,7 +9,7 @@ Add clapfig to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-clapfig = "0.23"
+clapfig = "0.25"
 ```
 
 This pulls in the `clap` feature by default, which gives you the `config`
@@ -18,7 +18,7 @@ subcommand integration, and the `derive` feature for
 
 ```toml
 [dependencies]
-clapfig = { version = "0.23", default-features = false, features = ["derive"] }
+clapfig = { version = "0.25", default-features = false, features = ["derive"] }
 ```
 
 ## Define your config struct
