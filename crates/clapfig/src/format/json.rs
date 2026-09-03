@@ -922,14 +922,7 @@ impl super::edit::EditDoc for Doc {
     }
 }
 
-/// Insert `leaf` into `members`, keeping comment keys adjacent to the
-/// fields they document: replacing an existing member keeps its position,
-/// and a NEW member whose `"//leaf"` comment already exists (a generated
-/// template documents defaultless leaves, `map_of` and `array_of` fields
-/// this way) lands immediately after that comment instead of at the end
-/// of the object. Both the leaf value and the empty object the edit
-/// walker creates for a missing parent segment go through here. Without
-/// a comment, a new member appends.
+/// A new member whose `"//name"` comment already exists lands right after that comment; an existing member keeps its position.
 fn insert_adjacent_to_comment(members: &mut Vec<(String, Doc)>, leaf: &str, value: Doc) {
     if let Some(member) = members.iter_mut().find(|(k, _)| k == leaf) {
         member.1 = value;
@@ -2714,11 +2707,6 @@ mod tests {
 
     #[test]
     fn edit_set_created_container_lands_adjacent_to_its_comment() {
-        // A template documents a map-of field as a "//field" comment with
-        // no real key (entry keys are user-supplied). Setting an entry
-        // inside it creates the container object on the way down; that
-        // object must land right after its comment too, not at the end
-        // of the document past every other member.
         let source = concat!(
             "{\n",
             "  \"//services\": [\"Named services.\", \"\\\"services\\\": {\\\"<key>\\\": \\\"\\\"}\"],\n",
