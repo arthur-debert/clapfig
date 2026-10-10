@@ -1,0 +1,1 @@
+- Add a default-enabled `yaml` feature. Disabling it removes the YAML parser and editor dependencies while TOML and JSON configuration remain available. Explicit YAML formats and filenames return `UnknownFormat`.

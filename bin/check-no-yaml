@@ -1,0 +1,3 @@
+#!/bin/sh
+set -eu
+cargo test -p clapfig --no-default-features --features clap,derive --lib

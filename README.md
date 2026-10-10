@@ -132,6 +132,10 @@ Layers listed later override earlier ones. Omitting a layer excludes it from mer
 
 ## Config File Formats
 
+The default Cargo features include `yaml`. With `default-features = false`,
+TOML and JSON remain available; enabling `yaml` adds YAML parsing, generation
+and comment-preserving edits.
+
 Config files can be TOML, YAML, or JSON. Formats are **opt-in and ordered** — the default is TOML only, never inferred from cargo features:
 
 ```rust

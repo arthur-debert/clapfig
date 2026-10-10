@@ -15,11 +15,12 @@ categories = ["config", "command-line-interface"]
 readme = "../../README.md"
 
 [features]
-default = ["clap", "derive"]
+default = ["clap", "derive", "yaml"]
 clap = ["dep:clap"]
 url = ["dep:percent-encoding"]
 rich-errors = ["dep:miette"]
 derive = ["dep:clapfig-derive"]
+yaml = ["dep:serde_norway", "dep:yamlpath", "dep:yamlpatch", "dep:yaml_serde"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "string"], optional = true }
@@ -43,14 +44,14 @@ thiserror = "2"
 # edits; yaml_serde exists only because yamlpatch's patch values are its
 # type. yamlpath/yamlpatch are held to the 1.26 series: later releases
 # pull tree-sitter-iter builds whose MSRV (1.97) exceeds ours.
-serde_norway = "0.9"
+serde_norway = { version = "0.9", optional = true }
 # Unconditional (ADR-0009): events are free without a subscriber; a Cargo
 # feature would remove the narration exactly when a developer needs it
 # (`RUST_LOG=clapfig=trace`). Values never appear in events.
 tracing = "0.1"
-yamlpath = ">=1.26, <1.28"
-yamlpatch = ">=1.26, <1.28"
-yaml_serde = "0.10"
+yamlpath = { version = ">=1.26, <1.28", optional = true }
+yamlpatch = { version = ">=1.26, <1.28", optional = true }
+yaml_serde = { version = "0.10", optional = true }
 
 [dev-dependencies]
 regex = "1"

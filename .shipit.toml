@@ -63,6 +63,11 @@ run = "test"
 required = true
 local = true
 
+[lanes.no-yaml]
+run = "no-yaml"
+required = true
+local = true
+
 [toolchains]
 "." = "rust"
 

@@ -518,7 +518,9 @@ mod tests {
     fn listing_display_is_format_aware() {
         // The active format spells the assignment lines: TOML `k = v`,
         // YAML `k: v`, JSON `"k": v`.
-        use crate::format::{JsonAdapter, YamlAdapter};
+        use crate::format::JsonAdapter;
+        #[cfg(feature = "yaml")]
+        use crate::format::YamlAdapter;
         let entries = |a: &dyn FormatAdapter| {
             format!(
                 "{}",
@@ -526,6 +528,7 @@ mod tests {
             )
         };
         assert_eq!(entries(&TomlAdapter), "database.url = pg://");
+        #[cfg(feature = "yaml")]
         assert_eq!(entries(&YamlAdapter), "database.url: pg://");
         assert_eq!(entries(&JsonAdapter), "\"database.url\": pg://");
     }
@@ -534,7 +537,9 @@ mod tests {
     fn key_value_display_is_format_aware() {
         // Doc lines follow the format's comment spelling; JSON (no real
         // comments) uses its `//` convention.
-        use crate::format::{JsonAdapter, YamlAdapter};
+        use crate::format::JsonAdapter;
+        #[cfg(feature = "yaml")]
+        use crate::format::YamlAdapter;
         let get = |a: &dyn FormatAdapter| {
             format!(
                 "{}",
@@ -542,11 +547,13 @@ mod tests {
             )
         };
         assert_eq!(get(&TomlAdapter), "# The port.\nport = 8080");
+        #[cfg(feature = "yaml")]
         assert_eq!(get(&YamlAdapter), "# The port.\nport: 8080");
         assert_eq!(get(&JsonAdapter), "// The port.\n\"port\": 8080");
     }
 
     #[test]
+    #[cfg(feature = "yaml")]
     fn value_set_display_is_format_aware() {
         use crate::format::YamlAdapter;
         let result = ConfigResult::value_set(&YamlAdapter, "port".into(), "8080".into());

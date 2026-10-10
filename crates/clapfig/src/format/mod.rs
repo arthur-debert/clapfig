@@ -33,10 +33,12 @@ pub(crate) mod edit;
 pub mod json;
 pub(crate) mod template;
 pub mod toml;
+#[cfg(feature = "yaml")]
 pub mod yaml;
 
 pub use json::JsonAdapter;
 pub use toml::TomlAdapter;
+#[cfg(feature = "yaml")]
 pub use yaml::YamlAdapter;
 
 use std::collections::BTreeMap;
@@ -633,6 +635,7 @@ impl FormatRegistry {
 pub(crate) fn builtin_adapter(name: &str) -> Option<Box<dyn FormatAdapter>> {
     match name {
         "toml" => Some(Box::new(toml::TomlAdapter)),
+        #[cfg(feature = "yaml")]
         "yaml" => Some(Box::new(yaml::YamlAdapter)),
         "json" => Some(Box::new(json::JsonAdapter)),
         _ => None,
@@ -641,7 +644,11 @@ pub(crate) fn builtin_adapter(name: &str) -> Option<Box<dyn FormatAdapter>> {
 
 /// The canonical names of every built-in adapter, for error messages.
 pub(crate) fn builtin_names() -> Vec<String> {
-    ["toml", "yaml", "json"].map(String::from).to_vec()
+    ["toml", "yaml", "json"]
+        .into_iter()
+        .filter(|name| builtin_adapter(name).is_some())
+        .map(String::from)
+        .collect()
 }
 
 /// The built-in adapter claiming `extension` (matched case-insensitively,
@@ -651,7 +658,7 @@ pub(crate) fn builtin_names() -> Vec<String> {
 /// formats the discovery list has not enabled.
 pub(crate) fn builtin_adapter_for_extension(extension: &str) -> Option<Box<dyn FormatAdapter>> {
     let extension = extension.to_ascii_lowercase();
-    ["toml", "yaml", "json"].iter().find_map(|name| {
+    builtin_names().iter().find_map(|name| {
         let adapter = builtin_adapter(name).expect("names enumerate the built-in set");
         adapter
             .extensions()
@@ -843,10 +850,12 @@ mod tests {
             builtin_adapter_for_extension("TOML").unwrap().name(),
             "toml"
         );
+        #[cfg(feature = "yaml")]
         assert_eq!(
             builtin_adapter_for_extension("yaml").unwrap().name(),
             "yaml"
         );
+        #[cfg(feature = "yaml")]
         assert_eq!(builtin_adapter_for_extension("yml").unwrap().name(), "yaml");
         assert_eq!(
             builtin_adapter_for_extension("json").unwrap().name(),
@@ -858,9 +867,11 @@ mod tests {
     #[test]
     fn builtin_adapter_lookup_by_canonical_name() {
         assert_eq!(builtin_adapter("toml").unwrap().name(), "toml");
+        #[cfg(feature = "yaml")]
         assert_eq!(builtin_adapter("yaml").unwrap().name(), "yaml");
         assert_eq!(builtin_adapter("json").unwrap().name(), "json");
         assert!(builtin_adapter("ini").is_none());
+        #[cfg(feature = "yaml")]
         assert_eq!(builtin_names(), ["toml", "yaml", "json"]);
     }
 
@@ -897,6 +908,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "yaml")]
     fn yaml_adapter_declares_its_matrix_rows() {
         // YAML's ADR-0002 matrix row declares every operation (its known
         // refusals are shape-level, inside the declared edits). Spans ride
@@ -919,7 +931,12 @@ mod tests {
             toml::TomlAdapter.schema_directive(&reference).unwrap(),
             "#:schema ./app.schema.json"
         );
-        for adapter in [&yaml::YamlAdapter as &dyn FormatAdapter, &json::JsonAdapter] {
+        let adapters: Vec<&dyn FormatAdapter> = vec![
+            #[cfg(feature = "yaml")]
+            &yaml::YamlAdapter,
+            &json::JsonAdapter,
+        ];
+        for adapter in adapters {
             assert!(!adapter.supports(Operation::SchemaDirective));
             let err = adapter.schema_directive(&reference).unwrap_err();
             assert_eq!(
@@ -949,6 +966,7 @@ mod tests {
         // (ADR-0005), YAML (ADR-0008), and JSON (ADR-0007).
         for (adapter, text) in [
             (&toml::TomlAdapter as &dyn FormatAdapter, ""),
+            #[cfg(feature = "yaml")]
             (&yaml::YamlAdapter, ""),
             (&json::JsonAdapter, ""),
         ] {
@@ -966,7 +984,9 @@ mod tests {
     fn adapters_carry_names_and_extensions() {
         assert_eq!(toml::TomlAdapter.name(), "toml");
         assert_eq!(toml::TomlAdapter.extensions(), ["toml"]);
+        #[cfg(feature = "yaml")]
         assert_eq!(yaml::YamlAdapter.name(), "yaml");
+        #[cfg(feature = "yaml")]
         assert_eq!(yaml::YamlAdapter.extensions(), ["yaml", "yml"]);
         assert_eq!(json::JsonAdapter.name(), "json");
         assert_eq!(json::JsonAdapter.extensions(), ["json"]);
