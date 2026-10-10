@@ -941,27 +941,30 @@ pool_size = 10
     #[test]
     fn yaml_and_json_unknown_keys_use_the_span_index() {
         use crate::format::FormatAdapter;
-        let yaml = "typo: 1\n";
-        let parsed = crate::format::YamlAdapter.parse(yaml).unwrap();
-        let table = match parsed.value {
-            crate::value::Value::Map(map) => map,
-            _ => panic!("expected map"),
-        };
-        let err = validate_unknown(
-            &table,
-            &crate::fixtures::test::test_schema(),
-            &UnknownKeySource::File {
-                path: Path::new("/p.yaml"),
-                source: yaml,
-                spans: &parsed.spans,
-            },
-            &test_ctx(),
-        )
-        .unwrap_err();
-        let keys = err.unknown_keys().expect("expected UnknownKeys");
-        assert_eq!(keys[0].line, 1);
-        let span = keys[0].span.expect("YAML key span");
-        assert_eq!(&yaml[span.start..span.end], "typo");
+        #[cfg(feature = "yaml")]
+        {
+            let yaml = "typo: 1\n";
+            let parsed = crate::format::YamlAdapter.parse(yaml).unwrap();
+            let table = match parsed.value {
+                crate::value::Value::Map(map) => map,
+                _ => panic!("expected map"),
+            };
+            let err = validate_unknown(
+                &table,
+                &crate::fixtures::test::test_schema(),
+                &UnknownKeySource::File {
+                    path: Path::new("/p.yaml"),
+                    source: yaml,
+                    spans: &parsed.spans,
+                },
+                &test_ctx(),
+            )
+            .unwrap_err();
+            let keys = err.unknown_keys().expect("expected UnknownKeys");
+            assert_eq!(keys[0].line, 1);
+            let span = keys[0].span.expect("YAML key span");
+            assert_eq!(&yaml[span.start..span.end], "typo");
+        }
 
         let json = "{\"typo\": 1}\n";
         let parsed = crate::format::JsonAdapter.parse(json).unwrap();
@@ -1085,12 +1088,15 @@ pool_size = 10
 
     #[test]
     fn yaml_and_json_quoted_dotted_map_of_key_keeps_the_span() {
-        let yaml = "plugins:\n  \"acme.prod\":\n    rogue: 1\n";
-        let err = unknown_in(yaml, &crate::format::YamlAdapter, "/p.yaml");
-        let keys = err.unknown_keys().expect("expected UnknownKeys");
-        assert_eq!(keys[0].line, 3);
-        let span = keys[0].span.expect("YAML key span");
-        assert_eq!(&yaml[span.start..span.end], "rogue");
+        #[cfg(feature = "yaml")]
+        {
+            let yaml = "plugins:\n  \"acme.prod\":\n    rogue: 1\n";
+            let err = unknown_in(yaml, &crate::format::YamlAdapter, "/p.yaml");
+            let keys = err.unknown_keys().expect("expected UnknownKeys");
+            assert_eq!(keys[0].line, 3);
+            let span = keys[0].span.expect("YAML key span");
+            assert_eq!(&yaml[span.start..span.end], "rogue");
+        }
 
         let json = "{\"plugins\":{\"acme.prod\":{\"rogue\":1}}}\n";
         let err = unknown_in(json, &crate::format::JsonAdapter, "/p.json");

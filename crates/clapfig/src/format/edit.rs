@@ -138,7 +138,7 @@ pub(crate) fn unset_at_path<D: EditDoc>(doc: &mut D, keys: &[&str]) -> bool {
     current.remove_key(leaf)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "yaml"))]
 mod tests {
     // The walkers run against the owned-model tree (the YAML adapter's
     // `EditDoc` impl); each adapter's own tests cover its document type

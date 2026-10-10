@@ -1713,13 +1713,16 @@ mod tests {
     // construction (the logic lives before the adapter seam), so every
     // scenario runs against all three adapters.
 
-    use crate::format::{JsonAdapter, YamlAdapter};
+    use crate::format::JsonAdapter;
+    #[cfg(feature = "yaml")]
+    use crate::format::YamlAdapter;
 
     /// Per-adapter document with the schema's `database.pool_size` leaf
     /// spelled in the given (kebab or snake) form.
-    fn docs(leaf: &str) -> [(&'static dyn FormatAdapter, String); 3] {
-        [
+    fn docs(leaf: &str) -> Vec<(&'static dyn FormatAdapter, String)> {
+        vec![
             (&TomlAdapter, format!("[database]\n{leaf} = 5\n")),
+            #[cfg(feature = "yaml")]
             (&YamlAdapter, format!("database:\n  {leaf}: 5\n")),
             (
                 &JsonAdapter,
@@ -1806,8 +1809,9 @@ mod tests {
     fn normalized_set_emits_kebab_for_missing_paths() {
         // A path not present in the document is created in the emitted
         // (kebab) spelling — the same spelling `config gen` produces.
-        let bases: [(&dyn FormatAdapter, &str); 3] = [
+        let bases: Vec<(&dyn FormatAdapter, &str)> = vec![
             (&TomlAdapter, "host = \"h\"\n"),
+            #[cfg(feature = "yaml")]
             (&YamlAdapter, "host: h\n"),
             (&JsonAdapter, "{\n  \"host\": \"h\"\n}\n"),
         ];
@@ -1839,7 +1843,12 @@ mod tests {
         // normalization setting, so the seeded file and `config gen`
         // agree on key spelling — and the set lands on the template's own
         // kebab key instead of adding a snake duplicate.
-        let adapters: [&dyn FormatAdapter; 3] = [&TomlAdapter, &YamlAdapter, &JsonAdapter];
+        let adapters: Vec<&dyn FormatAdapter> = vec![
+            &TomlAdapter,
+            #[cfg(feature = "yaml")]
+            &YamlAdapter,
+            &JsonAdapter,
+        ];
         for adapter in adapters {
             for action_key in ["database.pool-size", "database.pool_size"] {
                 let out = set_in_document(
@@ -1918,9 +1927,10 @@ mod tests {
 
     /// Per-adapter document with BOTH spellings of the pool-size leaf —
     /// a file the load path refuses as a NormalizedKeyCollision.
-    fn colliding_docs() -> [(&'static dyn FormatAdapter, &'static str); 3] {
-        [
+    fn colliding_docs() -> Vec<(&'static dyn FormatAdapter, &'static str)> {
+        vec![
             (&TomlAdapter, "[database]\npool-size = 5\npool_size = 6\n"),
+            #[cfg(feature = "yaml")]
             (&YamlAdapter, "database:\n  pool-size: 5\n  pool_size: 6\n"),
             (
                 &JsonAdapter,

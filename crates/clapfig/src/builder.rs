@@ -3704,11 +3704,14 @@ mod tests {
         // Scoped get reads the raw (un-normalized) file, so a kebab
         // document must answer for either action-key spelling — across
         // all three formats.
-        use crate::format::{FormatAdapter, JsonAdapter, TomlAdapter, YamlAdapter};
+        #[cfg(feature = "yaml")]
+        use crate::format::YamlAdapter;
+        use crate::format::{FormatAdapter, JsonAdapter, TomlAdapter};
 
         let dir = TempDir::new().unwrap();
-        let files: [(&str, &dyn FormatAdapter, &str); 3] = [
+        let files: Vec<(&str, &dyn FormatAdapter, &str)> = vec![
             ("demo.toml", &TomlAdapter, "[db]\npool-size = 42\n"),
+            #[cfg(feature = "yaml")]
             ("demo.yaml", &YamlAdapter, "db:\n  pool-size: 42\n"),
             ("demo.json", &JsonAdapter, "{\"db\": {\"pool-size\": 42}}"),
         ];
@@ -4597,6 +4600,25 @@ mod tests {
         assert_eq!(table.get("host"), Some(&Value::String("low".into())));
     }
 
+    #[cfg(not(feature = "yaml"))]
+    #[test]
+    fn disabled_yaml_refuses_discovery_and_explicit_files() {
+        for builder in [
+            Clapfig::builder(demo_schema())
+                .file_stem("demo")
+                .formats(["yaml"]),
+            Clapfig::builder(demo_schema()).file_name("demo.yaml"),
+        ] {
+            match builder.app_name("demo").no_env().build_resolver().err() {
+                Some(ClapfigError::UnknownFormat { name, available }) => {
+                    assert_eq!(name, "yaml");
+                    assert_eq!(available, ["toml", "json"]);
+                }
+                other => panic!("expected UnknownFormat, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn formats_unknown_name_errors() {
         let err = Clapfig::builder(demo_schema())
@@ -4609,7 +4631,7 @@ mod tests {
         match err {
             Some(ClapfigError::UnknownFormat { name, available }) => {
                 assert_eq!(name, "xml");
-                assert_eq!(available, ["toml", "yaml", "json"]);
+                assert_eq!(available, crate::format::builtin_names());
             }
             other => panic!("expected UnknownFormat, got {other:?}"),
         }
@@ -4712,7 +4734,7 @@ mod tests {
         match err {
             Some(ClapfigError::UnknownFormat { name, available }) => {
                 assert_eq!(name, "ini");
-                assert_eq!(available, ["toml", "yaml", "json"]);
+                assert_eq!(available, crate::format::builtin_names());
             }
             other => panic!("expected UnknownFormat, got {other:?}"),
         }

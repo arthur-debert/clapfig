@@ -6,6 +6,7 @@ channels = ["conda-forge"]
 platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64"]
 
 [tasks]
+no-yaml = "bin/check-no-yaml"
 # >>> shipit-managed test task (do not edit; regenerate via `shipit install`) >>>
 test = "./bin/shipit test"
 # <<< shipit-managed test task <<<

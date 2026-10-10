@@ -391,6 +391,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "yaml")]
     fn yaml_registry() -> &'static FormatRegistry {
         use std::sync::OnceLock;
         static REGISTRY: OnceLock<FormatRegistry> = OnceLock::new();
@@ -1308,6 +1309,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "yaml")]
     fn assert_yaml_root_invalid(source: &str, expected_slice: &str) {
         let spec = test_spec();
         let input = ResolveInput {
@@ -1336,11 +1338,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "yaml")]
     fn invalid_value_yaml_root_scalar_names_line_and_caret() {
         assert_yaml_root_invalid("42\n", "42");
     }
 
     #[test]
+    #[cfg(feature = "yaml")]
     fn invalid_value_yaml_root_array_names_line_and_caret() {
         assert_yaml_root_invalid("[1, 2]\n", "[1, 2]");
     }
